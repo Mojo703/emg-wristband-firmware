@@ -52,13 +52,16 @@ fn main() -> anyhow::Result<()> {
         idle();
     }
 
+    let ota = ota::Ota::new(cfg.ota_url);
+    let wifi = wifi::WiFi::new(cfg.wifi_ssid, cfg.wifi_psk);
+
     let peripherals = Peripherals::take()?;
     let sysloop = EspSystemEventLoop::take()?;
     let nvs = EspDefaultNvsPartition::take()?;
 
-    let _wifi = wifi::connect(cfg.wifi_ssid, cfg.wifi_psk, peripherals.modem, sysloop, nvs)?;
+    let _wifi = wifi.connect(peripherals.modem, sysloop, nvs)?;
 
-    match ota::run_update(cfg.ota_url) {
+    match ota.run_update() {
         Ok(()) => {
             info!("update applied; rebooting into new image in 3s");
             std::thread::sleep(Duration::from_secs(3));

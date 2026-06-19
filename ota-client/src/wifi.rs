@@ -4,50 +4,59 @@ use anyhow::{anyhow, Result};
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::modem::Modem;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
-use esp_idf_svc::wifi::{
-    AuthMethod, BlockingWifi, ClientConfiguration, Configuration, EspWifi,
-};
+use esp_idf_svc::wifi::{AuthMethod, BlockingWifi, ClientConfiguration, Configuration, EspWifi};
 use log::info;
 
-/// Connect to `ssid`/`psk` as a station and wait until the network interface is
-/// up. Returns the live `BlockingWifi` so the caller keeps it alive (dropping it
-/// tears down the connection).
-pub fn connect(
-    ssid: &str,
-    psk: &str,
-    modem: Modem<'static>,
-    sysloop: EspSystemEventLoop,
-    nvs: EspDefaultNvsPartition,
-) -> Result<BlockingWifi<EspWifi<'static>>> {
-    let mut wifi =
-        BlockingWifi::wrap(EspWifi::new(modem, sysloop.clone(), Some(nvs))?, sysloop)?;
+pub(crate) struct WiFi {
+    ssid: &'static str,
+    psk: &'static str,
+}
 
-    let auth_method = if psk.is_empty() {
-        AuthMethod::None
-    } else {
-        AuthMethod::WPA2Personal
-    };
+impl WiFi {
+    pub(crate) fn new(ssid: &'static str, psk: &'static str) -> Self {
+        Self { ssid, psk }
+    }
 
-    wifi.set_configuration(&Configuration::Client(ClientConfiguration {
-        ssid: ssid
-            .try_into()
-            .map_err(|_| anyhow!("SSID too long (max 32 bytes)"))?,
-        password: psk
-            .try_into()
-            .map_err(|_| anyhow!("WiFi password too long (max 64 bytes)"))?,
-        auth_method,
-        ..Default::default()
-    }))?;
+    /// Connect to `ssid`/`psk` as a station and wait until the network interface is
+    /// up. Returns the open `BlockingWifi`, drop closes the connection.
+    pub(crate) fn connect(
+        &self,
+        modem: Modem<'static>,
+        sysloop: EspSystemEventLoop,
+        nvs: EspDefaultNvsPartition,
+    ) -> Result<BlockingWifi<EspWifi<'static>>> {
+        let mut wifi =
+            BlockingWifi::wrap(EspWifi::new(modem, sysloop.clone(), Some(nvs))?, sysloop)?;
 
-    wifi.start()?;
-    info!("wifi started");
+        let auth_method = if self.psk.is_empty() {
+            AuthMethod::None
+        } else {
+            AuthMethod::WPA2Personal
+        };
 
-    wifi.connect()?;
-    info!("wifi associated, waiting for IP...");
+        wifi.set_configuration(&Configuration::Client(ClientConfiguration {
+            ssid: self
+                .ssid
+                .try_into()
+                .map_err(|_| anyhow!("SSID too long (max 32 bytes)"))?,
+            password: self
+                .psk
+                .try_into()
+                .map_err(|_| anyhow!("WiFi password too long (max 64 bytes)"))?,
+            auth_method,
+            ..Default::default()
+        }))?;
 
-    wifi.wait_netif_up()?;
-    let ip_info = wifi.wifi().sta_netif().get_ip_info()?;
-    info!("wifi up, ip = {}", ip_info.ip);
+        wifi.start()?;
+        info!("wifi started");
 
-    Ok(wifi)
+        wifi.connect()?;
+        info!("wifi associated, waiting for IP...");
+
+        wifi.wait_netif_up()?;
+        let ip_info = wifi.wifi().sta_netif().get_ip_info()?;
+        info!("wifi up, ip = {}", ip_info.ip);
+
+        Ok(wifi)
+    }
 }

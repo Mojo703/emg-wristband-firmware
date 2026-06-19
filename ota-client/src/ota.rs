@@ -13,51 +13,61 @@ use log::info;
 
 const BUF_SIZE: usize = 4096;
 
-/// Download the firmware at `url` and stage it as the next boot image.
-///
-/// On success the inactive OTA slot holds the new image and is set as the boot
-/// partition; the caller should reboot. On any failure the partially written
-/// update is aborted and the current firmware stays active.
-pub fn run_update(url: &str) -> Result<()> {
-    info!("OTA: fetching {url}");
+pub(crate) struct Ota {
+    url: &'static str,
+}
 
-    let mut conn = EspHttpConnection::new(&HttpConfig {
-        buffer_size: Some(BUF_SIZE),
-        ..Default::default()
-    })?;
-
-    conn.initiate_request(Method::Get, url, &[])?;
-    conn.initiate_response()?;
-
-    let status = conn.status();
-    if status != 200 {
-        bail!("server returned HTTP {status}");
+impl Ota {
+    pub(crate) fn new(url: &'static str) -> Self {
+        Self { url }
     }
 
-    let mut ota = EspOta::new()?;
-    let mut update = ota.initiate_update()?;
+    /// Download the firmware at the predefined `url` and stage it as the next boot image.
+    ///
+    /// On success the inactive OTA slot holds the new image and is set as the boot
+    /// partition; the caller should reboot. On any failure the partially written
+    /// update is aborted and the current firmware stays active.
+    pub(crate) fn run_update(&self) -> Result<()> {
+        info!("OTA: fetching {}", self.url);
 
-    let mut buf = [0u8; BUF_SIZE];
-    let mut total: usize = 0;
-    loop {
-        let n = Read::read(&mut conn, &mut buf)?;
-        if n == 0 {
-            break;
+        let mut conn = EspHttpConnection::new(&HttpConfig {
+            buffer_size: Some(BUF_SIZE),
+            ..Default::default()
+        })?;
+
+        conn.initiate_request(Method::Get, self.url, &[])?;
+        conn.initiate_response()?;
+
+        let status = conn.status();
+        if status != 200 {
+            bail!("server returned HTTP {status}");
         }
-        if let Err(e) = update.write(&buf[..n]) {
+
+        let mut ota = EspOta::new()?;
+        let mut update = ota.initiate_update()?;
+
+        let mut buf = [0u8; BUF_SIZE];
+        let mut total: usize = 0;
+        loop {
+            let n = Read::read(&mut conn, &mut buf)?;
+            if n == 0 {
+                break;
+            }
+            if let Err(e) = update.write(&buf[..n]) {
+                update.abort()?;
+                bail!("flash write failed after {total} bytes: {e:?}");
+            }
+            total += n;
+        }
+
+        if total == 0 {
             update.abort()?;
-            bail!("flash write failed after {total} bytes: {e:?}");
+            bail!("downloaded 0 bytes; nothing written");
         }
-        total += n;
-    }
 
-    if total == 0 {
-        update.abort()?;
-        bail!("downloaded 0 bytes; nothing written");
+        info!("OTA: downloaded {total} bytes, finalizing");
+        update.complete()?;
+        info!("OTA: image staged and set as boot partition");
+        Ok(())
     }
-
-    info!("OTA: downloaded {total} bytes, finalizing");
-    update.complete()?;
-    info!("OTA: image staged and set as boot partition");
-    Ok(())
 }
