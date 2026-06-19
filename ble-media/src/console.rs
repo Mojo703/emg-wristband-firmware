@@ -13,20 +13,8 @@ use core::ffi::c_void;
 use anyhow::Result;
 use esp_idf_svc::sys;
 
-use crate::media::MediaKey;
-
-/// A parsed console command.
-#[derive(Clone, Copy, Debug)]
-pub enum Command {
-    /// Send a media key.
-    Media(MediaKey),
-    /// Print the help text.
-    Help,
-}
-
 /// One-line usage shown at boot and on `h`/`?`.
-pub const HELP: &str =
-    "keys: p=play/pause  n=next  b=back  +=vol up  -=vol down  m=mute  h=help";
+pub const HELP: &str = "keys: p=play/pause  n=next  b=back  +=vol up  -=vol down  m=mute  h=help";
 
 /// Install the USB-Serial-JTAG driver so [`read_byte`] receives console input.
 /// Must be called once before reading.
@@ -48,27 +36,10 @@ pub fn init() -> Result<()> {
 ///
 /// A FreeRTOS tick is 1 ms here (`CONFIG_FREERTOS_HZ=1000`), so `timeout_ms`
 /// doubles as the tick count.
-pub fn read_byte(timeout_ms: u32) -> Option<u8> {
+pub(crate) fn read_byte_blocking(timeout_ms: u32) -> Option<u8> {
     let mut byte = 0u8;
     let read = unsafe {
         sys::usb_serial_jtag_read_bytes(&mut byte as *mut u8 as *mut c_void, 1, timeout_ms)
     };
     (read > 0).then_some(byte)
-}
-
-/// Map a console byte to a command. `Ok(None)` for whitespace (ignored),
-/// `Err(c)` for anything unrecognized so the caller can warn.
-pub fn parse(byte: u8) -> Result<Option<Command>, char> {
-    let c = byte as char;
-    match c.to_ascii_lowercase() {
-        'p' => Ok(Some(Command::Media(MediaKey::PlayPause))),
-        'n' => Ok(Some(Command::Media(MediaKey::NextTrack))),
-        'b' => Ok(Some(Command::Media(MediaKey::PrevTrack))),
-        '+' | '=' => Ok(Some(Command::Media(MediaKey::VolumeUp))),
-        '-' | '_' => Ok(Some(Command::Media(MediaKey::VolumeDown))),
-        'm' => Ok(Some(Command::Media(MediaKey::Mute))),
-        'h' | '?' => Ok(Some(Command::Help)),
-        '\r' | '\n' | ' ' | '\t' => Ok(None),
-        other => Err(other),
-    }
 }

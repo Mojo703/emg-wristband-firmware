@@ -6,12 +6,15 @@
 //! [`ble::MediaController::press`] directly.
 
 mod ble;
+mod command;
 mod config;
 mod console;
 mod media;
 
+use core::convert::TryFrom;
+
 use ble::MediaController;
-use console::Command;
+use command::Command;
 use log::{info, warn};
 
 /// Per-read console timeout. The read blocks up to this long, so the loop also
@@ -31,25 +34,21 @@ fn main() -> anyhow::Result<()> {
     info!("{}", console::HELP);
 
     loop {
-        if let Some(byte) = console::read_byte(READ_TIMEOUT_MS) {
-            handle(&controller, byte);
-        }
-    }
-}
+        let cmd = console::read_byte_blocking(READ_TIMEOUT_MS)
+            .map(|byte| Command::try_from(byte as char));
 
-/// Dispatch one console byte.
-fn handle(controller: &MediaController, byte: u8) {
-    match console::parse(byte) {
-        Ok(Some(Command::Media(key))) => {
-            if controller.is_connected() {
-                info!("sending {key:?}");
-                controller.press(key);
-            } else {
-                warn!("no host connected yet; ignoring {key:?}");
+        match cmd {
+            Some(Ok(Command::Media(key))) => {
+                if controller.is_connected() {
+                    info!("sending {key:?}");
+                    controller.press(key);
+                } else {
+                    warn!("no host connected yet; ignoring {key:?}");
+                }
             }
+            Some(Ok(Command::Help)) => info!("{}", console::HELP),
+            Some(Err(c)) => warn!("unknown key '{c}' ({})", console::HELP),
+            None => {}
         }
-        Ok(Some(Command::Help)) => info!("{}", console::HELP),
-        Ok(None) => {}
-        Err(c) => warn!("unknown key '{c}' ({})", console::HELP),
     }
 }

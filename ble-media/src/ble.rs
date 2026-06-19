@@ -107,14 +107,8 @@ impl MediaController {
 
     /// Send a media key as a press followed by a release.
     pub fn press(&self, key: MediaKey) {
-        self.input
-            .lock()
-            .set_value(&key.press_report())
-            .notify();
+        self.input.lock().set_value(&key.press_report()).notify();
         FreeRtos::delay_ms(KEY_HOLD_MS);
-        self.input
-            .lock()
-            .set_value(&media::RELEASE_REPORT)
-            .notify();
+        self.input.lock().set_value(&media::RELEASE_REPORT).notify();
     }
 }
