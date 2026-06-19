@@ -44,11 +44,15 @@ impl MediaController {
         BLEDevice::set_device_name(device_name)?;
 
         // Bond with "just works" pairing (no PIN). Bonding + encryption is
-        // mandatory for iOS to deliver HID input.
+        // mandatory for iOS to deliver HID input. `resolve_rpa()` is required
+        // for reconnection: iOS comes back with a rotating Resolvable Private
+        // Address, so without RPA resolution the device can't match the bonded
+        // peer after a reboot and the reconnect silently fails.
         device
             .security()
             .set_auth(AuthReq::all())
-            .set_io_cap(SecurityIOCap::NoInputNoOutput);
+            .set_io_cap(SecurityIOCap::NoInputNoOutput)
+            .resolve_rpa();
 
         let connected = Arc::new(AtomicBool::new(false));
         let server = device.get_server();
@@ -82,7 +86,10 @@ impl MediaController {
         let input = hid.input_report(media::REPORT_ID);
 
         let advertising = device.get_advertising();
-        advertising.lock().set_data(
+        // scan_response(false) keeps the name + HID service UUID in the primary
+        // advertisement (not the scan response), which iOS uses to recognize the
+        // bonded device for reconnection.
+        advertising.lock().scan_response(false).set_data(
             BLEAdvertisementData::new()
                 .name(device_name)
                 .appearance(APPEARANCE_HID_KEYBOARD)
