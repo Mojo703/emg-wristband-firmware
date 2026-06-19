@@ -1,11 +1,11 @@
 # ble-media
 
-ESP32-S3 BLE media remote. Advertises as a BLE **HID-over-GATT** consumer-control
+ESP32-S3 BLE media remote. Advertises as a BLE HID-over-GATT consumer-control
 device, bonds with a host (iPhone, also macOS/Android/Windows), and sends media
 keys (play/pause, next, previous, volume, mute). Built on `std` / `esp-idf-svc`
 with the [`esp32-nimble`](https://github.com/taks/esp32-nimble) NimBLE wrapper.
 
-For bring-up the keys are driven from the **serial console**; later the gesture
+For bring-up the keys are driven from the jtag serial console; later the gesture
 classifier will call `MediaController::press` directly instead.
 
 ## How it works
@@ -14,20 +14,11 @@ classifier will call `MediaController::press` directly instead.
   16-bit usage code (`media.rs`). Sending a usage = press, sending `0x0000` =
   release.
 - The device advertises with a HID-keyboard appearance and bonds on first
-  connect. iOS only delivers HID input over an **encrypted/bonded** link, so
+  connect. iOS only delivers HID input over an encrypted/bonded link, so
   bonding (`AuthReq::all`, "just works" pairing) is required, and bonding keys
   are persisted in NVS so it stays paired across reboots.
 - Media usages: Play/Pause `0xCD`, Next `0xB5`, Prev `0xB6`, Vol+ `0xE9`,
   Vol- `0xEA`, Mute `0xE2`.
-
-## Layout
-
-- `src/main.rs`    — boot + console read loop
-- `src/ble.rs`     — `MediaController`: HID device, advertising, bonding, `press`
-- `src/media.rs`   — HID report descriptor + `MediaKey` usages
-- `src/console.rs` — maps console bytes to commands
-- `src/config.rs`  — device name from `cfg.toml`
-- `partitions.csv` — single 3 MB app slot + nvs (BLE bonds) for 4 MB flash
 
 ## Build, flash, monitor
 
@@ -45,11 +36,11 @@ reason as `ota-client`).
 ## Using it
 
 1. Flash and open the monitor (`cargo run`).
-2. On the iPhone: **Settings → Bluetooth**, tap "EMG Wristband", accept pairing.
+2. On the iPhone: Settings>Bluetooth, tap "EMG Wristband", accept pairing.
    First-time pairing includes iOS reading the HID report map, so it can take a
-   few seconds; reconnects are faster once bonded.
-3. Open any media (Music, YouTube, etc.), then type into the **same espflash
-   monitor window** (a single keystroke, no Enter needed):
+   few seconds. Reconnects are faster once bonded.
+3. Open any media (Music, YouTube, etc.), then type into the same espflash
+   monitor window (a single keystroke, no Enter needed):
    - `p` play/pause, `n` next, `b` back, `+`/`-` volume, `m` mute, `h` help.
    The phone should respond. If you type before a host is connected, the command
    is ignored with a warning.
