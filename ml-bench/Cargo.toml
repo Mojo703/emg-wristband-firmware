@@ -1,0 +1,37 @@
+# Empty workspace table makes this a workspace root so cargo doesn't attach it
+# to an unrelated Cargo.toml higher up the directory tree.
+[workspace]
+
+[package]
+name = "ml-bench"
+version = "0.1.0"
+edition = "2021"
+resolver = "2"
+rust-version = "1.77"
+description = "ESP32-S3 latency/throughput benchmark for the EMG gesture encoder (int8)"
+
+[[bin]]
+name = "ml-bench"
+harness = false
+
+# Benchmark with --release. opt-level 3 (speed), NOT "s": this is compute we are
+# timing, so optimize for speed.
+[profile.release]
+opt-level = 3
+
+# Keep a debug build merely usable; real numbers come from --release.
+[profile.dev]
+opt-level = 1
+
+[features]
+default = []
+# Route the hot dot product through the ESP32-S3 PIE/ACCX SIMD kernel.
+simd = []
+
+[dependencies]
+log = "0.4"
+esp-idf-svc = "0.52"
+anyhow = "1"
+
+[build-dependencies]
+embuild = "0.33"
