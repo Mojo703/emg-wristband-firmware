@@ -36,6 +36,11 @@ pub fn init() -> Result<()> {
         rx_buffer_size: 256,
     };
     sys::esp!(unsafe { sys::usb_serial_jtag_driver_install(&mut cfg) })?;
+    // Route stdio/ESP_LOG through the driver as well. Without this, logs still
+    // use the polling path and contend with the driver for the peripheral, so
+    // output from other tasks (e.g. the NimBLE host task's connect/disconnect
+    // handlers) gets dropped.
+    unsafe { sys::esp_vfs_usb_serial_jtag_use_driver() };
     Ok(())
 }
 
