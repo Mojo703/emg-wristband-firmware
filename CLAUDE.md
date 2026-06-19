@@ -15,6 +15,10 @@ unrelated parent manifest.
   → write inactive OTA slot → reboot. Modules: `main`, `wifi`, `ota`, `config`.
 - `ota-server/` — minimal `axum` static host for firmware `.bin` images. Plain
   `x86_64` Rust, runs on the dev machine. No ESP toolchain needed.
+- `ble-media/` — ESP32-S3 BLE HID consumer-control media remote (`esp32-nimble`).
+  Advertises + bonds as a keyboard-class device and sends play/pause/next/etc;
+  driven from the serial console for now, gesture classifier later. Modules:
+  `main`, `ble`, `media`, `console`, `config`. Builds; not yet hardware-tested.
 
 The OTA system is the first firmware milestone: a tested update path so later
 work ships faster. Build it modular and extensible. **Verified end-to-end on

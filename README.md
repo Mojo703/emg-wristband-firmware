@@ -17,6 +17,9 @@ work faster to ship.
   reboots into it. Uses the ESP-IDF `esp_https_ota`-style flow via `EspOta`.
 - **`ota-server/`** — Minimal `axum` HTTP server (runs on your dev machine) that
   hosts firmware `.bin` images for the client to download.
+- **`ble-media/`** — ESP32-S3 BLE HID media remote (`esp32-nimble`). Bonds with
+  an iPhone and sends media keys (play/pause, next, volume); serial-console
+  driven for bring-up, gesture-driven later. See `ble-media/README.md`.
 
 ## Target hardware
 

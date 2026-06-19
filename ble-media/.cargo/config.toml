@@ -1,0 +1,18 @@
+[build]
+target = "xtensa-esp32s3-espidf"
+
+[target.xtensa-esp32s3-espidf]
+linker = "ldproxy"
+# `--partition-table` is required so our custom (large single-app) table is
+# flashed; without it espflash writes a default table whose app slot is too
+# small for a NimBLE + esp-idf-svc image.
+runner = "espflash flash --monitor --partition-table partitions.csv"
+rustflags = ["--cfg", "espidf_time64"]
+
+[unstable]
+build-std = ["std", "panic_abort"]
+
+[env]
+MCU = "esp32s3"
+# Pin a known-good ESP-IDF release so the build is reproducible across the team.
+ESP_IDF_VERSION = "v5.2.2"

@@ -1,0 +1,35 @@
+# Empty workspace table makes this a workspace root so cargo doesn't attach it
+# to an unrelated Cargo.toml higher up the directory tree.
+[workspace]
+
+[package]
+name = "ble-media"
+version = "0.1.0"
+edition = "2021"
+resolver = "2"
+rust-version = "1.77"
+description = "ESP32-S3 BLE HID consumer-control media remote (serial-driven for now)"
+
+[[bin]]
+name = "ble-media"
+harness = false
+
+[profile.release]
+opt-level = "s"
+
+[profile.dev]
+debug = true
+opt-level = "z"
+
+[dependencies]
+log = "0.4"
+esp-idf-svc = "0.52"
+# Pulls esp-idf-svc 0.52 itself, so the single `esp-idf-sys` (a `links` crate)
+# stays consistent across the graph.
+esp32-nimble = "0.12"
+anyhow = "1"
+toml-cfg = "0.2"
+
+[build-dependencies]
+embuild = "0.33"
+toml-cfg = "0.2"

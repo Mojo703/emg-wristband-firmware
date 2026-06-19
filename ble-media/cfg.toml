@@ -1,0 +1,5 @@
+# Device configuration, read at compile time by toml-cfg (see src/config.rs).
+# No secrets here, so this file is committed.
+[ble-media]
+# Name shown in the iPhone's Bluetooth settings.
+device_name = "EMG Wristband"
