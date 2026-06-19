@@ -1,4 +1,4 @@
-# EMG Wristband — Firmware
+# EMG Wristband Firmware
 
 Rust firmware for the sEMG gesture-recognition wristband (capstone S1). Each
 project here is self-contained (no shared workspace) so team members can develop
@@ -7,27 +7,41 @@ in parallel and merge at the integration phase.
 The first milestone is the OTA update system below, to make all later firmware
 work faster to ship.
 
-> Path note: keep this tree at a location **without spaces** in the path.
-> ESP-IDF refuses to build under paths containing spaces.
+> IMPORTANT! Keep this tree at a location without spaces in the path, because ESP-IDF refuses to build under paths containing spaces
 
 ## Projects
 
-- **`ota-client/`** — ESP32-S3 firmware (std / `esp-idf-svc`). Connects to WiFi,
+- `ota-client/`: ESP32-S3 firmware (std / `esp-idf-svc`). Connects to WiFi,
   pulls a firmware image over HTTP, writes it to the inactive OTA slot, and
   reboots into it. Uses the ESP-IDF `esp_https_ota`-style flow via `EspOta`.
-- **`ota-server/`** — Minimal `axum` HTTP server (runs on your dev machine) that
+- `ota-server/`: Minimal `axum` HTTP server (runs on your dev machine) that
   hosts firmware `.bin` images for the client to download.
-- **`ble-media/`** — ESP32-S3 BLE HID media remote (`esp32-nimble`). Bonds with
+- `ble-media/`: ESP32-S3 BLE HID media remote (`esp32-nimble`). Bonds with
   an iPhone and sends media keys (play/pause, next, volume); serial-console
   driven for bring-up, gesture-driven later. See `ble-media/README.md`.
+
+## Dev Environment
+## Development Environment
+
+| Tool | Version |
+|------|---------|
+| OS | EndeavourOS (Arch Linux) |
+| Kernel | 7.0.12-arch1-1 |
+| CPU | AMD Ryzen 9 7900X |
+| GCC / G++ | 16.1.1 |
+| Clang | 22.1.6 |
+| CMake | 4.3.3 |
+| GNU Make | 4.4.1 |
+| Rust (`rustc`) | 1.95.0-nightly |
+| Cargo | 1.95.0-nightly |
 
 ## Target hardware
 
 - ESP32-S3-Zero (Waveshare), 4 MB flash, native USB (USB-Serial-JTAG over USB-C).
-- Will move to a custom board later; nothing here is board-pinned beyond the
+- We will move to a custom board later, so nothing here is board-pinned beyond the
   partition table (`ota-client/partitions.csv`) sized for 4 MB flash.
 
-## How it works
+## How the OTA works
 
 The 4 MB flash holds two equal app slots (`ota_0`, `ota_1`) plus an `otadata`
 region that records which slot to boot. The client connects to WiFi, downloads
@@ -36,12 +50,12 @@ running, flips `otadata`, and reboots into it. The boot banner prints
 `FW_VERSION` and the active slot, so a successful update shows both changing.
 Full detail is in `ota-client/README.md`.
 
-Status: **verified end-to-end on hardware** — v1.0.0 updated to v1.0.1 over WiFi,
+Status: verified end-to-end on hardware, v1.0.0 updated to v1.0.1 over WiFi,
 slot `ota_0 → ota_1`, no re-flash.
 
-## End-to-end verification (the goal of this first milestone)
+## End-to-end verification for OTA
 
-Summary; the exact commands and expected logs are in `ota-client/README.md`.
+This is a summary. The exact commands and expected logs are in `ota-client/README.md`.
 
 1. Install the Xtensa toolchain and apply the Arch `libxml2` symlink
    (`ota-client/README.md`).
