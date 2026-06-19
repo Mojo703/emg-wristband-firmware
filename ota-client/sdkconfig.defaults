@@ -1,0 +1,21 @@
+# 4 MB flash on the ESP32-S3-Zero.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
+
+# Use our custom partition table (two ~1.8 MB OTA app slots + otadata). See
+# partitions.csv. esp-idf-sys runs the ESP-IDF cmake build from a generated dir,
+# so a path relative to the cmake project won't find our file. We use the
+# PROJECT_DIR env var (which esp-idf-sys sets to this crate's dir); ESP-IDF emits
+# this value into a cmake `set()`, where cmake evaluates $ENV{...} to an absolute
+# path. Portable across machines with no hard-coded path.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="$ENV{PROJECT_DIR}/partitions.csv"
+
+# Rust's main task needs a larger stack than the IDF default.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=20000
+
+CONFIG_FREERTOS_HZ=1000
+
+# Enable app rollback so a bad image can be reverted. We mark the running
+# image valid at boot (see src/main.rs) to confirm a successful update.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y

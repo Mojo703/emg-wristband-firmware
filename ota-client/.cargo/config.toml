@@ -1,0 +1,18 @@
+[build]
+target = "xtensa-esp32s3-espidf"
+
+[target.xtensa-esp32s3-espidf]
+linker = "ldproxy"
+# espflash flashes then opens the serial monitor. `--partition-table` is required
+# so our dual-OTA layout (otadata + ota_0 + ota_1) gets written; without it
+# espflash flashes a default single-factory table and OTA has nowhere to write.
+runner = "espflash flash --monitor --partition-table partitions.csv"
+rustflags = ["--cfg", "espidf_time64"]
+
+[unstable]
+build-std = ["std", "panic_abort"]
+
+[env]
+MCU = "esp32s3"
+# Pin a known-good ESP-IDF release so the build is reproducible across the team.
+ESP_IDF_VERSION = "v5.2.2"

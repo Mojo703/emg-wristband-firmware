@@ -1,0 +1,16 @@
+# Empty workspace table makes this a workspace root so cargo doesn't attach it
+# to an unrelated Cargo.toml higher up the directory tree.
+[workspace]
+
+[package]
+name = "ota-server"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal HTTP server that hosts firmware images for OTA updates"
+
+[dependencies]
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["fs", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

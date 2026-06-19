@@ -1,0 +1,38 @@
+# Empty workspace table makes this a workspace root so cargo doesn't attach it
+# to an unrelated Cargo.toml higher up the directory tree.
+[workspace]
+
+[package]
+name = "ota-client"
+version = "0.1.0"
+edition = "2021"
+resolver = "2"
+rust-version = "1.77"
+description = "ESP32-S3 OTA update client (std / esp-idf-svc)"
+
+[[bin]]
+name = "ota-client"
+harness = false # do not use the built-in test harness; we run on-device
+
+[profile.release]
+opt-level = "s"
+
+[profile.dev]
+debug = true # symbols are nice for development; cheap to include
+opt-level = "z"
+
+[features]
+default = []
+experimental = ["esp-idf-svc/experimental"]
+
+[dependencies]
+log = "0.4"
+# 0.52+ is built against the current Xtensa toolchain (fixes c_char signedness).
+esp-idf-svc = "0.52"
+embedded-svc = "0.29"
+anyhow = "1"
+toml-cfg = "0.2"
+
+[build-dependencies]
+embuild = "0.33"
+toml-cfg = "0.2"
