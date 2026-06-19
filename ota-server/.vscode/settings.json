@@ -1,0 +1,7 @@
+{
+  // Use the toolchain's rust-analyzer rather than the VS Code extension's
+  // bundled build, which passes an unstable `cargo metadata --lockfile-path`
+  // flag that cargo 1.96 rejects (it then drops the dependency graph). This is a
+  // plain host crate, so no ESP environment is needed here.
+  "rust-analyzer.server.path": "${userHome}/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/rust-analyzer"
+}

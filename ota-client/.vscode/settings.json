@@ -1,0 +1,20 @@
+{
+  // The Xtensa toolchain (rust-toolchain.toml, channel = "esp") and the build
+  // target + build-std (.cargo/config.toml) are picked up by rust-analyzer
+  // automatically. The one thing it can't infer is the ESP build environment:
+  // esp-idf-sys's build script runs bindgen, which needs LIBCLANG_PATH. Without
+  // it, `cargo check` fails and rust-analyzer goes dark for this project.
+  //
+  // ~/.espup/esp-clang is a stable symlink espup maintains (independent of the
+  // toolchain version), so this stays correct across updates and machines.
+  "rust-analyzer.cargo.extraEnv": {
+    "LIBCLANG_PATH": "${userHome}/.espup/esp-clang"
+  },
+  // Use the rust-analyzer that ships with the toolchain instead of the one
+  // bundled in the VS Code extension. The bundled build passes an unstable
+  // `cargo metadata --lockfile-path` flag that neither the esp (1.95) nor host
+  // (1.96) cargo accepts, so it silently falls back to `--no-deps` and drops the
+  // dependency graph (no completions for esp-idf-svc etc.). This pinned binary
+  // matches the toolchain and doesn't do that.
+  "rust-analyzer.server.path": "${userHome}/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/rust-analyzer"
+}
