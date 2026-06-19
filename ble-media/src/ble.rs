@@ -38,6 +38,11 @@ impl MediaController {
     pub fn new(device_name: &str) -> Result<Self> {
         let device = BLEDevice::take();
 
+        // Set the GAP device name (the 0x2A00 characteristic). Without this it
+        // defaults to "nimble", which is what the host shows once connected even
+        // if the advertisement carried a different name.
+        BLEDevice::set_device_name(device_name)?;
+
         // Bond with "just works" pairing (no PIN). Bonding + encryption is
         // mandatory for iOS to deliver HID input.
         device
