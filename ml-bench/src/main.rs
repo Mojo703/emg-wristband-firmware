@@ -2,8 +2,8 @@
 //!
 //! Runs the int8 encoder forward pass and reports: a startup self-test of the
 //! SIMD dot product (vs a scalar oracle), end-to-end latency/throughput, and a
-//! per-stage breakdown so each stage can be optimized in isolation. Inference is
-//! always SIMD (`ee.vmulas.s8.accx`). Build with `--release`.
+//! per-stage breakdown so each stage can be optimized in isolation.
+//! Also verifies real model correctness against a Python-exported reference.
 
 #![feature(asm_experimental_arch)]
 
@@ -16,8 +16,8 @@ mod tensor;
 use bench::Profile;
 use esp_idf_svc::sys;
 use layers::Requant;
-use log::{error, info};
-use model::{Model, INPUT_CH, INPUT_LEN, KERNEL, NUM_CLASSES, NUM_STAGES, STAGE_NAMES};
+use log::{error, info, warn};
+use model::{ForwardResult, Model, EMBED_DIM, INPUT_CH, KERNEL, NUM_STAGES, STAGE_NAMES};
 use tensor::{Act, AlignedI8, Rng};
 
 const WARMUP: usize = 20;
@@ -28,8 +28,6 @@ fn free_heap() -> u32 {
     unsafe { sys::esp_get_free_heap_size() }
 }
 
-/// Confirm the SIMD dot product matches scalar on aligned vectors of the lengths
-/// the model actually uses. Returns whether all cases matched.
 fn self_test() -> bool {
     let mut ok = true;
     for &n in &[16usize, 32, 64, 128, 256] {
@@ -83,65 +81,123 @@ fn dw_self_test() -> bool {
     ok
 }
 
+fn cosine_sim(a: &[f32; EMBED_DIM], b: &[f32; EMBED_DIM]) -> f32 {
+    let mut dot = 0.0f32;
+    let mut na = 0.0f32;
+    let mut nb = 0.0f32;
+    for i in 0..EMBED_DIM {
+        dot += a[i] * b[i];
+        na += a[i] * a[i];
+        nb += b[i] * b[i];
+    }
+    dot / (na.sqrt() * nb.sqrt()).max(1e-8)
+}
+
 fn main() -> anyhow::Result<()> {
     sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
 
     info!("=== ml-bench: EMG encoder int8 forward-pass benchmark ===");
-    info!(
-        "arch: {}ch x {} samples, dw-sep blocks 16->32->64->128->256, proj {}, head {}",
-        INPUT_CH, INPUT_LEN, model::EMBED_DIM, NUM_CLASSES
-    );
-    info!("dot path: SIMD (ee.vmulas.s8.accx) | synthetic weights (timing is value-independent)");
 
     info!("--- SIMD self-test (scalar oracle vs ee.vmulas.s8.accx) ---");
-    let passed = self_test();
-    if !passed {
-        error!("SIMD kernel is INCORRECT; latency below is not trustworthy");
+    if !self_test() {
+        error!("SIMD dot kernel MISMATCH");
     }
 
     info!("--- DW self-test (scalar oracle vs ee.vmulas.s8.qacc) ---");
-    let dw_passed = dw_self_test();
-    if !dw_passed {
-        error!("DW SIMD kernel is INCORRECT; latency below is not trustworthy");
+    if !dw_self_test() {
+        error!("DW SIMD kernel MISMATCH");
     }
 
+    // ---- Synthetic benchmark (timing, matches prior results) ----
+    info!("--- Synthetic model benchmark (timing) ---");
     let heap_boot = free_heap();
-    let model = Model::synthetic();
+    let synth = Model::synthetic();
     let heap_loaded = free_heap();
     info!(
-        "model RAM: ~{} KB | free heap after load: {} KB",
+        "synthetic model RAM: ~{} KB | free heap: {} KB",
         (heap_boot - heap_loaded) / 1024,
         heap_loaded / 1024
     );
 
-    let input = Act::synthetic(INPUT_LEN, INPUT_CH, 0xA5A5_1234);
-
-    info!("benchmarking: {} warmup + {} timed iterations...", WARMUP, ITERS);
+    let synth_input = Act::synthetic(synth.input_len, INPUT_CH, 0xA5A5_1234);
+    info!("benchmarking synthetic: {} warmup + {} timed...", WARMUP, ITERS);
     let stats = bench::run(WARMUP, ITERS, || {
-        let logits = model.forward(core::hint::black_box(&input));
-        core::hint::black_box(logits);
+        let r = synth.forward(core::hint::black_box(&synth_input));
+        core::hint::black_box(r);
     });
-
-    info!("---------------- end-to-end (one inference) ----------------");
+    info!("---------------- synthetic end-to-end ----------------");
     info!(
         "latency:    p50 {} us | p95 {} us | max {} us | mean {:.1} us",
         stats.p50_us, stats.p95_us, stats.max_us, stats.mean_us
     );
     info!("throughput: {:.1} inferences/sec", stats.throughput_hz);
+
+    // ---- Real model verification ----
+    info!("--- Real model (BN-folded, GELU, int8) ---");
+    let heap_pre = free_heap();
+    let real_model = Model::real();
+    let heap_post = free_heap();
     info!(
-        "heap:       {} -> {} KB free across timed loop (equal = no leak)",
-        stats.heap_before / 1024,
-        stats.heap_after / 1024
+        "real model RAM: ~{} KB | input_len: {} | free heap: {} KB",
+        (heap_pre - heap_post) / 1024,
+        real_model.input_len,
+        heap_post / 1024
     );
 
-    // Per-stage breakdown: where the time goes, so each stage can be targeted.
+    let test = Model::load_test_data();
+    info!("test input: {}x{}, scale={:.6}", test.input.t, test.input.c, test.input_scale);
+
+    let result = real_model.forward(&test.input);
+    match result {
+        ForwardResult::Embedding(emb) => {
+            let sim = cosine_sim(&emb, &test.expected_emb);
+            info!("cosine similarity vs Python reference: {:.6}", sim);
+            info!(
+                "device  emb[0..4]: {:.4} {:.4} {:.4} {:.4}",
+                emb[0], emb[1], emb[2], emb[3]
+            );
+            info!(
+                "python  emb[0..4]: {:.4} {:.4} {:.4} {:.4}",
+                test.expected_emb[0], test.expected_emb[1], test.expected_emb[2], test.expected_emb[3]
+            );
+            if sim > 0.90 {
+                info!("PASS: cosine similarity > 0.90");
+            } else if sim > 0.70 {
+                warn!("MARGINAL: cosine similarity {:.4} (expected > 0.90)", sim);
+            } else {
+                error!("FAIL: cosine similarity {:.4} (expected > 0.90)", sim);
+            }
+        }
+        ForwardResult::Logits(_) => {
+            error!("real model returned logits instead of embedding");
+        }
+    }
+
+    // ---- Real model benchmark ----
+    info!("benchmarking real: {} warmup + {} timed...", WARMUP, ITERS);
+    let real_stats = bench::run(WARMUP, ITERS, || {
+        let r = real_model.forward(core::hint::black_box(&test.input));
+        core::hint::black_box(r);
+    });
+    info!("---------------- real end-to-end ----------------");
+    info!(
+        "latency:    p50 {} us | p95 {} us | max {} us | mean {:.1} us",
+        real_stats.p50_us, real_stats.p95_us, real_stats.max_us, real_stats.mean_us
+    );
+    info!("throughput: {:.1} inferences/sec", real_stats.throughput_hz);
+    info!(
+        "heap:       {} -> {} KB free (equal = no leak)",
+        real_stats.heap_before / 1024,
+        real_stats.heap_after / 1024
+    );
+
     let mut prof = Profile::new(NUM_STAGES);
     for _ in 0..PROFILE_ITERS {
-        core::hint::black_box(model.forward_profiled(core::hint::black_box(&input), &mut prof));
+        core::hint::black_box(real_model.forward_profiled(core::hint::black_box(&test.input), &mut prof));
     }
     let total: u64 = prof.us.iter().sum();
-    info!("---------------- per-stage (mean over {}) ----------------", prof.iters);
+    info!("---------------- real per-stage (mean over {}) ----------------", prof.iters);
     for i in 0..NUM_STAGES {
         let mean = prof.us[i] as f32 / prof.iters as f32;
         let pct = 100.0 * prof.us[i] as f32 / total as f32;
@@ -152,6 +208,9 @@ fn main() -> anyhow::Result<()> {
 
     loop {
         std::thread::sleep(std::time::Duration::from_secs(30));
-        info!("idle (done): SIMD p50 {} us, {:.1} inf/s", stats.p50_us, stats.throughput_hz);
+        info!(
+            "idle: synth p50 {} us | real p50 {} us ({:.1} inf/s)",
+            stats.p50_us, real_stats.p50_us, real_stats.throughput_hz
+        );
     }
 }

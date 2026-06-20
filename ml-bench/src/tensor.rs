@@ -114,4 +114,13 @@ impl Act {
             c,
         }
     }
+
+    pub fn from_i8_slice(s: &[i8], t: usize, c: usize) -> Self {
+        assert_eq!(s.len(), t * c);
+        Self {
+            data: AlignedI8::from_slice(s),
+            t,
+            c,
+        }
+    }
 }

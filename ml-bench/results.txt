@@ -48,3 +48,41 @@ Per-stage comparison:
 
 DW dominance flipped: was 83% of total, now 24%. PW is now the bottleneck
 (70%). Next lever: pipelined ee.vmulas.s8.accx.ld.ip.qup for pointwise.
+
+== 2026-06-19: Real model export + on-device verification ==
+
+Exported pose_split16_plus_pinch.safetensors to int8 with:
+  - BatchNorm folded into pointwise conv weights
+  - Per-tensor symmetric int8 quantization
+  - Per-block GELU lookup tables (256-entry i8→i8)
+  - L2 normalization (float32) on the 256-D embedding output
+  - 500-sample window (real DEVICE_WINDOW_SAMPLES, was 256 synthetic)
+
+Export script: emg-gesture-class/scripts/export_int8.py
+Binary blob: ml-bench/data/model_int8.bin (127 KB, embedded via include_bytes!)
+
+Correctness (vs Python float32 reference, same random test input):
+  cosine similarity: 0.9719 — PASS
+  device  emb[0..4]: 0.1048 0.0768 0.1048 0.0367
+  python  emb[0..4]: 0.1226 0.0583 0.0992 0.0366
+
+Real model latency (500 samples, real int8 weights, GELU, L2 norm):
+  latency:    p50 18206 us | p95 18206 us | max 18226 us | mean 18206.2 us
+  throughput: 54.9 inferences/sec
+  heap:       115 -> 114 KB free (no leak)
+
+  block0.dw   1104.0 us   6.1%
+  block0.pw   2419.4 us  13.3%
+  block1.dw   1084.0 us   6.0%
+  block1.pw   2701.8 us  14.9%
+  block2.dw   1085.2 us   6.0%
+  block2.pw   3322.3 us  18.3%
+  block3.dw   1099.0 us   6.0%
+  block3.pw   4606.6 us  25.3%
+  pool         466.2 us   2.6%
+  proj         205.8 us   1.1%
+  head          97.1 us   0.5%   (L2 norm, not classifier)
+  total      18191.3 us (sum)
+
+18.2 ms meets the ≤30 ms target with 1.6× margin. 3-of-3 smoothing:
+3 × 18.2 = 54.6 ms, well within the 300 ms onset-to-action budget.

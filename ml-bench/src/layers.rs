@@ -166,6 +166,17 @@ pub fn depthwise(x: &Act, w: &AlignedI8, bias: &[i32], k: usize, stride: usize, 
     depthwise_simd(x, w, bias, k, stride, rq)
 }
 
+/// Apply a 256-entry GELU lookup table element-wise: `lut[(x + 128) as usize]`.
+pub fn gelu_act(x: &Act, lut: &[i8; 256]) -> Act {
+    let mut out = Act::zeros(x.t, x.c);
+    let src = x.data.as_slice();
+    let dst = out.data.as_mut_slice();
+    for i in 0..src.len() {
+        dst[i] = lut[(src[i] as i16 + 128) as usize];
+    }
+    out
+}
+
 /// Pointwise (1x1) conv: independent `cin -> out_ch` matmul at each time step.
 /// MAC-heavy; routes through [`mac::dot_i8`] (SIMD-capable).
 pub fn pointwise(x: &Act, w: &AlignedI8, bias: &[i32], out_ch: usize, rq: Requant) -> Act {
