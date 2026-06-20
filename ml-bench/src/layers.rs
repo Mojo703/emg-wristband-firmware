@@ -6,18 +6,18 @@
 //! Replace with the model's real per-channel scales when validating accuracy.
 
 use crate::mac;
-use crate::tensor::{Act, AlignedI8};
+use crate::tensor::{AlignedI8, I8Activation};
 
 #[derive(Clone, Copy)]
-pub struct Requant {
-    pub mult: i32,
-    pub shift: u32,
-    pub relu: bool,
+pub(crate) struct Requantize {
+    pub(crate) mult: i32,
+    pub(crate) shift: u32,
+    pub(crate) relu: bool,
 }
 
-impl Requant {
+impl Requantize {
     #[inline]
-    pub fn apply(&self, acc: i32) -> i8 {
+    pub(crate) fn apply(&self, acc: i32) -> i8 {
         let mut v = ((acc as i64 * self.mult as i64) >> self.shift) as i32;
         if self.relu {
             v = v.max(0);
@@ -26,9 +26,9 @@ impl Requant {
     }
 }
 
-fn pad_input(x: &Act, pad: usize) -> Act {
+fn pad_input(x: &I8Activation, pad: usize) -> I8Activation {
     let t_padded = x.t + 2 * pad;
-    let mut padded = Act::zeros(t_padded, x.c);
+    let mut padded = I8Activation::zeros(t_padded, x.c);
     let src = x.data.as_slice();
     let dst = padded.data.as_mut_slice();
     dst[pad * x.c..(pad + x.t) * x.c].copy_from_slice(src);
@@ -38,14 +38,21 @@ fn pad_input(x: &Act, pad: usize) -> Act {
 /// Scalar depthwise 1D conv. Weight layout `[K, C]`: `ws[j * c + ch]`.
 /// Pre-pads input to avoid inner-loop bounds checks. Retained as the
 /// correctness oracle for the SIMD self-test.
-pub fn depthwise_scalar(x: &Act, w: &AlignedI8, bias: &[i32], k: usize, stride: usize, rq: Requant) -> Act {
+pub(crate) fn depthwise_scalar(
+    x: &I8Activation,
+    w: &AlignedI8,
+    bias: &[i32],
+    k: usize,
+    stride: usize,
+    rq: Requantize,
+) -> I8Activation {
     let c = x.c;
     let t_out = x.t.div_ceil(stride);
     let pad = k / 2;
     let padded = pad_input(x, pad);
     let ws = w.as_slice();
     let pd = padded.data.as_slice();
-    let mut out = Act::zeros(t_out, c);
+    let mut out = I8Activation::zeros(t_out, c);
     let od = out.data.as_mut_slice();
     for to in 0..t_out {
         let base = to * stride;
@@ -85,14 +92,21 @@ fn extract_qacc_half(data: &[u8], out: &mut [i32]) {
 /// SIMD depthwise using QACC (16 independent 20-bit accumulators). Processes
 /// 16 channels per vector instruction. Weight layout `[K, C]`.
 #[cfg(target_arch = "xtensa")]
-pub fn depthwise_simd(x: &Act, w: &AlignedI8, bias: &[i32], k: usize, stride: usize, rq: Requant) -> Act {
+pub(crate) fn depthwise_simd(
+    x: &I8Activation,
+    w: &AlignedI8,
+    bias: &[i32],
+    k: usize,
+    stride: usize,
+    rq: Requantize,
+) -> I8Activation {
     let c = x.c;
     let t_out = x.t.div_ceil(stride);
     let pad = k / 2;
     let padded = pad_input(x, pad);
     let ws = w.as_slice();
     let pd = padded.data.as_slice();
-    let mut out = Act::zeros(t_out, c);
+    let mut out = I8Activation::zeros(t_out, c);
     let od = out.data.as_mut_slice();
 
     #[repr(align(16))]
@@ -156,19 +170,33 @@ pub fn depthwise_simd(x: &Act, w: &AlignedI8, bias: &[i32], k: usize, stride: us
 }
 
 #[cfg(not(target_arch = "xtensa"))]
-pub fn depthwise_simd(x: &Act, w: &AlignedI8, bias: &[i32], k: usize, stride: usize, rq: Requant) -> Act {
+pub(crate) fn depthwise_simd(
+    x: &I8Activation,
+    w: &AlignedI8,
+    bias: &[i32],
+    k: usize,
+    stride: usize,
+    rq: Requantize,
+) -> I8Activation {
     depthwise_scalar(x, w, bias, k, stride, rq)
 }
 
 /// Depthwise 1D conv: SIMD on ESP32-S3, scalar fallback off-target.
 /// Weight layout `[K, C]`: `ws[j * c + ch]`.
-pub fn depthwise(x: &Act, w: &AlignedI8, bias: &[i32], k: usize, stride: usize, rq: Requant) -> Act {
+pub(crate) fn depthwise(
+    x: &I8Activation,
+    w: &AlignedI8,
+    bias: &[i32],
+    k: usize,
+    stride: usize,
+    rq: Requantize,
+) -> I8Activation {
     depthwise_simd(x, w, bias, k, stride, rq)
 }
 
 /// Apply a 256-entry GELU lookup table element-wise: `lut[(x + 128) as usize]`.
-pub fn gelu_act(x: &Act, lut: &[i8; 256]) -> Act {
-    let mut out = Act::zeros(x.t, x.c);
+pub(crate) fn gelu_act(x: &I8Activation, lut: &[i8; 256]) -> I8Activation {
+    let mut out = I8Activation::zeros(x.t, x.c);
     let src = x.data.as_slice();
     let dst = out.data.as_mut_slice();
     for i in 0..src.len() {
@@ -179,10 +207,16 @@ pub fn gelu_act(x: &Act, lut: &[i8; 256]) -> Act {
 
 /// Pointwise (1x1) conv: independent `cin -> out_ch` matmul at each time step.
 /// MAC-heavy; routes through [`mac::dot_i8`] (SIMD-capable).
-pub fn pointwise(x: &Act, w: &AlignedI8, bias: &[i32], out_ch: usize, rq: Requant) -> Act {
+pub(crate) fn pointwise(
+    x: &I8Activation,
+    w: &AlignedI8,
+    bias: &[i32],
+    out_ch: usize,
+    rq: Requantize,
+) -> I8Activation {
     let cin = x.c;
     let ws = w.as_slice();
-    let mut out = Act::zeros(x.t, out_ch);
+    let mut out = I8Activation::zeros(x.t, out_ch);
     let od = out.data.as_mut_slice();
     for ti in 0..x.t {
         let xs = x.row(ti);
@@ -195,21 +229,24 @@ pub fn pointwise(x: &Act, w: &AlignedI8, bias: &[i32], out_ch: usize, rq: Requan
 }
 
 /// Global average pool over time: `[T, C] -> [C]`.
-pub fn global_avg_pool(x: &Act) -> AlignedI8 {
+pub(crate) fn global_avg_pool(x: &I8Activation) -> AlignedI8 {
     let mut v = AlignedI8::zeroed(x.c);
     let vs = v.as_mut_slice();
-    for ch in 0..x.c {
-        let mut s = 0i32;
-        for ti in 0..x.t {
-            s += x.at(ti, ch) as i32;
-        }
-        vs[ch] = (s / x.t as i32).clamp(-128, 127) as i8;
+    for (ch, value) in vs.iter_mut().enumerate().take(x.c) {
+        let s: i32 = (0..x.t).map(|ti| x.at(ti, ch) as i32).sum();
+        *value = (s / x.t as i32).clamp(-128, 127) as i8;
     }
     v
 }
 
 /// Fully-connected `cin -> out`, requantized to int8. `v` must be 16-aligned.
-pub fn linear(v: &[i8], w: &AlignedI8, bias: &[i32], out: usize, rq: Requant) -> AlignedI8 {
+pub(crate) fn linear(
+    v: &[i8],
+    w: &AlignedI8,
+    bias: &[i32],
+    out: usize,
+    rq: Requantize,
+) -> AlignedI8 {
     let cin = v.len();
     let ws = w.as_slice();
     let mut o = AlignedI8::zeroed(out);
@@ -221,7 +258,7 @@ pub fn linear(v: &[i8], w: &AlignedI8, bias: &[i32], out: usize, rq: Requant) ->
 }
 
 /// Fully-connected `cin -> out` returning raw i32 logits (final head).
-pub fn linear_i32(v: &[i8], w: &AlignedI8, bias: &[i32], out: usize) -> Vec<i32> {
+pub(crate) fn linear_i32(v: &[i8], w: &AlignedI8, bias: &[i32], out: usize) -> Vec<i32> {
     let cin = v.len();
     let ws = w.as_slice();
     (0..out)

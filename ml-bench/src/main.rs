@@ -15,16 +15,16 @@ mod tensor;
 
 use bench::Profile;
 use esp_idf_svc::sys;
-use layers::Requant;
+use layers::Requantize;
 use log::{error, info, warn};
-use model::{ForwardResult, Model, EMBED_DIM, INPUT_CH, KERNEL, NUM_STAGES, STAGE_NAMES};
-use tensor::{Act, AlignedI8, Rng};
+use model::{ForwardResult, Model, EMBED_DIM, INPUT_CH, KERNEL, STAGES};
+use tensor::{AlignedI8, I8Activation, Rng};
 
 const WARMUP: usize = 20;
 const ITERS: usize = 200;
 const PROFILE_ITERS: usize = 50;
 
-fn free_heap() -> u32 {
+fn free_heap_discontinuous() -> u32 {
     unsafe { sys::esp_get_free_heap_size() }
 }
 
@@ -39,7 +39,10 @@ fn self_test() -> bool {
         if s == v {
             info!("self-test n={:<3} scalar={:>9} simd={:>9}  OK", n, s, v);
         } else {
-            error!("self-test n={:<3} scalar={:>9} simd={:>9}  MISMATCH", n, s, v);
+            error!(
+                "self-test n={:<3} scalar={:>9} simd={:>9}  MISMATCH",
+                n, s, v
+            );
             ok = false;
         }
     }
@@ -47,11 +50,15 @@ fn self_test() -> bool {
 }
 
 fn dw_self_test() -> bool {
-    let rq = Requant { mult: 1, shift: 12, relu: true };
+    let rq = Requantize {
+        mult: 1,
+        shift: 12,
+        relu: true,
+    };
     let mut ok = true;
     for &(t, c) in &[(32usize, 16usize), (64, 32), (128, 16), (256, 16)] {
         let mut rng = Rng::new(0xDEAD + t as u32);
-        let input = Act::synthetic(t, c, 0xBEEF + t as u32);
+        let input = I8Activation::synthetic(t, c, 0xBEEF + t as u32);
         let w = AlignedI8::from_slice(&rng.fill_i8(KERNEL * c));
         let bias = rng.fill_i32_small(c);
 
@@ -61,7 +68,13 @@ fn dw_self_test() -> bool {
         let rs = ref_out.data.as_slice();
         let ss = simd_out.data.as_slice();
         if rs.len() != ss.len() {
-            error!("dw-test t={} c={}: length mismatch {} vs {}", t, c, rs.len(), ss.len());
+            error!(
+                "dw-test t={} c={}: length mismatch {} vs {}",
+                t,
+                c,
+                rs.len(),
+                ss.len()
+            );
             ok = false;
             continue;
         }
@@ -74,7 +87,13 @@ fn dw_self_test() -> bool {
         if mismatches == 0 {
             info!("dw-test t={:<3} c={:<3} len={:<5}  OK", t, c, rs.len());
         } else {
-            error!("dw-test t={:<3} c={:<3} len={:<5}  {} MISMATCHES", t, c, rs.len(), mismatches);
+            error!(
+                "dw-test t={:<3} c={:<3} len={:<5}  {} MISMATCHES",
+                t,
+                c,
+                rs.len(),
+                mismatches
+            );
             ok = false;
         }
     }
@@ -111,17 +130,20 @@ fn main() -> anyhow::Result<()> {
 
     // ---- Synthetic benchmark (timing, matches prior results) ----
     info!("--- Synthetic model benchmark (timing) ---");
-    let heap_boot = free_heap();
+    let heap_boot = free_heap_discontinuous();
     let synth = Model::synthetic();
-    let heap_loaded = free_heap();
+    let heap_loaded = free_heap_discontinuous();
     info!(
         "synthetic model RAM: ~{} KB | free heap: {} KB",
         (heap_boot - heap_loaded) / 1024,
         heap_loaded / 1024
     );
 
-    let synth_input = Act::synthetic(synth.input_len, INPUT_CH, 0xA5A5_1234);
-    info!("benchmarking synthetic: {} warmup + {} timed...", WARMUP, ITERS);
+    let synth_input = I8Activation::synthetic(synth.input_len, INPUT_CH, 0xA5A5_1234);
+    info!(
+        "benchmarking synthetic: {} warmup + {} timed...",
+        WARMUP, ITERS
+    );
     let stats = bench::run(WARMUP, ITERS, || {
         let r = synth.forward(core::hint::black_box(&synth_input));
         core::hint::black_box(r);
@@ -135,9 +157,9 @@ fn main() -> anyhow::Result<()> {
 
     // ---- Real model verification ----
     info!("--- Real model (BN-folded, GELU, int8) ---");
-    let heap_pre = free_heap();
+    let heap_pre = free_heap_discontinuous();
     let real_model = Model::real();
-    let heap_post = free_heap();
+    let heap_post = free_heap_discontinuous();
     info!(
         "real model RAM: ~{} KB | input_len: {} | free heap: {} KB",
         (heap_pre - heap_post) / 1024,
@@ -146,7 +168,10 @@ fn main() -> anyhow::Result<()> {
     );
 
     let test = Model::load_test_data();
-    info!("test input: {}x{}, scale={:.6}", test.input.t, test.input.c, test.input_scale);
+    info!(
+        "test input: {}x{}, scale={:.6}",
+        test.input.t, test.input.c, test.input_scale
+    );
 
     let result = real_model.forward(&test.input);
     match result {
@@ -159,7 +184,10 @@ fn main() -> anyhow::Result<()> {
             );
             info!(
                 "python  emb[0..4]: {:.4} {:.4} {:.4} {:.4}",
-                test.expected_emb[0], test.expected_emb[1], test.expected_emb[2], test.expected_emb[3]
+                test.expected_emb[0],
+                test.expected_emb[1],
+                test.expected_emb[2],
+                test.expected_emb[3]
             );
             if sim > 0.90 {
                 info!("PASS: cosine similarity > 0.90");
@@ -192,18 +220,27 @@ fn main() -> anyhow::Result<()> {
         real_stats.heap_after / 1024
     );
 
-    let mut prof = Profile::new(NUM_STAGES);
+    let mut prof = Profile::new(STAGES.len());
     for _ in 0..PROFILE_ITERS {
-        core::hint::black_box(real_model.forward_profiled(core::hint::black_box(&test.input), &mut prof));
+        core::hint::black_box(
+            real_model.forward_profiled(core::hint::black_box(&test.input), &mut prof),
+        );
     }
     let total: u64 = prof.us.iter().sum();
-    info!("---------------- real per-stage (mean over {}) ----------------", prof.iters);
-    for i in 0..NUM_STAGES {
+    info!(
+        "---------------- real per-stage (mean over {}) ----------------",
+        prof.iters
+    );
+    for (i, name) in STAGES.iter().enumerate() {
         let mean = prof.us[i] as f32 / prof.iters as f32;
         let pct = 100.0 * prof.us[i] as f32 / total as f32;
-        info!("  {:<9} {:>8.1} us  {:>4.1}%", STAGE_NAMES[i], mean, pct);
+        info!("  {:<9} {:>8.1} us  {:>4.1}%", name, mean, pct);
     }
-    info!("  {:<9} {:>8.1} us (sum)", "total", total as f32 / prof.iters as f32);
+    info!(
+        "  {:<9} {:>8.1} us (sum)",
+        "total",
+        total as f32 / prof.iters as f32
+    );
     info!("------------------------------------------------------------");
 
     loop {

@@ -13,7 +13,7 @@
 /// inference path. `zip` elides bounds checks; `sum()` over i32 can't overflow
 /// for `cin <= 256` int8 operands.
 #[inline]
-pub fn dot_i8_scalar(w: &[i8], x: &[i8]) -> i32 {
+pub(crate) fn dot_i8_scalar(w: &[i8], x: &[i8]) -> i32 {
     debug_assert_eq!(w.len(), x.len());
     w.iter().zip(x).map(|(&a, &b)| a as i32 * b as i32).sum()
 }
@@ -22,7 +22,7 @@ pub fn dot_i8_scalar(w: &[i8], x: &[i8]) -> i32 {
 /// length, a non-zero multiple of 16 (see [`crate::tensor::AlignedI8`]).
 #[cfg(target_arch = "xtensa")]
 #[inline]
-pub fn dot_i8_simd(w: &[i8], x: &[i8]) -> i32 {
+pub(crate) fn dot_i8_simd(w: &[i8], x: &[i8]) -> i32 {
     debug_assert_eq!(w.len(), x.len());
     debug_assert_eq!(w.len() % 16, 0);
     debug_assert!(!w.is_empty());
@@ -60,13 +60,13 @@ pub fn dot_i8_simd(w: &[i8], x: &[i8]) -> i32 {
 /// Non-xtensa fallback so the crate still type-checks off-target.
 #[cfg(not(target_arch = "xtensa"))]
 #[inline]
-pub fn dot_i8_simd(w: &[i8], x: &[i8]) -> i32 {
+pub(crate) fn dot_i8_simd(w: &[i8], x: &[i8]) -> i32 {
     dot_i8_scalar(w, x)
 }
 
 /// The dot used by the layers. SIMD on ESP32-S3; scalar fallback only off-target
 /// (so the crate still type-checks on the host for rust-analyzer).
 #[inline]
-pub fn dot_i8(w: &[i8], x: &[i8]) -> i32 {
+pub(crate) fn dot_i8(w: &[i8], x: &[i8]) -> i32 {
     dot_i8_simd(w, x)
 }
