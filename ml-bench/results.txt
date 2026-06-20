@@ -1,18 +1,50 @@
-I (15235) ml_bench: ---------------- end-to-end (one inference) ----------------
+== 2026-06-19: QACC SIMD depthwise (ee.vmulas.s8.qacc) ==
+
+Replaced scalar depthwise conv with SIMD using ESP32-S3 QACC accumulator
+(16 independent 20-bit lanes). Vectorizes across channels instead of kernel
+taps: each ee.vmulas.s8.qacc processes 16 channels in parallel for one tap.
+Filter layout changed from [C,K] to [K,C] for contiguous 16-ch loads.
+Input pre-padded to eliminate inner-loop bounds checks.
+
+Self-test: all 4 depthwise configs (t=32/64/128/256, c=16/32) bit-exact
+vs scalar oracle.
+
+I (2232) ml_bench: latency:    p50 7321 us | p95 7321 us | max 7332 us | mean 7321.1 us
+I (2237) ml_bench: throughput: 136.6 inferences/sec
+I (2242) ml_bench: heap:       239 -> 238 KB free across timed loop (equal = no leak)
+I (2619) ml_bench: ---------------- per-stage (mean over 50) ----------------
+I (2619) ml_bench:   block0.dw    438.7 us   6.0%
+I (2621) ml_bench:   block0.pw    871.2 us  11.9%
+I (2627) ml_bench:   block1.dw    427.3 us   5.9%
+I (2632) ml_bench:   block1.pw   1015.7 us  13.9%
+I (2637) ml_bench:   block2.dw    424.8 us   5.8%
+I (2643) ml_bench:   block2.pw   1320.2 us  18.1%
+I (2648) ml_bench:   block3.dw    424.6 us   5.8%
+I (2653) ml_bench:   block3.pw   1935.8 us  26.5%
+I (2659) ml_bench:   pool         241.4 us   3.3%
+I (2664) ml_bench:   proj         195.9 us   2.7%
+I (2670) ml_bench:   head           7.9 us   0.1%
+I (2675) ml_bench:   total       7303.4 us (sum)
+
+vs prior (SIMD pointwise only, scalar depthwise):
+
 I (15236) ml_bench: latency:    p50 66621 us | p95 66621 us | max 66630 us | mean 66621.0 us
 I (15242) ml_bench: throughput: 15.0 inferences/sec
-I (15247) ml_bench: heap:       235 -> 234 KB free across timed loop (equal = no leak)
-I (18589) ml_bench: ---------------- per-stage (mean over 50) ----------------
-I (18590) ml_bench:   block0.dw  13933.8 us  20.9%
-I (18592) ml_bench:   block0.pw   2214.6 us   3.3%
-I (18597) ml_bench:   block1.dw  14161.0 us  21.3%
-I (18603) ml_bench:   block1.pw   2342.2 us   3.5%
-I (18608) ml_bench:   block2.dw  13878.0 us  20.8%
-I (18614) ml_bench:   block2.pw   2608.4 us   3.9%
-I (18619) ml_bench:   block3.dw  13320.8 us  20.0%
-I (18625) ml_bench:   block3.pw   3153.9 us   4.7%
-I (18630) ml_bench:   pool         717.8 us   1.1%
-I (18636) ml_bench:   proj         252.0 us   0.4%
-I (18641) ml_bench:   head          11.7 us   0.0%
-I (18647) ml_bench:   total      66594.3 us (sum)
-I (18652) ml_bench: ------------------------------------------------------------
+
+Per-stage comparison:
+  stage       before (us)   after (us)   speedup
+  block0.dw     13933.8        438.7      31.7x
+  block0.pw      2214.6        871.2       2.5x
+  block1.dw     14161.0        427.3      33.2x
+  block1.pw      2342.2       1015.7       2.3x
+  block2.dw     13878.0        424.8      32.7x
+  block2.pw      2608.4       1320.2       2.0x
+  block3.dw     13320.8        424.6      31.3x
+  block3.pw      3153.9       1935.8       1.6x
+  pool            717.8        241.4       3.0x
+  proj            252.0        195.9       1.3x
+  head             11.7          7.9       1.5x
+  total         66594.3       7303.4       9.1x
+
+DW dominance flipped: was 83% of total, now 24%. PW is now the bottleneck
+(70%). Next lever: pipelined ee.vmulas.s8.accx.ld.ip.qup for pointwise.

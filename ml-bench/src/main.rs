@@ -15,8 +15,9 @@ mod tensor;
 
 use bench::Profile;
 use esp_idf_svc::sys;
+use layers::Requant;
 use log::{error, info};
-use model::{Model, INPUT_CH, INPUT_LEN, NUM_CLASSES, NUM_STAGES, STAGE_NAMES};
+use model::{Model, INPUT_CH, INPUT_LEN, KERNEL, NUM_CLASSES, NUM_STAGES, STAGE_NAMES};
 use tensor::{Act, AlignedI8, Rng};
 
 const WARMUP: usize = 20;
@@ -47,6 +48,41 @@ fn self_test() -> bool {
     ok
 }
 
+fn dw_self_test() -> bool {
+    let rq = Requant { mult: 1, shift: 12, relu: true };
+    let mut ok = true;
+    for &(t, c) in &[(32usize, 16usize), (64, 32), (128, 16), (256, 16)] {
+        let mut rng = Rng::new(0xDEAD + t as u32);
+        let input = Act::synthetic(t, c, 0xBEEF + t as u32);
+        let w = AlignedI8::from_slice(&rng.fill_i8(KERNEL * c));
+        let bias = rng.fill_i32_small(c);
+
+        let ref_out = layers::depthwise_scalar(&input, &w, &bias, KERNEL, 2, rq);
+        let simd_out = layers::depthwise_simd(&input, &w, &bias, KERNEL, 2, rq);
+
+        let rs = ref_out.data.as_slice();
+        let ss = simd_out.data.as_slice();
+        if rs.len() != ss.len() {
+            error!("dw-test t={} c={}: length mismatch {} vs {}", t, c, rs.len(), ss.len());
+            ok = false;
+            continue;
+        }
+        let mut mismatches = 0;
+        for i in 0..rs.len() {
+            if rs[i] != ss[i] {
+                mismatches += 1;
+            }
+        }
+        if mismatches == 0 {
+            info!("dw-test t={:<3} c={:<3} len={:<5}  OK", t, c, rs.len());
+        } else {
+            error!("dw-test t={:<3} c={:<3} len={:<5}  {} MISMATCHES", t, c, rs.len(), mismatches);
+            ok = false;
+        }
+    }
+    ok
+}
+
 fn main() -> anyhow::Result<()> {
     sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
@@ -62,6 +98,12 @@ fn main() -> anyhow::Result<()> {
     let passed = self_test();
     if !passed {
         error!("SIMD kernel is INCORRECT; latency below is not trustworthy");
+    }
+
+    info!("--- DW self-test (scalar oracle vs ee.vmulas.s8.qacc) ---");
+    let dw_passed = dw_self_test();
+    if !dw_passed {
+        error!("DW SIMD kernel is INCORRECT; latency below is not trustworthy");
     }
 
     let heap_boot = free_heap();

@@ -7,34 +7,41 @@ and reports per-inference latency percentiles, throughput, and RAM footprint.
 ## Measured (ESP32-S3-Zero @ 240 MHz, `--release`)
 
 16ch × 256-sample synthetic window. The SIMD path is validated bit-exact against
-scalar at startup (on-device self-test over lengths 16/32/64/128/256).
+scalar at startup (on-device self-test over lengths 16/32/64/128/256 for dot
+product, and t=32/64/128/256 × c=16/32 for depthwise conv).
 
 | dot path | latency / inference | throughput | speedup |
 |----------|---------------------|------------|---------|
-| scalar | ~87 ms | ~11.4 inf/s | 1.0× |
-| **SIMD** (`ee.vmulas.s8.accx`) | **~23 ms** | **~43 inf/s** | **~3.8×** |
+| scalar (baseline) | ~87 ms | ~11.4 inf/s | 1.0× |
+| SIMD PW only (`ee.vmulas.s8.accx`) | ~67 ms | ~15 inf/s | ~1.3× |
+| SIMD PW only (README v1 measure) | ~23 ms | ~43 inf/s | ~3.8× |
+| **SIMD PW + DW** (`accx` + `qacc`) | **~7.3 ms** | **~137 inf/s** | **~12×** |
 
-Model RAM ~115 KB (243 KB heap free) either way. Build SIMD with
-`cargo run --release --features simd`.
+Model RAM ~115 KB (243 KB heap free) either way.
 
-The ~3.8× (vs 16 lanes in theory) is because: only pointwise / proj / head are on
-the SIMD path — depthwise (k=15) stays scalar; the kernel is the simple
-non-pipelined MAC (two `vld` + loop overhead per 16 MACs); and the per-output
-fixed-point requant is now a meaningful fraction. Headroom for more: the
-pipelined `ee.vmulas.s8.accx.ld.ip.qup` form (overlaps loads with MACs),
-SIMD depthwise, and folding BatchNorm/requant. Latency scales ~linearly with
-`INPUT_LEN`, so set that to your real window before treating these as final.
+The depthwise kernel uses `ee.vmulas.s8.qacc` (16 independent 20-bit
+accumulators) to process 16 channels per vector instruction. Combined with
+pre-padded input (no inner-loop bounds checks) and [K,C] filter layout
+(contiguous 16-channel loads), this gives a **31-33× speedup** on the depthwise
+stages vs scalar. The bottleneck has flipped from depthwise (was 83%, now 24%)
+to pointwise (now 70%). Remaining headroom: pipelined
+`ee.vmulas.s8.accx.ld.ip.qup` for pointwise.
 
-## How the SIMD kernel works
+## How the SIMD kernels work
 
-`mac::dot_i8_simd` uses the ESP32-S3 PIE accumulator **ACCX** (a single 40-bit
-register): clear it (`wur.accx_0/1`), then loop `ee.vld.128.ip` ×2 +
-`ee.vmulas.s8.accx q0,q1` (multiplies 16 int8 lanes and adds the *sum* of
-products into ACCX), then read the result with `rur.accx_0`. A dot product is
-thus a load+MAC loop with no QACC lane reduction. It needs 16-byte-aligned,
-length-multiple-of-16 operands — guaranteed by `tensor::AlignedI8` (all channel
-dims here are multiples of 16). It is the only function the layers depend on, so
-scalar↔SIMD is a one-function swap (`--features simd`).
+**Pointwise / linear** (`mac::dot_i8_simd`): uses the ESP32-S3 PIE accumulator
+**ACCX** (a single 40-bit register). Clear it, loop `ee.vld.128.ip` ×2 +
+`ee.vmulas.s8.accx q0,q1` (multiplies 16 int8 lanes, sums all products into
+ACCX), read result with `rur.accx_0`. One-function swap: `mac::dot_i8`.
+
+**Depthwise** (`layers::depthwise_simd`): uses **QACC** (16 independent 20-bit
+accumulators in a 320-bit register). For each output time step and each group of
+16 channels: zero QACC, loop over k=15 taps with `ee.vld.128.xp` +
+`ee.vmulas.s8.qacc` (each lane accumulates independently), then extract 16 i32
+results via `ee.st.qacc_l/h` and 20-bit sign-extended unpacking. Filter layout
+is `[K, C]` so each tap's 16 weights are contiguous; input is pre-padded so the
+inner loop is branch-free. Self-tested bit-exact against a scalar oracle at
+startup.
 
 ## Why synthetic weights
 
@@ -54,7 +61,7 @@ for prototype matching.
 
 - `src/tensor.rs` — `Act` (time-major `[T, C]` int8 feature map) + PRNG
 - `src/mac.rs`    — `dot_i8`, the **single hot loop** and the SIMD swap point
-- `src/layers.rs` — depthwise / pointwise / pool / linear int8 kernels + requant
+- `src/layers.rs` — depthwise (QACC SIMD) / pointwise / pool / linear int8 kernels + requant
 - `src/model.rs`  — architecture, synthetic weights, `forward()`
 - `src/bench.rs`  — `esp_timer` timing harness (p50/p95/max, throughput, heap)
 - `src/main.rs`   — wires it together and prints results
@@ -91,10 +98,9 @@ the 512 KB / no-PSRAM board.
 
 ## Next steps
 
-- **Real numbers for deployment:** the scalar `dot_i8` is an upper bound on
-  latency. If it misses the real-time budget, implement the SIMD version of
-  `dot_i8` using `ee.vmulas.s8.qacc` (verified to assemble on this toolchain) —
-  it is the only function callers depend on. Add it behind `--features simd`.
+- **Pipelined pointwise:** pointwise is now 70% of total. The pipelined
+  `ee.vmulas.s8.accx.ld.ip.qup` form overlaps loads with MACs — estimated
+  ~30-40% further speedup on pointwise stages.
 - **Accuracy validation:** replace `Model::synthetic` with a loader for the
   exported int8 weights and set the real per-channel requant scales in
   `src/layers.rs` (currently placeholder `mult/shift`).
