@@ -1,0 +1,18 @@
+I (15235) ml_bench: ---------------- end-to-end (one inference) ----------------
+I (15236) ml_bench: latency:    p50 66621 us | p95 66621 us | max 66630 us | mean 66621.0 us
+I (15242) ml_bench: throughput: 15.0 inferences/sec
+I (15247) ml_bench: heap:       235 -> 234 KB free across timed loop (equal = no leak)
+I (18589) ml_bench: ---------------- per-stage (mean over 50) ----------------
+I (18590) ml_bench:   block0.dw  13933.8 us  20.9%
+I (18592) ml_bench:   block0.pw   2214.6 us   3.3%
+I (18597) ml_bench:   block1.dw  14161.0 us  21.3%
+I (18603) ml_bench:   block1.pw   2342.2 us   3.5%
+I (18608) ml_bench:   block2.dw  13878.0 us  20.8%
+I (18614) ml_bench:   block2.pw   2608.4 us   3.9%
+I (18619) ml_bench:   block3.dw  13320.8 us  20.0%
+I (18625) ml_bench:   block3.pw   3153.9 us   4.7%
+I (18630) ml_bench:   pool         717.8 us   1.1%
+I (18636) ml_bench:   proj         252.0 us   0.4%
+I (18641) ml_bench:   head          11.7 us   0.0%
+I (18647) ml_bench:   total      66594.3 us (sum)
+I (18652) ml_bench: ------------------------------------------------------------

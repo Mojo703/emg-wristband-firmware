@@ -17,6 +17,30 @@ fn now_us() -> i64 {
     unsafe { sys::esp_timer_get_time() }
 }
 
+/// Accumulates per-stage time across many forward passes. `time(slot, f)` runs
+/// `f`, charges its duration to `slot`, and returns its result.
+pub struct Profile {
+    pub us: Vec<u64>,
+    pub iters: u64,
+}
+
+impl Profile {
+    pub fn new(stages: usize) -> Self {
+        Self {
+            us: vec![0; stages],
+            iters: 0,
+        }
+    }
+
+    #[inline]
+    pub fn time<T>(&mut self, slot: usize, f: impl FnOnce() -> T) -> T {
+        let t0 = now_us();
+        let r = f();
+        self.us[slot] += (now_us() - t0) as u64;
+        r
+    }
+}
+
 #[inline]
 fn free_heap() -> u32 {
     unsafe { sys::esp_get_free_heap_size() }

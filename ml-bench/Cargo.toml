@@ -23,11 +23,6 @@ opt-level = 3
 [profile.dev]
 opt-level = 1
 
-[features]
-default = []
-# Route the hot dot product through the ESP32-S3 PIE/ACCX SIMD kernel.
-simd = []
-
 [dependencies]
 log = "0.4"
 esp-idf-svc = "0.52"

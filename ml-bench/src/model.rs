@@ -13,8 +13,17 @@
 //! weight loader (and set real per-channel requant in `layers`) to validate
 //! accuracy.
 
+use crate::bench::Profile;
 use crate::layers::{self, Requant};
 use crate::tensor::{Act, AlignedI8, Rng};
+
+/// Stage labels for the per-stage profile (see [`Model::forward_profiled`]).
+/// 2 per block (depthwise, pointwise) + pool + proj + head.
+pub const STAGE_NAMES: [&str; 11] = [
+    "block0.dw", "block0.pw", "block1.dw", "block1.pw", "block2.dw", "block2.pw", "block3.dw",
+    "block3.pw", "pool", "proj", "head",
+];
+pub const NUM_STAGES: usize = STAGE_NAMES.len();
 
 pub const INPUT_CH: usize = 16;
 /// EMG window length in samples. SET THIS to the real window; latency scales
@@ -84,5 +93,32 @@ impl Model {
         let pooled = layers::global_avg_pool(&x);
         let embedding = layers::linear(pooled.as_slice(), &self.proj, &self.proj_bias, EMBED_DIM, RQ);
         layers::linear_i32(embedding.as_slice(), &self.head, &self.head_bias, NUM_CLASSES)
+    }
+
+    /// Same as [`Self::forward`] but charges each stage's time into `p`. Used to
+    /// see where the latency goes so each stage can be optimized in isolation.
+    pub fn forward_profiled(&self, input: &Act, p: &mut Profile) -> Vec<i32> {
+        let mut cur: Option<Act> = None;
+        for (b, blk) in self.blocks.iter().enumerate() {
+            let d = {
+                let xin = cur.as_ref().unwrap_or(input);
+                p.time(b * 2, || {
+                    layers::depthwise(xin, &blk.dw, &blk.dw_bias, KERNEL, STRIDE, RQ)
+                })
+            };
+            cur = Some(p.time(b * 2 + 1, || {
+                layers::pointwise(&d, &blk.pw, &blk.pw_bias, blk.out_ch, RQ)
+            }));
+        }
+        let x = cur.expect("at least one block");
+        let pooled = p.time(8, || layers::global_avg_pool(&x));
+        let embedding = p.time(9, || {
+            layers::linear(pooled.as_slice(), &self.proj, &self.proj_bias, EMBED_DIM, RQ)
+        });
+        let logits = p.time(10, || {
+            layers::linear_i32(embedding.as_slice(), &self.head, &self.head_bias, NUM_CLASSES)
+        });
+        p.iters += 1;
+        logits
     }
 }

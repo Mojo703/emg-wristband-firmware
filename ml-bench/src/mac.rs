@@ -8,7 +8,9 @@
 //! (Structure follows esp-dsp's `dspi_dotprod_s8_aes3`; this is the simple
 //! non-pipelined form — already 16 MACs/instruction.)
 
-/// Scalar baseline. `zip` elides bounds checks; `sum()` over i32 can't overflow
+/// Scalar reference, retained as the correctness **oracle** for the startup
+/// self-test (the SIMD kernel is checked bit-exact against this). Not on the
+/// inference path. `zip` elides bounds checks; `sum()` over i32 can't overflow
 /// for `cin <= 256` int8 operands.
 #[inline]
 pub fn dot_i8_scalar(w: &[i8], x: &[i8]) -> i32 {
@@ -62,15 +64,9 @@ pub fn dot_i8_simd(w: &[i8], x: &[i8]) -> i32 {
     dot_i8_scalar(w, x)
 }
 
-/// The dot used by the layers: SIMD when built with `--features simd`.
+/// The dot used by the layers. SIMD on ESP32-S3; scalar fallback only off-target
+/// (so the crate still type-checks on the host for rust-analyzer).
 #[inline]
 pub fn dot_i8(w: &[i8], x: &[i8]) -> i32 {
-    #[cfg(feature = "simd")]
-    {
-        dot_i8_simd(w, x)
-    }
-    #[cfg(not(feature = "simd"))]
-    {
-        dot_i8_scalar(w, x)
-    }
+    dot_i8_simd(w, x)
 }
