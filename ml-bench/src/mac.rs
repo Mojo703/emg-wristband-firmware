@@ -29,28 +29,42 @@ pub(crate) fn dot_i8_simd(w: &[i8], x: &[i8]) -> i32 {
 
     let mut wp = w.as_ptr();
     let mut xp = x.as_ptr();
-    let mut chunks = (w.len() / 16) as u32;
+    // Software-pipelined: preload chunk 0, then loop `chunks-1` times folding the
+    // *next* weight load into the MAC via `ee.vmulas.s8.accx.ld.ip` (one fewer
+    // instruction per 16-MAC step than the standalone-vld form), and finish with
+    // a tail MAC on the last preloaded chunk. The fused load prefetches at most
+    // chunk `chunks-1`, so there is no over-read past the slice. `chunks >= 1` is
+    // guaranteed by the non-empty multiple-of-16 contract, so `rem` never wraps.
+    let mut rem = (w.len() / 16) as u32 - 1;
     let acc: i32;
     unsafe {
         core::arch::asm!(
             "movi.n {z}, 0",
             "wur.accx_0 {z}",          // clear the 40-bit ACCX accumulator
             "wur.accx_1 {z}",
+            "ee.vld.128.ip q0, {w}, 16", // preload chunk 0 weights, ptr += 16
+            "ee.vld.128.ip q1, {x}, 16", // preload chunk 0 inputs,  ptr += 16
+            "beqz {c}, 3f",              // chunks == 1: skip straight to the tail MAC
             "2:",
-            "ee.vld.128.ip q0, {w}, 16", // 16 int8 weights, ptr += 16
-            "ee.vld.128.ip q1, {x}, 16", // 16 int8 inputs,  ptr += 16
-            "ee.vmulas.s8.accx q0, q1",  // ACCX += sum_{i<16} q0[i]*q1[i]
+            // ACCX += q0·q1 (current chunk), then q0 := next chunk's weights.
+            // dest q0 aliases source q0: the multiply reads q0/q1 before the load
+            // writes q0 (same pattern esp-dsp's pipelined s8 dotprod relies on).
+            "ee.vmulas.s8.accx.ld.ip q0, {w}, 16, q0, q1",
+            "ee.vld.128.ip q1, {x}, 16", // q1 := next chunk's inputs
             "addi {c}, {c}, -1",
             "bnez {c}, 2b",
+            "3:",
+            "ee.vmulas.s8.accx q0, q1",  // tail: MAC the final preloaded chunk
             "rur.accx_0 {acc}",          // low 32 bits hold the dot (fits i32 here)
             z = out(reg) _,
             w = inout(reg) wp,
             x = inout(reg) xp,
-            c = inout(reg) chunks,
+            c = inout(reg) rem,
             acc = out(reg) acc,
             options(nostack, readonly),
         );
     }
+    let chunks = rem; // consumed below alongside the post-incremented pointers
     // The asm writes the post-incremented pointers / decremented counter back;
     // we don't need them, but consume them so the lint stays quiet.
     let _ = (wp, xp, chunks);
