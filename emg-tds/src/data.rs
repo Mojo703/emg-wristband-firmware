@@ -72,46 +72,47 @@ impl Dataset {
     }
 }
 
-/// Pose-pretraining set: x [N,1,C,T], y [N,20] f32 regression targets.
-pub struct PoseDataset {
-    pub x: Tensor,
-    pub y: Tensor,
+/// Per-timestep pose pretraining set: x [N,1,C,T], seq [N,P,20] pose trajectory.
+pub struct PoseSeqDataset {
+    pub x: Tensor,   // [N,1,C,T]
+    pub seq: Tensor, // [N,P,pose_dim]
     pub n: usize,
     pub channels: usize,
     pub time: usize,
+    pub frames: usize,
     pub pose_dim: usize,
 }
 
-impl PoseDataset {
+impl PoseSeqDataset {
     pub fn load(dir: &Path, device: &Device) -> Result<Self> {
         let x: Array3<f32> = ndarray_npy::read_npy(dir.join("pose_x.npy")).context("pose_x.npy")?;
-        let y: Array2<f32> = ndarray_npy::read_npy(dir.join("pose_y.npy")).context("pose_y.npy")?;
+        let seq: Array3<f32> =
+            ndarray_npy::read_npy(dir.join("pose_seq.npy")).context("pose_seq.npy")?;
         let (n, c, t) = x.dim();
-        let pose_dim = y.dim().1;
+        let (_, frames, pose_dim) = seq.dim();
         let xv = x.as_standard_layout().to_owned().into_raw_vec_and_offset().0;
-        let yv = y.as_standard_layout().to_owned().into_raw_vec_and_offset().0;
+        let sv = seq.as_standard_layout().to_owned().into_raw_vec_and_offset().0;
         Ok(Self {
             x: Tensor::from_vec(xv, (n, 1, c, t), device)?,
-            y: Tensor::from_vec(yv, (n, pose_dim), device)?,
+            seq: Tensor::from_vec(sv, (n, frames, pose_dim), device)?,
             n,
             channels: c,
             time: t,
+            frames,
             pose_dim,
         })
     }
 
     pub fn batch(&self, idx: &[u32], device: &Device) -> Result<(Tensor, Tensor)> {
         let sel = Tensor::from_vec(idx.to_vec(), idx.len(), device)?;
-        Ok((self.x.index_select(&sel, 0)?, self.y.index_select(&sel, 0)?))
+        Ok((self.x.index_select(&sel, 0)?, self.seq.index_select(&sel, 0)?))
     }
 
-    /// Per-dimension z-score stats over the whole set, so pose MSE isn't dominated
-    /// by a few high-variance joints (the failure mode in 0007). Returns (mean,std)
-    /// each [pose_dim], on device.
+    /// Per-dimension z-score stats over all windows and frames → (mean,std) [pose_dim].
     pub fn zscore_stats(&self, device: &Device) -> Result<(Tensor, Tensor)> {
-        let mean = self.y.mean(0)?; // [pose_dim]
-        let centered = self.y.broadcast_sub(&mean)?;
-        let var = centered.sqr()?.mean(0)?;
+        let flat = self.seq.reshape((self.n * self.frames, self.pose_dim))?;
+        let mean = flat.mean(0)?;
+        let var = flat.broadcast_sub(&mean)?.sqr()?.mean(0)?;
         let std = (var + 1e-6)?.sqrt()?;
         Ok((mean.to_device(device)?, std.to_device(device)?))
     }

@@ -17,8 +17,8 @@ use anyhow::Result;
 use candle_core::{DType, Device, Tensor, D};
 use candle_nn::{AdamW, Optimizer, ParamsAdamW, VarBuilder, VarMap};
 use clap::{Parser, Subcommand};
-use data::{Dataset, PoseDataset};
-use model::{Config, TdsNet};
+use data::{Dataset, PoseSeqDataset};
+use model::{Config, PoseNet, TdsNet};
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use rand_distr::Distribution;
@@ -186,31 +186,42 @@ fn run_pretrain(
     out: PathBuf,
 ) -> Result<()> {
     let device = device()?;
-    let ds = PoseDataset::load(&data_dir, &device)?;
+    let ds = PoseSeqDataset::load(&data_dir, &device)?;
     println!(
-        "pose pretrain: {} windows, {}ch × {} → {}-d pose",
-        ds.n, ds.channels, ds.time, ds.pose_dim
+        "pose pretrain (per-timestep): {} windows, {}ch × {} → {} frames × {}-d pose",
+        ds.n, ds.channels, ds.time, ds.frames, ds.pose_dim
     );
-    // Per-dimension z-score: without this, MSE is dominated by a few high-variance
-    // joints and the encoder converges to the mean (the 0007 failure).
+    // Per-dimension z-score over all frames: without this, MSE is dominated by a
+    // few high-variance joints and the encoder converges to the mean (0007/0008).
     let (mean, std) = ds.zscore_stats(&device)?;
 
     let varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-    let model = TdsNet::new(Config::pose(ds.channels, ds.pose_dim), vb)?;
+    let cfg = Config::classify(ds.channels, 5); // num_classes unused by the pose head
+    let model = PoseNet::new(&cfg, ds.pose_dim, vb)?;
     println!("params: {:.2}M", param_count(&varmap) as f64 / 1e6);
-    let mut opt = AdamW::new(varmap.all_vars(), ParamsAdamW { lr, ..Default::default() })?;
 
-    let mut rng = rand::thread_rng();
+    // Determine the encoder's output time resolution T' from one forward, then
+    // build a fixed [P, T'] linear-interp matrix to map the P-frame exported pose
+    // onto the prediction's time grid.
+    let probe = model.forward(&ds.x.narrow(0, 0, 1)?, false)?; // [1,pose_dim,T']
+    let tprime = probe.dim(2)?;
+    let interp = augment::warp_basis(ds.frames, tprime, &device)?; // [P, T']
+    println!("encoder T'={tprime}; interpolating pose {} → {tprime}", ds.frames);
+
+    let mut opt = AdamW::new(varmap.all_vars(), ParamsAdamW { lr, ..Default::default() })?;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(0);
     let mut order: Vec<u32> = (0..ds.n as u32).collect();
     for epoch in 0..epochs {
         order.shuffle(&mut rng);
         let (mut running, mut nb) = (0f32, 0usize);
         for chunk in order.chunks(batch) {
-            let (xb, yb) = ds.batch(chunk, &device)?;
-            let yb = yb.broadcast_sub(&mean)?.broadcast_div(&std)?; // z-score
-            let pred = model.forward(&xb, true)?;
-            let loss = (pred - yb)?.sqr()?.mean_all()?;
+            let (xb, seq) = ds.batch(chunk, &device)?; // seq [B,P,pose_dim]
+            // z-score, then [B,P,D] → [B,D,P] → interp to [B,D,T'].
+            let z = seq.broadcast_sub(&mean)?.broadcast_div(&std)?;
+            let target = z.transpose(1, 2)?.contiguous()?.broadcast_matmul(&interp)?; // [B,D,T']
+            let pred = model.forward(&xb, true)?; // [B,D,T']
+            let loss = (pred - target)?.sqr()?.mean_all()?;
             opt.backward_step(&loss)?;
             running += loss.to_scalar::<f32>()?;
             nb += 1;
