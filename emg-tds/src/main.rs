@@ -109,6 +109,15 @@ enum Cmd {
         /// Optional pose-pretrain checkpoint to initialize the encoder from.
         #[arg(long)]
         init: Option<PathBuf>,
+        /// Class index of the pooled "negative" pose class (commands are 0..neg-1).
+        /// When set, print a command-recall / negative-leakage report on the test
+        /// set at the selected checkpoint (engineering-logs/0012).
+        #[arg(long)]
+        neg_class: Option<usize>,
+        /// Balanced per-epoch sampling: equal windows per class each epoch. Needed
+        /// when a pooled negative class dwarfs the per-command counts.
+        #[arg(long)]
+        balance: bool,
     },
     /// Compare per-user calibration methods on the held-out test subjects.
     Calibrate {
@@ -252,6 +261,8 @@ fn run_train(
     aug: augment::AugCfg,
     mixup_alpha: f64,
     init: Option<PathBuf>,
+    neg_class: Option<usize>,
+    balance: bool,
 ) -> Result<()> {
     let device = device()?;
     device.set_seed(seed)?;
@@ -301,12 +312,38 @@ fn run_train(
     )?;
 
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    // Balanced sampling: group fit rows by class so each epoch draws an equal count
+    // per class (the smallest class), reshuffled, so the majority class is fully
+    // covered across epochs without swamping the minority. Needed once a pooled
+    // negative class (many poses) dwarfs the per-command counts (0012).
+    let class_groups: Vec<Vec<u32>> = if balance {
+        let y_host = train.y.to_vec1::<u32>()?;
+        let n_classes = classes;
+        let mut groups = vec![Vec::new(); n_classes];
+        for &i in &fit_idx {
+            groups[y_host[i as usize] as usize].push(i);
+        }
+        let sizes: Vec<usize> = groups.iter().map(|g| g.len()).collect();
+        println!("balanced sampling: per-class fit counts {sizes:?} → {} each/epoch", sizes.iter().min().copied().unwrap_or(0));
+        groups
+    } else {
+        Vec::new()
+    };
     let mut order: Vec<u32> = fit_idx.clone();
     let mut best = 0f32;
     let mut best_test = 0f32; // test acc at the val-selected checkpoint
     let mut best_epoch = 0usize;
     let mut stale = 0usize; // evals since last improvement ≥ min_delta
     for epoch in 0..epochs {
+        if balance {
+            let per_class = class_groups.iter().map(|g| g.len()).min().unwrap_or(0);
+            order.clear();
+            for g in &class_groups {
+                let mut gi = g.clone();
+                gi.shuffle(&mut rng);
+                order.extend_from_slice(&gi[..per_class.min(gi.len())]);
+            }
+        }
         order.shuffle(&mut rng);
         let (mut running, mut nb) = (0f32, 0usize);
         for chunk in order.chunks(batch) {
@@ -378,6 +415,72 @@ fn run_train(
         "RESULT seed={seed} aug={}{mixup_str} val_acc={best:.3} test_acc={best_test:.3} @epoch {best_epoch}",
         aug.describe()
     );
+    if let Some(neg) = neg_class {
+        // Reload the selected (best-val) checkpoint; the in-memory model is the
+        // last epoch, not the saved one. All names match → full reload.
+        load_matching(&varmap, &out, &device)?;
+        neg_report(&model, &test, batch, &device, neg, seed)?;
+    }
+    Ok(())
+}
+
+/// Command-recall / negative-leakage breakdown on the test set. Commands are
+/// classes `0..neg_class`; `neg_class` is the pooled non-command pose class.
+/// The product cares about two rates: negative→command leakage (a non-command
+/// pose fires a command — the false-activation source) and command→negative
+/// (a real command suppressed — a false negative).
+fn neg_report(
+    model: &TdsNet,
+    test: &Dataset,
+    batch: usize,
+    device: &Device,
+    neg_class: usize,
+    seed: u64,
+) -> Result<()> {
+    let idx: Vec<u32> = (0..test.n as u32).collect();
+    let (mut cmd_total, mut cmd_correct, mut cmd_to_neg, mut cmd_misclass) = (0usize, 0, 0, 0);
+    let (mut neg_total, mut neg_leak) = (0usize, 0usize);
+    for chunk in idx.chunks(batch) {
+        let (xb, yb) = test.batch(chunk, device)?;
+        let pred = model.forward(&xb, false)?.argmax(D::Minus1)?.to_vec1::<u32>()?;
+        let truth = yb.to_vec1::<u32>()?;
+        for (p, t) in pred.iter().zip(&truth) {
+            let (p, t) = (*p as usize, *t as usize);
+            if t == neg_class {
+                neg_total += 1;
+                if p != neg_class {
+                    neg_leak += 1; // non-command pose fired a command
+                }
+            } else {
+                cmd_total += 1;
+                if p == t {
+                    cmd_correct += 1;
+                } else if p == neg_class {
+                    cmd_to_neg += 1;
+                } else {
+                    cmd_misclass += 1;
+                }
+            }
+        }
+    }
+    let pct = |a: usize, b: usize| if b == 0 { 0.0 } else { 100.0 * a as f32 / b as f32 };
+    println!("--- NEG-REPORT seed={seed} (test subjects, window-level) ---");
+    println!(
+        "  command windows {cmd_total}: recall {:.1}%  misclass(other cmd) {:.1}%  suppressed→neg {:.1}%",
+        pct(cmd_correct, cmd_total),
+        pct(cmd_misclass, cmd_total),
+        pct(cmd_to_neg, cmd_total),
+    );
+    println!(
+        "  negative windows {neg_total}: leaked→command {:.1}%  correctly rejected {:.1}%",
+        pct(neg_leak, neg_total),
+        pct(neg_total - neg_leak, neg_total),
+    );
+    println!(
+        "  LEAK seed={seed} cmd_recall={:.3} neg_leak={:.3}",
+        pct(cmd_correct, cmd_total) / 100.0,
+        pct(neg_leak, neg_total) / 100.0,
+    );
     Ok(())
 }
 
@@ -418,6 +521,8 @@ fn main() -> Result<()> {
             chan_dropout,
             mixup_alpha,
             init,
+            neg_class,
+            balance,
         } => run_train(
             data_dir,
             epochs,
@@ -440,6 +545,8 @@ fn main() -> Result<()> {
             },
             mixup_alpha,
             init,
+            neg_class,
+            balance,
         ),
         Cmd::Calibrate { data_dir, ckpt, shots, probe_steps, probe_lr } => {
             let device = device()?;
