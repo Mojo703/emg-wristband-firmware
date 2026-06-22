@@ -3,11 +3,11 @@
 //!
 //! Only the two transforms that earned their place in the 0010 sweep survive:
 //!
-//! - **magnitude warp** (σ=0.3): multiply each channel by a smooth random gain
+//! - **magnitude warp** (sigma=0.3): multiply each channel by a smooth random gain
 //!   curve (low-frequency, K knots linearly interpolated to T). Simulates electrode
 //!   contact / amplitude differences across people — the dominant inter-subject
 //!   factor in the electrode-shift literature.
-//! - **channel dropout** (p=0.1): zero a channel at random (inverted-scale).
+//! - **channel dropout** (probability=0.1): zero a channel at random (inverted-scale).
 //!
 //! Rotate (−15 pt), noise, time-warp, and mixup were tested and dropped (0010).
 
@@ -15,21 +15,21 @@ use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 use rand::Rng;
 
-/// Winning augmentation combo from 0010/0013: warp σ=0.3 + channel-dropout 0.1.
+/// Winning augmentation combo from 0010/0013: warp sigma=0.3 + channel-dropout 0.1.
 #[derive(Clone)]
-pub(crate) struct AugCfg {
+pub(crate) struct AugmentConfig {
     pub(crate) warp_sigma: f64,
-    pub(crate) chan_dropout: f64,
-    pub(crate) knots: usize,
+    pub(crate) channel_dropout: f64,
+    pub(crate) num_knots: usize,
 }
 
-impl AugCfg {
+impl AugmentConfig {
     /// The proven combo (`--augment`).
     pub(crate) fn on() -> Self {
         Self {
             warp_sigma: 0.3,
-            chan_dropout: 0.1,
-            knots: 5,
+            channel_dropout: 0.1,
+            num_knots: 5,
         }
     }
 
@@ -37,13 +37,13 @@ impl AugCfg {
     pub(crate) fn off() -> Self {
         Self {
             warp_sigma: 0.0,
-            chan_dropout: 0.0,
-            knots: 5,
+            channel_dropout: 0.0,
+            num_knots: 5,
         }
     }
 
     pub(crate) fn enabled(&self) -> bool {
-        self.warp_sigma > 0.0 || self.chan_dropout > 0.0
+        self.warp_sigma > 0.0 || self.channel_dropout > 0.0
     }
 
     /// True if the warp transform (which needs the [K,T] knot basis) is on.
@@ -59,8 +59,8 @@ impl AugCfg {
         if self.warp_sigma > 0.0 {
             parts.push(format!("warp{:.2}", self.warp_sigma));
         }
-        if self.chan_dropout > 0.0 {
-            parts.push(format!("cdrop{:.2}", self.chan_dropout));
+        if self.channel_dropout > 0.0 {
+            parts.push(format!("cdrop{:.2}", self.channel_dropout));
         }
         parts.join("+")
     }
@@ -68,54 +68,54 @@ impl AugCfg {
 
 /// Fixed [K,T] linear-interpolation basis mapping K knots → T samples, so a warp
 /// envelope is `knots[B*C,K] @ basis[K,T]`.
-pub(crate) fn warp_basis(knots: usize, t: usize, device: &Device) -> Result<Tensor> {
-    let mut w = vec![0f32; knots * t];
-    for ti in 0..t {
-        let p = if t > 1 {
-            ti as f32 / (t - 1) as f32 * (knots - 1) as f32
+pub(crate) fn warp_basis(num_knots: usize, time: usize, device: &Device) -> Result<Tensor> {
+    let mut weights = vec![0f32; num_knots * time];
+    for time_index in 0..time {
+        let position = if time > 1 {
+            time_index as f32 / (time - 1) as f32 * (num_knots - 1) as f32
         } else {
             0.0
         };
-        let kl = p.floor() as usize;
-        let frac = p - kl as f32;
-        w[kl * t + ti] += 1.0 - frac;
-        if kl + 1 < knots {
-            w[(kl + 1) * t + ti] += frac;
+        let lower_knot = position.floor() as usize;
+        let fraction = position - lower_knot as f32;
+        weights[lower_knot * time + time_index] += 1.0 - fraction;
+        if lower_knot + 1 < num_knots {
+            weights[(lower_knot + 1) * time + time_index] += fraction;
         }
     }
-    Ok(Tensor::from_vec(w, (knots, t), device)?)
+    Ok(Tensor::from_vec(weights, (num_knots, time), device)?)
 }
 
-/// Apply enabled transforms to xb [B,1,C,T]. `basis` is required iff warp is on.
+/// Apply enabled transforms to `inputs` [B,1,C,T]. `basis` is required iff warp is on.
 pub(crate) fn apply(
-    xb: &Tensor,
-    cfg: &AugCfg,
+    inputs: &Tensor,
+    config: &AugmentConfig,
     basis: Option<&Tensor>,
     _rng: &mut impl Rng,
     device: &Device,
 ) -> Result<Tensor> {
-    let (b, _, c, t) = xb.dims4()?;
-    let mut x = xb.clone();
+    let (batch_size, _, channels, time) = inputs.dims4()?;
+    let mut output = inputs.clone();
 
-    if cfg.warp_sigma > 0.0 {
+    if config.warp_sigma > 0.0 {
         let basis = basis.expect("warp basis required");
-        let k = basis.dim(0)?;
+        let num_knots = basis.dim(0)?;
         // knots ~ N(0,1) per (sample, channel); envelope = knots @ basis.
-        let knots = Tensor::randn(0f32, 1f32, (b * c, k), device)?;
-        let env = knots.matmul(basis)?.reshape((b, 1, c, t))?;
+        let knot_values = Tensor::randn(0f32, 1f32, (batch_size * channels, num_knots), device)?;
+        let envelope = knot_values.matmul(basis)?.reshape((batch_size, 1, channels, time))?;
         let gain =
-            (env * cfg.warp_sigma)?.broadcast_add(&Tensor::ones((1,), DType::F32, device)?)?;
-        x = x.mul(&gain)?;
+            (envelope * config.warp_sigma)?.broadcast_add(&Tensor::ones((1,), DType::F32, device)?)?;
+        output = output.mul(&gain)?;
     }
 
-    if cfg.chan_dropout > 0.0 {
-        let keep = 1.0 - cfg.chan_dropout;
-        let r = Tensor::rand(0f32, 1f32, (b, 1, c, 1), device)?;
-        let keep_t = Tensor::full(keep as f32, (1, 1, 1, 1), device)?;
-        let mask = r.broadcast_lt(&keep_t)?.to_dtype(DType::F32)?;
+    if config.channel_dropout > 0.0 {
+        let keep_probability = 1.0 - config.channel_dropout;
+        let random = Tensor::rand(0f32, 1f32, (batch_size, 1, channels, 1), device)?;
+        let keep_threshold = Tensor::full(keep_probability as f32, (1, 1, 1, 1), device)?;
+        let mask = random.broadcast_lt(&keep_threshold)?.to_dtype(DType::F32)?;
         // inverted dropout: scale kept channels by 1/keep so the expected scale holds
-        x = x.broadcast_mul(&mask)?.affine(1.0 / keep, 0.0)?;
+        output = output.broadcast_mul(&mask)?.affine(1.0 / keep_probability, 0.0)?;
     }
 
-    Ok(x.contiguous()?)
+    Ok(output.contiguous()?)
 }

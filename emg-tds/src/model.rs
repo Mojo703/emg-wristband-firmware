@@ -29,7 +29,7 @@ pub(crate) struct Config {
     pub(crate) in_channels: usize,
     /// Output channels per depthwise-separable block (each block strides time 2×).
     pub(crate) channels: Vec<usize>,
-    /// Depthwise temporal kernel (odd → length-preserving with k/2 padding).
+    /// Depthwise temporal kernel (odd → length-preserving with kernel/2 padding).
     pub(crate) kernel: usize,
     pub(crate) num_classes: usize,
 }
@@ -44,55 +44,67 @@ impl Config {
         }
     }
 
-    fn feature_dim(&self) -> usize {
+    fn feature_dimension(&self) -> usize {
         *self.channels.last().expect("at least one block")
     }
 }
 
 /// Depthwise-separable conv block: depthwise temporal conv (keeps channels
 /// separate, strides time) → pointwise 1×1 (mixes channels) → BatchNorm → ReLU.
-struct DsConvBlock {
-    dw: Conv1d, // (in -> in), grouped depthwise, kernel kt, stride s
-    pw: Conv1d, // (in -> out), 1×1
-    bn: BatchNorm,
+struct DepthwiseSeparableBlock {
+    depthwise: Conv1d, // (in -> in), grouped depthwise, temporal kernel, strides time
+    pointwise: Conv1d, // (in -> out), 1×1
+    batch_norm: BatchNorm,
 }
 
-impl DsConvBlock {
-    fn new(in_ch: usize, out_ch: usize, kernel: usize, stride: usize, vb: VarBuilder) -> Result<Self> {
-        let dw = conv1d(
-            in_ch,
-            in_ch,
+impl DepthwiseSeparableBlock {
+    fn new(
+        in_channels: usize,
+        out_channels: usize,
+        kernel: usize,
+        stride: usize,
+        var_builder: VarBuilder,
+    ) -> Result<Self> {
+        let depthwise = conv1d(
+            in_channels,
+            in_channels,
             kernel,
             Conv1dConfig {
                 padding: kernel / 2,
                 stride,
-                groups: in_ch, // depthwise
+                groups: in_channels, // depthwise
                 ..Default::default()
             },
-            vb.pp("dw"),
+            var_builder.pp("dw"),
         )?;
-        let pw = conv1d(in_ch, out_ch, 1, Conv1dConfig::default(), vb.pp("pw"))?;
-        let bn = batch_norm(out_ch, BatchNormConfig::default(), vb.pp("bn"))?;
-        Ok(Self { dw, pw, bn })
+        let pointwise = conv1d(in_channels, out_channels, 1, Conv1dConfig::default(), var_builder.pp("pw"))?;
+        let batch_norm = batch_norm(out_channels, BatchNormConfig::default(), var_builder.pp("bn"))?;
+        Ok(Self { depthwise, pointwise, batch_norm })
     }
 
-    fn forward(&self, x: &Tensor, train: bool) -> Result<Tensor> {
-        let x = self.dw.forward(x)?;
-        let x = self.pw.forward(&x)?;
-        let x = self.bn.forward_t(&x, train)?;
-        Ok(x.relu()?)
+    fn forward(&self, input: &Tensor, training: bool) -> Result<Tensor> {
+        let output = self.depthwise.forward(input)?;
+        let output = self.pointwise.forward(&output)?;
+        let output = self.batch_norm.forward_t(&output, training)?;
+        Ok(output.relu()?)
     }
 }
 
-/// Build the shared DS-conv encoder blocks at `block{i}` under `vb`. Used by both
-/// the classifier and the pose-pretraining net so their encoder var names match
-/// and transfer by name.
-fn build_blocks(cfg: &Config, vb: &VarBuilder) -> Result<Vec<DsConvBlock>> {
-    let mut blocks = Vec::with_capacity(cfg.channels.len());
-    let mut prev = cfg.in_channels;
-    for (i, &out) in cfg.channels.iter().enumerate() {
-        blocks.push(DsConvBlock::new(prev, out, cfg.kernel, 2, vb.pp(format!("block{i}")))?);
-        prev = out;
+/// Build the shared depthwise-separable encoder blocks at `block{i}` under
+/// `var_builder`. Used by both the classifier and the pose-pretraining net so
+/// their encoder var names match and transfer by name.
+fn build_blocks(config: &Config, var_builder: &VarBuilder) -> Result<Vec<DepthwiseSeparableBlock>> {
+    let mut blocks = Vec::with_capacity(config.channels.len());
+    let mut prev_channels = config.in_channels;
+    for (block_index, &out_channels) in config.channels.iter().enumerate() {
+        blocks.push(DepthwiseSeparableBlock::new(
+            prev_channels,
+            out_channels,
+            config.kernel,
+            2,
+            var_builder.pp(format!("block{block_index}")),
+        )?);
+        prev_channels = out_channels;
     }
     Ok(blocks)
 }
@@ -101,49 +113,55 @@ fn build_blocks(cfg: &Config, vb: &VarBuilder) -> Result<Vec<DsConvBlock>> {
 /// pose at the encoder's time resolution. The encoder blocks share names with
 /// `TdsNet`, so a classifier finetune loads them and skips `pose_head`.
 pub(crate) struct PoseNet {
-    blocks: Vec<DsConvBlock>,
+    blocks: Vec<DepthwiseSeparableBlock>,
     pose_head: Conv1d,
 }
 
 impl PoseNet {
-    pub(crate) fn new(cfg: &Config, pose_dim: usize, vb: VarBuilder) -> Result<Self> {
-        let blocks = build_blocks(cfg, &vb)?;
-        let pose_head = conv1d(cfg.feature_dim(), pose_dim, 1, Conv1dConfig::default(), vb.pp("pose_head"))?;
+    pub(crate) fn new(config: &Config, pose_dimension: usize, var_builder: VarBuilder) -> Result<Self> {
+        let blocks = build_blocks(config, &var_builder)?;
+        let pose_head = conv1d(
+            config.feature_dimension(),
+            pose_dimension,
+            1,
+            Conv1dConfig::default(),
+            var_builder.pp("pose_head"),
+        )?;
         Ok(Self { blocks, pose_head })
     }
 
-    /// [B,1,C,T] → predicted pose trajectory [B, pose_dim, T'].
-    pub(crate) fn forward(&self, x: &Tensor, train: bool) -> Result<Tensor> {
-        let mut h = x.squeeze(1)?;
-        for blk in &self.blocks {
-            h = blk.forward(&h, train)?;
+    /// [B,1,C,T] → predicted pose trajectory [B, pose_dimension, T'].
+    pub(crate) fn forward(&self, input: &Tensor, training: bool) -> Result<Tensor> {
+        let mut hidden = input.squeeze(1)?;
+        for block in &self.blocks {
+            hidden = block.forward(&hidden, training)?;
         }
-        Ok(self.pose_head.forward(&h)?)
+        Ok(self.pose_head.forward(&hidden)?)
     }
 }
 
 pub(crate) struct TdsNet {
-    blocks: Vec<DsConvBlock>,
+    blocks: Vec<DepthwiseSeparableBlock>,
     head: Linear,
 }
 
 impl TdsNet {
-    pub(crate) fn new(cfg: Config, vb: VarBuilder) -> Result<Self> {
-        let blocks = build_blocks(&cfg, &vb)?;
+    pub(crate) fn new(config: Config, var_builder: VarBuilder) -> Result<Self> {
+        let blocks = build_blocks(&config, &var_builder)?;
         // Classifier head is named distinctly from the pose head so a finetune
         // loads the encoder by name and skips the wrong-task head.
-        let head = linear(cfg.feature_dim(), cfg.num_classes, vb.pp("cls_head"))?;
+        let head = linear(config.feature_dimension(), config.num_classes, var_builder.pp("cls_head"))?;
         Ok(Self { blocks, head })
     }
 
-    /// Classification logits [B,num_classes]. `train` toggles BatchNorm
+    /// Classification logits [B,num_classes]. `training` toggles BatchNorm
     /// running-stat updates. Encoder blocks → global average pool over time → head.
-    pub(crate) fn forward(&self, x: &Tensor, train: bool) -> Result<Tensor> {
-        let mut h = x.squeeze(1)?; // [B,C,T]
-        for blk in &self.blocks {
-            h = blk.forward(&h, train)?;
+    pub(crate) fn forward(&self, input: &Tensor, training: bool) -> Result<Tensor> {
+        let mut hidden = input.squeeze(1)?; // [B,C,T]
+        for block in &self.blocks {
+            hidden = block.forward(&hidden, training)?;
         }
-        let feat = h.mean(D::Minus1)?; // GAP → [B,d]
-        Ok(self.head.forward(&feat)?)
+        let features = hidden.mean(D::Minus1)?; // global average pool → [B,d]
+        Ok(self.head.forward(&features)?)
     }
 }
