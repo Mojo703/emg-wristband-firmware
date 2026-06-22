@@ -16,6 +16,8 @@ pub struct Dataset {
     pub n: usize,
     pub channels: usize,
     pub time: usize,
+    /// Per-window subject id from `{split}_meta.npy` (empty if absent).
+    pub subject: Vec<i64>,
 }
 
 impl Dataset {
@@ -29,12 +31,16 @@ impl Dataset {
         let (n, c, t) = x.dim();
         let xv: Vec<f32> = x.as_standard_layout().to_owned().into_raw_vec_and_offset().0;
         let yv: Vec<u32> = y.iter().map(|&v| v as u32).collect();
+        let subject = ndarray_npy::read_npy::<_, Array2<i64>>(dir.join(format!("{split}_meta.npy")))
+            .map(|m| m.column(0).to_vec())
+            .unwrap_or_default();
         Ok(Self {
             x: Tensor::from_vec(xv, (n, 1, c, t), device)?,
             y: Tensor::from_vec(yv, n, device)?,
             n,
             channels: c,
             time: t,
+            subject,
         })
     }
 
@@ -46,6 +52,23 @@ impl Dataset {
 
     pub fn num_classes(&self) -> Result<usize> {
         Ok(self.y.max(0)?.to_scalar::<u32>()? as usize + 1)
+    }
+
+    /// Split rows into (fit, val) by holding out the `holdout` highest subject ids
+    /// as validation. Returns all rows in `fit` and none in `val` if metadata is
+    /// missing or `holdout == 0`.
+    pub fn subject_holdout(&self, holdout: usize) -> (Vec<u32>, Vec<u32>) {
+        let all: Vec<u32> = (0..self.n as u32).collect();
+        if holdout == 0 || self.subject.is_empty() {
+            return (all, Vec::new());
+        }
+        let mut subs: Vec<i64> = self.subject.clone();
+        subs.sort_unstable();
+        subs.dedup();
+        let val_subs: std::collections::HashSet<i64> =
+            subs.iter().rev().take(holdout).copied().collect();
+        all.into_iter()
+            .partition(|&i| !val_subs.contains(&self.subject[i as usize]))
     }
 }
 

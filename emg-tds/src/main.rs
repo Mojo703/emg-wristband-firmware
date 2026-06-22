@@ -8,6 +8,8 @@
 //!
 //! GPU: build `--features cuda` and set `CUDARC_CUDA_VERSION=13020`.
 
+mod augment;
+mod calibrate;
 mod data;
 mod model;
 
@@ -18,6 +20,7 @@ use clap::{Parser, Subcommand};
 use data::{Dataset, PoseDataset};
 use model::{Config, TdsNet};
 use rand::seq::SliceRandom;
+use rand::SeedableRng;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
@@ -76,9 +79,41 @@ enum Cmd {
         /// Minimum test-accuracy gain to count as an improvement.
         #[arg(long, default_value_t = 0.002)]
         min_delta: f32,
+        /// Hold out this many of the highest training-subject ids as the
+        /// validation set used for checkpoint/early-stop selection, so the test
+        /// subjects are never touched during training. 0 = select on test (leaky).
+        #[arg(long, default_value_t = 3)]
+        val_subjects: usize,
+        /// RNG seed (shuffle + augmentation), for reproducible variance runs.
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+        /// Magnitude-warp strength (per-channel smooth gain sigma). 0 = off.
+        #[arg(long, default_value_t = 0.0)]
+        warp_sigma: f64,
+        /// Additive Gaussian noise sigma. 0 = off.
+        #[arg(long, default_value_t = 0.0)]
+        noise_sigma: f64,
+        /// Random cyclic channel-rotation augmentation.
+        #[arg(long)]
+        rotate: bool,
         /// Optional pose-pretrain checkpoint to initialize the encoder from.
         #[arg(long)]
         init: Option<PathBuf>,
+    },
+    /// Compare per-user calibration methods on the held-out test subjects.
+    Calibrate {
+        #[arg(long, default_value = "data")]
+        data_dir: PathBuf,
+        /// Trained encoder+head checkpoint (from `train --out`).
+        #[arg(long, default_value = "checkpoints/best.safetensors")]
+        ckpt: PathBuf,
+        /// Calibration reps (trials) per gesture to sweep.
+        #[arg(long, value_delimiter = ',', default_value = "1,3,5")]
+        shots: Vec<usize>,
+        #[arg(long, default_value_t = 300)]
+        probe_steps: usize,
+        #[arg(long, default_value_t = 0.05)]
+        probe_lr: f64,
     },
 }
 
@@ -112,15 +147,25 @@ fn load_matching(varmap: &VarMap, path: &Path, device: &Device) -> Result<usize>
 }
 
 fn accuracy(model: &TdsNet, ds: &Dataset, batch: usize, device: &Device) -> Result<f32> {
-    let mut correct = 0usize;
     let idx: Vec<u32> = (0..ds.n as u32).collect();
+    accuracy_idx(model, ds, &idx, batch, device)
+}
+
+fn accuracy_idx(
+    model: &TdsNet,
+    ds: &Dataset,
+    idx: &[u32],
+    batch: usize,
+    device: &Device,
+) -> Result<f32> {
+    let mut correct = 0usize;
     for chunk in idx.chunks(batch) {
         let (xb, yb) = ds.batch(chunk, device)?;
         let pred = model.forward(&xb, false)?.argmax(D::Minus1)?.to_vec1::<u32>()?;
         let truth = yb.to_vec1::<u32>()?;
         correct += pred.iter().zip(&truth).filter(|(a, b)| a == b).count();
     }
-    Ok(correct as f32 / ds.n as f32)
+    Ok(correct as f32 / idx.len() as f32)
 }
 
 fn run_pretrain(
@@ -181,15 +226,31 @@ fn run_train(
     out: PathBuf,
     patience: usize,
     min_delta: f32,
+    val_subjects: usize,
+    seed: u64,
+    aug: augment::AugCfg,
     init: Option<PathBuf>,
 ) -> Result<()> {
     let device = device()?;
+    device.set_seed(seed)?;
     let train = Dataset::load(&data_dir, "train", &device)?;
     let test = Dataset::load(&data_dir, "test", &device)?;
     let classes = train.num_classes()?;
+    let (fit_idx, val_idx) = train.subject_holdout(val_subjects);
+    let select_on_test = val_idx.is_empty();
+    if select_on_test {
+        println!("WARNING: no validation subjects held out — selecting on TEST (leaky)");
+    }
     println!(
-        "train {} / test {} windows | {}ch × {} | {} classes",
-        train.n, test.n, train.channels, train.time, classes
+        "train {} (fit {} / val {}) / test {} windows | {}ch × {} | {} classes | select on {}",
+        train.n,
+        fit_idx.len(),
+        val_idx.len(),
+        test.n,
+        train.channels,
+        train.time,
+        classes,
+        if select_on_test { "test" } else { "val(held-out train subjects)" }
     );
 
     let varmap = VarMap::new();
@@ -204,13 +265,20 @@ fn run_train(
         std::fs::create_dir_all(p)?;
     }
 
+    println!("seed {seed} | augment: {}", aug.describe());
+    let warp_basis = if aug.warp_sigma > 0.0 {
+        Some(augment::warp_basis(aug.knots, train.time, &device)?)
+    } else {
+        None
+    };
+
     let mut opt = AdamW::new(
         varmap.all_vars(),
         ParamsAdamW { lr, weight_decay, ..Default::default() },
     )?;
 
-    let mut rng = rand::thread_rng();
-    let mut order: Vec<u32> = (0..train.n as u32).collect();
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let mut order: Vec<u32> = fit_idx.clone();
     let mut best = 0f32;
     let mut best_epoch = 0usize;
     let mut stale = 0usize; // evals since last improvement ≥ min_delta
@@ -218,7 +286,10 @@ fn run_train(
         order.shuffle(&mut rng);
         let (mut running, mut nb) = (0f32, 0usize);
         for chunk in order.chunks(batch) {
-            let (xb, yb) = train.batch(chunk, &device)?;
+            let (mut xb, yb) = train.batch(chunk, &device)?;
+            if aug.enabled() {
+                xb = augment::apply(&xb, &aug, warp_basis.as_ref(), &mut rng, &device)?;
+            }
             let logits = model.forward(&xb, true)?;
             let loss = candle_nn::loss::cross_entropy(&logits, &yb)?;
             opt.backward_step(&loss)?;
@@ -226,19 +297,27 @@ fn run_train(
             nb += 1;
         }
         if epoch % eval_every == 0 || epoch + 1 == epochs {
+            // Selection metric: held-out training subjects (val), never the test
+            // subjects, unless no val was requested.
+            let sel_acc = if select_on_test {
+                accuracy(&model, &test, batch, &device)?
+            } else {
+                accuracy_idx(&model, &train, &val_idx, batch, &device)?
+            };
             let test_acc = accuracy(&model, &test, batch, &device)?;
-            let train_acc = accuracy(&model, &train, batch, &device)?;
-            let improved = test_acc > best + min_delta;
-            if test_acc > best {
-                best = test_acc;
+            let train_acc = accuracy_idx(&model, &train, &fit_idx, batch, &device)?;
+            let improved = sel_acc > best + min_delta;
+            if sel_acc > best {
+                best = sel_acc;
                 best_epoch = epoch;
-                varmap.save(&out)?; // checkpoint the best model
+                varmap.save(&out)?; // checkpoint the best model (by selection metric)
             }
             stale = if improved { 0 } else { stale + 1 };
             println!(
-                "epoch {epoch:>3}  loss {:.4}  train_acc {:.3}  test_acc {:.3}{}",
+                "epoch {epoch:>3}  loss {:.4}  fit_acc {:.3}  val_acc {:.3}  test_acc {:.3}{}",
                 running / nb as f32,
                 train_acc,
+                sel_acc,
                 test_acc,
                 if improved { "  *" } else { "" }
             );
@@ -252,7 +331,11 @@ fn run_train(
             println!("epoch {epoch:>3}  loss {:.4}", running / nb as f32);
         }
     }
-    println!("best test_acc {best:.3} @ epoch {best_epoch} → {}", out.display());
+    let final_test = accuracy(&model, &test, batch, &device)?;
+    println!(
+        "best selection_acc {best:.3} @ epoch {best_epoch} → {} (final-epoch test_acc {final_test:.3})",
+        out.display()
+    );
     Ok(())
 }
 
@@ -284,9 +367,30 @@ fn main() -> Result<()> {
             out,
             patience,
             min_delta,
+            val_subjects,
+            seed,
+            warp_sigma,
+            noise_sigma,
+            rotate,
             init,
         } => run_train(
-            data_dir, epochs, batch, lr, weight_decay, eval_every, out, patience, min_delta, init,
+            data_dir,
+            epochs,
+            batch,
+            lr,
+            weight_decay,
+            eval_every,
+            out,
+            patience,
+            min_delta,
+            val_subjects,
+            seed,
+            augment::AugCfg { warp_sigma, noise_sigma, rotate, knots: 5 },
+            init,
         ),
+        Cmd::Calibrate { data_dir, ckpt, shots, probe_steps, probe_lr } => {
+            let device = device()?;
+            calibrate::run(&data_dir, &ckpt, &shots, probe_steps, probe_lr, &device)
+        }
     }
 }

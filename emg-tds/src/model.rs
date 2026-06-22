@@ -132,8 +132,9 @@ impl TdsNet {
         Ok(Self { blocks, head })
     }
 
-    /// Encode [B,1,C,T] → pooled feature [B,d] (GAP over time).
-    fn encode(&self, x: &Tensor, train: bool) -> Result<Tensor> {
+    /// Encode [B,1,C,T] → pooled feature [B,d] (GAP over time). Public so
+    /// calibration can use the frozen encoder as a feature extractor.
+    pub fn embed(&self, x: &Tensor, train: bool) -> Result<Tensor> {
         let mut x = x.squeeze(1)?; // [B,C,T]
         for blk in &self.blocks {
             x = blk.forward(&x, train)?;
@@ -141,10 +142,15 @@ impl TdsNet {
         Ok(x.mean(D::Minus1)?) // GAP → [B,d]
     }
 
+    /// Apply the trained head to a precomputed feature [B,d].
+    pub fn head_logits(&self, feat: &Tensor) -> Result<Tensor> {
+        Ok(self.head.forward(feat)?)
+    }
+
     /// Classification logits / pose regression, depending on the head built.
     /// `train` toggles BatchNorm running-stat updates.
     pub fn forward(&self, x: &Tensor, train: bool) -> Result<Tensor> {
-        let feat = self.encode(x, train)?;
+        let feat = self.embed(x, train)?;
         Ok(self.head.forward(&feat)?)
     }
 }
