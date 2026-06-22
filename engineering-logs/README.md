@@ -23,4 +23,9 @@ boot, plus cosine ≥ 0.90 vs the Python float32 reference.
 | # | Title | Result |
 |---|-------|--------|
 | [0001](0001-baseline-and-bottleneck.md) | Baseline + bottleneck analysis | 18.23 ms p50; pointwise = 71.6% |
-| [0002](0002-pipelined-pointwise-mac.md) | Pipelined pointwise MAC (`accx.ld.ip`) | 17.07 ms p50 (−6.4%); confirms overhead-bound |
+| [0002](0002-pipelined-pointwise-mac.md) | Pipelined pointwise MAC (`accx.ld.ip`) | **17.07 ms p50 (−6.4%)** — current best |
+| [0003](0003-qacc-multioutput-pointwise.md) | QACC multi-output pointwise | ❌ correct but +57% slower; reverted. ACCX wins reductions |
+| [0004](0004-model-shrink-plan.md) | Model-shrink plan (overnight retrain) | PLAN — kernel floor reached; gains now need a smaller model |
+| [0005](0005-sota-review-and-waveformer.md) | Accuracy reality check + SOTA review | pivot to accuracy; reimplement WaveFormer in Rust (`../waveformer/`) |
+| [0006](0006-waveformer-rust-port.md) | WaveFormer Rust/candle port | architecture + forward pass OK (2.50M params); data/training next |
+| [0007](0007-waveformer-training-gpu-and-pose-pretrain.md) | Training: GPU unblock + pose-pretrain + zero-init fix | CUDA 13.3 fixed; model now learns (was collapsing to mean); finetune numbers pending |
