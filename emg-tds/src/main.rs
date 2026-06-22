@@ -24,7 +24,7 @@ use rand::SeedableRng;
 use std::path::{Path, PathBuf};
 
 // Folded-in training constants (settled in the logs; no longer worth a CLI flag).
-const WEIGHT_DECAY: f64 = 0.05; // AdamW
+const WEIGHT_DECAY: f64 = 0.05;
 const MINIMUM_IMPROVEMENT: f32 = 0.002; // gain needed to reset early-stop patience
 
 #[derive(Parser)]
@@ -67,9 +67,8 @@ enum Command {
         /// Early stop after this many epochs with no improvement ≥ MINIMUM_IMPROVEMENT.
         #[arg(long, default_value_t = 30)]
         patience: usize,
-        /// Hold out this many of the highest training-subject ids as the
-        /// validation set used for checkpoint/early-stop selection, so the test
-        /// subjects are never touched during training. 0 = select on test (leaky).
+        /// Hold out this many of the highest training-subject ids for checkpoint/early-stop
+        /// selection, keeping the test subjects untouched. 0 = select on test (leaky).
         #[arg(long, default_value_t = 3)]
         validation_subjects: usize,
         /// RNG seed (shuffle + augmentation), for reproducible variance runs.
@@ -82,9 +81,8 @@ enum Command {
         /// Optional pose-pretrain checkpoint to initialize the encoder from.
         #[arg(long)]
         init: Option<PathBuf>,
-        /// Number of command classes (labels 0..n-commands). Labels ≥ this are
-        /// grouped negatives, trained as their own softmax classes. When set, prints
-        /// the command-recall / leakage reject report (engineering-logs/0013).
+        /// Number of command classes; labels ≥ this are grouped negatives. When set,
+        /// prints the command-recall / leakage reject report (0013).
         #[arg(long)]
         n_commands: Option<usize>,
         /// Balanced per-epoch sampling: equal windows per class each epoch. Needed
@@ -153,8 +151,7 @@ fn run_pretrain(
         "pose pretrain (per-timestep): {} windows, {}ch × {} → {} frames × {}-d pose",
         dataset.num_windows, dataset.channels, dataset.time, dataset.frames, dataset.pose_dimension
     );
-    // Per-dimension z-score over all frames: without this, the error is dominated by
-    // a few high-variance joints and the encoder converges to the mean (0007/0008).
+    // Without per-dim z-score a few high-variance joints dominate and the encoder collapses to the mean (0007/0008).
     let (mean, std_dev) = dataset.zscore_stats(&device)?;
 
     let var_map = VarMap::new();
@@ -163,9 +160,7 @@ fn run_pretrain(
     let model = PoseNet::new(&config, dataset.pose_dimension, var_builder)?;
     println!("params: {:.2}M", parameter_count(&var_map) as f64 / 1e6);
 
-    // Determine the encoder's output time resolution T' from one forward, then
-    // build a fixed [P, T'] linear-interp matrix to map the P-frame exported pose
-    // onto the prediction's time grid.
+    // Map the P-frame pose onto the encoder's output time grid T' (probed from one forward).
     let probe_output = model.forward(&dataset.inputs.narrow(0, 0, 1)?, false)?; // [1,pose_dimension,T']
     let encoder_time_steps = probe_output.dim(2)?;
     let interpolation = augment::warp_basis(dataset.frames, encoder_time_steps, &device)?; // [P, T']
@@ -261,9 +256,7 @@ fn run_train(
     )?;
 
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-    // Balanced sampling: group fit rows by class so each epoch draws an equal count
-    // per class (the smallest class), reshuffled, so the majority class is fully
-    // covered across epochs without swamping the minority (0012).
+    // Equal windows per class each epoch (sized to the smallest), so a large negative class can't swamp the commands (0012).
     let class_groups: Vec<Vec<u32>> = if balance {
         let mut groups = vec![Vec::new(); num_classes];
         for &index in &fit_indices {
@@ -281,7 +274,7 @@ fn run_train(
     };
     let mut order: Vec<u32> = fit_indices.clone();
     let mut best_selection_accuracy = 0f32;
-    let mut best_test_accuracy = 0f32; // test acc at the validation-selected checkpoint
+    let mut best_test_accuracy = 0f32;
     let mut best_epoch = 0usize;
     let mut evals_without_improvement = 0usize;
     for epoch in 0..epochs {
@@ -307,8 +300,7 @@ fn run_train(
             running_loss += loss.to_scalar::<f32>()?;
             num_batches += 1;
         }
-        // Selection metric: held-out training subjects (validation), never the test
-        // subjects, unless no validation was requested.
+        // Select on held-out train subjects, never the test set (unless none were held out).
         let test_indices: Vec<u32> = (0..test_set.num_windows as u32).collect();
         let selection_accuracy = if select_on_test {
             accuracy_on_indices(&model, &test_set, &test_indices, batch_size, &device)?
@@ -321,8 +313,8 @@ fn run_train(
         if selection_accuracy > best_selection_accuracy {
             best_selection_accuracy = selection_accuracy;
             best_epoch = epoch;
-            best_test_accuracy = test_accuracy; // test acc at the selected checkpoint
-            var_map.save(&out)?; // checkpoint the best model (by selection metric)
+            best_test_accuracy = test_accuracy; // the test number we report is the one at selection time
+            var_map.save(&out)?;
         }
         evals_without_improvement = if improved { 0 } else { evals_without_improvement + 1 };
         println!(
@@ -345,12 +337,24 @@ fn run_train(
         augment_config.describe()
     );
     if let Some(num_commands) = n_commands {
-        // Reload the selected (best-validation) checkpoint; the in-memory model is
-        // the last epoch, not the saved one. All names match → full reload.
+        // In-memory model is the last epoch; reload the saved best before reporting.
         load_matching_tensors(&var_map, &out, &device)?;
         unified_report(&model, &test_set, batch_size, &device, num_commands, seed)?;
     }
     Ok(())
+}
+
+/// A true-command test window, scored by its max softmax over the command classes.
+struct CommandScore {
+    confidence: f32,
+    correct: bool, // predicted command matched the true label
+}
+
+/// Reject quality at one operating point: fraction of negatives that leak past the
+/// threshold, and misclassification among the accepted commands.
+struct RejectStats {
+    leakage: f32,
+    misclassification: f32,
 }
 
 /// Unified, threshold-based reject metric (0013). The rejection score is the max
@@ -367,7 +371,7 @@ fn unified_report(
     seed: u64,
 ) -> Result<()> {
     let indices: Vec<u32> = (0..test_set.num_windows as u32).collect();
-    let mut command_scores: Vec<(f32, bool)> = Vec::new(); // (confidence, correct) for true commands
+    let mut command_scores: Vec<CommandScore> = Vec::new();
     let mut negative_scores: Vec<f32> = Vec::new(); // confidence for true negatives
     for chunk in indices.chunks(batch_size) {
         let (inputs, labels) = test_set.batch(chunk, device)?;
@@ -384,7 +388,10 @@ fn unified_report(
                 }
             }
             if (label as usize) < num_commands {
-                command_scores.push((max_confidence, argmax_command == label as usize));
+                command_scores.push(CommandScore {
+                    confidence: max_confidence,
+                    correct: argmax_command == label as usize,
+                });
             } else {
                 negative_scores.push(max_confidence);
             }
@@ -392,35 +399,35 @@ fn unified_report(
     }
     // AUROC via Mann–Whitney: P(confidence(command) > confidence(negative)).
     let auroc_score = area_under_roc(
-        &command_scores.iter().map(|score| score.0).collect::<Vec<_>>(),
+        &command_scores.iter().map(|score| score.confidence).collect::<Vec<_>>(),
         &negative_scores,
     );
-    // Leakage + misclassification at fixed command recall: threshold = the
-    // recall-quantile of command confidences, then leakage = fraction of negatives ≥ threshold.
-    let mut command_confidences: Vec<f32> = command_scores.iter().map(|score| score.0).collect();
+    // At a recall-quantile threshold of command confidence: leakage = negatives scoring ≥ it.
+    let mut command_confidences: Vec<f32> = command_scores.iter().map(|score| score.confidence).collect();
     command_confidences.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let report_at = |recall: f32| -> (f32, f32, f32) {
+    let report_at = |recall: f32| -> RejectStats {
         let quantile_index = ((1.0 - recall) * command_confidences.len() as f32).floor() as usize;
         let threshold = command_confidences[quantile_index.min(command_confidences.len() - 1)];
         let leakage = negative_scores.iter().filter(|&&confidence| confidence >= threshold).count() as f32
             / negative_scores.len().max(1) as f32;
-        let accepted: Vec<_> = command_scores.iter().filter(|score| score.0 >= threshold).collect();
-        let misclassification =
-            accepted.iter().filter(|score| !score.1).count() as f32 / accepted.len().max(1) as f32;
-        (threshold, leakage, misclassification)
+        let accepted = command_scores.iter().filter(|score| score.confidence >= threshold);
+        let misclassification = accepted.clone().filter(|score| !score.correct).count() as f32
+            / accepted.count().max(1) as f32;
+        RejectStats { leakage, misclassification }
     };
-    let (_, leakage_at_90, misclassification_at_90) = report_at(0.90);
-    let (_, leakage_at_95, misclassification_at_95) = report_at(0.95);
+    let at_90 = report_at(0.90);
+    let at_95 = report_at(0.95);
     println!(
         "--- UNIFIED seed={seed} ({} cmd / {} neg test windows) ---",
         command_scores.len(),
         negative_scores.len()
     );
     println!("  AUROC(command vs negative) {auroc_score:.3}");
-    println!("  @recall0.90: leak {:.1}%  misclass {:.1}%", leakage_at_90 * 100.0, misclassification_at_90 * 100.0);
-    println!("  @recall0.95: leak {:.1}%  misclass {:.1}%", leakage_at_95 * 100.0, misclassification_at_95 * 100.0);
+    println!("  @recall0.90: leak {:.1}%  misclass {:.1}%", at_90.leakage * 100.0, at_90.misclassification * 100.0);
+    println!("  @recall0.95: leak {:.1}%  misclass {:.1}%", at_95.leakage * 100.0, at_95.misclassification * 100.0);
     println!(
-        "  METRIC seed={seed} auroc={auroc_score:.4} leak90={leakage_at_90:.4} leak95={leakage_at_95:.4} mis90={misclassification_at_90:.4}"
+        "  METRIC seed={seed} auroc={auroc_score:.4} leak90={:.4} leak95={:.4} mis90={:.4}",
+        at_90.leakage, at_95.leakage, at_90.misclassification
     );
     Ok(())
 }

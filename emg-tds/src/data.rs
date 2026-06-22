@@ -49,7 +49,6 @@ impl Dataset {
         })
     }
 
-    /// Gather a batch by row indices.
     pub(crate) fn batch(&self, indices: &[u32], device: &Device) -> Result<(Tensor, Tensor)> {
         let index_tensor = Tensor::from_vec(indices.to_vec(), indices.len(), device)?;
         Ok((

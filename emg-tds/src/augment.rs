@@ -1,13 +1,11 @@
 //! On-the-fly training augmentation that simulates inter-subject / placement
-//! variability (engineering-logs/0010). Applied to the fit batch only.
+//! variability (0010), applied to the fit batch only. Two transforms survived the
+//! 0010 sweep:
 //!
-//! Only the two transforms that earned their place in the 0010 sweep survive:
-//!
-//! - **magnitude warp** (sigma=0.3): multiply each channel by a smooth random gain
-//!   curve (low-frequency, K knots linearly interpolated to T). Simulates electrode
-//!   contact / amplitude differences across people — the dominant inter-subject
-//!   factor in the electrode-shift literature.
-//! - **channel dropout** (probability=0.1): zero a channel at random (inverted-scale).
+//! - magnitude warp (sigma=0.3): scale each channel by a smooth random gain curve
+//!   (K knots interpolated to T), simulating the electrode contact / amplitude
+//!   differences that dominate inter-subject variation.
+//! - channel dropout (probability=0.1): zero a channel at random, inverted-scale.
 //!
 //! Rotate (−15 pt), noise, time-warp, and mixup were tested and dropped (0010).
 

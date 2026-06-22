@@ -1,21 +1,15 @@
-//! Depthwise-separable conv encoder for sEMG, with swappable heads.
+//! Depthwise-separable conv encoder for sEMG, with swappable classifier/pose heads.
 //!
-//! Redesign after the first TDS attempt underfit (engineering-logs/0008): on this
-//! data the architecture that fits is the `emg-gesture-class` CNN's, so we adopt
-//! its three winning choices and drop the ones that capped train accuracy:
-//!   1. **BatchNorm**, not LayerNorm — conv nets optimize much better with BN.
-//!   2. **Large temporal kernels** (25) for receptive field per layer.
-//!   3. **Depthwise-separable blocks that keep the 16 channels separate** — the
-//!      first conv is depthwise (per-channel over time), then a 1×1 pointwise
-//!      mixes channels. Avoids the early channel collapse the old stem did.
+//! The first TDS attempt underfit (0008). What fits this data is the
+//! `emg-gesture-class` CNN's recipe, so this adopts its three choices: BatchNorm
+//! rather than LayerNorm, large temporal kernels (25), and depthwise-separable
+//! blocks that keep the 16 channels separate (depthwise conv over time, then a 1×1
+//! pointwise to mix) instead of collapsing them in an early stem.
 //!
-//! Heads are swappable so the encoder can be pose-pretrained then head-swapped to
-//! a classifier (the transfer recipe). Encoder var names are identical across
-//! tasks; only the head name differs, so a finetune loads the encoder by name and
-//! skips the wrong-task head.
-//!
-//! Init goes through candle_nn's conv/linear builders (kaiming), so we never hit
-//! the zero-init collapse that bit the WaveFormer port (0007).
+//! The heads share encoder var names and differ only in the head name, so a
+//! classifier finetune loads a pose-pretrained encoder by name and skips the
+//! wrong-task head. Init goes through candle_nn's kaiming builders, avoiding the
+//! zero-init collapse from the WaveFormer port (0007).
 
 use anyhow::Result;
 use candle_core::{Tensor, D};
@@ -52,8 +46,8 @@ impl Config {
 /// Depthwise-separable conv block: depthwise temporal conv (keeps channels
 /// separate, strides time) → pointwise 1×1 (mixes channels) → BatchNorm → ReLU.
 struct DepthwiseSeparableBlock {
-    depthwise: Conv1d, // (in -> in), grouped depthwise, temporal kernel, strides time
-    pointwise: Conv1d, // (in -> out), 1×1
+    depthwise: Conv1d,
+    pointwise: Conv1d,
     batch_norm: BatchNorm,
 }
 
@@ -72,7 +66,7 @@ impl DepthwiseSeparableBlock {
             Conv1dConfig {
                 padding: kernel / 2,
                 stride,
-                groups: in_channels, // depthwise
+                groups: in_channels,
                 ..Default::default()
             },
             var_builder.pp("dw"),
@@ -90,9 +84,8 @@ impl DepthwiseSeparableBlock {
     }
 }
 
-/// Build the shared depthwise-separable encoder blocks at `block{i}` under
-/// `var_builder`. Used by both the classifier and the pose-pretraining net so
-/// their encoder var names match and transfer by name.
+/// Builds the shared encoder blocks, named `block{i}`. Both nets build them this
+/// way so the var names line up and transfer between tasks.
 fn build_blocks(config: &Config, var_builder: &VarBuilder) -> Result<Vec<DepthwiseSeparableBlock>> {
     let mut blocks = Vec::with_capacity(config.channels.len());
     let mut prev_channels = config.in_channels;
@@ -109,9 +102,9 @@ fn build_blocks(config: &Config, var_builder: &VarBuilder) -> Result<Vec<Depthwi
     Ok(blocks)
 }
 
-/// Per-timestep pose pretraining net: shared encoder + a 1×1 conv head predicting
-/// pose at the encoder's time resolution. The encoder blocks share names with
-/// `TdsNet`, so a classifier finetune loads them and skips `pose_head`.
+/// Pose pretraining net: shared encoder + a 1×1 conv head predicting pose at the
+/// encoder's time resolution. Encoder blocks share names with `TdsNet`'s, so a
+/// classifier finetune loads them and skips `pose_head`.
 pub(crate) struct PoseNet {
     blocks: Vec<DepthwiseSeparableBlock>,
     pose_head: Conv1d,
@@ -148,8 +141,6 @@ pub(crate) struct TdsNet {
 impl TdsNet {
     pub(crate) fn new(config: Config, var_builder: VarBuilder) -> Result<Self> {
         let blocks = build_blocks(&config, &var_builder)?;
-        // Classifier head is named distinctly from the pose head so a finetune
-        // loads the encoder by name and skips the wrong-task head.
         let head = linear(config.feature_dimension(), config.num_classes, var_builder.pp("cls_head"))?;
         Ok(Self { blocks, head })
     }
@@ -161,7 +152,7 @@ impl TdsNet {
         for block in &self.blocks {
             hidden = block.forward(&hidden, training)?;
         }
-        let features = hidden.mean(D::Minus1)?; // global average pool → [B,d]
+        let features = hidden.mean(D::Minus1)?; // [B,d]
         Ok(self.head.forward(&features)?)
     }
 }
