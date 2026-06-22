@@ -34,3 +34,5 @@ boot, plus cosine ≥ 0.90 vs the Python float32 reference.
 | [0010](0010-augmentation-tested.md) | Data augmentation | **warp σ=0.3 helps (+~4 pt, kills bad-seed collapse)**; rotate hurts |
 | [0011](0011-pose-pretrain-transfer-tested.md) | Per-timestep pose pretrain transfer | transfers (+3.8 pt) but redundant with augmentation; augmentation wins |
 | [0012](0012-negative-class-training-tested.md) | Negative-class training (false-positive rejection) | explicit reject learnable but pooled negatives too coarse: 60% leak, −10 pt recall |
+| [0013](0013-improved-negative-class-training.md) | Improved negative training: grouping vs outlier-exposure vs orthogonal | **grouping wins (AUROC 0.61→0.70)**; outlier-exposure noisy-positive, orthogonal inert; no combination helps |
+| [0014](0014-emg2pose-false-activation-mining.md) | Mining false activations on unlabeled emg2pose | model fires on 81% of emg2pose; pronation dominance is a label-space sink, not a bad command — no wrist swap helps; fires unverified (no ground truth) |

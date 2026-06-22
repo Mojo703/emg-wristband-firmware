@@ -13,7 +13,7 @@ mod calibrate;
 mod data;
 mod model;
 
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use candle_core::{DType, Device, Tensor, D};
 use candle_nn::{AdamW, Optimizer, ParamsAdamW, VarBuilder, VarMap};
 use clap::{Parser, Subcommand};
@@ -22,6 +22,8 @@ use model::{Config, PoseNet, TdsNet};
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use rand_distr::Distribution;
+use std::fs::File;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
@@ -29,6 +31,16 @@ use std::path::{Path, PathBuf};
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum NegMode {
+    /// Negatives are their own softmax class(es): pooled (1) or grouped (K).
+    Classes,
+    /// Outlier exposure: command-only head, negatives pushed toward uniform.
+    Oe,
+    /// Negatives dropped from training, kept only for the test-time report.
+    Ignore,
 }
 
 #[derive(Subcommand)]
@@ -109,11 +121,24 @@ enum Cmd {
         /// Optional pose-pretrain checkpoint to initialize the encoder from.
         #[arg(long)]
         init: Option<PathBuf>,
-        /// Class index of the pooled "negative" pose class (commands are 0..neg-1).
-        /// When set, print a command-recall / negative-leakage report on the test
-        /// set at the selected checkpoint (engineering-logs/0012).
+        /// Number of command classes (labels 0..n-commands). Labels ≥ this are
+        /// negatives. When set, prints the unified command-recall / leakage report
+        /// (engineering-logs/0012, 0013). Negative *handling* is set by --neg-mode.
         #[arg(long)]
-        neg_class: Option<usize>,
+        n_commands: Option<usize>,
+        /// How the negative windows (label ≥ n-commands) are used in training:
+        /// `classes` = their own softmax classes (pooled or grouped), `oe` =
+        /// outlier exposure (5-command head, drive negatives to uniform), `ignore`
+        /// = dropped from the fit set but kept for the test report (0013).
+        #[arg(long, value_enum, default_value_t = NegMode::Classes)]
+        neg_mode: NegMode,
+        /// Outlier-exposure loss weight (only used by --neg-mode oe).
+        #[arg(long, default_value_t = 0.5)]
+        oe_weight: f64,
+        /// Orthogonal-prototype penalty: weight on the off-diagonal cosine of the
+        /// classifier head rows, to spread class directions apart (0013 technique C).
+        #[arg(long, default_value_t = 0.0)]
+        ortho: f64,
         /// Balanced per-epoch sampling: equal windows per class each epoch. Needed
         /// when a pooled negative class dwarfs the per-command counts.
         #[arg(long)]
@@ -133,6 +158,37 @@ enum Cmd {
         probe_steps: usize,
         #[arg(long, default_value_t = 0.05)]
         probe_lr: f64,
+    },
+    /// Run a trained classifier over unlabeled EMG windows (e.g. emg2pose) and
+    /// record every window that fires a command above a recall-calibrated
+    /// threshold — false-activation mining on out-of-set data (0014).
+    ScanUnlabeled {
+        /// Trained classifier checkpoint (the best grouped model from 0013).
+        #[arg(long)]
+        ckpt: PathBuf,
+        /// Number of command classes (the head may have extra negative-group
+        /// classes; the reject score is the max softmax over commands 0..n).
+        #[arg(long, default_value_t = 5)]
+        n_commands: usize,
+        /// Labeled dataset dir used only to calibrate the threshold τ.
+        #[arg(long)]
+        cal_dir: PathBuf,
+        #[arg(long, default_value = "test")]
+        cal_split: String,
+        /// Command recall the threshold is set to on the calibration set.
+        #[arg(long, default_value_t = 0.95)]
+        target_recall: f32,
+        /// Unlabeled EMG windows .npy, shape [N,C,T] (e.g. waveformer/data/pose_x.npy).
+        #[arg(long)]
+        unlabeled_x: PathBuf,
+        /// Optional matching pose .npy [N,P] (emg2pose mean pose) written out per
+        /// fired window so the hand configuration that triggered it can be inspected.
+        #[arg(long)]
+        pose_y: Option<PathBuf>,
+        #[arg(long, default_value_t = 256)]
+        batch: usize,
+        #[arg(long, default_value = "results/emg2pose_fires.csv")]
+        out: PathBuf,
     },
 }
 
@@ -163,11 +219,6 @@ fn load_matching(varmap: &VarMap, path: &Path, device: &Device) -> Result<usize>
         }
     }
     Ok(loaded)
-}
-
-fn accuracy(model: &TdsNet, ds: &Dataset, batch: usize, device: &Device) -> Result<f32> {
-    let idx: Vec<u32> = (0..ds.n as u32).collect();
-    accuracy_idx(model, ds, &idx, batch, device)
 }
 
 fn accuracy_idx(
@@ -261,15 +312,34 @@ fn run_train(
     aug: augment::AugCfg,
     mixup_alpha: f64,
     init: Option<PathBuf>,
-    neg_class: Option<usize>,
+    n_commands: Option<usize>,
+    neg_mode: NegMode,
+    oe_weight: f64,
+    ortho: f64,
     balance: bool,
 ) -> Result<()> {
     let device = device()?;
     device.set_seed(seed)?;
     let train = Dataset::load(&data_dir, "train", &device)?;
     let test = Dataset::load(&data_dir, "test", &device)?;
-    let classes = train.num_classes()?;
+    let data_classes = train.num_classes()?;
+    // Head size: for `classes` mode every label gets a softmax slot; for `oe`/
+    // `ignore` the head is command-only and labels ≥ n_commands are negatives
+    // handled outside the softmax.
+    let classes = match (n_commands, neg_mode) {
+        (Some(nc), NegMode::Oe) | (Some(nc), NegMode::Ignore) => nc,
+        _ => data_classes,
+    };
+    let oe_outlier = n_commands.filter(|_| neg_mode == NegMode::Oe);
+    let y_host = train.y.to_vec1::<u32>()?;
+    // Drop negatives from the fit set in `ignore` mode (they stay in `test`).
+    let drop_neg = matches!(neg_mode, NegMode::Ignore);
     let (fit_idx, val_idx) = train.subject_holdout(val_subjects);
+    let fit_idx: Vec<u32> = if let (Some(nc), true) = (n_commands, drop_neg) {
+        fit_idx.into_iter().filter(|&i| (y_host[i as usize] as usize) < nc).collect()
+    } else {
+        fit_idx
+    };
     let select_on_test = val_idx.is_empty();
     if select_on_test {
         println!("WARNING: no validation subjects held out — selecting on TEST (leaky)");
@@ -311,20 +381,28 @@ fn run_train(
         ParamsAdamW { lr, weight_decay, ..Default::default() },
     )?;
 
+    // Handle to the classifier head weight for the orthogonal-prototype penalty.
+    let head_w = if ortho > 0.0 {
+        varmap.data().lock().unwrap().get("cls_head.weight").cloned()
+    } else {
+        None
+    };
+
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
     // Balanced sampling: group fit rows by class so each epoch draws an equal count
     // per class (the smallest class), reshuffled, so the majority class is fully
     // covered across epochs without swamping the minority. Needed once a pooled
     // negative class (many poses) dwarfs the per-command counts (0012).
     let class_groups: Vec<Vec<u32>> = if balance {
-        let y_host = train.y.to_vec1::<u32>()?;
-        let n_classes = classes;
-        let mut groups = vec![Vec::new(); n_classes];
+        // Group by the raw label (sized to the data, since OE keeps label ≥ head
+        // size as outliers); drop empty groups so the per-epoch min isn't zero.
+        let mut groups = vec![Vec::new(); data_classes];
         for &i in &fit_idx {
             groups[y_host[i as usize] as usize].push(i);
         }
+        groups.retain(|g| !g.is_empty());
         let sizes: Vec<usize> = groups.iter().map(|g| g.len()).collect();
-        println!("balanced sampling: per-class fit counts {sizes:?} → {} each/epoch", sizes.iter().min().copied().unwrap_or(0));
+        println!("balanced sampling: per-group fit counts {sizes:?} → {} each/epoch", sizes.iter().min().copied().unwrap_or(0));
         groups
     } else {
         Vec::new()
@@ -351,7 +429,33 @@ fn run_train(
             if aug.enabled() {
                 xb = augment::apply(&xb, &aug, warp_basis.as_ref(), &mut rng, &device)?;
             }
-            let loss = if mixup_alpha > 0.0 {
+            let mut loss = if let Some(nc) = oe_outlier {
+                // Outlier exposure: command rows get CE; negative rows get pushed
+                // toward a uniform command distribution (CE-to-uniform). Each term
+                // weighted by its batch-row fraction so the sum is a batch mean.
+                let n = chunk.len() as f64;
+                let cmd_pos: Vec<u32> = chunk.iter().enumerate()
+                    .filter(|(_, &g)| (y_host[g as usize] as usize) < nc)
+                    .map(|(b, _)| b as u32).collect();
+                let out_pos: Vec<u32> = chunk.iter().enumerate()
+                    .filter(|(_, &g)| (y_host[g as usize] as usize) >= nc)
+                    .map(|(b, _)| b as u32).collect();
+                let logits = model.forward(&xb, true)?;
+                let mut l = Tensor::zeros((), DType::F32, &device)?;
+                if !cmd_pos.is_empty() {
+                    let sel = Tensor::from_vec(cmd_pos.clone(), cmd_pos.len(), &device)?;
+                    let ce = candle_nn::loss::cross_entropy(
+                        &logits.index_select(&sel, 0)?, &yb.index_select(&sel, 0)?)?;
+                    l = (l + ce.affine(cmd_pos.len() as f64 / n, 0.0)?)?;
+                }
+                if !out_pos.is_empty() {
+                    let sel = Tensor::from_vec(out_pos.clone(), out_pos.len(), &device)?;
+                    let lsm = candle_nn::ops::log_softmax(&logits.index_select(&sel, 0)?, D::Minus1)?;
+                    let oe = lsm.mean_all()?.affine(-1.0, 0.0)?; // -mean log-softmax = CE to uniform
+                    l = (l + oe.affine(oe_weight * out_pos.len() as f64 / n, 0.0)?)?;
+                }
+                l
+            } else if mixup_alpha > 0.0 {
                 // Mixup: blend window+label pairs with λ ~ Beta(α,α).
                 let m = chunk.len();
                 let mut perm: Vec<u32> = (0..m as u32).collect();
@@ -371,20 +475,45 @@ fn run_train(
                 let logits = model.forward(&xb, true)?;
                 candle_nn::loss::cross_entropy(&logits, &yb)?
             };
+            if let Some(w) = &head_w {
+                // Orthogonal-prototype penalty: mean squared off-diagonal cosine of
+                // the head rows. Pushes class directions apart to break the cone.
+                let wt = w.as_tensor();
+                let norm = wt.sqr()?.sum_keepdim(1)?.sqrt()?;
+                let wn = wt.broadcast_div(&norm)?;
+                let g = wn.matmul(&wn.t()?)?; // [C,C] cosine gram
+                let c = g.dim(0)? as f64;
+                let off = (g.sqr()?.sum_all()? - c)?; // remove unit diagonal
+                let penalty = (off.affine(1.0 / (c * c - c), 0.0)?).affine(ortho, 0.0)?;
+                loss = (loss + penalty)?;
+            }
             opt.backward_step(&loss)?;
             running += loss.to_scalar::<f32>()?;
             nb += 1;
         }
         if epoch % eval_every == 0 || epoch + 1 == epochs {
+            // Command-only head (oe/ignore) can't predict negative labels, so
+            // select on command accuracy only; classes mode uses the full set.
+            let command_only = classes != data_classes;
+            let cmd_only = |idx: &[u32], y: &[u32]| -> Vec<u32> {
+                if command_only {
+                    idx.iter().copied().filter(|&i| (y[i as usize] as usize) < classes).collect()
+                } else {
+                    idx.to_vec()
+                }
+            };
+            let test_y = test.y.to_vec1::<u32>()?;
+            let test_idx_all: Vec<u32> = (0..test.n as u32).collect();
+            let test_cmd = cmd_only(&test_idx_all, &test_y);
             // Selection metric: held-out training subjects (val), never the test
             // subjects, unless no val was requested.
             let sel_acc = if select_on_test {
-                accuracy(&model, &test, batch, &device)?
+                accuracy_idx(&model, &test, &test_cmd, batch, &device)?
             } else {
-                accuracy_idx(&model, &train, &val_idx, batch, &device)?
+                accuracy_idx(&model, &train, &cmd_only(&val_idx, &y_host), batch, &device)?
             };
-            let test_acc = accuracy(&model, &test, batch, &device)?;
-            let train_acc = accuracy_idx(&model, &train, &fit_idx, batch, &device)?;
+            let test_acc = accuracy_idx(&model, &test, &test_cmd, batch, &device)?;
+            let train_acc = accuracy_idx(&model, &train, &cmd_only(&fit_idx, &y_host), batch, &device)?;
             let improved = sel_acc > best + min_delta;
             if sel_acc > best {
                 best = sel_acc;
@@ -415,73 +544,251 @@ fn run_train(
         "RESULT seed={seed} aug={}{mixup_str} val_acc={best:.3} test_acc={best_test:.3} @epoch {best_epoch}",
         aug.describe()
     );
-    if let Some(neg) = neg_class {
+    if let Some(nc) = n_commands {
         // Reload the selected (best-val) checkpoint; the in-memory model is the
         // last epoch, not the saved one. All names match → full reload.
         load_matching(&varmap, &out, &device)?;
-        neg_report(&model, &test, batch, &device, neg, seed)?;
+        unified_report(&model, &test, batch, &device, nc, seed)?;
     }
     Ok(())
 }
 
-/// Command-recall / negative-leakage breakdown on the test set. Commands are
-/// classes `0..neg_class`; `neg_class` is the pooled non-command pose class.
-/// The product cares about two rates: negative→command leakage (a non-command
-/// pose fires a command — the false-activation source) and command→negative
-/// (a real command suppressed — a false negative).
-fn neg_report(
+/// Unified, threshold-based reject metric shared by every 0013 variant. The
+/// rejection score is the max softmax probability over the *command* classes
+/// [0,n_commands); commands are positives, negatives (label ≥ n_commands) are
+/// the false-activation source. Reports threshold-free AUROC (command vs
+/// negative separability) and, at fixed command recall, the leakage and the
+/// misclassification among accepted commands — the S1.1.2 vs S1.1.3 tradeoff.
+fn unified_report(
     model: &TdsNet,
     test: &Dataset,
     batch: usize,
     device: &Device,
-    neg_class: usize,
+    n_commands: usize,
     seed: u64,
 ) -> Result<()> {
     let idx: Vec<u32> = (0..test.n as u32).collect();
-    let (mut cmd_total, mut cmd_correct, mut cmd_to_neg, mut cmd_misclass) = (0usize, 0, 0, 0);
-    let (mut neg_total, mut neg_leak) = (0usize, 0usize);
+    // (command_confidence, predicted_command, is_command, correct) per window.
+    let mut cmd: Vec<(f32, bool)> = Vec::new(); // (conf, correct) for true commands
+    let mut neg: Vec<f32> = Vec::new(); // conf for true negatives
     for chunk in idx.chunks(batch) {
         let (xb, yb) = test.batch(chunk, device)?;
-        let pred = model.forward(&xb, false)?.argmax(D::Minus1)?.to_vec1::<u32>()?;
+        let probs = candle_nn::ops::softmax(&model.forward(&xb, false)?, D::Minus1)?
+            .narrow(1, 0, n_commands)? // command columns only
+            .to_vec2::<f32>()?;
         let truth = yb.to_vec1::<u32>()?;
-        for (p, t) in pred.iter().zip(&truth) {
-            let (p, t) = (*p as usize, *t as usize);
-            if t == neg_class {
-                neg_total += 1;
-                if p != neg_class {
-                    neg_leak += 1; // non-command pose fired a command
+        for (row, &t) in probs.iter().zip(&truth) {
+            let (mut best, mut argmax) = (f32::MIN, 0usize);
+            for (k, &p) in row.iter().enumerate() {
+                if p > best {
+                    best = p;
+                    argmax = k;
                 }
+            }
+            if (t as usize) < n_commands {
+                cmd.push((best, argmax == t as usize));
             } else {
-                cmd_total += 1;
-                if p == t {
-                    cmd_correct += 1;
-                } else if p == neg_class {
-                    cmd_to_neg += 1;
-                } else {
-                    cmd_misclass += 1;
-                }
+                neg.push(best);
             }
         }
     }
-    let pct = |a: usize, b: usize| if b == 0 { 0.0 } else { 100.0 * a as f32 / b as f32 };
-    println!("--- NEG-REPORT seed={seed} (test subjects, window-level) ---");
-    println!(
-        "  command windows {cmd_total}: recall {:.1}%  misclass(other cmd) {:.1}%  suppressed→neg {:.1}%",
-        pct(cmd_correct, cmd_total),
-        pct(cmd_misclass, cmd_total),
-        pct(cmd_to_neg, cmd_total),
-    );
-    println!(
-        "  negative windows {neg_total}: leaked→command {:.1}%  correctly rejected {:.1}%",
-        pct(neg_leak, neg_total),
-        pct(neg_total - neg_leak, neg_total),
-    );
-    println!(
-        "  LEAK seed={seed} cmd_recall={:.3} neg_leak={:.3}",
-        pct(cmd_correct, cmd_total) / 100.0,
-        pct(neg_leak, neg_total) / 100.0,
-    );
+    // AUROC via Mann–Whitney: P(conf(command) > conf(negative)).
+    let auroc = auroc(&cmd.iter().map(|c| c.0).collect::<Vec<_>>(), &neg);
+    // Leakage + misclass at fixed command recall: τ = the recall-quantile of
+    // command confidences, then leak = fraction of negatives ≥ τ.
+    let mut cmd_conf: Vec<f32> = cmd.iter().map(|c| c.0).collect();
+    cmd_conf.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let report_at = |recall: f32| -> (f32, f32, f32) {
+        let q = ((1.0 - recall) * cmd_conf.len() as f32).floor() as usize;
+        let tau = cmd_conf[q.min(cmd_conf.len() - 1)];
+        let leak = neg.iter().filter(|&&c| c >= tau).count() as f32 / neg.len().max(1) as f32;
+        let acc: Vec<_> = cmd.iter().filter(|c| c.0 >= tau).collect();
+        let mis = acc.iter().filter(|c| !c.1).count() as f32 / acc.len().max(1) as f32;
+        (tau, leak, mis)
+    };
+    let (_, leak90, mis90) = report_at(0.90);
+    let (_, leak95, mis95) = report_at(0.95);
+    println!("--- UNIFIED seed={seed} ({} cmd / {} neg test windows) ---", cmd.len(), neg.len());
+    println!("  AUROC(command vs negative) {auroc:.3}");
+    println!("  @recall0.90: leak {:.1}%  misclass {:.1}%", leak90 * 100.0, mis90 * 100.0);
+    println!("  @recall0.95: leak {:.1}%  misclass {:.1}%", leak95 * 100.0, mis95 * 100.0);
+    println!("  METRIC seed={seed} auroc={auroc:.4} leak90={leak90:.4} leak95={leak95:.4} mis90={mis90:.4}");
     Ok(())
+}
+
+/// Max softmax probability over the command columns [0,n_commands) for a batch of
+/// logits [B,C], plus the command argmax. The reject score used everywhere in 0013/0014.
+fn command_confidence(logits: &Tensor, n_commands: usize) -> Result<(Vec<f32>, Vec<usize>)> {
+    let probs = candle_nn::ops::softmax(logits, D::Minus1)?
+        .narrow(1, 0, n_commands)?
+        .to_vec2::<f32>()?;
+    let mut conf = Vec::with_capacity(probs.len());
+    let mut pred = Vec::with_capacity(probs.len());
+    for row in &probs {
+        let (mut best, mut arg) = (f32::MIN, 0usize);
+        for (k, &p) in row.iter().enumerate() {
+            if p > best {
+                best = p;
+                arg = k;
+            }
+        }
+        conf.push(best);
+        pred.push(arg);
+    }
+    Ok((conf, pred))
+}
+
+/// Threshold τ such that `target_recall` of the command windows in `ds` score ≥ τ.
+fn recall_threshold(
+    model: &TdsNet,
+    ds: &Dataset,
+    n_commands: usize,
+    target_recall: f32,
+    batch: usize,
+    device: &Device,
+) -> Result<f32> {
+    let y = ds.y.to_vec1::<u32>()?;
+    let idx: Vec<u32> = (0..ds.n as u32).collect();
+    let mut cmd_conf = Vec::new();
+    for chunk in idx.chunks(batch) {
+        let (xb, _) = ds.batch(chunk, device)?;
+        let (conf, _) = command_confidence(&model.forward(&xb, false)?, n_commands)?;
+        for (c, &i) in conf.into_iter().zip(chunk) {
+            if (y[i as usize] as usize) < n_commands {
+                cmd_conf.push(c);
+            }
+        }
+    }
+    cmd_conf.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let q = ((1.0 - target_recall) * cmd_conf.len() as f32).floor() as usize;
+    Ok(cmd_conf[q.min(cmd_conf.len() - 1)])
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_scan_unlabeled(
+    ckpt: PathBuf,
+    n_commands: usize,
+    cal_dir: PathBuf,
+    cal_split: String,
+    target_recall: f32,
+    unlabeled_x: PathBuf,
+    pose_y: Option<PathBuf>,
+    batch: usize,
+    out: PathBuf,
+) -> Result<()> {
+    let device = device()?;
+    // Head class count comes from the checkpoint (commands + any negative groups).
+    let tensors = candle_core::safetensors::load(&ckpt, &device)?;
+    let classes = tensors
+        .get("cls_head.weight")
+        .ok_or_else(|| anyhow::anyhow!("no cls_head.weight in {}", ckpt.display()))?
+        .dims()[0];
+    println!("checkpoint head: {classes} classes ({n_commands} commands + {} negative groups)", classes - n_commands);
+
+    // Calibration set picks τ at the target command recall.
+    let cal = Dataset::load(&cal_dir, &cal_split, &device)?;
+    let varmap = VarMap::new();
+    let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+    let model = TdsNet::new(Config::classify(cal.channels, classes), vb)?;
+    let loaded = load_matching(&varmap, &ckpt, &device)?;
+    println!("loaded {loaded} tensors");
+    let tau = recall_threshold(&model, &cal, n_commands, target_recall, batch, &device)?;
+    let tau90 = recall_threshold(&model, &cal, n_commands, 0.90, batch, &device)?;
+    println!("τ@recall{target_recall} = {tau:.4} (τ@recall0.90 = {tau90:.4}) from {} ({})", cal_dir.display(), cal_split);
+
+    // Unlabeled windows [N,C,T] → [N,1,C,T] inputs.
+    let x: ndarray::Array3<f32> = ndarray_npy::read_npy(&unlabeled_x)
+        .with_context(|| format!("read {}", unlabeled_x.display()))?;
+    let (n, c, t) = x.dim();
+    if c != cal.channels {
+        bail!("unlabeled channels {c} != model channels {}", cal.channels);
+    }
+    let xflat = x.as_standard_layout().to_owned().into_raw_vec_and_offset().0;
+    let pose: Option<ndarray::Array2<f32>> = match &pose_y {
+        Some(p) => Some(ndarray_npy::read_npy(p).with_context(|| format!("read {}", p.display()))?),
+        None => None,
+    };
+    let pose_dim = pose.as_ref().map(|p| p.dim().1).unwrap_or(0);
+    println!("scanning {n} unlabeled windows ({c}×{t}) at τ={tau:.4}...");
+
+    if let Some(p) = out.parent() {
+        std::fs::create_dir_all(p)?;
+    }
+    let mut f = File::create(&out)?;
+    write!(f, "window_idx,pred_command,confidence")?;
+    for d in 0..pose_dim {
+        write!(f, ",pose{d}")?;
+    }
+    writeln!(f)?;
+
+    let mut fires = 0usize;
+    let mut fires90 = 0usize;
+    let mut per_cmd = vec![0usize; n_commands];
+    let row_bytes = c * t;
+    let mut i = 0usize;
+    while i < n {
+        let j = (i + batch).min(n);
+        let slice = &xflat[i * row_bytes..j * row_bytes];
+        let xb = Tensor::from_slice(slice, (j - i, 1, c, t), &device)?;
+        let (conf, pred) = command_confidence(&model.forward(&xb, false)?, n_commands)?;
+        for (k, (&cf, &pr)) in conf.iter().zip(&pred).enumerate() {
+            if cf >= tau90 {
+                fires90 += 1;
+            }
+            if cf >= tau {
+                fires += 1;
+                per_cmd[pr] += 1;
+                let idx = i + k;
+                write!(f, "{idx},{pr},{cf:.4}")?;
+                if let Some(p) = &pose {
+                    for d in 0..pose_dim {
+                        write!(f, ",{:.4}", p[[idx, d]])?;
+                    }
+                }
+                writeln!(f)?;
+            }
+        }
+        i = j;
+    }
+    let pct = |a: usize| 100.0 * a as f32 / n as f32;
+    println!("\n=== emg2pose false-activation scan ===");
+    println!("fires @τ(recall{target_recall}): {fires} / {n} = {:.2}% of windows", pct(fires));
+    println!("fires @τ(recall0.90):  {fires90} / {n} = {:.2}%", pct(fires90));
+    println!("per-command fires @τ(recall{target_recall}):");
+    for (cmd, &cnt) in per_cmd.iter().enumerate() {
+        println!("  command {cmd}: {cnt} ({:.2}% of all windows)", pct(cnt));
+    }
+    println!("\nwrote fired windows → {} (inspect pose columns for genuine-positive vs FP)", out.display());
+    Ok(())
+}
+
+/// Area under ROC for separating `pos` (should score high) from `neg`, via the
+/// rank-sum (Mann–Whitney U) identity. Ties count as half.
+fn auroc(pos: &[f32], neg: &[f32]) -> f32 {
+    if pos.is_empty() || neg.is_empty() {
+        return f32::NAN;
+    }
+    let mut all: Vec<(f32, bool)> = pos.iter().map(|&v| (v, true)).chain(neg.iter().map(|&v| (v, false))).collect();
+    all.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    // Average ranks (1-based), handling ties.
+    let mut rank_sum_pos = 0f64;
+    let mut i = 0;
+    while i < all.len() {
+        let mut j = i;
+        while j + 1 < all.len() && all[j + 1].0 == all[i].0 {
+            j += 1;
+        }
+        let avg_rank = (i + j) as f64 / 2.0 + 1.0; // average of ranks i+1..=j+1
+        for k in i..=j {
+            if all[k].1 {
+                rank_sum_pos += avg_rank;
+            }
+        }
+        i = j + 1;
+    }
+    let (np, nn) = (pos.len() as f64, neg.len() as f64);
+    let u = rank_sum_pos - np * (np + 1.0) / 2.0;
+    (u / (np * nn)) as f32
 }
 
 fn main() -> Result<()> {
@@ -521,7 +828,10 @@ fn main() -> Result<()> {
             chan_dropout,
             mixup_alpha,
             init,
-            neg_class,
+            n_commands,
+            neg_mode,
+            oe_weight,
+            ortho,
             balance,
         } => run_train(
             data_dir,
@@ -545,12 +855,28 @@ fn main() -> Result<()> {
             },
             mixup_alpha,
             init,
-            neg_class,
+            n_commands,
+            neg_mode,
+            oe_weight,
+            ortho,
             balance,
         ),
         Cmd::Calibrate { data_dir, ckpt, shots, probe_steps, probe_lr } => {
             let device = device()?;
             calibrate::run(&data_dir, &ckpt, &shots, probe_steps, probe_lr, &device)
         }
+        Cmd::ScanUnlabeled {
+            ckpt,
+            n_commands,
+            cal_dir,
+            cal_split,
+            target_recall,
+            unlabeled_x,
+            pose_y,
+            batch,
+            out,
+        } => run_scan_unlabeled(
+            ckpt, n_commands, cal_dir, cal_split, target_recall, unlabeled_x, pose_y, batch, out,
+        ),
     }
 }
