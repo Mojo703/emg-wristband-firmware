@@ -25,17 +25,17 @@ use candle_nn::{
 };
 
 #[derive(Clone)]
-pub struct Config {
-    pub in_channels: usize,
+pub(crate) struct Config {
+    pub(crate) in_channels: usize,
     /// Output channels per depthwise-separable block (each block strides time 2×).
-    pub channels: Vec<usize>,
+    pub(crate) channels: Vec<usize>,
     /// Depthwise temporal kernel (odd → length-preserving with k/2 padding).
-    pub kernel: usize,
-    pub num_classes: usize,
+    pub(crate) kernel: usize,
+    pub(crate) num_classes: usize,
 }
 
 impl Config {
-    pub fn classify(in_channels: usize, num_classes: usize) -> Self {
+    pub(crate) fn classify(in_channels: usize, num_classes: usize) -> Self {
         Self {
             in_channels,
             channels: vec![32, 64, 128, 128],
@@ -100,20 +100,20 @@ fn build_blocks(cfg: &Config, vb: &VarBuilder) -> Result<Vec<DsConvBlock>> {
 /// Per-timestep pose pretraining net: shared encoder + a 1×1 conv head predicting
 /// pose at the encoder's time resolution. The encoder blocks share names with
 /// `TdsNet`, so a classifier finetune loads them and skips `pose_head`.
-pub struct PoseNet {
+pub(crate) struct PoseNet {
     blocks: Vec<DsConvBlock>,
     pose_head: Conv1d,
 }
 
 impl PoseNet {
-    pub fn new(cfg: &Config, pose_dim: usize, vb: VarBuilder) -> Result<Self> {
+    pub(crate) fn new(cfg: &Config, pose_dim: usize, vb: VarBuilder) -> Result<Self> {
         let blocks = build_blocks(cfg, &vb)?;
         let pose_head = conv1d(cfg.feature_dim(), pose_dim, 1, Conv1dConfig::default(), vb.pp("pose_head"))?;
         Ok(Self { blocks, pose_head })
     }
 
     /// [B,1,C,T] → predicted pose trajectory [B, pose_dim, T'].
-    pub fn forward(&self, x: &Tensor, train: bool) -> Result<Tensor> {
+    pub(crate) fn forward(&self, x: &Tensor, train: bool) -> Result<Tensor> {
         let mut h = x.squeeze(1)?;
         for blk in &self.blocks {
             h = blk.forward(&h, train)?;
@@ -122,13 +122,13 @@ impl PoseNet {
     }
 }
 
-pub struct TdsNet {
+pub(crate) struct TdsNet {
     blocks: Vec<DsConvBlock>,
     head: Linear,
 }
 
 impl TdsNet {
-    pub fn new(cfg: Config, vb: VarBuilder) -> Result<Self> {
+    pub(crate) fn new(cfg: Config, vb: VarBuilder) -> Result<Self> {
         let blocks = build_blocks(&cfg, &vb)?;
         // Classifier head is named distinctly from the pose head so a finetune
         // loads the encoder by name and skips the wrong-task head.
@@ -136,31 +136,14 @@ impl TdsNet {
         Ok(Self { blocks, head })
     }
 
-    /// Encode [B,1,C,T] → feature map [B,d,T'] (pre-GAP). The shared encoder; a
-    /// per-timestep pose head attaches here for pretraining.
-    pub fn feature_map(&self, x: &Tensor, train: bool) -> Result<Tensor> {
-        let mut x = x.squeeze(1)?; // [B,C,T]
+    /// Classification logits [B,num_classes]. `train` toggles BatchNorm
+    /// running-stat updates. Encoder blocks → global average pool over time → head.
+    pub(crate) fn forward(&self, x: &Tensor, train: bool) -> Result<Tensor> {
+        let mut h = x.squeeze(1)?; // [B,C,T]
         for blk in &self.blocks {
-            x = blk.forward(&x, train)?;
+            h = blk.forward(&h, train)?;
         }
-        Ok(x) // [B,d,T']
-    }
-
-    /// Encode → pooled feature [B,d] (GAP over time). Public so calibration can
-    /// use the frozen encoder as a feature extractor.
-    pub fn embed(&self, x: &Tensor, train: bool) -> Result<Tensor> {
-        Ok(self.feature_map(x, train)?.mean(D::Minus1)?) // GAP → [B,d]
-    }
-
-    /// Apply the trained head to a precomputed feature [B,d].
-    pub fn head_logits(&self, feat: &Tensor) -> Result<Tensor> {
-        Ok(self.head.forward(feat)?)
-    }
-
-    /// Classification logits / pose regression, depending on the head built.
-    /// `train` toggles BatchNorm running-stat updates.
-    pub fn forward(&self, x: &Tensor, train: bool) -> Result<Tensor> {
-        let feat = self.embed(x, train)?;
+        let feat = h.mean(D::Minus1)?; // GAP → [B,d]
         Ok(self.head.forward(&feat)?)
     }
 }

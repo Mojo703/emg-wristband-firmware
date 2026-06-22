@@ -34,15 +34,22 @@ Data is the `.npy` export from `emg-gesture-class` (same format as the old
 `pose_x|y.npy` for pretrain.
 
 ```
-# supervised classifier, best-checkpointed + early stopped
+# supervised classifier with the proven augmentation combo, early-stopped
 CUDARC_CUDA_VERSION=13020 ./target/release/emg-tds train \
-  --data-dir ../waveformer/data --epochs 300 --lr 1e-3 \
-  --patience 30 --out checkpoints/best.safetensors
+  --data-dir ../waveformer/data --epochs 300 --augment \
+  --out checkpoints/best.safetensors
+
+# open-set: 5 commands + grouped negatives, balanced, with the reject report
+./target/release/emg-tds train --data-dir ../waveformer/data \
+  --n-commands 5 --balance --augment
 
 # pose-regression pretrain (per-dim z-scored targets), then head-swap finetune
 ./target/release/emg-tds pretrain --data-dir ../waveformer/data --out checkpoints/pose.safetensors
 ./target/release/emg-tds train --data-dir ../waveformer/data --init checkpoints/pose.safetensors
 ```
 
-`train` early-stops when test accuracy hasn't gained ≥`--min-delta` for
-`--patience` evals, and saves the best model to `--out`.
+`train` selects on held-out training subjects (`--val-subjects`, never the test
+subjects), early-stops after `--patience` epochs with no gain, and saves the best
+model to `--out`. `--augment` applies the winning combo (warp σ=0.3 +
+channel-dropout 0.1); weight-decay, eval cadence, and the early-stop delta are
+fixed constants now (settled in engineering-logs/0010–0013).
