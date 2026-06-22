@@ -18,12 +18,25 @@ pub struct AugCfg {
     pub warp_sigma: f64,
     pub noise_sigma: f64,
     pub rotate: bool,
+    /// Time-warp strength (smooth random resampling of the time axis). 0 = off.
+    pub time_warp_sigma: f64,
+    /// Per-channel dropout probability (zero a channel, inverted-scale). 0 = off.
+    pub chan_dropout: f64,
     pub knots: usize,
 }
 
 impl AugCfg {
     pub fn enabled(&self) -> bool {
-        self.warp_sigma > 0.0 || self.noise_sigma > 0.0 || self.rotate
+        self.warp_sigma > 0.0
+            || self.noise_sigma > 0.0
+            || self.rotate
+            || self.time_warp_sigma > 0.0
+            || self.chan_dropout > 0.0
+    }
+
+    /// True if any enabled transform needs the [K,T] knot basis.
+    pub fn needs_basis(&self) -> bool {
+        self.warp_sigma > 0.0 || self.time_warp_sigma > 0.0
     }
 
     pub fn describe(&self) -> String {
@@ -39,6 +52,12 @@ impl AugCfg {
         }
         if self.rotate {
             parts.push("rotate".into());
+        }
+        if self.time_warp_sigma > 0.0 {
+            parts.push(format!("twarp{:.2}", self.time_warp_sigma));
+        }
+        if self.chan_dropout > 0.0 {
+            parts.push(format!("cdrop{:.2}", self.chan_dropout));
         }
         parts.join("+")
     }
@@ -99,6 +118,47 @@ pub fn apply(
             let bottom = x.narrow(2, 0, s)?;
             x = Tensor::cat(&[&top, &bottom], 2)?;
         }
+    }
+
+    if cfg.time_warp_sigma > 0.0 {
+        let basis = basis.expect("warp basis required");
+        let k = basis.dim(0)?;
+        // Smooth positive speed curve over time; cumulative → monotonic warp path,
+        // normalized to [0, T-1]. One warp per batch (cheap; varies across batches).
+        let speeds = (Tensor::randn(0f32, 1f32, (1, k), device)? * cfg.time_warp_sigma)?.exp()?;
+        let curve = speeds.matmul(basis)?.reshape((t,))?; // [T]
+        let cum = curve.cumsum(0)?;
+        let total = cum.narrow(0, t - 1, 1)?.to_vec1::<f32>()?[0];
+        let pos: Vec<f32> = cum
+            .to_vec1::<f32>()?
+            .iter()
+            .map(|&v| v / total * (t - 1) as f32)
+            .collect();
+        let mut lo = vec![0u32; t];
+        let mut hi = vec![0u32; t];
+        let mut frac = vec![0f32; t];
+        for (i, &p) in pos.iter().enumerate() {
+            let l = p.floor().clamp(0.0, (t - 1) as f32) as usize;
+            lo[i] = l as u32;
+            hi[i] = (l + 1).min(t - 1) as u32;
+            frac[i] = p - l as f32;
+        }
+        let lo = Tensor::from_vec(lo, t, device)?;
+        let hi = Tensor::from_vec(hi, t, device)?;
+        let fr = Tensor::from_vec(frac, (1, 1, 1, t), device)?;
+        let xl = x.index_select(&lo, 3)?;
+        let xh = x.index_select(&hi, 3)?;
+        let one_minus = fr.affine(-1.0, 1.0)?; // 1 - frac
+        x = (xl.broadcast_mul(&one_minus)? + xh.broadcast_mul(&fr)?)?;
+    }
+
+    if cfg.chan_dropout > 0.0 {
+        let keep = 1.0 - cfg.chan_dropout;
+        let r = Tensor::rand(0f32, 1f32, (b, 1, c, 1), device)?;
+        let keep_t = Tensor::full(keep as f32, (1, 1, 1, 1), device)?;
+        let mask = r.broadcast_lt(&keep_t)?.to_dtype(candle_core::DType::F32)?;
+        // inverted dropout: scale kept channels by 1/keep so the expected scale holds
+        x = x.broadcast_mul(&mask)?.affine(1.0 / keep, 0.0)?;
     }
 
     let _ = D::Minus1;

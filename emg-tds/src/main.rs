@@ -21,6 +21,7 @@ use data::{Dataset, PoseDataset};
 use model::{Config, TdsNet};
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
+use rand_distr::Distribution;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
@@ -96,6 +97,15 @@ enum Cmd {
         /// Random cyclic channel-rotation augmentation.
         #[arg(long)]
         rotate: bool,
+        /// Time-warp strength (smooth random time resampling). 0 = off.
+        #[arg(long, default_value_t = 0.0)]
+        time_warp_sigma: f64,
+        /// Per-channel dropout probability. 0 = off.
+        #[arg(long, default_value_t = 0.0)]
+        chan_dropout: f64,
+        /// Mixup Beta(alpha,alpha) strength (mixes window+label pairs). 0 = off.
+        #[arg(long, default_value_t = 0.0)]
+        mixup_alpha: f64,
         /// Optional pose-pretrain checkpoint to initialize the encoder from.
         #[arg(long)]
         init: Option<PathBuf>,
@@ -229,6 +239,7 @@ fn run_train(
     val_subjects: usize,
     seed: u64,
     aug: augment::AugCfg,
+    mixup_alpha: f64,
     init: Option<PathBuf>,
 ) -> Result<()> {
     let device = device()?;
@@ -265,8 +276,9 @@ fn run_train(
         std::fs::create_dir_all(p)?;
     }
 
-    println!("seed {seed} | augment: {}", aug.describe());
-    let warp_basis = if aug.warp_sigma > 0.0 {
+    let mixup_str = if mixup_alpha > 0.0 { format!("+mixup{mixup_alpha:.2}") } else { String::new() };
+    println!("seed {seed} | augment: {}{mixup_str}", aug.describe());
+    let warp_basis = if aug.needs_basis() {
         Some(augment::warp_basis(aug.knots, train.time, &device)?)
     } else {
         None
@@ -280,6 +292,7 @@ fn run_train(
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
     let mut order: Vec<u32> = fit_idx.clone();
     let mut best = 0f32;
+    let mut best_test = 0f32; // test acc at the val-selected checkpoint
     let mut best_epoch = 0usize;
     let mut stale = 0usize; // evals since last improvement ≥ min_delta
     for epoch in 0..epochs {
@@ -290,8 +303,26 @@ fn run_train(
             if aug.enabled() {
                 xb = augment::apply(&xb, &aug, warp_basis.as_ref(), &mut rng, &device)?;
             }
-            let logits = model.forward(&xb, true)?;
-            let loss = candle_nn::loss::cross_entropy(&logits, &yb)?;
+            let loss = if mixup_alpha > 0.0 {
+                // Mixup: blend window+label pairs with λ ~ Beta(α,α).
+                let m = chunk.len();
+                let mut perm: Vec<u32> = (0..m as u32).collect();
+                perm.shuffle(&mut rng);
+                let lam = rand_distr::Beta::new(mixup_alpha, mixup_alpha)
+                    .unwrap()
+                    .sample(&mut rng) as f32;
+                let sel = Tensor::from_vec(perm, m, &device)?;
+                let xb2 = xb.index_select(&sel, 0)?;
+                let yb2 = yb.index_select(&sel, 0)?;
+                let xmix = (xb.affine(lam as f64, 0.0)? + xb2.affine(1.0 - lam as f64, 0.0)?)?;
+                let logits = model.forward(&xmix, true)?;
+                let l1 = candle_nn::loss::cross_entropy(&logits, &yb)?;
+                let l2 = candle_nn::loss::cross_entropy(&logits, &yb2)?;
+                (l1.affine(lam as f64, 0.0)? + l2.affine(1.0 - lam as f64, 0.0)?)?
+            } else {
+                let logits = model.forward(&xb, true)?;
+                candle_nn::loss::cross_entropy(&logits, &yb)?
+            };
             opt.backward_step(&loss)?;
             running += loss.to_scalar::<f32>()?;
             nb += 1;
@@ -310,6 +341,7 @@ fn run_train(
             if sel_acc > best {
                 best = sel_acc;
                 best_epoch = epoch;
+                best_test = test_acc; // test acc at the selected checkpoint
                 varmap.save(&out)?; // checkpoint the best model (by selection metric)
             }
             stale = if improved { 0 } else { stale + 1 };
@@ -331,10 +363,9 @@ fn run_train(
             println!("epoch {epoch:>3}  loss {:.4}", running / nb as f32);
         }
     }
-    let final_test = accuracy(&model, &test, batch, &device)?;
     println!(
-        "best selection_acc {best:.3} @ epoch {best_epoch} → {} (final-epoch test_acc {final_test:.3})",
-        out.display()
+        "RESULT seed={seed} aug={}{mixup_str} val_acc={best:.3} test_acc={best_test:.3} @epoch {best_epoch}",
+        aug.describe()
     );
     Ok(())
 }
@@ -372,6 +403,9 @@ fn main() -> Result<()> {
             warp_sigma,
             noise_sigma,
             rotate,
+            time_warp_sigma,
+            chan_dropout,
+            mixup_alpha,
             init,
         } => run_train(
             data_dir,
@@ -385,7 +419,15 @@ fn main() -> Result<()> {
             min_delta,
             val_subjects,
             seed,
-            augment::AugCfg { warp_sigma, noise_sigma, rotate, knots: 5 },
+            augment::AugCfg {
+                warp_sigma,
+                noise_sigma,
+                rotate,
+                time_warp_sigma,
+                chan_dropout,
+                knots: 5,
+            },
+            mixup_alpha,
             init,
         ),
         Cmd::Calibrate { data_dir, ckpt, shots, probe_steps, probe_lr } => {
