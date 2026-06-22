@@ -1,0 +1,29 @@
+# emg-tds — TDS-conv encoder for sEMG gesture recognition, the architecture the
+# emg2pose SOTA (vemg2pose) is built on (Time-Depth Separable convs). Replaces the
+# retired WaveFormer ceiling experiment (see engineering-logs/0008). Empty
+# [workspace] so cargo treats this as its own root (repo's two-project convention).
+[workspace]
+
+[package]
+name = "emg-tds"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+candle-core = "0.10"
+candle-nn = "0.10"
+ndarray = "0.16"
+ndarray-npy = "0.9"
+rand = "0.8"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+
+[features]
+# Opt into CUDA with `--features cuda`; set CUDARC_CUDA_VERSION=13020 (CUDA 13.3
+# is ABI-compatible with cudarc's 13.2 target; auto-detect rejects 13.3). CPU by
+# default so it builds anywhere.
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
