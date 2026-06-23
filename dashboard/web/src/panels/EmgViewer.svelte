@@ -211,6 +211,17 @@
     if (startAbs < oldestAbs) startAbs = oldestAbs;
     if (startAbs < 0) startAbs = 0;
 
+    // The min/max-per-column envelope only reads as a continuous trace when each
+    // column holds several samples; under that it degrades to disconnected ticks
+    // (and to nothing when a column's single sample makes min == max). So below a
+    // density threshold, draw a real connected polyline through the samples
+    // instead. Density is taken from the span (not the partial pass) so the choice
+    // is stable while a pass fills.
+    const spanSamples = Math.floor((spanMs / 1000) * sampleRate);
+    const samplesPerColumn = spanSamples / cols;
+    const useEnvelope = samplesPerColumn >= 8;
+    const stride = Math.max(1, Math.round(samplesPerColumn / 2)); // ~2 points/column
+
     ctx.font = '11px system-ui, sans-serif';
     for (let ch = 0; ch < channels; ch++) {
       const laneTop = ch * laneHeight;
@@ -226,43 +237,64 @@
       ctx.lineTo(width, laneTop);
       ctx.stroke();
 
-      // One pass: bin samples into pixel columns (min/max envelope) and find the
-      // peak for auto-gain. Empty columns stay NaN and are skipped, so data gaps
-      // show the faint baseline through. The ring index and the fractional column
-      // both advance by a fixed step with a single wrap — far cheaper per sample
-      // than a modulo each (5× in practice over a full visible window).
-      colMin.fill(NaN);
-      colMax.fill(NaN);
+      // Auto-gain peak over the (decimated) visible samples.
       let peak = 1e-6;
-      let pos = startAbs % capacity;
-      let colFrac = ((((anchorMs + startAbs * msPerSample) % spanMs) + spanMs) % spanMs) * invSpan * cols;
-      for (let a = startAbs; a <= newestAbs; a++) {
+      for (let a = startAbs; a <= newestAbs; a += stride) {
+        const pos = a % capacity;
         if (ringAbs[pos] === a) {
-          // overwritten / never-written slots fail this and leave a gap
-          let col = colFrac | 0;
-          if (col >= cols) col = cols - 1;
-          const v = ring[pos];
-          if (!(v >= colMin[col])) colMin[col] = v; // NaN-safe init via negated compare
-          if (!(v <= colMax[col])) colMax[col] = v;
-          const av = v < 0 ? -v : v;
+          const av = Math.abs(ring[pos]);
           if (av > peak) peak = av;
         }
-        pos++;
-        if (pos >= capacity) pos = 0;
-        colFrac += colStep;
-        if (colFrac >= cols) colFrac -= cols;
       }
-
       const gain = (laneHeight * 0.42) / peak;
+
       ctx.strokeStyle = PALETTE[0];
       ctx.lineWidth = 1;
       ctx.beginPath();
-      for (let col = 0; col < cols; col++) {
-        const lo = colMin[col];
-        if (lo !== lo) continue; // NaN: empty column
-        const x = col + 0.5;
-        ctx.moveTo(x, midY - colMax[col] * gain);
-        ctx.lineTo(x, midY - lo * gain);
+      if (useEnvelope) {
+        // Bin samples into pixel columns and stroke each column's min→max as a
+        // short vertical segment. Incremental ring index + fractional column
+        // (one add + wrap each) is far cheaper per sample than a modulo each.
+        colMin.fill(NaN);
+        colMax.fill(NaN);
+        let pos = startAbs % capacity;
+        let colFrac = ((((anchorMs + startAbs * msPerSample) % spanMs) + spanMs) % spanMs) * invSpan * cols;
+        for (let a = startAbs; a <= newestAbs; a++) {
+          if (ringAbs[pos] === a) {
+            let col = colFrac | 0;
+            if (col >= cols) col = cols - 1;
+            const v = ring[pos];
+            if (!(v >= colMin[col])) colMin[col] = v; // NaN-safe init via negated compare
+            if (!(v <= colMax[col])) colMax[col] = v;
+          }
+          pos++;
+          if (pos >= capacity) pos = 0;
+          colFrac += colStep;
+          if (colFrac >= cols) colFrac -= cols;
+        }
+        for (let col = 0; col < cols; col++) {
+          const lo = colMin[col];
+          if (lo !== lo) continue; // NaN: empty column → gap shows the baseline
+          const x = col + 0.5;
+          ctx.moveTo(x, midY - colMax[col] * gain);
+          ctx.lineTo(x, midY - lo * gain);
+        }
+      } else {
+        // Connected polyline through the samples; breaks at gaps (invalid slots).
+        let drawing = false;
+        for (let a = startAbs; a <= newestAbs; a += stride) {
+          const pos = a % capacity;
+          if (ringAbs[pos] !== a) {
+            drawing = false;
+            continue;
+          }
+          const t = anchorMs + a * msPerSample;
+          const x = ((((t % spanMs) + spanMs) % spanMs) * invSpan) * cols;
+          const y = midY - ring[pos] * gain;
+          if (drawing) ctx.lineTo(x, y);
+          else ctx.moveTo(x, y);
+          drawing = true;
+        }
       }
       ctx.stroke();
 
@@ -281,7 +313,10 @@
       ctx.lineTo(points[1].x, points[1].y);
       return;
     }
-    for (let i = 1; i < points.length - 1; i++) {
+    // Curve through segment midpoints, data points as controls. Stop at length-2
+    // so the closing quadratic's control (points[n-2]) is still *ahead* of the pen;
+    // going one further leaves it behind and kicks out a tangent spike at the tip.
+    for (let i = 1; i < points.length - 2; i++) {
       const mx = (points[i].x + points[i + 1].x) / 2;
       const my = (points[i].y + points[i + 1].y) / 2;
       ctx.quadraticCurveTo(points[i].x, points[i].y, mx, my);
