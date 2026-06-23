@@ -12,17 +12,15 @@
   import { live, api, on } from '../lib/socket.svelte.js';
 
   const MAX_SPAN_SEC = 30; // ring sizing ceiling; the visible span is a subset
-  const PALETTE = ['#3b82f6', '#22c55e', '#f59e0b', '#a855f7', '#ec4899', '#14b8a6', '#f97316', '#60a5fa'];
-  const GREY = '#6b7280'; // reject / non-command classes
+  const BAND_HEIGHT = 24; // wake-state / streak row at the bottom of the track
   const BG = '#0b0e14';
+  const NEUTRAL = '#6b7280'; // fallback when a backend colour is missing
+  const TRACE = '#3b82f6'; // EMG line accent (cosmetic; not class-related)
 
   let canvas;
   let spanSec = $state(6);
   let tau = $state(0.5);
   let tauTouched = false;
-
-  // Inference readout (reactive; the per-class detail lives in the track below).
-  const prediction = $derived(live.prediction);
 
   // --- imperative scope state (deliberately non-reactive; touched per frame) ---
   let sampleRate = 0;
@@ -35,7 +33,8 @@
   let anchorMs = null; // localMs(a) = anchorMs + a * msPerSample
   let msPerSample = 0;
 
-  const preds = []; // { seq, softmax: Float32Array, argmax } in arrival order
+  const preds = []; // { seq, softmax, argmax, accepted, wakeState, streak }
+  const events = []; // generic decision events: { tUs, kind, label, color }
 
   // Reusable per-column min/max envelope buffers (sized to canvas width). Binning
   // the visible samples into pixel columns caps canvas work at ~width segments per
@@ -101,17 +100,26 @@
       softmax: Float32Array.from(p.softmax),
       argmax: p.argmax,
       accepted: p.accepted,
+      wakeState: p.wake_state,
+      streak: p.streak,
     });
     if (preds.length > 4096) preds.splice(0, preds.length - 4096);
+  }
+
+  function onEvent(e) {
+    events.push({ tUs: e.t_us, kind: e.kind, label: e.label ?? null, color: e.color ?? null });
+    if (events.length > 4096) events.splice(0, events.length - 4096);
   }
 
   onMount(() => {
     const offEmg = on('emg', onEmg);
     const offPred = on('prediction', onPrediction);
+    const offEvent = on('event', onEvent);
     let raf = requestAnimationFrame(frame);
     return () => {
       offEmg();
       offPred();
+      offEvent();
       cancelAnimationFrame(raf);
     };
 
@@ -121,25 +129,14 @@
     }
   });
 
-  const commandCount = $derived(live.hello?.gestures ?? 0);
-  const classCount = $derived(live.prediction?.softmax?.length ?? commandCount);
-  function classColor(cls, count) {
-    return cls < count ? PALETTE[cls % PALETTE.length] : GREY;
-  }
-
-  const KEY_LABELS = {
-    play_pause: 'Play/Pause',
-    next_track: 'Next',
-    prev_track: 'Prev',
-    volume_up: 'Vol +',
-    volume_down: 'Vol −',
-    mute: 'Mute',
-  };
-  function classLabel(cls) {
-    if (cls >= commandCount) return commandCount && cls === commandCount ? 'reject' : `rest ${cls}`;
-    const binding = live.hello?.keymap?.find((entry) => entry.gesture === cls);
-    const key = binding ? (KEY_LABELS[binding.key] ?? binding.key) : null;
-    return key ? `C${cls} · ${key}` : `C${cls}`;
+  // Display descriptors come entirely from the backend (labels, colours, the
+  // command/reject split, state vocabulary). The frontend just looks them up.
+  const classInfo = $derived(live.hello?.classes ?? []);
+  const stateByName = $derived(
+    Object.fromEntries((live.hello?.states ?? []).map((state) => [state.name, state]))
+  );
+  function classColor(cls) {
+    return classInfo[cls]?.color ?? NEUTRAL;
   }
 
   function render() {
@@ -169,7 +166,7 @@
     const phaseX = (tMs) => ((((tMs % spanMs) + spanMs) % spanMs) / spanMs) * width;
     const xNow = phaseX(now);
 
-    const trackHeight = commandCount ? Math.min(120, height * 0.28) : 0;
+    const trackHeight = classInfo.length ? Math.min(120, height * 0.28) : 0;
     const emgHeight = height - trackHeight;
 
     // Draw only the current sweep pass: [passStart, now] maps to [0, xNow]. Data
@@ -177,10 +174,64 @@
     // everything behind the cursor is always valid current-pass data.
     const passStart = Math.floor(now / spanMs) * spanMs;
 
+    // Streak-row centre: the band always sits at the very bottom of the plot.
+    const rowCenterY = height - BAND_HEIGHT / 2;
+
     drawTimeGrid(ctx, width, height, spanMs);
     if (channels && rings) drawChannels(ctx, width, emgHeight, spanMs, now, passStart);
     if (trackHeight) drawTrack(ctx, width, emgHeight, trackHeight, now, passStart, phaseX);
+    drawEvents(ctx, width, height, now, passStart, phaseX, rowCenterY);
     drawSweep(ctx, xNow, height, width);
+  }
+
+  // Generic decision events: a dashed full-height line for temporal context plus a
+  // glyph centred on the streak row. The glyph is the event colour with a light
+  // contrast ring so it stays visible even on the same-coloured active band. The
+  // frontend knows nothing about each kind — it draws what the backend sent.
+  function drawEvents(ctx, width, height, now, passStart, phaseX, rowCenterY) {
+    if (anchorMs === null) return;
+    ctx.font = '10px system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    for (const e of events) {
+      const t = anchorMs + e.tUs / 1000;
+      if (t < passStart || t > now) continue;
+      const x = phaseX(t);
+      const color = e.color || NEUTRAL;
+
+      // Context line down the plot.
+      ctx.strokeStyle = color + '66';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([3, 4]);
+      ctx.beginPath();
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, height);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // Diamond glyph centred on the streak row, ringed for contrast.
+      const r = 4;
+      ctx.beginPath();
+      ctx.moveTo(x, rowCenterY - r);
+      ctx.lineTo(x + r, rowCenterY);
+      ctx.lineTo(x, rowCenterY + r);
+      ctx.lineTo(x - r, rowCenterY);
+      ctx.closePath();
+      ctx.fillStyle = color;
+      ctx.fill();
+      ctx.strokeStyle = '#0b0e14';
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+      ctx.strokeStyle = '#e5e7eb';
+      ctx.lineWidth = 0.75;
+      ctx.stroke();
+
+      // Label just above the band, centred on the line.
+      if (e.label) {
+        ctx.fillStyle = '#e5e7ebdd';
+        ctx.fillText(e.label, x, rowCenterY - BAND_HEIGHT / 2 - 4);
+      }
+    }
+    ctx.textAlign = 'start';
   }
 
   function drawTimeGrid(ctx, width, height, spanMs) {
@@ -248,7 +299,7 @@
       }
       const gain = (laneHeight * 0.42) / peak;
 
-      ctx.strokeStyle = PALETTE[0];
+      ctx.strokeStyle = TRACE;
       ctx.lineWidth = 1;
       ctx.beginPath();
       if (useEnvelope) {
@@ -358,13 +409,21 @@
   }
 
   function drawTrack(ctx, width, trackTop, trackHeight, now, passStart, phaseX) {
-    const count = commandCount;
-    const classes = preds.length ? preds[preds.length - 1].softmax.length : 0;
+    const classCount = classInfo.length;
+    const needed = live.hello?.needed ?? 3;
+    // Authoritative τ from the backend (per-window); fall back to the slider only
+    // until the first prediction lands.
+    const tauLine = live.prediction?.tau ?? tau;
     const top = trackTop;
     const bottom = trackTop + trackHeight;
-    const yFor = (v) => bottom - v * (trackHeight - 6) - 3;
+    // Reserve a bottom strip for the wake-gate band; the confidence curves live
+    // above it.
+    const bandHeight = BAND_HEIGHT;
+    const confBottom = bottom - bandHeight;
+    const confHeight = trackHeight - bandHeight;
+    const yFor = (v) => confBottom - v * (confHeight - 6) - 3;
 
-    // Track frame + 50% line.
+    // Confidence frame + 50% line.
     ctx.strokeStyle = '#ffffff14';
     ctx.beginPath();
     ctx.moveTo(0, top);
@@ -376,7 +435,19 @@
     ctx.font = '11px system-ui, sans-serif';
     ctx.fillText('class confidence', 6, top + 13);
 
-    if (!classes) return;
+    // τ threshold line (the per-window trigger level) — plain dashed line.
+    const yTau = yFor(tauLine);
+    ctx.strokeStyle = '#e5e7eb55';
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath();
+    ctx.moveTo(0, yTau);
+    ctx.lineTo(width, yTau);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#e5e7eb99';
+    ctx.fillText('τ', width - 14, yTau - 3);
+
+    if (!classCount) return;
 
     // Predictions in the current sweep pass, timed off their window's backend
     // index. Each covers window `seq`, i.e. samples [seq*window, (seq+1)*window).
@@ -387,6 +458,7 @@
       if (t >= passStart && t <= now) visible.push({ ...p, x: phaseX(t) });
     }
     if (!visible.length) return;
+    const xNow = phaseX(now);
 
     // Fill under the chosen class only where the wake-gate accepted it.
     for (let i = 0; i < visible.length - 1; i++) {
@@ -394,26 +466,51 @@
       if (!a.accepted) continue;
       const b = visible[i + 1];
       const v = a.softmax[a.argmax];
-      ctx.fillStyle = classColor(a.argmax, count) + '33';
+      ctx.fillStyle = classColor(a.argmax) + '33';
       ctx.beginPath();
-      ctx.moveTo(a.x, bottom);
+      ctx.moveTo(a.x, confBottom);
       ctx.lineTo(a.x, yFor(v));
       ctx.lineTo(b.x, yFor(v));
-      ctx.lineTo(b.x, bottom);
+      ctx.lineTo(b.x, confBottom);
       ctx.closePath();
       ctx.fill();
     }
 
-    // One smoothed line per class; command classes coloured, the rest grey.
+    // One smoothed line per class, coloured and weighted from the backend table.
     const pts = new Array(visible.length);
-    for (let cls = 0; cls < classes; cls++) {
-      for (let i = 0; i < visible.length; i++) pts[i] = { x: visible[i].x, y: yFor(visible[i].softmax[cls]) };
-      ctx.strokeStyle = classColor(cls, count);
-      ctx.lineWidth = cls < count ? 1.5 : 1;
+    for (let cls = 0; cls < classCount; cls++) {
+      for (let i = 0; i < visible.length; i++) pts[i] = { x: visible[i].x, y: yFor(visible[i].softmax[cls] ?? 0) };
+      ctx.strokeStyle = classColor(cls);
+      ctx.lineWidth = classInfo[cls]?.command ? 1.5 : 1;
       ctx.beginPath();
       monotoneCurve(ctx, pts);
       ctx.stroke();
     }
+
+    drawStateBand(ctx, width, confBottom, bandHeight, needed, visible, xNow);
+  }
+
+  // Wake-gate band: each window painted in the active command's colour (idle has
+  // none, so neutral), with opacity ramping by streak progress toward the latch —
+  // so the colour visibly intensifies window by window as a command arms, and
+  // saturates once latched. Different commands stay distinguishable by hue. The
+  // ramp ends come from the backend state intensities.
+  function drawStateBand(ctx, width, bandTop, bandHeight, needed, visible, xNow) {
+    const idleAlpha = stateByName.idle?.intensity ?? 0.12;
+    const activeAlpha = stateByName.active?.intensity ?? 0.9;
+    for (let i = 0; i < visible.length; i++) {
+      const a = visible[i];
+      const x1 = i + 1 < visible.length ? visible[i + 1].x : xNow;
+      const progress = Math.min(a.streak / needed, 1); // 0 → idle, 1 → latched
+      ctx.globalAlpha = idleAlpha + (activeAlpha - idleAlpha) * progress;
+      ctx.fillStyle = a.streak === 0 ? NEUTRAL : classColor(a.argmax);
+      ctx.fillRect(a.x, bandTop, Math.max(0, x1 - a.x), bandHeight);
+    }
+    ctx.globalAlpha = 1;
+
+    ctx.fillStyle = '#ffffff66';
+    ctx.font = '11px system-ui, sans-serif';
+    ctx.fillText('wake gate', 6, bandTop + 13);
   }
 
   function drawSweep(ctx, xNow, height, width) {
@@ -434,9 +531,6 @@
     tau = value;
     api.threshold(value);
   }
-  function pct(value) {
-    return `${(value * 100).toFixed(0)}%`;
-  }
 </script>
 
 <h2>Stream</h2>
@@ -448,28 +542,16 @@
       oninput={(event) => (spanSec = +event.currentTarget.value)} />
   </label>
   <span class="muted">{spanSec}s</span>
-
-  <span class="spacer"></span>
-
-  {#if prediction}
-    <span class="badge {prediction.wake_state}">{prediction.wake_state}</span>
-    <span class="badge" class:active={prediction.accepted}>
-      {prediction.accepted ? 'accepted' : 'rejected'}
-    </span>
-    <span class="muted">reject {pct(prediction.reject_score)}</span>
-  {:else}
-    <span class="muted">no predictions</span>
-  {/if}
 </div>
 
 <canvas bind:this={canvas}></canvas>
 
-{#if classCount}
+{#if classInfo.length}
   <div class="legend">
-    {#each Array(classCount) as _, cls}
+    {#each classInfo as info}
       <span class="legend-item">
-        <span class="swatch" style="background: {classColor(cls, commandCount)}"></span>
-        {classLabel(cls)}
+        <span class="swatch" style="background: {info.color}"></span>
+        {info.label}
       </span>
     {/each}
     <span class="muted legend-note">filled = accepted</span>
@@ -483,7 +565,6 @@
       oninput={(event) => onTau(+event.currentTarget.value)} />
   </label>
 </div>
-<p class="muted">A command must clear τ for 3 consecutive windows to latch (Active).</p>
 
 <style>
   .legend { display: flex; flex-wrap: wrap; gap: 6px 16px; align-items: center; margin-top: 10px; font-size: 13px; }

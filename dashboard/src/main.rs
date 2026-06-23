@@ -22,8 +22,8 @@ use axum::Router;
 use config::AppConfig;
 use emg_tds::Classifier;
 use futures_util::{SinkExt, StreamExt};
-use pipeline::RejectPipeline;
-use protocol::{Frame, ReplayAction};
+use pipeline::{Decision, RejectPipeline};
+use protocol::{ClassInfo, Frame, MediaKey, ReplayAction, StateInfo, WakeState};
 use replay::{FrameSource, Replay};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -35,6 +35,9 @@ use tower_http::trace::TraceLayer;
 const SAMPLE_RATE: u32 = 2048; // Hyser acquisition rate (informational on the wire)
 const DISPLAY_SCALE: f32 = 3000.0; // f32 unit → i16 count, for the scope
 const DEFAULT_TAU: f32 = 0.5;
+/// Per-class line/legend/band colours; the frontend just paints index → colour.
+const CLASS_PALETTE: [&str; 8] =
+    ["#3b82f6", "#22c55e", "#f59e0b", "#a855f7", "#ec4899", "#14b8a6", "#f97316", "#60a5fa"];
 
 #[derive(Clone)]
 struct AppState {
@@ -121,6 +124,8 @@ struct Session {
     seq: u32,
     playing: bool,
     pipeline: RejectPipeline,
+    /// Previous window's wake state, for emitting transition events.
+    prev_wake: WakeState,
 }
 
 async fn handle_socket(socket: WebSocket, state: AppState) {
@@ -132,6 +137,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         seq: 0,
         playing: true,
         pipeline: RejectPipeline::new(state.num_commands, DEFAULT_TAU),
+        prev_wake: WakeState::Idle,
     };
 
     if sink.send(Message::Binary(frame::encode(&hello(&state)))).await.is_err() {
@@ -178,12 +184,42 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
 fn hello(state: &AppState) -> Frame {
     let config = state.config.lock().unwrap();
+    // Class palette + labels live here so the frontend carries no palette or
+    // command/reject knowledge. All current classes are commands (softmax length
+    // equals num_commands); reject/rest entries would append with command: false.
+    let classes = (0..state.num_commands)
+        .map(|gesture| {
+            let key = config
+                .keymap
+                .iter()
+                .find(|binding| binding.gesture == gesture as u8)
+                .map(|binding| media_label(binding.key));
+            let label = match key {
+                Some(name) => format!("C{gesture} · {name}"),
+                None => format!("C{gesture}"),
+            };
+            ClassInfo { label, color: class_color(gesture as u8).to_string(), command: true }
+        })
+        .collect();
+
+    // Wake-gate vocabulary + presentation. `intensity` is how strongly the band
+    // paints the command colour, so states read by brightness while commands stay
+    // distinct by hue.
+    let states = vec![
+        StateInfo { name: "idle".into(), label: "idle".into(), color: "#6b7280".into(), intensity: 0.12 },
+        StateInfo { name: "arming".into(), label: "arming".into(), color: "#f59e0b".into(), intensity: 0.45 },
+        StateInfo { name: "active".into(), label: "active".into(), color: "#22c55e".into(), intensity: 0.9 },
+    ];
+
     Frame::Hello {
         gestures: state.num_commands as u8,
         sources: state.replay.names(),
         keymap: config.keymap.clone(),
         wifi_ssid: config.wifi_ssid.clone(),
         tau: DEFAULT_TAU,
+        needed: RejectPipeline::NEEDED as u8,
+        classes,
+        states,
     }
 }
 
@@ -252,13 +288,80 @@ fn produce(session: &mut Session, state: &AppState) -> Vec<Frame> {
                 argmax: decision.argmax,
                 accepted: decision.accepted,
                 wake_state: decision.wake_state,
+                streak: decision.streak,
+                tau: session.pipeline.tau,
             });
+
+            // Emit transition events at the end of this window. The frontend just
+            // renders them; all the "what happened" logic stays here.
+            let window_us = view.time as u64 * 1_000_000 / SAMPLE_RATE as u64;
+            let t_us = (session.seq as u64 + 1) * window_us;
+            push_events(&mut out, session, state, &decision, t_us);
+            session.prev_wake = decision.wake_state;
         }
     }
 
     session.cursor = (session.cursor + 1) % count;
     session.seq = session.seq.wrapping_add(1);
     out
+}
+
+/// Detect wake-gate transitions against the previous window and append a generic
+/// `Event` frame for each. Adding a new event kind is a change here only.
+///
+/// A media command fires exactly when a command latches — the Active edge — and
+/// only then; that's the single key-bearing `commit` event, so the triggered
+/// commands strictly follow the latch. Re-arming onto another command (streak
+/// reset, still Arming) does not fire anything, so it gets no event here; the
+/// state band already shows it by changing hue.
+fn push_events(out: &mut Vec<Frame>, session: &Session, state: &AppState, decision: &Decision, t_us: u64) {
+    let now = decision.wake_state;
+    let prev = session.prev_wake;
+    let mut event = |kind: &str, label: Option<String>, color: &str| {
+        out.push(Frame::Event {
+            t_us,
+            kind: kind.to_string(),
+            label,
+            color: Some(color.to_string()),
+        });
+    };
+
+    // Commit: a command just latched — this is the media key actually firing. The
+    // marker takes the firing class's own colour so it matches that command's line
+    // and band.
+    if now == WakeState::Active && prev != WakeState::Active {
+        event("commit", Some(key_label(state, decision.argmax)), class_color(decision.argmax));
+    }
+    // Release: dropped back to rejecting (state change, no key fires).
+    if now == WakeState::Idle && prev != WakeState::Idle {
+        event("release", None, "#6b7280");
+    }
+}
+
+/// Human label for the media key bound to a gesture (falls back to the index).
+fn key_label(state: &AppState, gesture: u8) -> String {
+    let config = state.config.lock().unwrap();
+    match config.keymap.iter().find(|binding| binding.gesture == gesture) {
+        Some(binding) => media_label(binding.key).to_string(),
+        None => format!("C{gesture}"),
+    }
+}
+
+/// The palette colour for a class index — the single source for line, legend,
+/// band, and commit-marker colour.
+fn class_color(gesture: u8) -> &'static str {
+    CLASS_PALETTE[gesture as usize % CLASS_PALETTE.len()]
+}
+
+fn media_label(key: MediaKey) -> &'static str {
+    match key {
+        MediaKey::PlayPause => "Play/Pause",
+        MediaKey::NextTrack => "Next",
+        MediaKey::PrevTrack => "Prev",
+        MediaKey::VolumeUp => "Vol +",
+        MediaKey::VolumeDown => "Vol −",
+        MediaKey::Mute => "Mute",
+    }
 }
 
 fn emg_frame(seq: u32, channels: usize, time: usize, samples: &[f32]) -> Frame {

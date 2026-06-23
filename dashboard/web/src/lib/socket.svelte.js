@@ -19,7 +19,7 @@ export const live = $state({
 // continuous renderer sees every window. `live.*` reassignments can coalesce
 // under Svelte's effect batching and drop intermediate frames; these callbacks
 // fire once per frame, synchronously, on arrival.
-const listeners = { emg: new Set(), prediction: new Set() };
+const listeners = { emg: new Set(), prediction: new Set(), event: new Set() };
 export function on(type, callback) {
   listeners[type].add(callback);
   return () => listeners[type].delete(callback);
@@ -52,6 +52,8 @@ export function connect() {
     } else if (frame.type === 'prediction') {
       live.prediction = frame;
       for (const cb of listeners.prediction) cb(frame);
+    } else if (frame.type === 'event') {
+      for (const cb of listeners.event) cb(frame);
     }
   };
 }

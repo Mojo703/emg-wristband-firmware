@@ -32,6 +32,14 @@ pub enum Frame {
         keymap: Vec<Binding>,
         wifi_ssid: Option<String>,
         tau: f32,
+        /// Consecutive above-τ windows a command needs to latch (the streak goal).
+        needed: u8,
+        /// Display descriptor per softmax class (label/colour/role) so the frontend
+        /// needs no built-in palette or command/reject knowledge.
+        classes: Vec<ClassInfo>,
+        /// Display descriptor per wake-gate state (colour/label/intensity) so the
+        /// frontend hardcodes none of the state vocabulary.
+        states: Vec<StateInfo>,
     },
 
     /// Bulk EMG window. `samples` is little-endian `i16`, channel-major:
@@ -57,6 +65,25 @@ pub enum Frame {
         /// reject_score ≥ tau after smoothing.
         accepted: bool,
         wake_state: WakeState,
+        /// How many consecutive above-τ windows `argmax` has held (0..=needed).
+        streak: u8,
+        /// The authoritative reject threshold in effect for this window, so the
+        /// frontend draws the τ line from the backend rather than a local copy.
+        tau: f32,
+    },
+
+    /// A discrete decision event (backend → browser). Deliberately generic: the
+    /// frontend draws each as a labelled vertical line at `t_us` in `color`, with
+    /// no knowledge of what `kind` means — new event kinds need no frontend change.
+    /// `t_us` shares the EMG `t0_us` timeline.
+    Event {
+        t_us: u64,
+        /// Opaque tag, e.g. "commit" / "release" / "switch".
+        kind: String,
+        /// Optional text to render beside the line (e.g. the media key that fired).
+        label: Option<String>,
+        /// Optional CSS colour; the frontend falls back to a neutral default.
+        color: Option<String>,
     },
 
     /// Replay transport (browser → backend).
@@ -71,6 +98,32 @@ pub enum Frame {
 
     /// Persist WiFi credentials for the device (browser → backend).
     SetWifi { ssid: String, psk: String },
+}
+
+/// Display descriptor for one softmax class. The backend owns the palette and the
+/// command/reject distinction; the frontend just paints what it's told.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClassInfo {
+    /// Human label, e.g. "C0 · Play/Pause" or "reject".
+    pub label: String,
+    /// CSS colour for this class's confidence line, legend swatch, and band fill.
+    pub color: String,
+    /// True for a real command class, false for reject/rest classes.
+    pub command: bool,
+}
+
+/// Display descriptor for one wake-gate state. `intensity` drives how strongly the
+/// state band paints the active command's colour (idle faint → active bright), so
+/// different commands in the same state stay distinguishable by hue.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StateInfo {
+    /// Matches the `WakeState` snake_case name ("idle"/"arming"/"active").
+    pub name: String,
+    pub label: String,
+    /// CSS colour for the status badge.
+    pub color: String,
+    /// Band opacity 0..=1 for this state.
+    pub intensity: f32,
 }
 
 /// Wake-gate state machine position, surfaced for the inference inspector.

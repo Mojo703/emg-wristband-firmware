@@ -10,6 +10,8 @@ pub struct Decision {
     pub reject_score: f32,
     pub accepted: bool,
     pub wake_state: WakeState,
+    /// Consecutive above-τ windows held by `argmax` (0..=needed).
+    pub streak: u8,
 }
 
 /// Per-session reject pipeline. Commands are classes `0..num_commands`; the reject
@@ -25,8 +27,11 @@ pub struct RejectPipeline {
 }
 
 impl RejectPipeline {
+    /// Consecutive above-τ windows a command must hold to latch.
+    pub const NEEDED: usize = 3;
+
     pub fn new(num_commands: usize, tau: f32) -> Self {
-        Self { num_commands, tau, needed: 3, last_command: None, streak: 0, latched: false }
+        Self { num_commands, tau, needed: Self::NEEDED, last_command: None, streak: 0, latched: false }
     }
 
     pub fn step(&mut self, softmax: &[f32]) -> Decision {
@@ -62,6 +67,12 @@ impl RejectPipeline {
             WakeState::Arming
         };
 
-        Decision { argmax: argmax as u8, reject_score, accepted: self.latched, wake_state }
+        Decision {
+            argmax: argmax as u8,
+            reject_score,
+            accepted: self.latched,
+            wake_state,
+            streak: self.streak.min(u8::MAX as usize) as u8,
+        }
     }
 }
