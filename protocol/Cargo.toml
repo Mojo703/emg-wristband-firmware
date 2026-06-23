@@ -1,0 +1,16 @@
+# Shared wire-protocol types for the EMG wristband: CBOR frames exchanged over the
+# dashboard WebSocket now, and the device link later. no_std + alloc so the same
+# types compile for the ESP32-S3 firmware. Empty [workspace] per repo convention.
+[workspace]
+
+[package]
+name = "protocol"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+serde_bytes = { version = "0.11", default-features = false, features = ["alloc"] }
+
+[dev-dependencies]
+ciborium = "0.2"

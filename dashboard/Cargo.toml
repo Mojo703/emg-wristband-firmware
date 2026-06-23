@@ -1,0 +1,27 @@
+# EMG wristband dashboard — axum backend that replays exported EMG windows, runs
+# the host classifier, and streams CBOR frames to the Svelte frontend over a
+# WebSocket. Host-only dev tool (pulls candle via emg-tds). Empty [workspace] per
+# repo convention. Serves the built frontend from web/dist.
+[workspace]
+
+[package]
+name = "dashboard"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+protocol = { path = "../protocol" }
+emg-tds = { path = "../emg-tds" }
+
+axum = { version = "0.7", features = ["ws"] }
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["fs", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures-util = "0.3"
+
+ciborium = "0.2"
+serde = { version = "1", features = ["derive"] }
+ndarray = "0.16"
+ndarray-npy = "0.9"
+anyhow = "1"
