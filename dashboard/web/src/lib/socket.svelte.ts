@@ -1,6 +1,12 @@
 // One WebSocket, shared reactive state, and typed senders. Panels import `live`
 // and read fields reactively; they never touch the socket directly.
 //
+// `live` is a class instance so Svelte can export it as a constant while still
+// allowing internal state transitions. It exposes a small state machine:
+// offline → handshake → online. That makes `connected` derived and it keeps
+// `hello` private until the socket is online, so the public API never presents a
+// Hello frame while disconnected.
+//
 // CBOR via a configured cbor-x Encoder: `useRecords: false` is essential so we
 // emit plain standard-CBOR maps that ciborium (the Rust backend) understands —
 // the default cbor-x record extension would be opaque to it.
@@ -19,24 +25,60 @@ import {
 
 const cbor = new Encoder({ useRecords: false, mapsAsObjects: true, tagUint8Array: false });
 
-interface LiveState {
-  connected: boolean;
-  hello: HelloFrame | null;
-  emg: DecodedEmg | null;
-  prediction: PredictionFrame | null;
+class LiveStateManager {
+  status = $state<'offline' | 'handshake' | 'online'>('offline');
+  connected = $derived(this.status !== 'offline');
+  #hello = $state<HelloFrame | null>(null);
+  #emg = $state<DecodedEmg | null>(null);
+  #prediction = $state<PredictionFrame | null>(null);
+
+  get hello(): HelloFrame | null {
+    return this.status === 'online' ? this.#hello : null;
+  }
+
+  get emg(): DecodedEmg | null {
+    return this.status === 'online' ? this.#emg : null;
+  }
+
+  get prediction(): PredictionFrame | null {
+    return this.status === 'online' ? this.#prediction : null;
+  }
+
+  setHello(value: HelloFrame): void {
+    this.#hello = value;
+    if (this.status === 'handshake') {
+      this.status = 'online';
+    }
+  }
+
+  setEmg(value: DecodedEmg | null): void {
+    this.#emg = value;
+  }
+
+  setPrediction(value: PredictionFrame | null): void {
+    this.#prediction = value;
+  }
+
+  setHandshake(): void {
+    this.status = 'handshake';
+    this.#hello = null;
+    this.#emg = null;
+    this.#prediction = null;
+  }
+
+  setOffline(): void {
+    this.status = 'offline';
+    this.#hello = null;
+    this.#emg = null;
+    this.#prediction = null;
+  }
 }
 
-export const live = $state<LiveState>({
-  connected: false,
-  hello: null,
-  emg: null,
-  prediction: null,
-});
+export const live = new LiveStateManager();
 
 // Streaming frames (emg/prediction) also fan out to imperative subscribers so a
-// continuous renderer sees every window. `live.*` reassignments can coalesce
-// under Svelte's effect batching and drop intermediate frames; these callbacks
-// fire once per frame, synchronously, on arrival.
+// continuous renderer sees every window. These callbacks fire once per frame,
+// synchronously, on arrival.
 type EmgHandler = (emg: DecodedEmg) => void;
 type PredictionHandler = (prediction: PredictionFrame) => void;
 type EventHandler = (event: EventFrame) => void;
@@ -75,10 +117,10 @@ export function connect(): void {
   socket = new WebSocket(`${scheme}://${location.host}/ws`);
   socket.binaryType = 'arraybuffer';
   socket.onopen = () => {
-    live.connected = true;
+    live.setHandshake();
   };
   socket.onclose = () => {
-    live.connected = false;
+    live.setOffline();
     socket = null;
     setTimeout(connect, 1000);
   };
@@ -93,13 +135,13 @@ export function connect(): void {
     if (frame === null) return;
 
     if (frame.type === 'hello') {
-      live.hello = frame;
+      live.setHello(frame);
     } else if (frame.type === 'emg') {
       const emg = decodeEmg(frame);
-      live.emg = emg;
+      live.setEmg(emg);
       for (const cb of listeners.emg) cb(emg);
     } else if (frame.type === 'prediction') {
-      live.prediction = frame;
+      live.setPrediction(frame);
       for (const cb of listeners.prediction) cb(frame);
     } else if (frame.type === 'event') {
       for (const cb of listeners.event) cb(frame);
@@ -134,4 +176,4 @@ export const api = {
 } as const;
 
 // Re-export protocol types so panels can import everything from the socket module.
-export type { Binding, DecodedEmg, EventFrame, HelloFrame, PredictionFrame } from './protocol.ts';
+export type { Binding, DecodedEmg, EventFrame, HelloFrame, PredictionFrame } from './protocol';

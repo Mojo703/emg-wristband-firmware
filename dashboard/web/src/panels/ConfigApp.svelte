@@ -15,9 +15,10 @@
   // The discrete settings reflect the backend's live config directly — no local
   // draft. Each change applies immediately; the backend echoes a fresh Hello, so
   // what's shown is always what's active.
-  const gestures = $derived(live.hello?.gestures ?? 0);
-  const keymap = $derived(live.hello?.keymap ?? []);
-  const levels = $derived(live.hello?.sensitivity_levels ?? []);
+  const config = $derived(live.hello);
+  const gestures = $derived(config?.gestures ?? 0);
+  const keymap = $derived(config?.keymap ?? []);
+  const levels = $derived(config?.sensitivity_levels ?? []);
   const gestureIndices = $derived(Array.from({ length: gestures }, (_, i) => i));
 
   function keyFor(gesture: number): MediaKey {
@@ -49,9 +50,9 @@
   let psk = $state('');
   let wifiSeeded = false;
   $effect(() => {
-    if (wifiSeeded || live.hello === null) return;
+    if (wifiSeeded || config === null) return;
     wifiSeeded = true;
-    ssid = live.hello.wifi_ssid ?? '';
+    ssid = config.wifi_ssid ?? '';
   });
   const saveWifi = () => api.wifi(ssid, psk);
 
@@ -68,7 +69,7 @@
   <div class="row">
     <label>
       Trigger sensitivity
-      <select value={live.hello?.sensitivity ?? ''} onchange={handleSensitivityChange}>
+      <select value={config?.sensitivity ?? ''} onchange={handleSensitivityChange}>
         {#each levels as level}
           <option value={level.id}>{level.label}</option>
         {/each}

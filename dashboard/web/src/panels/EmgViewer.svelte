@@ -20,18 +20,25 @@
   const TRACE = '#8593a8'; // EMG line accent (cosmetic; not class-related)
   const DEFAULT_SPAN = SPANS[Math.floor(SPANS.length / 2)] ?? 10;
 
+  // All per-stream mutable state is grouped into one struct: it is either fully
+  // present or fully absent, so there is no chance of `rings` existing while
+  // `anchorMs` is missing. Only `anchorMs` remains nullable inside the struct,
+  // because the first packet sets it after the ring buffers are created.
+  interface StreamState {
+    sampleRate: number;
+    channels: number;
+    windowSamples: number;
+    capacity: number;
+    rings: Float32Array[];
+    ringAbs: Float64Array;
+    newestAbs: number;
+    anchorMs: number | null;
+    msPerSample: number;
+  }
+
   let canvas: HTMLCanvasElement | undefined = $state(undefined);
   let spanSec = $state<number>(DEFAULT_SPAN);
-  // --- imperative scope state (deliberately non-reactive; touched per frame) ---
-  let sampleRate = $state<number>(0);
-  let channels = $state<number>(0);
-  let windowSamples = 0; // samples per channel per window, for prediction timing
-  let capacity = 0; // ring length in samples per channel
-  let rings: Float32Array[] | null = null; // indexed by absoluteSample % capacity
-  let ringAbs: Float64Array | null = null; // which absolute sample index a slot holds
-  let newestAbs = -1;
-  let anchorMs: number | null = null; // localMs(a) = anchorMs + a * msPerSample
-  let msPerSample = 0;
+  let stream: StreamState | null = $state(null);
 
   interface StoredPrediction {
     readonly seq: number;
@@ -65,50 +72,59 @@
   }
 
   function localMs(a: number): number {
-    return (anchorMs as number) + a * msPerSample;
+    if (stream === null || stream.anchorMs === null) {
+      throw new Error('localMs called before stream is anchored');
+    }
+    return stream.anchorMs + a * stream.msPerSample;
   }
 
   function reinit(emg: DecodedEmg): void {
-    sampleRate = emg.sampleRate;
-    channels = emg.channels;
-    windowSamples = emg.time;
-    msPerSample = 1000 / sampleRate;
-    capacity = Math.ceil(MAX_SPAN_SEC * sampleRate);
-    rings = Array.from({ length: channels }, () => new Float32Array(capacity));
-    ringAbs = new Float64Array(capacity).fill(-1);
-    newestAbs = -1;
-    anchorMs = null;
+    const sampleRate = emg.sampleRate;
+    const channels = emg.channels;
+    const windowSamples = emg.time;
+    const msPerSample = 1000 / sampleRate;
+    const capacity = Math.ceil(MAX_SPAN_SEC * sampleRate);
+    stream = {
+      sampleRate,
+      channels,
+      windowSamples,
+      msPerSample,
+      capacity,
+      rings: Array.from({ length: channels }, () => new Float32Array(capacity)),
+      ringAbs: new Float64Array(capacity).fill(-1),
+      newestAbs: -1,
+      anchorMs: null,
+    };
     preds.length = 0;
   }
 
   function onEmg(emg: DecodedEmg): void {
-    if (channels !== emg.channels || sampleRate !== emg.sampleRate) {
+    if (stream === null || stream.channels !== emg.channels || stream.sampleRate !== emg.sampleRate) {
       reinit(emg);
     }
+    if (stream === null) return; // reinit should have set this
     const { int16, time, scaleUv } = emg;
     // Absolute sample index of this window's first sample, from the backend clock.
-    const idx0 = Math.round((emg.t0us / 1e6) * sampleRate);
+    const idx0 = Math.round((emg.t0us / 1e6) * stream.sampleRate);
 
     // A backwards jump means the stream reset (e.g. source switch / seq wrap).
-    const reset = idx0 < newestAbs - 1;
-    if (rings === null || ringAbs === null) return; // reinit should have set these
+    const reset = idx0 < stream.newestAbs - 1;
     for (let i = 0; i < time; i++) {
       const a = idx0 + i;
-      const pos = ((a % capacity) + capacity) % capacity;
-      ringAbs[pos] = a;
-      for (let ch = 0; ch < channels; ch++) {
-        const ring = rings[ch]!; // ch < channels by loop invariant
-        ring[pos] = int16[ch * time + i]! * scaleUv;
+      const pos = ((a % stream.capacity) + stream.capacity) % stream.capacity;
+      stream.ringAbs[pos] = a;
+      for (let ch = 0; ch < stream.channels; ch++) {
+        stream.rings[ch]![pos] = int16[ch * time + i]! * scaleUv;
       }
     }
-    newestAbs = idx0 + time - 1;
+    stream.newestAbs = idx0 + time - 1;
 
     const now = performance.now();
     const drifted =
-      anchorMs !== null && Math.abs(localMs(newestAbs) - now) > spanSec * 1000;
-    if (anchorMs === null || reset || drifted) {
+      stream.anchorMs !== null && Math.abs(localMs(stream.newestAbs) - now) > spanSec * 1000;
+    if (stream.anchorMs === null || reset || drifted) {
       // Pin the newest sample at "now": one window of lead keeps it under the bar.
-      anchorMs = now - newestAbs * msPerSample;
+      stream.anchorMs = now - stream.newestAbs * stream.msPerSample;
     }
   }
 
@@ -158,10 +174,11 @@
 
   // Display descriptors come entirely from the backend (labels, colours, the
   // command/reject split, state vocabulary). The frontend just looks them up.
-  const classInfo = $derived<readonly ClassInfo[]>(live.hello?.classes ?? []);
+  const config = $derived(live.hello);
+  const classInfo = $derived<readonly ClassInfo[]>(config?.classes ?? []);
   const stateByName = $derived<Record<string, StateInfo>>(
-    Object.fromEntries(
-      (live.hello?.states ?? []).map((state) => [state.name, state]),
+    config === null ? {} : Object.fromEntries(
+      config.states.map((state) => [state.name, state]),
     ),
   );
   function classColor(cls: number): string {
@@ -209,7 +226,7 @@
     const rowCenterY = height - BAND_HEIGHT / 2;
 
     drawTimeGrid(ctx, width, height, spanMs);
-    if (channels > 0 && rings !== null) {
+    if (stream !== null && stream.channels > 0) {
       drawChannels(ctx, width, emgHeight, spanMs, now, passStart);
     }
     if (trackHeight > 0) {
@@ -232,11 +249,11 @@
     phaseX: (tMs: number) => number,
     rowCenterY: number,
   ): void {
-    if (anchorMs === null) return;
+    if (stream === null || stream.anchorMs === null) return;
     ctx.font = '13px system-ui, sans-serif';
     ctx.textAlign = 'center';
     for (const e of events) {
-      const t = anchorMs + e.tUs / 1000;
+      const t = stream.anchorMs + e.tUs / 1000;
       if (t < passStart || t > now) continue;
       const x = phaseX(t);
       const color = e.color ?? NEUTRAL;
@@ -305,15 +322,15 @@
     _now: number,
     passStart: number,
   ): void {
-    if (rings === null || ringAbs === null || anchorMs === null || channels === 0) return;
-    const laneHeight = emgHeight / channels;
+    if (stream === null || stream.anchorMs === null || stream.channels === 0) return;
+    const laneHeight = emgHeight / stream.channels;
     const cols = Math.max(1, Math.floor(width));
     ensureColumns(cols);
     const invSpan = 1 / spanMs;
-    const colStep = msPerSample * invSpan * cols; // fractional columns per sample
+    const colStep = stream.msPerSample * invSpan * cols; // fractional columns per sample
     // First sample of the current sweep pass; clamp to what's actually buffered.
-    let startAbs = Math.ceil((passStart - anchorMs) / msPerSample);
-    const oldestAbs = newestAbs - Math.floor((spanMs / 1000) * sampleRate);
+    let startAbs = Math.ceil((passStart - stream.anchorMs) / stream.msPerSample);
+    const oldestAbs = stream.newestAbs - Math.floor((spanMs / 1000) * stream.sampleRate);
     if (startAbs < oldestAbs) startAbs = oldestAbs;
     if (startAbs < 0) startAbs = 0;
 
@@ -323,16 +340,16 @@
     // density threshold, draw a real connected polyline through the samples
     // instead. Density is taken from the span (not the partial pass) so the choice
     // is stable while a pass fills.
-    const spanSamples = Math.floor((spanMs / 1000) * sampleRate);
+    const spanSamples = Math.floor((spanMs / 1000) * stream.sampleRate);
     const samplesPerColumn = spanSamples / cols;
     const useEnvelope = samplesPerColumn >= 8;
     const stride = Math.max(1, Math.round(samplesPerColumn / 2)); // ~2 points/column
 
     ctx.font = '13px system-ui, sans-serif';
-    for (let ch = 0; ch < channels; ch++) {
+    for (let ch = 0; ch < stream.channels; ch++) {
       const laneTop = ch * laneHeight;
       const midY = laneTop + laneHeight / 2;
-      const ring = rings[ch]!; // ch < channels by loop invariant
+      const ring = stream.rings[ch]!; // ch < channels by loop invariant
 
       // Faint baseline + lane separator: this is the "empty / future" look.
       ctx.strokeStyle = '#ffffff10';
@@ -345,9 +362,9 @@
 
       // Auto-gain peak over the (decimated) visible samples.
       let peak = 1e-6;
-      for (let a = startAbs; a <= newestAbs; a += stride) {
-        const pos = a % capacity;
-        if (ringAbs[pos] === a) {
+      for (let a = startAbs; a <= stream.newestAbs; a += stride) {
+        const pos = a % stream.capacity;
+        if (stream.ringAbs[pos] === a) {
           const av = Math.abs(ring[pos]!);
           if (av > peak) peak = av;
         }
@@ -363,13 +380,13 @@
         // (one add + wrap each) is far cheaper per sample than a modulo each.
         colMin.fill(NaN);
         colMax.fill(NaN);
-        let pos = startAbs % capacity;
+        let pos = startAbs % stream.capacity;
         let colFrac =
-          ((((anchorMs + startAbs * msPerSample) % spanMs) + spanMs) % spanMs) *
+          ((((stream.anchorMs + startAbs * stream.msPerSample) % spanMs) + spanMs) % spanMs) *
           invSpan *
           cols;
-        for (let a = startAbs; a <= newestAbs; a++) {
-          if (ringAbs[pos] === a) {
+        for (let a = startAbs; a <= stream.newestAbs; a++) {
+          if (stream.ringAbs[pos] === a) {
             let col = colFrac | 0;
             if (col >= cols) col = cols - 1;
             const v = ring[pos]!;
@@ -379,7 +396,7 @@
             if (!(v <= colMaxVal)) colMax[col] = v;
           }
           pos++;
-          if (pos >= capacity) pos = 0;
+          if (pos >= stream.capacity) pos = 0;
           colFrac += colStep;
           if (colFrac >= cols) colFrac -= cols;
         }
@@ -394,13 +411,13 @@
       } else {
         // Connected polyline through the samples; breaks at gaps (invalid slots).
         let drawing = false;
-        for (let a = startAbs; a <= newestAbs; a += stride) {
-          const pos = a % capacity;
-          if (ringAbs[pos] !== a) {
+        for (let a = startAbs; a <= stream.newestAbs; a += stride) {
+          const pos = a % stream.capacity;
+          if (stream.ringAbs[pos] !== a) {
             drawing = false;
             continue;
           }
-          const t = anchorMs + a * msPerSample;
+          const t = stream.anchorMs + a * stream.msPerSample;
           const x = (((t % spanMs) + spanMs) % spanMs) * invSpan * cols;
           const y = midY - ring[pos]! * gain;
           if (drawing) {
@@ -503,10 +520,10 @@
     phaseX: (tMs: number) => number,
   ): void {
     const classCount = classInfo.length;
-    const needed = live.hello?.needed ?? 3;
+    const needed = config?.needed ?? 3;
     // Authoritative τ from the backend (per-window prediction, or Hello before the
     // first prediction lands). The sensitivity control lives in Config.
-    const tauLine = live.prediction?.tau ?? live.hello?.tau ?? 0.5;
+    const tauLine = live.prediction?.tau ?? config?.tau ?? 0.5;
     const top = trackTop;
     const bottom = trackTop + trackHeight;
     // Reserve a bottom strip for the wake-gate band; the confidence curves live
@@ -541,13 +558,13 @@
     ctx.fillText('τ', width - 14, yTau - 3);
 
     if (classCount === 0) return;
-    if (anchorMs === null) return;
+    if (stream === null || stream.anchorMs === null) return;
 
     // Predictions in the current sweep pass, timed off their window's backend
     // index. Each covers window `seq`, i.e. samples [seq*window, (seq+1)*window).
     const visible: VisiblePrediction[] = [];
     for (const p of preds) {
-      const endAbs = p.seq * windowSamples + windowSamples - 1;
+      const endAbs = p.seq * stream.windowSamples + stream.windowSamples - 1;
       const t = localMs(endAbs);
       if (t >= passStart && t <= now) {
         visible.push({ ...p, x: phaseX(t) });
@@ -647,7 +664,7 @@
     {/each}
   </select>
 
-  <span class="muted">{channels} channels @{sampleRate}Hz</span>
+  <span class="muted">{stream?.channels ?? 0} channels @{stream?.sampleRate ?? 0}Hz</span>
 </div>
 
 <canvas bind:this={canvas}></canvas>
