@@ -31,6 +31,7 @@ export const FrameType = {
   Emg: 'emg',
   Prediction: 'prediction',
   Event: 'event',
+  Pose: 'pose',
   Replay: 'replay',
   SetSensitivity: 'set_sensitivity',
   SetKeymap: 'set_keymap',
@@ -125,6 +126,14 @@ export interface EventFrame {
   readonly color: string | null;
 }
 
+export interface PoseFrame {
+  readonly type: 'pose';
+  readonly t_us: number;
+  readonly joints: readonly (readonly [number, number, number])[];
+  readonly confidence: number;
+  readonly format: string;
+}
+
 export interface ReplayActionPlay {
   readonly action: 'play';
 }
@@ -186,7 +195,8 @@ export type IncomingFrame =
   | HelloFrame
   | EmgFrame
   | PredictionFrame
-  | EventFrame;
+  | EventFrame
+  | PoseFrame;
 
 export type Frame = IncomingFrame | OutgoingFrame;
 
@@ -350,6 +360,27 @@ export function isEventFrame(value: unknown): value is EventFrame {
   );
 }
 
+function isJointArray(
+  value: unknown,
+): value is readonly (readonly [number, number, number])[] {
+  if (!Array.isArray(value)) return false;
+  return value.every((entry) => {
+    if (!Array.isArray(entry) || entry.length !== 3) return false;
+    return entry.every(isNumber);
+  });
+}
+
+export function isPoseFrame(value: unknown): value is PoseFrame {
+  return (
+    hasType(value, 'pose') &&
+    isObject(value) &&
+    isNumber(value['t_us']) &&
+    isJointArray(value['joints']) &&
+    isNumber(value['confidence']) &&
+    isString(value['format'])
+  );
+}
+
 export function isReplayAction(value: unknown): value is ReplayAction {
   if (!isObject(value)) return false;
   const action = value['action'];
@@ -390,6 +421,7 @@ export function asIncomingFrame(value: unknown): IncomingFrame | null {
   if (isEmgFrame(value)) return value;
   if (isPredictionFrame(value)) return value;
   if (isEventFrame(value)) return value;
+  if (isPoseFrame(value)) return value;
   return null;
 }
 

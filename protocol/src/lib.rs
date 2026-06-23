@@ -91,6 +91,21 @@ pub enum Frame {
         color: Option<String>,
     },
 
+    /// 3-D hand pose estimate (backend → browser). The backend is only a proxy: it
+    /// forwards the output of a separate pose-inference service, so the frontend
+    /// does not need to know which model produced the joints.
+    Pose {
+        t_us: u64,
+        /// 3-D joint positions in a model-defined coordinate space. The `format`
+        /// field tells the renderer how to interpret these (count/order).
+        joints: Vec<[f32; 3]>,
+        /// Per-frame confidence, 0..=1. The renderer can dim or ignore low-confidence
+        /// poses.
+        confidence: f32,
+        /// Coordinate/joint convention, e.g. "umetrack_21" or "mano".
+        format: String,
+    },
+
     /// Replay transport (browser → backend).
     Replay { action: ReplayAction },
 
@@ -252,5 +267,24 @@ mod tests {
             roundtrip(&frame),
             Frame::Replay { action: ReplayAction::Seek { window: 42 } }
         ));
+    }
+
+    #[test]
+    fn pose_frame_roundtrips() {
+        let frame = Frame::Pose {
+            t_us: 1_000_000,
+            joints: vec![[0.0, 1.0, 2.0], [3.0, 4.0, 5.0]],
+            confidence: 0.95,
+            format: "umetrack_21".into(),
+        };
+        match roundtrip(&frame) {
+            Frame::Pose { t_us, joints, confidence, format } => {
+                assert_eq!(t_us, 1_000_000);
+                assert_eq!(joints.len(), 2);
+                assert!((confidence - 0.95).abs() < 1e-6);
+                assert_eq!(format, "umetrack_21");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
     }
 }

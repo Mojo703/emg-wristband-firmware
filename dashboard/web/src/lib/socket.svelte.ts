@@ -20,6 +20,7 @@ import {
   type EventFrame,
   type HelloFrame,
   type OutgoingFrame,
+  type PoseFrame,
   type PredictionFrame,
 } from './protocol';
 
@@ -31,6 +32,7 @@ class LiveStateManager {
   #hello = $state<HelloFrame | null>(null);
   #emg = $state<DecodedEmg | null>(null);
   #prediction = $state<PredictionFrame | null>(null);
+  #pose = $state<PoseFrame | null>(null);
 
   get hello(): HelloFrame | null {
     return this.status === 'online' ? this.#hello : null;
@@ -42,6 +44,10 @@ class LiveStateManager {
 
   get prediction(): PredictionFrame | null {
     return this.status === 'online' ? this.#prediction : null;
+  }
+
+  get pose(): PoseFrame | null {
+    return this.status === 'online' ? this.#pose : null;
   }
 
   setHello(value: HelloFrame): void {
@@ -59,11 +65,16 @@ class LiveStateManager {
     this.#prediction = value;
   }
 
+  setPose(value: PoseFrame | null): void {
+    this.#pose = value;
+  }
+
   setHandshake(): void {
     this.status = 'handshake';
     this.#hello = null;
     this.#emg = null;
     this.#prediction = null;
+    this.#pose = null;
   }
 
   setOffline(): void {
@@ -71,6 +82,7 @@ class LiveStateManager {
     this.#hello = null;
     this.#emg = null;
     this.#prediction = null;
+    this.#pose = null;
   }
 }
 
@@ -82,24 +94,29 @@ export const live = new LiveStateManager();
 type EmgHandler = (emg: DecodedEmg) => void;
 type PredictionHandler = (prediction: PredictionFrame) => void;
 type EventHandler = (event: EventFrame) => void;
+type PoseHandler = (pose: PoseFrame) => void;
 
 interface ListenerMap {
   emg: Set<EmgHandler>;
   prediction: Set<PredictionHandler>;
   event: Set<EventHandler>;
+  pose: Set<PoseHandler>;
 }
 
 const listeners: ListenerMap = {
   emg: new Set<EmgHandler>(),
   prediction: new Set<PredictionHandler>(),
   event: new Set<EventHandler>(),
+  pose: new Set<PoseHandler>(),
 };
 
 type HandlerFor<T extends keyof ListenerMap> = T extends 'emg'
   ? EmgHandler
   : T extends 'prediction'
     ? PredictionHandler
-    : EventHandler;
+    : T extends 'pose'
+      ? PoseHandler
+      : EventHandler;
 
 export function on<T extends keyof ListenerMap>(
   type: T,
@@ -143,6 +160,9 @@ export function connect(): void {
     } else if (frame.type === 'prediction') {
       live.setPrediction(frame);
       for (const cb of listeners.prediction) cb(frame);
+    } else if (frame.type === 'pose') {
+      live.setPose(frame);
+      for (const cb of listeners.pose) cb(frame);
     } else if (frame.type === 'event') {
       for (const cb of listeners.event) cb(frame);
     }
@@ -176,4 +196,4 @@ export const api = {
 } as const;
 
 // Re-export protocol types so panels can import everything from the socket module.
-export type { Binding, DecodedEmg, EventFrame, HelloFrame, PredictionFrame } from './protocol';
+export type { Binding, DecodedEmg, EventFrame, HelloFrame, PoseFrame, PredictionFrame } from './protocol';

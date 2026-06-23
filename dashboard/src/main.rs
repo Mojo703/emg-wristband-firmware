@@ -7,7 +7,12 @@
 //! Env: `DASHBOARD_ADDR` (bind, default 0.0.0.0:8090), `EMG_DATA_DIR` (replay npy,
 //! default ../waveformer/data), `EMG_CHECKPOINT` (classifier, default
 //! ../emg-tds/checkpoints/best.safetensors), `DASHBOARD_WEB` (static dir, default
-//! web/dist).
+//! web/dist), `EMG_POSE_URL` (optional pose inference service WebSocket).
+//!
+//! When `EMG_POSE_URL` is set, the backend connects to a separate pose-inference
+//! service, forwards every `Emg` frame to it, and proxies the resulting `Pose`
+//! frames back to the browser. This keeps the heavy pose model out of the Rust
+//! process and out of the firmware.
 
 mod config;
 mod frame;
@@ -29,6 +34,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 
@@ -142,7 +148,66 @@ struct Session {
 }
 
 async fn handle_socket(socket: WebSocket, state: AppState) {
-    let (mut sink, mut stream) = socket.split();
+    tracing::info!("browser websocket connected");
+    let (browser_sink, mut browser_stream) = socket.split();
+
+    // All outbound browser traffic goes through this channel, so optional pose-proxy
+    // tasks can send frames without contending for the split sink.
+    let (browser_tx, mut browser_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+
+    // Task: drain outbound channel into the browser socket.
+    let browser_forwarder = tokio::spawn(async move {
+        let mut sink = browser_sink;
+        while let Some(msg) = browser_rx.recv().await {
+            if sink.send(msg).await.is_err() {
+                break;
+            }
+        }
+        tracing::info!("browser websocket forwarder ended");
+    });
+
+    // Optional pose-inference service proxy.
+    let pose_tx = if let Some(url) = std::env::var("EMG_POSE_URL").ok() {
+        let (to_service_tx, mut to_service_rx) = tokio::sync::mpsc::unbounded_channel::<Frame>();
+        let browser_tx_for_pose = browser_tx.clone();
+
+        tokio::spawn(async move {
+            match tokio_tungstenite::connect_async(&url).await {
+                Ok((ws, _)) => {
+                    tracing::info!("connected to pose service at {url}");
+                    let (mut sink, mut stream) = ws.split();
+
+                    // Forward Emg frames to the pose service.
+                    let to_service = tokio::spawn(async move {
+                        while let Some(frame) = to_service_rx.recv().await {
+                            if sink.send(WsMessage::Binary(frame::encode(&frame))).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+
+                    // Forward Pose frames from the service back to the browser.
+                    while let Some(Ok(msg)) = stream.next().await {
+                        if let WsMessage::Binary(bytes) = msg {
+                            // Only forward well-formed Pose frames; drop anything else.
+                            if let Ok(Frame::Pose { .. }) = frame::decode(&bytes) {
+                                let _ = browser_tx_for_pose.send(Message::Binary(bytes));
+                            }
+                        }
+                    }
+
+                    to_service.abort();
+                }
+                Err(e) => {
+                    tracing::warn!("pose service connection failed ({e}); pose frames disabled");
+                }
+            }
+        });
+
+        Some(to_service_tx)
+    } else {
+        None
+    };
 
     let initial_tau = tau_for_sensitivity(&state.config.lock().unwrap().sensitivity);
     let mut session = Session {
@@ -154,9 +219,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         prev_wake: WakeState::Idle,
     };
 
-    if sink.send(Message::Binary(frame::encode(&hello(&state)))).await.is_err() {
+    if browser_tx.send(Message::Binary(frame::encode(&hello(&state)))).is_err() {
+        tracing::warn!("failed to send hello to browser; disconnecting");
         return;
     }
+    tracing::info!("hello sent to browser");
 
     // Pace windows at their real-world duration so the emitted `t0_us` timeline
     // advances at wall-clock rate. The frontend anchors to the first packet and
@@ -168,13 +235,13 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
     loop {
         tokio::select! {
-            incoming = stream.next() => match incoming {
+            incoming = browser_stream.next() => match incoming {
                 Some(Ok(Message::Binary(bytes))) => {
                     if let Ok(frame) = frame::decode(&bytes) {
                         // On any config change, echo the authoritative snapshot back
                         // so the UI always shows what's actually in effect.
                         if handle_incoming(frame, &mut session, &state) {
-                            if sink.send(Message::Binary(frame::encode(&hello(&state)))).await.is_err() {
+                            if browser_tx.send(Message::Binary(frame::encode(&hello(&state)))).is_err() {
                                 return;
                             }
                         }
@@ -191,15 +258,27 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             },
             _ = interval.tick() => {
                 if session.playing {
-                    for produced in produce(&mut session, &state) {
-                        if sink.send(Message::Binary(frame::encode(&produced))).await.is_err() {
+                    let produced = produce(&mut session, &state);
+                    if !produced.is_empty() {
+                        tracing::debug!("produced {} frames for browser", produced.len());
+                    }
+                    for produced in produced {
+                        if browser_tx.send(Message::Binary(frame::encode(&produced))).is_err() {
+                            tracing::warn!("browser send failed; disconnecting");
                             return;
+                        }
+                        // Forward Emg frames to the optional pose service.
+                        if let (Frame::Emg { .. }, Some(tx)) = (&produced, &pose_tx) {
+                            let _ = tx.send(produced.clone());
                         }
                     }
                 }
             }
         }
     }
+
+    tracing::info!("browser websocket loop ended");
+    browser_forwarder.abort();
 }
 
 fn hello(state: &AppState) -> Frame {

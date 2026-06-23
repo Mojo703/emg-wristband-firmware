@@ -3,6 +3,7 @@
 import type { Component } from 'svelte';
 import EmgViewer from '../panels/EmgViewer.svelte';
 import ConfigApp from '../panels/ConfigApp.svelte';
+import PoseViewer from '../panels/PoseViewer.svelte';
 import Stub from '../panels/Stub.svelte';
 
 export interface Panel {
@@ -18,5 +19,5 @@ export const panels: readonly Panel[] = [
   { id: 'emg', title: 'Stream', icon: 'activity', component: EmgViewer },
   { id: 'config', title: 'Config', icon: 'sliders', component: ConfigApp },
   { id: 'eval', title: 'Eval', icon: 'chart', component: Stub, props: { title: 'Eval dashboard' } },
-  { id: 'pose', title: 'Pose', icon: 'scan', component: Stub, props: { title: 'Pose viewer (SVG-2D)' } },
+  { id: 'pose', title: 'Pose', icon: 'scan', component: PoseViewer },
 ];
