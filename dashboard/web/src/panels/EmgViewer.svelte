@@ -304,26 +304,57 @@
     }
   }
 
-  // Smooth curve through points via quadratic midpoints (control points at the
-  // data, curve passing through segment midpoints) — softens the sparse polyline.
-  function smoothCurve(ctx, points) {
-    if (points.length === 1) return;
+  // Monotone cubic (Fritsch–Carlson PCHIP) through the points. Tangents are
+  // clamped so the curve never overshoots the data — it stays within [0,1] and
+  // invents no peaks between predictions. Locality: each segment depends only on
+  // its immediate neighbours, so a new point reshapes at most the one segment
+  // behind the tip; everything older is frozen.
+  function monotoneCurve(ctx, points) {
+    const n = points.length;
+    if (n < 2) return;
     ctx.moveTo(points[0].x, points[0].y);
-    if (points.length === 2) {
+    if (n === 2) {
       ctx.lineTo(points[1].x, points[1].y);
       return;
     }
-    // Curve through segment midpoints, data points as controls. Stop at length-2
-    // so the closing quadratic's control (points[n-2]) is still *ahead* of the pen;
-    // going one further leaves it behind and kicks out a tangent spike at the tip.
-    for (let i = 1; i < points.length - 2; i++) {
-      const mx = (points[i].x + points[i + 1].x) / 2;
-      const my = (points[i].y + points[i + 1].y) / 2;
-      ctx.quadraticCurveTo(points[i].x, points[i].y, mx, my);
+    const dx = new Array(n - 1);
+    const delta = new Array(n - 1); // secant slopes
+    for (let i = 0; i < n - 1; i++) {
+      const h = points[i + 1].x - points[i].x;
+      dx[i] = h;
+      delta[i] = h !== 0 ? (points[i + 1].y - points[i].y) / h : 0;
     }
-    const last = points[points.length - 1];
-    const prev = points[points.length - 2];
-    ctx.quadraticCurveTo(prev.x, prev.y, last.x, last.y);
+    const m = new Array(n); // tangents
+    m[0] = delta[0];
+    m[n - 1] = delta[n - 2];
+    for (let i = 1; i < n - 1; i++) {
+      // Flat at local extrema (opposite-signed secants), else average the two.
+      m[i] = delta[i - 1] * delta[i] <= 0 ? 0 : (delta[i - 1] + delta[i]) / 2;
+    }
+    for (let i = 0; i < n - 1; i++) {
+      if (delta[i] === 0) {
+        m[i] = 0;
+        m[i + 1] = 0;
+        continue;
+      }
+      const a = m[i] / delta[i];
+      const b = m[i + 1] / delta[i];
+      const s = a * a + b * b;
+      if (s > 9) {
+        const t = 3 / Math.sqrt(s);
+        m[i] = t * a * delta[i];
+        m[i + 1] = t * b * delta[i];
+      }
+    }
+    // Each Hermite segment as a cubic bezier (controls a third of the way in).
+    for (let i = 0; i < n - 1; i++) {
+      const h = dx[i];
+      const x0 = points[i].x;
+      const y0 = points[i].y;
+      const x1 = points[i + 1].x;
+      const y1 = points[i + 1].y;
+      ctx.bezierCurveTo(x0 + h / 3, y0 + (m[i] * h) / 3, x1 - h / 3, y1 - (m[i + 1] * h) / 3, x1, y1);
+    }
   }
 
   function drawTrack(ctx, width, trackTop, trackHeight, now, passStart, phaseX) {
@@ -380,7 +411,7 @@
       ctx.strokeStyle = classColor(cls, count);
       ctx.lineWidth = cls < count ? 1.5 : 1;
       ctx.beginPath();
-      smoothCurve(ctx, pts);
+      monotoneCurve(ctx, pts);
       ctx.stroke();
     }
   }
