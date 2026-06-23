@@ -1,10 +1,19 @@
 // Panel registry — the one place panels are wired in. Add a component and one
 // entry here to extend the dashboard.
+import type { Component } from 'svelte';
 import EmgViewer from '../panels/EmgViewer.svelte';
 import ConfigApp from '../panels/ConfigApp.svelte';
 import Stub from '../panels/Stub.svelte';
 
-export const panels = [
+export interface Panel {
+  readonly id: string;
+  readonly title: string;
+  readonly icon: string;
+  readonly component: Component<any, any, any>;
+  readonly props?: Record<string, unknown>;
+}
+
+export const panels: readonly Panel[] = [
   // Stream folds in the inference readout: the live confidence track + status.
   { id: 'emg', title: 'Stream', icon: 'activity', component: EmgViewer },
   { id: 'config', title: 'Config', icon: 'sliders', component: ConfigApp },

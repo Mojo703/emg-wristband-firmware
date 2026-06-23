@@ -1,14 +1,15 @@
-<script>
-  import { live, api } from '../lib/socket.svelte.js';
+<script lang="ts">
+  import { live, api } from '../lib/socket.svelte';
+  import { MediaKey, isMediaKey, type Binding } from '../lib/protocol';
   import Icon from '../lib/Icon.svelte';
 
-  const KEYS = [
-    { value: 'play_pause', label: 'Play/Pause' },
-    { value: 'next_track', label: 'Next track' },
-    { value: 'prev_track', label: 'Previous track' },
-    { value: 'volume_up', label: 'Volume up' },
-    { value: 'volume_down', label: 'Volume down' },
-    { value: 'mute', label: 'Mute' },
+  const KEYS: readonly { value: MediaKey; label: string }[] = [
+    { value: MediaKey.PlayPause, label: 'Play/Pause' },
+    { value: MediaKey.NextTrack, label: 'Next track' },
+    { value: MediaKey.PrevTrack, label: 'Previous track' },
+    { value: MediaKey.VolumeUp, label: 'Volume up' },
+    { value: MediaKey.VolumeDown, label: 'Volume down' },
+    { value: MediaKey.Mute, label: 'Mute' },
   ];
 
   // The discrete settings reflect the backend's live config directly — no local
@@ -17,16 +18,28 @@
   const gestures = $derived(live.hello?.gestures ?? 0);
   const keymap = $derived(live.hello?.keymap ?? []);
   const levels = $derived(live.hello?.sensitivity_levels ?? []);
+  const gestureIndices = $derived(Array.from({ length: gestures }, (_, i) => i));
 
-  function keyFor(gesture) {
-    return keymap.find((entry) => entry.gesture === gesture)?.key ?? KEYS[gesture % KEYS.length].value;
+  function keyFor(gesture: number): MediaKey {
+    const bound = keymap.find((entry) => entry.gesture === gesture)?.key;
+    if (bound !== undefined) return bound;
+    const fallback = KEYS[gesture % KEYS.length];
+    if (fallback === undefined) return MediaKey.PlayPause;
+    return fallback.value;
   }
-  function setKey(gesture, key) {
-    const next = Array.from({ length: gestures }, (_, g) => ({
+
+  function setKey(gesture: number, key: MediaKey): void {
+    const next: Binding[] = Array.from({ length: gestures }, (_, g) => ({
       gesture: g,
       key: g === gesture ? key : keyFor(g),
     }));
     api.keymap(next);
+  }
+
+  function handleKeyChange(gesture: number, event: Event & { currentTarget: HTMLSelectElement }): void {
+    const key = event.currentTarget.value;
+    if (!isMediaKey(key)) return;
+    setKey(gesture, key);
   }
 
   // WiFi is the exception: free-text credentials are entered as a set and committed
@@ -36,11 +49,15 @@
   let psk = $state('');
   let wifiSeeded = false;
   $effect(() => {
-    if (wifiSeeded || !live.hello) return;
+    if (wifiSeeded || live.hello === null) return;
     wifiSeeded = true;
     ssid = live.hello.wifi_ssid ?? '';
   });
   const saveWifi = () => api.wifi(ssid, psk);
+
+  function handleSensitivityChange(event: Event & { currentTarget: HTMLSelectElement }): void {
+    api.sensitivity(event.currentTarget.value);
+  }
 </script>
 
 <h2>Config</h2>
@@ -51,7 +68,7 @@
   <div class="row">
     <label>
       Trigger sensitivity
-      <select value={live.hello?.sensitivity ?? ''} onchange={(event) => api.sensitivity(event.currentTarget.value)}>
+      <select value={live.hello?.sensitivity ?? ''} onchange={handleSensitivityChange}>
         {#each levels as level}
           <option value={level.id}>{level.label}</option>
         {/each}
@@ -65,11 +82,11 @@
   <div class="row"><Icon name="keyboard" /><strong>Gesture → action</strong></div>
   <table>
     <tbody>
-      {#each Array(gestures) as _, gesture}
+      {#each gestureIndices as gesture}
         <tr>
           <td>Gesture {gesture}</td>
           <td>
-            <select value={keyFor(gesture)} onchange={(event) => setKey(gesture, event.currentTarget.value)}>
+            <select value={keyFor(gesture)} onchange={(event) => handleKeyChange(gesture, event)}>
               {#each KEYS as option}
                 <option value={option.value}>{option.label}</option>
               {/each}

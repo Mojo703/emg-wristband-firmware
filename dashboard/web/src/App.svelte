@@ -1,11 +1,12 @@
-<script>
+<script lang="ts">
   import { onMount } from 'svelte';
-  import { panels } from './lib/panels.js';
-  import { connect, live } from './lib/socket.svelte.js';
+  import { panels } from './lib/panels';
+  import { connect, live } from './lib/socket.svelte';
   import Icon from './lib/Icon.svelte';
 
-  let active = $state(panels[0].id);
-  const current = $derived(panels.find((panel) => panel.id === active));
+  const firstPanel = panels[0]!;
+  let active = $state<string>(firstPanel.id);
+  const current = $derived(panels.find((panel) => panel.id === active) ?? firstPanel);
 
   onMount(connect);
 </script>

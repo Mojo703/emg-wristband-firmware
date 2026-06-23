@@ -1,7 +1,12 @@
-<script>
+<script lang="ts">
   // Inline Lucide (MIT) path data — real SVG icons, no dependency.
-  let { name, size = 18 } = $props();
-  const paths = {
+  interface Props {
+    name: string;
+    size?: number;
+  }
+
+  let { name, size = 18 }: Props = $props();
+  const paths: Record<string, string> = {
     activity: '<path d="M22 12h-4l-3 9L9 3l-3 9H2"/>',
     cpu: '<rect width="16" height="16" x="4" y="4" rx="2"/><rect width="6" height="6" x="9" y="9"/><path d="M9 2v2"/><path d="M15 2v2"/><path d="M9 20v2"/><path d="M15 20v2"/><path d="M2 9h2"/><path d="M2 15h2"/><path d="M20 9h2"/><path d="M20 15h2"/>',
     sliders: '<line x1="21" x2="14" y1="4" y2="4"/><line x1="10" x2="3" y1="4" y2="4"/><line x1="21" x2="12" y1="12" y2="12"/><line x1="8" x2="3" y1="12" y2="12"/><line x1="21" x2="16" y1="20" y2="20"/><line x1="12" x2="3" y1="20" y2="20"/><line x1="14" x2="14" y1="2" y2="6"/><line x1="8" x2="8" y1="10" y2="14"/><line x1="16" x2="16" y1="18" y2="22"/>',

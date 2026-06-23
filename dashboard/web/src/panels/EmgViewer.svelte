@@ -1,4 +1,4 @@
-<script>
+<script lang="ts">
   // Logic-scope EMG viewer. A vertical "now" bar sweeps left→right and wraps; the
   // live trace is painted behind it, a dim erase band sits just ahead of it, and
   // any stretch with no data shows the faint baseline (the "empty / future"
@@ -8,49 +8,67 @@
   // backend `t0_us` timeline. We anchor that timeline to local time once, on the
   // first packet (assuming zero delay for it), so later network jitter can't
   // smear the trace. Re-anchor only on a stream reset or a large drift.
-  import { onMount } from "svelte";
-  import { live, on } from "../lib/socket.svelte.js";
+  import { onMount } from 'svelte';
+  import { live, on } from '../lib/socket.svelte';
+  import { WakeState, type ClassInfo, type DecodedEmg, type EventFrame, type PredictionFrame, type StateInfo } from '../lib/protocol';
 
-  const SPANS = [1, 2, 5, 10, 15, 20, 30]; // ring sizes; the visible span is a subset
+  const SPANS = [1, 2, 5, 10, 15, 20, 30] as const; // ring sizes; the visible span is a subset
   const MAX_SPAN_SEC = Math.max(...SPANS);
   const BAND_HEIGHT = 24; // wake-state / streak row at the bottom of the track
-  const BG = "#0b0e14";
-  const NEUTRAL = "#6b7280"; // fallback when a backend colour is missing
-  const TRACE = "#8593a8"; // EMG line accent (cosmetic; not class-related)
+  const BG = '#0b0e14';
+  const NEUTRAL = '#6b7280'; // fallback when a backend colour is missing
+  const TRACE = '#8593a8'; // EMG line accent (cosmetic; not class-related)
+  const DEFAULT_SPAN = SPANS[Math.floor(SPANS.length / 2)] ?? 10;
 
-  let canvas;
-  let spanSec = $state(SPANS[Math.floor(SPANS.length / 2)]);
+  let canvas: HTMLCanvasElement | undefined = $state(undefined);
+  let spanSec = $state<number>(DEFAULT_SPAN);
   // --- imperative scope state (deliberately non-reactive; touched per frame) ---
-  let sampleRate = $state(0);
-  let channels = $state(0);
+  let sampleRate = $state<number>(0);
+  let channels = $state<number>(0);
   let windowSamples = 0; // samples per channel per window, for prediction timing
   let capacity = 0; // ring length in samples per channel
-  let rings = null; // Float32Array[channels], indexed by absoluteSample % capacity
-  let ringAbs = null; // Float64Array: which absolute sample index a slot holds
+  let rings: Float32Array[] | null = null; // indexed by absoluteSample % capacity
+  let ringAbs: Float64Array | null = null; // which absolute sample index a slot holds
   let newestAbs = -1;
-  let anchorMs = null; // localMs(a) = anchorMs + a * msPerSample
+  let anchorMs: number | null = null; // localMs(a) = anchorMs + a * msPerSample
   let msPerSample = 0;
 
-  const preds = []; // { seq, softmax, argmax, accepted, wakeState, streak }
-  const events = []; // generic decision events: { tUs, kind, label, color }
+  interface StoredPrediction {
+    readonly seq: number;
+    readonly softmax: Float32Array;
+    readonly argmax: number;
+    readonly accepted: boolean;
+    readonly wakeState: WakeState;
+    readonly streak: number;
+  }
+
+  interface StoredEvent {
+    readonly tUs: number;
+    readonly kind: string;
+    readonly label: string | null;
+    readonly color: string | null;
+  }
+
+  const preds: StoredPrediction[] = []; // { seq, softmax, argmax, accepted, wakeState, streak }
+  const events: StoredEvent[] = []; // generic decision events: { tUs, kind, label, color }
 
   // Reusable per-column min/max envelope buffers (sized to canvas width). Binning
   // the visible samples into pixel columns caps canvas work at ~width segments per
   // channel instead of one path node per sample.
   let colMin = new Float32Array(0);
   let colMax = new Float32Array(0);
-  function ensureColumns(cols) {
+  function ensureColumns(cols: number): void {
     if (colMin.length !== cols) {
       colMin = new Float32Array(cols);
       colMax = new Float32Array(cols);
     }
   }
 
-  function localMs(a) {
-    return anchorMs + a * msPerSample;
+  function localMs(a: number): number {
+    return (anchorMs as number) + a * msPerSample;
   }
 
-  function reinit(emg) {
+  function reinit(emg: DecodedEmg): void {
     sampleRate = emg.sampleRate;
     channels = emg.channels;
     windowSamples = emg.time;
@@ -63,20 +81,25 @@
     preds.length = 0;
   }
 
-  function onEmg(emg) {
-    if (channels !== emg.channels || sampleRate !== emg.sampleRate) reinit(emg);
+  function onEmg(emg: DecodedEmg): void {
+    if (channels !== emg.channels || sampleRate !== emg.sampleRate) {
+      reinit(emg);
+    }
     const { int16, time, scaleUv } = emg;
     // Absolute sample index of this window's first sample, from the backend clock.
     const idx0 = Math.round((emg.t0us / 1e6) * sampleRate);
 
     // A backwards jump means the stream reset (e.g. source switch / seq wrap).
     const reset = idx0 < newestAbs - 1;
+    if (rings === null || ringAbs === null) return; // reinit should have set these
     for (let i = 0; i < time; i++) {
       const a = idx0 + i;
       const pos = ((a % capacity) + capacity) % capacity;
       ringAbs[pos] = a;
-      for (let ch = 0; ch < channels; ch++)
-        rings[ch][pos] = int16[ch * time + i] * scaleUv;
+      for (let ch = 0; ch < channels; ch++) {
+        const ring = rings[ch]!; // ch < channels by loop invariant
+        ring[pos] = int16[ch * time + i]! * scaleUv;
+      }
     }
     newestAbs = idx0 + time - 1;
 
@@ -89,7 +112,7 @@
     }
   }
 
-  function onPrediction(p) {
+  function onPrediction(p: PredictionFrame): void {
     preds.push({
       seq: p.seq,
       softmax: Float32Array.from(p.softmax),
@@ -98,23 +121,27 @@
       wakeState: p.wake_state,
       streak: p.streak,
     });
-    if (preds.length > 4096) preds.splice(0, preds.length - 4096);
+    if (preds.length > 4096) {
+      preds.splice(0, preds.length - 4096);
+    }
   }
 
-  function onEvent(e) {
+  function onEvent(e: EventFrame): void {
     events.push({
       tUs: e.t_us,
       kind: e.kind,
       label: e.label ?? null,
       color: e.color ?? null,
     });
-    if (events.length > 4096) events.splice(0, events.length - 4096);
+    if (events.length > 4096) {
+      events.splice(0, events.length - 4096);
+    }
   }
 
   onMount(() => {
-    const offEmg = on("emg", onEmg);
-    const offPred = on("prediction", onPrediction);
-    const offEvent = on("event", onEvent);
+    const offEmg = on('emg', onEmg);
+    const offPred = on('prediction', onPrediction);
+    const offEvent = on('event', onEvent);
     let raf = requestAnimationFrame(frame);
     return () => {
       offEmg();
@@ -123,7 +150,7 @@
       cancelAnimationFrame(raf);
     };
 
-    function frame() {
+    function frame(): void {
       raf = requestAnimationFrame(frame);
       render();
     }
@@ -131,18 +158,18 @@
 
   // Display descriptors come entirely from the backend (labels, colours, the
   // command/reject split, state vocabulary). The frontend just looks them up.
-  const classInfo = $derived(live.hello?.classes ?? []);
-  const stateByName = $derived(
+  const classInfo = $derived<readonly ClassInfo[]>(live.hello?.classes ?? []);
+  const stateByName = $derived<Record<string, StateInfo>>(
     Object.fromEntries(
       (live.hello?.states ?? []).map((state) => [state.name, state]),
     ),
   );
-  function classColor(cls) {
+  function classColor(cls: number): string {
     return classInfo[cls]?.color ?? NEUTRAL;
   }
 
-  function render() {
-    if (!canvas) return;
+  function render(): void {
+    if (canvas === undefined) return;
     const dpr = window.devicePixelRatio || 1;
     const cssWidth = canvas.clientWidth;
     const cssHeight = canvas.clientHeight;
@@ -153,7 +180,8 @@
     if (canvas.width !== pxWidth) canvas.width = pxWidth;
     if (canvas.height !== pxHeight) canvas.height = pxHeight;
 
-    const ctx = canvas.getContext("2d");
+    const ctx = canvas.getContext('2d');
+    if (ctx === null) return;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0); // draw in CSS pixels
     ctx.clearRect(0, 0, cssWidth, cssHeight);
     ctx.fillStyle = BG;
@@ -165,11 +193,11 @@
     const now = performance.now();
 
     // Where a local-time sample lands on the wrapping sweep.
-    const phaseX = (tMs) =>
+    const phaseX = (tMs: number): number =>
       ((((tMs % spanMs) + spanMs) % spanMs) / spanMs) * width;
     const xNow = phaseX(now);
 
-    const trackHeight = classInfo.length ? Math.min(120, height * 0.28) : 0;
+    const trackHeight = classInfo.length > 0 ? Math.min(120, height * 0.28) : 0;
     const emgHeight = height - trackHeight;
 
     // Draw only the current sweep pass: [passStart, now] maps to [0, xNow]. Data
@@ -181,10 +209,12 @@
     const rowCenterY = height - BAND_HEIGHT / 2;
 
     drawTimeGrid(ctx, width, height, spanMs);
-    if (channels && rings)
+    if (channels > 0 && rings !== null) {
       drawChannels(ctx, width, emgHeight, spanMs, now, passStart);
-    if (trackHeight)
+    }
+    if (trackHeight > 0) {
       drawTrack(ctx, width, emgHeight, trackHeight, now, passStart, phaseX);
+    }
     drawEvents(ctx, width, height, now, passStart, phaseX, rowCenterY);
     drawSweep(ctx, xNow, height, width);
   }
@@ -193,18 +223,26 @@
   // glyph centred on the streak row. The glyph is the event colour with a light
   // contrast ring so it stays visible even on the same-coloured active band. The
   // frontend knows nothing about each kind — it draws what the backend sent.
-  function drawEvents(ctx, width, height, now, passStart, phaseX, rowCenterY) {
+  function drawEvents(
+    ctx: CanvasRenderingContext2D,
+    _width: number,
+    height: number,
+    now: number,
+    passStart: number,
+    phaseX: (tMs: number) => number,
+    rowCenterY: number,
+  ): void {
     if (anchorMs === null) return;
-    ctx.font = "13px system-ui, sans-serif";
-    ctx.textAlign = "center";
+    ctx.font = '13px system-ui, sans-serif';
+    ctx.textAlign = 'center';
     for (const e of events) {
       const t = anchorMs + e.tUs / 1000;
       if (t < passStart || t > now) continue;
       const x = phaseX(t);
-      const color = e.color || NEUTRAL;
+      const color = e.color ?? NEUTRAL;
 
       // Context line down the plot.
-      ctx.strokeStyle = color + "ee";
+      ctx.strokeStyle = color + 'ee';
       ctx.lineWidth = 2;
       ctx.setLineDash([3, 4]);
       ctx.beginPath();
@@ -223,27 +261,32 @@
       ctx.closePath();
       ctx.fillStyle = color;
       ctx.fill();
-      ctx.strokeStyle = "#0b0e14";
+      ctx.strokeStyle = '#0b0e14';
       ctx.lineWidth = 1.5;
       ctx.stroke();
-      ctx.strokeStyle = "#e5e7eb";
+      ctx.strokeStyle = '#e5e7eb';
       ctx.lineWidth = 0.75;
       ctx.stroke();
 
       // Label just above the band, centred on the line.
-      if (e.label) {
-        ctx.fillStyle = "#e5e7ebee";
+      if (e.label !== null) {
+        ctx.fillStyle = '#e5e7ebee';
         ctx.fillText(e.label, x, rowCenterY - BAND_HEIGHT / 2 - 8);
       }
     }
-    ctx.textAlign = "start";
+    ctx.textAlign = 'start';
   }
 
-  function drawTimeGrid(ctx, width, height, spanMs) {
-    ctx.strokeStyle = "#ffffff14";
-    ctx.fillStyle = "#ffffff44";
+  function drawTimeGrid(
+    ctx: CanvasRenderingContext2D,
+    width: number,
+    height: number,
+    _spanMs: number,
+  ): void {
+    ctx.strokeStyle = '#ffffff14';
+    ctx.fillStyle = '#ffffff44';
     ctx.lineWidth = 1;
-    ctx.font = "13px system-ui, sans-serif";
+    ctx.font = '13px system-ui, sans-serif';
     // Vertical lines at second boundaries (sweep x is fixed for a given offset).
     for (let s = 0; s <= spanSec; s++) {
       const x = (s / spanSec) * width;
@@ -254,7 +297,15 @@
     }
   }
 
-  function drawChannels(ctx, width, emgHeight, spanMs, now, passStart) {
+  function drawChannels(
+    ctx: CanvasRenderingContext2D,
+    width: number,
+    emgHeight: number,
+    spanMs: number,
+    _now: number,
+    passStart: number,
+  ): void {
+    if (rings === null || ringAbs === null || anchorMs === null || channels === 0) return;
     const laneHeight = emgHeight / channels;
     const cols = Math.max(1, Math.floor(width));
     ensureColumns(cols);
@@ -277,14 +328,14 @@
     const useEnvelope = samplesPerColumn >= 8;
     const stride = Math.max(1, Math.round(samplesPerColumn / 2)); // ~2 points/column
 
-    ctx.font = "13px system-ui, sans-serif";
+    ctx.font = '13px system-ui, sans-serif';
     for (let ch = 0; ch < channels; ch++) {
       const laneTop = ch * laneHeight;
       const midY = laneTop + laneHeight / 2;
-      const ring = rings[ch];
+      const ring = rings[ch]!; // ch < channels by loop invariant
 
       // Faint baseline + lane separator: this is the "empty / future" look.
-      ctx.strokeStyle = "#ffffff10";
+      ctx.strokeStyle = '#ffffff10';
       ctx.beginPath();
       ctx.moveTo(0, midY);
       ctx.lineTo(width, midY);
@@ -297,7 +348,7 @@
       for (let a = startAbs; a <= newestAbs; a += stride) {
         const pos = a % capacity;
         if (ringAbs[pos] === a) {
-          const av = Math.abs(ring[pos]);
+          const av = Math.abs(ring[pos]!);
           if (av > peak) peak = av;
         }
       }
@@ -321,9 +372,11 @@
           if (ringAbs[pos] === a) {
             let col = colFrac | 0;
             if (col >= cols) col = cols - 1;
-            const v = ring[pos];
-            if (!(v >= colMin[col])) colMin[col] = v; // NaN-safe init via negated compare
-            if (!(v <= colMax[col])) colMax[col] = v;
+            const v = ring[pos]!;
+            const colMinVal = colMin[col]!;
+            const colMaxVal = colMax[col]!;
+            if (!(v >= colMinVal)) colMin[col] = v;
+            if (!(v <= colMaxVal)) colMax[col] = v;
           }
           pos++;
           if (pos >= capacity) pos = 0;
@@ -331,10 +384,11 @@
           if (colFrac >= cols) colFrac -= cols;
         }
         for (let col = 0; col < cols; col++) {
-          const lo = colMin[col];
+          const lo = colMin[col]!;
           if (lo !== lo) continue; // NaN: empty column → gap shows the baseline
           const x = col + 0.5;
-          ctx.moveTo(x, midY - colMax[col] * gain);
+          const hi = colMax[col]!;
+          ctx.moveTo(x, midY - hi * gain);
           ctx.lineTo(x, midY - lo * gain);
         }
       } else {
@@ -348,18 +402,26 @@
           }
           const t = anchorMs + a * msPerSample;
           const x = (((t % spanMs) + spanMs) % spanMs) * invSpan * cols;
-          const y = midY - ring[pos] * gain;
-          if (drawing) ctx.lineTo(x, y);
-          else ctx.moveTo(x, y);
+          const y = midY - ring[pos]! * gain;
+          if (drawing) {
+            ctx.lineTo(x, y);
+          } else {
+            ctx.moveTo(x, y);
+          }
           drawing = true;
         }
       }
       ctx.stroke();
 
       // Channel label, top-left of its lane.
-      ctx.fillStyle = "#ffffff77";
+      ctx.fillStyle = '#ffffff77';
       ctx.fillText(`CH${ch}`, 6, laneTop + 13);
     }
+  }
+
+  interface Point {
+    readonly x: number;
+    readonly y: number;
   }
 
   // Monotone cubic (Fritsch–Carlson PCHIP) through the points. Tangents are
@@ -367,27 +429,34 @@
   // invents no peaks between predictions. Locality: each segment depends only on
   // its immediate neighbours, so a new point reshapes at most the one segment
   // behind the tip; everything older is frozen.
-  function monotoneCurve(ctx, points) {
+  function monotoneCurve(
+    ctx: CanvasRenderingContext2D,
+    points: readonly Point[],
+  ): void {
     const n = points.length;
     if (n < 2) return;
-    ctx.moveTo(points[0].x, points[0].y);
+    const p0 = points[0]!;
+    ctx.moveTo(p0.x, p0.y);
     if (n === 2) {
-      ctx.lineTo(points[1].x, points[1].y);
+      const p1 = points[1]!;
+      ctx.lineTo(p1.x, p1.y);
       return;
     }
-    const dx = new Array(n - 1);
-    const delta = new Array(n - 1); // secant slopes
+    const dx = new Array<number>(n - 1);
+    const delta = new Array<number>(n - 1); // secant slopes
     for (let i = 0; i < n - 1; i++) {
-      const h = points[i + 1].x - points[i].x;
+      const a = points[i]!;
+      const b = points[i + 1]!;
+      const h = b.x - a.x;
       dx[i] = h;
-      delta[i] = h !== 0 ? (points[i + 1].y - points[i].y) / h : 0;
+      delta[i] = h !== 0 ? (b.y - a.y) / h : 0;
     }
-    const m = new Array(n); // tangents
-    m[0] = delta[0];
-    m[n - 1] = delta[n - 2];
+    const m = new Array<number>(n); // tangents
+    m[0] = delta[0]!;
+    m[n - 1] = delta[n - 2]!;
     for (let i = 1; i < n - 1; i++) {
       // Flat at local extrema (opposite-signed secants), else average the two.
-      m[i] = delta[i - 1] * delta[i] <= 0 ? 0 : (delta[i - 1] + delta[i]) / 2;
+      m[i] = delta[i - 1]! * delta[i]! <= 0 ? 0 : (delta[i - 1]! + delta[i]!) / 2;
     }
     for (let i = 0; i < n - 1; i++) {
       if (delta[i] === 0) {
@@ -395,42 +464,44 @@
         m[i + 1] = 0;
         continue;
       }
-      const a = m[i] / delta[i];
-      const b = m[i + 1] / delta[i];
+      const a = m[i]! / delta[i]!;
+      const b = m[i + 1]! / delta[i]!;
       const s = a * a + b * b;
       if (s > 9) {
         const t = 3 / Math.sqrt(s);
-        m[i] = t * a * delta[i];
-        m[i + 1] = t * b * delta[i];
+        m[i] = t * a * delta[i]!;
+        m[i + 1] = t * b * delta[i]!;
       }
     }
     // Each Hermite segment as a cubic bezier (controls a third of the way in).
     for (let i = 0; i < n - 1; i++) {
-      const h = dx[i];
-      const x0 = points[i].x;
-      const y0 = points[i].y;
-      const x1 = points[i + 1].x;
-      const y1 = points[i + 1].y;
+      const start = points[i]!;
+      const end = points[i + 1]!;
+      const h = dx[i]!;
       ctx.bezierCurveTo(
-        x0 + h / 3,
-        y0 + (m[i] * h) / 3,
-        x1 - h / 3,
-        y1 - (m[i + 1] * h) / 3,
-        x1,
-        y1,
+        start.x + h / 3,
+        start.y + (m[i]! * h) / 3,
+        end.x - h / 3,
+        end.y - (m[i + 1]! * h) / 3,
+        end.x,
+        end.y,
       );
     }
   }
 
+  interface VisiblePrediction extends StoredPrediction {
+    x: number;
+  }
+
   function drawTrack(
-    ctx,
-    width,
-    trackTop,
-    trackHeight,
-    now,
-    passStart,
-    phaseX,
-  ) {
+    ctx: CanvasRenderingContext2D,
+    width: number,
+    trackTop: number,
+    trackHeight: number,
+    now: number,
+    passStart: number,
+    phaseX: (tMs: number) => number,
+  ): void {
     const classCount = classInfo.length;
     const needed = live.hello?.needed ?? 3;
     // Authoritative τ from the backend (per-window prediction, or Hello before the
@@ -443,52 +514,55 @@
     const bandHeight = BAND_HEIGHT;
     const confBottom = bottom - bandHeight;
     const confHeight = trackHeight - bandHeight;
-    const yFor = (v) => confBottom - v * (confHeight - 6) - 3;
+    const yFor = (v: number): number => confBottom - v * (confHeight - 6) - 3;
 
     // Confidence frame + 50% line.
-    ctx.strokeStyle = "#ffffff14";
+    ctx.strokeStyle = '#ffffff14';
     ctx.beginPath();
     ctx.moveTo(0, top);
     ctx.lineTo(width, top);
     ctx.moveTo(0, yFor(0.5));
     ctx.lineTo(width, yFor(0.5));
     ctx.stroke();
-    ctx.fillStyle = "#ffffff66";
-    ctx.font = "13px system-ui, sans-serif";
-    ctx.fillText("Class Confidence", 6, top + 13);
+    ctx.fillStyle = '#ffffff66';
+    ctx.font = '13px system-ui, sans-serif';
+    ctx.fillText('Class Confidence', 6, top + 13);
 
     // τ threshold line (the per-window trigger level) — plain dashed line.
     const yTau = yFor(tauLine);
-    ctx.strokeStyle = "#e5e7eb55";
+    ctx.strokeStyle = '#e5e7eb55';
     ctx.setLineDash([4, 4]);
     ctx.beginPath();
     ctx.moveTo(0, yTau);
     ctx.lineTo(width, yTau);
     ctx.stroke();
     ctx.setLineDash([]);
-    ctx.fillStyle = "#e5e7eb99";
-    ctx.fillText("τ", width - 14, yTau - 3);
+    ctx.fillStyle = '#e5e7eb99';
+    ctx.fillText('τ', width - 14, yTau - 3);
 
-    if (!classCount) return;
+    if (classCount === 0) return;
+    if (anchorMs === null) return;
 
     // Predictions in the current sweep pass, timed off their window's backend
     // index. Each covers window `seq`, i.e. samples [seq*window, (seq+1)*window).
-    const visible = [];
+    const visible: VisiblePrediction[] = [];
     for (const p of preds) {
       const endAbs = p.seq * windowSamples + windowSamples - 1;
       const t = localMs(endAbs);
-      if (t >= passStart && t <= now) visible.push({ ...p, x: phaseX(t) });
+      if (t >= passStart && t <= now) {
+        visible.push({ ...p, x: phaseX(t) });
+      }
     }
-    if (!visible.length) return;
+    if (visible.length === 0) return;
     const xNow = phaseX(now);
 
     // Fill under the chosen class only where it is above threshold.
     for (let i = 0; i < visible.length - 1; i++) {
-      const a = visible[i];
+      const a = visible[i]!;
       if (a.streak <= 0 && !a.accepted) continue;
-      const b = visible[i + 1];
-      const v = a.softmax[a.argmax];
-      ctx.fillStyle = classColor(a.argmax) + "18";
+      const b = visible[i + 1]!;
+      const v = a.softmax[a.argmax]!;
+      ctx.fillStyle = classColor(a.argmax) + '18';
       ctx.beginPath();
       ctx.moveTo(a.x, confBottom);
       ctx.lineTo(a.x, yFor(v));
@@ -499,10 +573,12 @@
     }
 
     // One smoothed line per class, coloured and weighted from the backend table.
-    const pts = new Array(visible.length);
+    const pts = new Array<Point>(visible.length);
     for (let cls = 0; cls < classCount; cls++) {
-      for (let i = 0; i < visible.length; i++)
-        pts[i] = { x: visible[i].x, y: yFor(visible[i].softmax[cls] ?? 0) };
+      for (let i = 0; i < visible.length; i++) {
+        const p = visible[i]!;
+        pts[i] = { x: p.x, y: yFor(p.softmax[cls] ?? 0) };
+      }
       ctx.strokeStyle = classColor(cls);
       ctx.lineWidth = classInfo[cls]?.command ? 1.5 : 1;
       ctx.beginPath();
@@ -519,19 +595,19 @@
   // saturates once latched. Different commands stay distinguishable by hue. The
   // ramp ends come from the backend state intensities.
   function drawStateBand(
-    ctx,
-    width,
-    bandTop,
-    bandHeight,
-    needed,
-    visible,
-    xNow,
-  ) {
-    const idleAlpha = stateByName.idle?.intensity ?? 0.12;
-    const activeAlpha = stateByName.active?.intensity ?? 0.9;
+    ctx: CanvasRenderingContext2D,
+    _width: number,
+    bandTop: number,
+    bandHeight: number,
+    needed: number,
+    visible: readonly VisiblePrediction[],
+    xNow: number,
+  ): void {
+    const idleAlpha = stateByName['idle']?.intensity ?? 0.12;
+    const activeAlpha = stateByName['active']?.intensity ?? 0.9;
     for (let i = 0; i < visible.length; i++) {
-      const a = visible[i];
-      const x1 = i + 1 < visible.length ? visible[i + 1].x : xNow;
+      const a = visible[i]!;
+      const x1 = i + 1 < visible.length ? visible[i + 1]!.x : xNow;
       const progress = Math.min(a.streak / needed, 1); // 0 → idle, 1 → latched
       ctx.globalAlpha = idleAlpha + (activeAlpha - idleAlpha) * progress;
       ctx.fillStyle = a.streak === 0 ? NEUTRAL : classColor(a.argmax);
@@ -539,17 +615,22 @@
     }
     ctx.globalAlpha = 1;
 
-    ctx.fillStyle = "#ffffff66";
-    ctx.font = "13px system-ui, sans-serif";
-    ctx.fillText("State", 6, bandTop + 13);
+    ctx.fillStyle = '#ffffff66';
+    ctx.font = '13px system-ui, sans-serif';
+    ctx.fillText('State', 6, bandTop + 13);
   }
 
-  function drawSweep(ctx, xNow, height, width) {
+  function drawSweep(
+    ctx: CanvasRenderingContext2D,
+    xNow: number,
+    height: number,
+    width: number,
+  ): void {
     // Dim the whole future region (right of the present) — empty, less-emphasis.
-    ctx.fillStyle = "#0b0e1466";
-    ctx.fillRect(xNow, 0, width - xNow, height);
+    ctx.fillStyle = '#0b0e1466';
+    ctx.fillRect(xNow, 0, Math.max(0, width - xNow), height);
     // The present.
-    ctx.strokeStyle = "#e5e7eb";
+    ctx.strokeStyle = '#e5e7eb';
     ctx.lineWidth = 1;
     ctx.beginPath();
     ctx.moveTo(xNow, 0);
@@ -571,7 +652,7 @@
 
 <canvas bind:this={canvas}></canvas>
 
-{#if classInfo.length}
+{#if classInfo.length > 0}
   <div class="legend">
     {#each classInfo as info}
       <span class="legend-item">

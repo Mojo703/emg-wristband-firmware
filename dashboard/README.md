@@ -9,9 +9,9 @@ hardware required; it runs against the `.npy` exports and a trained checkpoint.
 
 - `src/` — axum backend: replay source, reject pipeline (3-of-3 smoothing +
   wake-gate), config persistence, and the `/ws` session loop.
-- `web/` — Svelte (Vite) frontend: a panel shell + registry. MVP panels are the
-  EMG stream viewer, inference inspector, and config app (keymap + WiFi). Eval and
-  pose are registered stubs.
+- `web/` — Svelte 5 + TypeScript (Vite) frontend: a panel shell + registry. MVP
+  panels are the EMG stream viewer, inference inspector, and config app (keymap +
+  WiFi). Eval and pose are registered stubs.
 - Shared wire types live in the sibling [`protocol`](../protocol) crate (CBOR via
   ciborium ↔ cbor-x). Inference reuses [`emg-tds`](../emg-tds)'s `Classifier`.
 
@@ -27,8 +27,8 @@ frontend iteration; open <http://localhost:5173>, which proxies `/ws` to the
 backend. The equivalent manual steps:
 
 ```
-cd web && pnpm install && pnpm run build   # emits web/dist
-cd .. && cargo run                          # serves the app + /ws on :8090
+cd web && pnpm install && pnpm run check && pnpm run build  # type-check + emit web/dist
+cd .. && cargo run                                          # serves the app + /ws on :8090
 ```
 
 Env: `DASHBOARD_ADDR` (default `0.0.0.0:8090`), `EMG_DATA_DIR` (default
