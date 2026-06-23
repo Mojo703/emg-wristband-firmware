@@ -8,21 +8,21 @@
   // backend `t0_us` timeline. We anchor that timeline to local time once, on the
   // first packet (assuming zero delay for it), so later network jitter can't
   // smear the trace. Re-anchor only on a stream reset or a large drift.
-  import { onMount } from 'svelte';
-  import { live, on } from '../lib/socket.svelte.js';
+  import { onMount } from "svelte";
+  import { live, on } from "../lib/socket.svelte.js";
 
-  const MAX_SPAN_SEC = 30; // ring sizing ceiling; the visible span is a subset
+  const SPANS = [1, 2, 5, 10, 15, 20, 30]; // ring sizes; the visible span is a subset
+  const MAX_SPAN_SEC = Math.max(...SPANS);
   const BAND_HEIGHT = 24; // wake-state / streak row at the bottom of the track
-  const BG = '#0b0e14';
-  const NEUTRAL = '#6b7280'; // fallback when a backend colour is missing
-  const TRACE = '#3b82f6'; // EMG line accent (cosmetic; not class-related)
+  const BG = "#0b0e14";
+  const NEUTRAL = "#6b7280"; // fallback when a backend colour is missing
+  const TRACE = "#8593a8"; // EMG line accent (cosmetic; not class-related)
 
   let canvas;
-  let spanSec = $state(6);
-
+  let spanSec = $state(SPANS[Math.floor(SPANS.length / 2)]);
   // --- imperative scope state (deliberately non-reactive; touched per frame) ---
-  let sampleRate = 0;
-  let channels = 0;
+  let sampleRate = $state(0);
+  let channels = $state(0);
   let windowSamples = 0; // samples per channel per window, for prediction timing
   let capacity = 0; // ring length in samples per channel
   let rings = null; // Float32Array[channels], indexed by absoluteSample % capacity
@@ -75,12 +75,14 @@
       const a = idx0 + i;
       const pos = ((a % capacity) + capacity) % capacity;
       ringAbs[pos] = a;
-      for (let ch = 0; ch < channels; ch++) rings[ch][pos] = int16[ch * time + i] * scaleUv;
+      for (let ch = 0; ch < channels; ch++)
+        rings[ch][pos] = int16[ch * time + i] * scaleUv;
     }
     newestAbs = idx0 + time - 1;
 
     const now = performance.now();
-    const drifted = anchorMs !== null && Math.abs(localMs(newestAbs) - now) > spanSec * 1000;
+    const drifted =
+      anchorMs !== null && Math.abs(localMs(newestAbs) - now) > spanSec * 1000;
     if (anchorMs === null || reset || drifted) {
       // Pin the newest sample at "now": one window of lead keeps it under the bar.
       anchorMs = now - newestAbs * msPerSample;
@@ -100,14 +102,19 @@
   }
 
   function onEvent(e) {
-    events.push({ tUs: e.t_us, kind: e.kind, label: e.label ?? null, color: e.color ?? null });
+    events.push({
+      tUs: e.t_us,
+      kind: e.kind,
+      label: e.label ?? null,
+      color: e.color ?? null,
+    });
     if (events.length > 4096) events.splice(0, events.length - 4096);
   }
 
   onMount(() => {
-    const offEmg = on('emg', onEmg);
-    const offPred = on('prediction', onPrediction);
-    const offEvent = on('event', onEvent);
+    const offEmg = on("emg", onEmg);
+    const offPred = on("prediction", onPrediction);
+    const offEvent = on("event", onEvent);
     let raf = requestAnimationFrame(frame);
     return () => {
       offEmg();
@@ -126,7 +133,9 @@
   // command/reject split, state vocabulary). The frontend just looks them up.
   const classInfo = $derived(live.hello?.classes ?? []);
   const stateByName = $derived(
-    Object.fromEntries((live.hello?.states ?? []).map((state) => [state.name, state]))
+    Object.fromEntries(
+      (live.hello?.states ?? []).map((state) => [state.name, state]),
+    ),
   );
   function classColor(cls) {
     return classInfo[cls]?.color ?? NEUTRAL;
@@ -144,7 +153,7 @@
     if (canvas.width !== pxWidth) canvas.width = pxWidth;
     if (canvas.height !== pxHeight) canvas.height = pxHeight;
 
-    const ctx = canvas.getContext('2d');
+    const ctx = canvas.getContext("2d");
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0); // draw in CSS pixels
     ctx.clearRect(0, 0, cssWidth, cssHeight);
     ctx.fillStyle = BG;
@@ -156,7 +165,8 @@
     const now = performance.now();
 
     // Where a local-time sample lands on the wrapping sweep.
-    const phaseX = (tMs) => ((((tMs % spanMs) + spanMs) % spanMs) / spanMs) * width;
+    const phaseX = (tMs) =>
+      ((((tMs % spanMs) + spanMs) % spanMs) / spanMs) * width;
     const xNow = phaseX(now);
 
     const trackHeight = classInfo.length ? Math.min(120, height * 0.28) : 0;
@@ -171,8 +181,10 @@
     const rowCenterY = height - BAND_HEIGHT / 2;
 
     drawTimeGrid(ctx, width, height, spanMs);
-    if (channels && rings) drawChannels(ctx, width, emgHeight, spanMs, now, passStart);
-    if (trackHeight) drawTrack(ctx, width, emgHeight, trackHeight, now, passStart, phaseX);
+    if (channels && rings)
+      drawChannels(ctx, width, emgHeight, spanMs, now, passStart);
+    if (trackHeight)
+      drawTrack(ctx, width, emgHeight, trackHeight, now, passStart, phaseX);
     drawEvents(ctx, width, height, now, passStart, phaseX, rowCenterY);
     drawSweep(ctx, xNow, height, width);
   }
@@ -183,8 +195,8 @@
   // frontend knows nothing about each kind — it draws what the backend sent.
   function drawEvents(ctx, width, height, now, passStart, phaseX, rowCenterY) {
     if (anchorMs === null) return;
-    ctx.font = '10px system-ui, sans-serif';
-    ctx.textAlign = 'center';
+    ctx.font = "13px system-ui, sans-serif";
+    ctx.textAlign = "center";
     for (const e of events) {
       const t = anchorMs + e.tUs / 1000;
       if (t < passStart || t > now) continue;
@@ -192,8 +204,8 @@
       const color = e.color || NEUTRAL;
 
       // Context line down the plot.
-      ctx.strokeStyle = color + '66';
-      ctx.lineWidth = 1;
+      ctx.strokeStyle = color + "ee";
+      ctx.lineWidth = 2;
       ctx.setLineDash([3, 4]);
       ctx.beginPath();
       ctx.moveTo(x, 0);
@@ -211,27 +223,27 @@
       ctx.closePath();
       ctx.fillStyle = color;
       ctx.fill();
-      ctx.strokeStyle = '#0b0e14';
+      ctx.strokeStyle = "#0b0e14";
       ctx.lineWidth = 1.5;
       ctx.stroke();
-      ctx.strokeStyle = '#e5e7eb';
+      ctx.strokeStyle = "#e5e7eb";
       ctx.lineWidth = 0.75;
       ctx.stroke();
 
       // Label just above the band, centred on the line.
       if (e.label) {
-        ctx.fillStyle = '#e5e7ebdd';
-        ctx.fillText(e.label, x, rowCenterY - BAND_HEIGHT / 2 - 4);
+        ctx.fillStyle = "#e5e7ebee";
+        ctx.fillText(e.label, x, rowCenterY - BAND_HEIGHT / 2 - 8);
       }
     }
-    ctx.textAlign = 'start';
+    ctx.textAlign = "start";
   }
 
   function drawTimeGrid(ctx, width, height, spanMs) {
-    ctx.strokeStyle = '#ffffff14';
-    ctx.fillStyle = '#ffffff44';
+    ctx.strokeStyle = "#ffffff14";
+    ctx.fillStyle = "#ffffff44";
     ctx.lineWidth = 1;
-    ctx.font = '11px system-ui, sans-serif';
+    ctx.font = "13px system-ui, sans-serif";
     // Vertical lines at second boundaries (sweep x is fixed for a given offset).
     for (let s = 0; s <= spanSec; s++) {
       const x = (s / spanSec) * width;
@@ -240,7 +252,6 @@
       ctx.lineTo(x, height);
       ctx.stroke();
     }
-    ctx.fillText(`${spanSec}s span · ${sampleRate || '—'} Hz`, 6, height - 6);
   }
 
   function drawChannels(ctx, width, emgHeight, spanMs, now, passStart) {
@@ -266,14 +277,14 @@
     const useEnvelope = samplesPerColumn >= 8;
     const stride = Math.max(1, Math.round(samplesPerColumn / 2)); // ~2 points/column
 
-    ctx.font = '11px system-ui, sans-serif';
+    ctx.font = "13px system-ui, sans-serif";
     for (let ch = 0; ch < channels; ch++) {
       const laneTop = ch * laneHeight;
       const midY = laneTop + laneHeight / 2;
       const ring = rings[ch];
 
       // Faint baseline + lane separator: this is the "empty / future" look.
-      ctx.strokeStyle = '#ffffff10';
+      ctx.strokeStyle = "#ffffff10";
       ctx.beginPath();
       ctx.moveTo(0, midY);
       ctx.lineTo(width, midY);
@@ -302,7 +313,10 @@
         colMin.fill(NaN);
         colMax.fill(NaN);
         let pos = startAbs % capacity;
-        let colFrac = ((((anchorMs + startAbs * msPerSample) % spanMs) + spanMs) % spanMs) * invSpan * cols;
+        let colFrac =
+          ((((anchorMs + startAbs * msPerSample) % spanMs) + spanMs) % spanMs) *
+          invSpan *
+          cols;
         for (let a = startAbs; a <= newestAbs; a++) {
           if (ringAbs[pos] === a) {
             let col = colFrac | 0;
@@ -333,7 +347,7 @@
             continue;
           }
           const t = anchorMs + a * msPerSample;
-          const x = ((((t % spanMs) + spanMs) % spanMs) * invSpan) * cols;
+          const x = (((t % spanMs) + spanMs) % spanMs) * invSpan * cols;
           const y = midY - ring[pos] * gain;
           if (drawing) ctx.lineTo(x, y);
           else ctx.moveTo(x, y);
@@ -343,7 +357,7 @@
       ctx.stroke();
 
       // Channel label, top-left of its lane.
-      ctx.fillStyle = '#ffffff66';
+      ctx.fillStyle = "#ffffff77";
       ctx.fillText(`CH${ch}`, 6, laneTop + 13);
     }
   }
@@ -397,11 +411,26 @@
       const y0 = points[i].y;
       const x1 = points[i + 1].x;
       const y1 = points[i + 1].y;
-      ctx.bezierCurveTo(x0 + h / 3, y0 + (m[i] * h) / 3, x1 - h / 3, y1 - (m[i + 1] * h) / 3, x1, y1);
+      ctx.bezierCurveTo(
+        x0 + h / 3,
+        y0 + (m[i] * h) / 3,
+        x1 - h / 3,
+        y1 - (m[i + 1] * h) / 3,
+        x1,
+        y1,
+      );
     }
   }
 
-  function drawTrack(ctx, width, trackTop, trackHeight, now, passStart, phaseX) {
+  function drawTrack(
+    ctx,
+    width,
+    trackTop,
+    trackHeight,
+    now,
+    passStart,
+    phaseX,
+  ) {
     const classCount = classInfo.length;
     const needed = live.hello?.needed ?? 3;
     // Authoritative τ from the backend (per-window prediction, or Hello before the
@@ -417,28 +446,28 @@
     const yFor = (v) => confBottom - v * (confHeight - 6) - 3;
 
     // Confidence frame + 50% line.
-    ctx.strokeStyle = '#ffffff14';
+    ctx.strokeStyle = "#ffffff14";
     ctx.beginPath();
     ctx.moveTo(0, top);
     ctx.lineTo(width, top);
     ctx.moveTo(0, yFor(0.5));
     ctx.lineTo(width, yFor(0.5));
     ctx.stroke();
-    ctx.fillStyle = '#ffffff66';
-    ctx.font = '11px system-ui, sans-serif';
-    ctx.fillText('class confidence', 6, top + 13);
+    ctx.fillStyle = "#ffffff66";
+    ctx.font = "13px system-ui, sans-serif";
+    ctx.fillText("Class Confidence", 6, top + 13);
 
     // τ threshold line (the per-window trigger level) — plain dashed line.
     const yTau = yFor(tauLine);
-    ctx.strokeStyle = '#e5e7eb55';
+    ctx.strokeStyle = "#e5e7eb55";
     ctx.setLineDash([4, 4]);
     ctx.beginPath();
     ctx.moveTo(0, yTau);
     ctx.lineTo(width, yTau);
     ctx.stroke();
     ctx.setLineDash([]);
-    ctx.fillStyle = '#e5e7eb99';
-    ctx.fillText('τ', width - 14, yTau - 3);
+    ctx.fillStyle = "#e5e7eb99";
+    ctx.fillText("τ", width - 14, yTau - 3);
 
     if (!classCount) return;
 
@@ -453,13 +482,13 @@
     if (!visible.length) return;
     const xNow = phaseX(now);
 
-    // Fill under the chosen class only where the wake-gate accepted it.
+    // Fill under the chosen class only where it is above threshold.
     for (let i = 0; i < visible.length - 1; i++) {
       const a = visible[i];
-      if (!a.accepted) continue;
+      if (a.streak <= 0 && !a.accepted) continue;
       const b = visible[i + 1];
       const v = a.softmax[a.argmax];
-      ctx.fillStyle = classColor(a.argmax) + '33';
+      ctx.fillStyle = classColor(a.argmax) + "18";
       ctx.beginPath();
       ctx.moveTo(a.x, confBottom);
       ctx.lineTo(a.x, yFor(v));
@@ -472,7 +501,8 @@
     // One smoothed line per class, coloured and weighted from the backend table.
     const pts = new Array(visible.length);
     for (let cls = 0; cls < classCount; cls++) {
-      for (let i = 0; i < visible.length; i++) pts[i] = { x: visible[i].x, y: yFor(visible[i].softmax[cls] ?? 0) };
+      for (let i = 0; i < visible.length; i++)
+        pts[i] = { x: visible[i].x, y: yFor(visible[i].softmax[cls] ?? 0) };
       ctx.strokeStyle = classColor(cls);
       ctx.lineWidth = classInfo[cls]?.command ? 1.5 : 1;
       ctx.beginPath();
@@ -488,7 +518,15 @@
   // so the colour visibly intensifies window by window as a command arms, and
   // saturates once latched. Different commands stay distinguishable by hue. The
   // ramp ends come from the backend state intensities.
-  function drawStateBand(ctx, width, bandTop, bandHeight, needed, visible, xNow) {
+  function drawStateBand(
+    ctx,
+    width,
+    bandTop,
+    bandHeight,
+    needed,
+    visible,
+    xNow,
+  ) {
     const idleAlpha = stateByName.idle?.intensity ?? 0.12;
     const activeAlpha = stateByName.active?.intensity ?? 0.9;
     for (let i = 0; i < visible.length; i++) {
@@ -501,35 +539,34 @@
     }
     ctx.globalAlpha = 1;
 
-    ctx.fillStyle = '#ffffff66';
-    ctx.font = '11px system-ui, sans-serif';
-    ctx.fillText('wake gate', 6, bandTop + 13);
+    ctx.fillStyle = "#ffffff66";
+    ctx.font = "13px system-ui, sans-serif";
+    ctx.fillText("State", 6, bandTop + 13);
   }
 
   function drawSweep(ctx, xNow, height, width) {
     // Dim the whole future region (right of the present) — empty, less-emphasis.
-    ctx.fillStyle = '#0b0e1466';
+    ctx.fillStyle = "#0b0e1466";
     ctx.fillRect(xNow, 0, width - xNow, height);
     // The present.
-    ctx.strokeStyle = '#e5e7eb';
+    ctx.strokeStyle = "#e5e7eb";
     ctx.lineWidth = 1;
     ctx.beginPath();
     ctx.moveTo(xNow, 0);
     ctx.lineTo(xNow, height);
     ctx.stroke();
   }
-
 </script>
 
 <h2>Stream</h2>
-
 <div class="row">
-  <label>
-    Time span
-    <input type="range" min="1" max={MAX_SPAN_SEC} step="1" value={spanSec}
-      oninput={(event) => (spanSec = +event.currentTarget.value)} />
-  </label>
-  <span class="muted">{spanSec}s</span>
+  <select bind:value={spanSec} title="Timeline Period">
+    {#each SPANS as s}
+      <option value={s}>{s}s</option>
+    {/each}
+  </select>
+
+  <span class="muted">{channels} channels @{sampleRate}Hz</span>
 </div>
 
 <canvas bind:this={canvas}></canvas>
@@ -542,13 +579,28 @@
         {info.label}
       </span>
     {/each}
-    <span class="muted legend-note">filled = accepted</span>
   </div>
 {/if}
 
 <style>
-  .legend { display: flex; flex-wrap: wrap; gap: 6px 16px; align-items: center; margin-top: 10px; font-size: 13px; }
-  .legend-item { display: inline-flex; align-items: center; gap: 6px; }
-  .swatch { width: 14px; height: 3px; border-radius: 2px; display: inline-block; }
-  .legend-note { margin-left: auto; }
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 16px;
+    align-items: center;
+    justify-content: center;
+    margin-top: 10px;
+    font-size: 13px;
+  }
+  .legend-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .swatch {
+    width: 14px;
+    height: 3px;
+    border-radius: 2px;
+    display: inline-block;
+  }
 </style>
