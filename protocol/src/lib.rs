@@ -31,9 +31,14 @@ pub enum Frame {
         sources: Vec<String>,
         keymap: Vec<Binding>,
         wifi_ssid: Option<String>,
+        /// The reject threshold currently in effect (resolved from `sensitivity`).
         tau: f32,
         /// Consecutive above-τ windows a command needs to latch (the streak goal).
         needed: u8,
+        /// Selectable sensitivity presets and the id of the active one. The backend
+        /// owns the preset → threshold mapping; the frontend only shows the labels.
+        sensitivity_levels: Vec<SensitivityLevel>,
+        sensitivity: String,
         /// Display descriptor per softmax class (label/colour/role) so the frontend
         /// needs no built-in palette or command/reject knowledge.
         classes: Vec<ClassInfo>,
@@ -89,15 +94,24 @@ pub enum Frame {
     /// Replay transport (browser → backend).
     Replay { action: ReplayAction },
 
-    /// Set the reject threshold, in permille 0..=1000 (browser → backend). Integer
-    /// so it survives CBOR encoders that emit whole numbers as ints (cbor-x).
-    SetThreshold { tau_permille: u16 },
+    /// Select a sensitivity preset by id (browser → backend). The backend resolves
+    /// it to a reject threshold; the frontend never sees raw τ values here.
+    SetSensitivity { level: String },
 
     /// Persist a gesture→action keymap (browser → backend).
     SetKeymap { bindings: Vec<Binding> },
 
     /// Persist WiFi credentials for the device (browser → backend).
     SetWifi { ssid: String, psk: String },
+}
+
+/// One sensitivity preset the user can pick. `id` is echoed back in
+/// `SetSensitivity`; `label` is what the dropdown shows. The threshold each maps
+/// to lives in the backend.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SensitivityLevel {
+    pub id: String,
+    pub label: String,
 }
 
 /// Display descriptor for one softmax class. The backend owns the palette and the

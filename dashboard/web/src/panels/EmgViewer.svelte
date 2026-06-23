@@ -9,7 +9,7 @@
   // first packet (assuming zero delay for it), so later network jitter can't
   // smear the trace. Re-anchor only on a stream reset or a large drift.
   import { onMount } from 'svelte';
-  import { live, api, on } from '../lib/socket.svelte.js';
+  import { live, on } from '../lib/socket.svelte.js';
 
   const MAX_SPAN_SEC = 30; // ring sizing ceiling; the visible span is a subset
   const BAND_HEIGHT = 24; // wake-state / streak row at the bottom of the track
@@ -19,8 +19,6 @@
 
   let canvas;
   let spanSec = $state(6);
-  let tau = $state(0.5);
-  let tauTouched = false;
 
   // --- imperative scope state (deliberately non-reactive; touched per frame) ---
   let sampleRate = 0;
@@ -47,11 +45,6 @@
       colMax = new Float32Array(cols);
     }
   }
-
-  // Initialise the threshold slider from the backend once Hello lands.
-  $effect(() => {
-    if (!tauTouched && live.hello) tau = live.hello.tau;
-  });
 
   function localMs(a) {
     return anchorMs + a * msPerSample;
@@ -411,9 +404,9 @@
   function drawTrack(ctx, width, trackTop, trackHeight, now, passStart, phaseX) {
     const classCount = classInfo.length;
     const needed = live.hello?.needed ?? 3;
-    // Authoritative τ from the backend (per-window); fall back to the slider only
-    // until the first prediction lands.
-    const tauLine = live.prediction?.tau ?? tau;
+    // Authoritative τ from the backend (per-window prediction, or Hello before the
+    // first prediction lands). The sensitivity control lives in Config.
+    const tauLine = live.prediction?.tau ?? live.hello?.tau ?? 0.5;
     const top = trackTop;
     const bottom = trackTop + trackHeight;
     // Reserve a bottom strip for the wake-gate band; the confidence curves live
@@ -526,11 +519,6 @@
     ctx.stroke();
   }
 
-  function onTau(value) {
-    tauTouched = true;
-    tau = value;
-    api.threshold(value);
-  }
 </script>
 
 <h2>Stream</h2>
@@ -557,14 +545,6 @@
     <span class="muted legend-note">filled = accepted</span>
   </div>
 {/if}
-
-<div class="row" style="margin-top: 12px; max-width: 640px;">
-  <label style="flex: 1;">
-    Reject threshold τ = {tau.toFixed(2)}
-    <input type="range" min="0" max="1" step="0.01" value={tau}
-      oninput={(event) => onTau(+event.currentTarget.value)} />
-  </label>
-</div>
 
 <style>
   .legend { display: flex; flex-wrap: wrap; gap: 6px 16px; align-items: center; margin-top: 10px; font-size: 13px; }

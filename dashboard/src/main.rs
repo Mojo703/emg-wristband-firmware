@@ -23,7 +23,7 @@ use config::AppConfig;
 use emg_tds::Classifier;
 use futures_util::{SinkExt, StreamExt};
 use pipeline::{Decision, RejectPipeline};
-use protocol::{ClassInfo, Frame, MediaKey, ReplayAction, StateInfo, WakeState};
+use protocol::{ClassInfo, Frame, MediaKey, ReplayAction, SensitivityLevel, StateInfo, WakeState};
 use replay::{FrameSource, Replay};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -38,6 +38,19 @@ const DEFAULT_TAU: f32 = 0.5;
 /// Per-class line/legend/band colours; the frontend just paints index → colour.
 const CLASS_PALETTE: [&str; 8] =
     ["#3b82f6", "#22c55e", "#f59e0b", "#a855f7", "#ec4899", "#14b8a6", "#f97316", "#60a5fa"];
+/// Sensitivity presets: (id, label, reject threshold). Lower τ ⇒ easier to trigger.
+/// This table is the sole owner of the preset → threshold mapping.
+const SENSITIVITY_LEVELS: [(&str, &str, f32); 3] =
+    [("low", "Low", 0.7), ("medium", "Medium", 0.5), ("high", "High", 0.3)];
+
+/// Resolve a sensitivity preset id to its reject threshold (defaults if unknown).
+fn tau_for_sensitivity(id: &str) -> f32 {
+    SENSITIVITY_LEVELS
+        .iter()
+        .find(|(level_id, _, _)| *level_id == id)
+        .map(|(_, _, tau)| *tau)
+        .unwrap_or(DEFAULT_TAU)
+}
 
 #[derive(Clone)]
 struct AppState {
@@ -131,12 +144,13 @@ struct Session {
 async fn handle_socket(socket: WebSocket, state: AppState) {
     let (mut sink, mut stream) = socket.split();
 
+    let initial_tau = tau_for_sensitivity(&state.config.lock().unwrap().sensitivity);
     let mut session = Session {
         source: state.replay.default_source(),
         cursor: 0,
         seq: 0,
         playing: true,
-        pipeline: RejectPipeline::new(state.num_commands, DEFAULT_TAU),
+        pipeline: RejectPipeline::new(state.num_commands, initial_tau),
         prev_wake: WakeState::Idle,
     };
 
@@ -157,7 +171,13 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             incoming = stream.next() => match incoming {
                 Some(Ok(Message::Binary(bytes))) => {
                     if let Ok(frame) = frame::decode(&bytes) {
-                        handle_incoming(frame, &mut session, &state);
+                        // On any config change, echo the authoritative snapshot back
+                        // so the UI always shows what's actually in effect.
+                        if handle_incoming(frame, &mut session, &state) {
+                            if sink.send(Message::Binary(frame::encode(&hello(&state)))).await.is_err() {
+                                return;
+                            }
+                        }
                     }
                     if session.source != tick_source {
                         tick_source = session.source.clone();
@@ -211,43 +231,68 @@ fn hello(state: &AppState) -> Frame {
         StateInfo { name: "active".into(), label: "active".into(), color: "#22c55e".into(), intensity: 0.9 },
     ];
 
+    let sensitivity_levels = SENSITIVITY_LEVELS
+        .iter()
+        .map(|(id, label, _)| SensitivityLevel { id: id.to_string(), label: label.to_string() })
+        .collect();
+
     Frame::Hello {
         gestures: state.num_commands as u8,
         sources: state.replay.names(),
         keymap: config.keymap.clone(),
         wifi_ssid: config.wifi_ssid.clone(),
-        tau: DEFAULT_TAU,
+        tau: tau_for_sensitivity(&config.sensitivity),
         needed: RejectPipeline::NEEDED as u8,
         classes,
         states,
+        sensitivity_levels,
+        sensitivity: config.sensitivity.clone(),
     }
 }
 
-fn handle_incoming(frame: Frame, session: &mut Session, state: &AppState) {
+/// Handle a browser→backend frame. Returns true when it changed persisted config,
+/// so the caller can echo a fresh `Hello` (the authoritative config snapshot).
+fn handle_incoming(frame: Frame, session: &mut Session, state: &AppState) -> bool {
     match frame {
-        Frame::Replay { action } => match action {
-            ReplayAction::Play => session.playing = true,
-            ReplayAction::Pause => session.playing = false,
-            ReplayAction::Seek { window } => session.cursor = window as usize,
-            // Streaming is paced to real time now; an explicit rate is ignored.
-            ReplayAction::Rate { .. } => {}
-            ReplayAction::Source { name } => {
-                if state.replay.names().contains(&name) {
-                    session.source = name;
-                    session.cursor = 0;
+        Frame::Replay { action } => {
+            match action {
+                ReplayAction::Play => session.playing = true,
+                ReplayAction::Pause => session.playing = false,
+                ReplayAction::Seek { window } => session.cursor = window as usize,
+                // Streaming is paced to real time now; an explicit rate is ignored.
+                ReplayAction::Rate { .. } => {}
+                ReplayAction::Source { name } => {
+                    if state.replay.names().contains(&name) {
+                        session.source = name;
+                        session.cursor = 0;
+                    }
                 }
             }
-        },
-        Frame::SetThreshold { tau_permille } => {
-            session.pipeline.tau = (tau_permille.min(1000) as f32) / 1000.0
+            false
         }
-        Frame::SetKeymap { bindings } => persist(state, |config| config.keymap = bindings),
-        Frame::SetWifi { ssid, psk } => persist(state, |config| {
-            config.wifi_ssid = Some(ssid);
-            config.wifi_psk = Some(psk);
-        }),
+        Frame::SetSensitivity { level } => {
+            // Resolve and apply to this session, and persist the preset choice.
+            if SENSITIVITY_LEVELS.iter().any(|(id, _, _)| *id == level) {
+                session.pipeline.tau = tau_for_sensitivity(&level);
+                persist(state, |config| config.sensitivity = level);
+                true
+            } else {
+                false
+            }
+        }
+        Frame::SetKeymap { bindings } => {
+            persist(state, |config| config.keymap = bindings);
+            true
+        }
+        Frame::SetWifi { ssid, psk } => {
+            persist(state, |config| {
+                config.wifi_ssid = Some(ssid);
+                config.wifi_psk = Some(psk);
+            });
+            true
+        }
         // Server-origin frames are ignored if echoed back.
-        _ => {}
+        _ => false,
     }
 }
 

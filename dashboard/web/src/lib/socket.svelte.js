@@ -87,7 +87,7 @@ export const api = {
   seek: (window) => send({ type: 'replay', action: { action: 'seek', window } }),
   rate: (fps) => send({ type: 'replay', action: { action: 'rate', fps } }),
   source: (name) => send({ type: 'replay', action: { action: 'source', name } }),
-  threshold: (tau) => send({ type: 'set_threshold', tau_permille: Math.round(tau * 1000) }),
+  sensitivity: (level) => send({ type: 'set_sensitivity', level }),
   keymap: (bindings) => send({ type: 'set_keymap', bindings }),
   wifi: (ssid, psk) => send({ type: 'set_wifi', ssid, psk }),
 };

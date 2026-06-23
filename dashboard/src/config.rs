@@ -11,6 +11,14 @@ pub struct AppConfig {
     pub keymap: Vec<Binding>,
     pub wifi_ssid: Option<String>,
     pub wifi_psk: Option<String>,
+    /// Selected sensitivity preset id (resolves to a reject threshold). `default`
+    /// so configs written before this field still load.
+    #[serde(default = "default_sensitivity")]
+    pub sensitivity: String,
+}
+
+fn default_sensitivity() -> String {
+    "medium".to_string()
 }
 
 impl AppConfig {
@@ -22,7 +30,7 @@ impl AppConfig {
                 key: MediaKey::ALL[gesture % MediaKey::ALL.len()],
             })
             .collect();
-        Self { keymap, wifi_ssid: None, wifi_psk: None }
+        Self { keymap, wifi_ssid: None, wifi_psk: None, sensitivity: default_sensitivity() }
     }
 
     pub fn load_or_default(path: &Path, num_commands: usize) -> Self {
