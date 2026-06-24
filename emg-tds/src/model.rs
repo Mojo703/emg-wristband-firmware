@@ -71,9 +71,23 @@ impl DepthwiseSeparableBlock {
             },
             var_builder.pp("dw"),
         )?;
-        let pointwise = conv1d(in_channels, out_channels, 1, Conv1dConfig::default(), var_builder.pp("pw"))?;
-        let batch_norm = batch_norm(out_channels, BatchNormConfig::default(), var_builder.pp("bn"))?;
-        Ok(Self { depthwise, pointwise, batch_norm })
+        let pointwise = conv1d(
+            in_channels,
+            out_channels,
+            1,
+            Conv1dConfig::default(),
+            var_builder.pp("pw"),
+        )?;
+        let batch_norm = batch_norm(
+            out_channels,
+            BatchNormConfig::default(),
+            var_builder.pp("bn"),
+        )?;
+        Ok(Self {
+            depthwise,
+            pointwise,
+            batch_norm,
+        })
     }
 
     fn forward(&self, input: &Tensor, training: bool) -> Result<Tensor> {
@@ -111,7 +125,11 @@ pub(crate) struct PoseNet {
 }
 
 impl PoseNet {
-    pub(crate) fn new(config: &Config, pose_dimension: usize, var_builder: VarBuilder) -> Result<Self> {
+    pub(crate) fn new(
+        config: &Config,
+        pose_dimension: usize,
+        var_builder: VarBuilder,
+    ) -> Result<Self> {
         let blocks = build_blocks(config, &var_builder)?;
         let pose_head = conv1d(
             config.feature_dimension(),
@@ -141,7 +159,11 @@ pub(crate) struct TdsNet {
 impl TdsNet {
     pub(crate) fn new(config: Config, var_builder: VarBuilder) -> Result<Self> {
         let blocks = build_blocks(&config, &var_builder)?;
-        let head = linear(config.feature_dimension(), config.num_classes, var_builder.pp("cls_head"))?;
+        let head = linear(
+            config.feature_dimension(),
+            config.num_classes,
+            var_builder.pp("cls_head"),
+        )?;
         Ok(Self { blocks, head })
     }
 
@@ -154,5 +176,28 @@ impl TdsNet {
         }
         let features = hidden.mean(D::Minus1)?; // [B,d]
         Ok(self.head.forward(&features)?)
+    }
+
+    /// Run a forward pass and return the activation tensors at the quantization
+    /// boundaries: squeezed input, each depthwise output, each post-ReLU block
+    /// output, and the global-average-pooled feature vector. Used by the int8
+    /// exporter to calibrate per-tensor activation scales.
+    pub(crate) fn forward_intermediates(
+        &self,
+        input: &Tensor,
+        training: bool,
+    ) -> Result<Vec<Tensor>> {
+        let mut hidden = input.squeeze(1)?; // [B,C,T]
+        let mut out = vec![hidden.clone()];
+        for block in &self.blocks {
+            hidden = block.depthwise.forward(&hidden)?;
+            out.push(hidden.clone());
+            hidden = block.pointwise.forward(&hidden)?;
+            hidden = block.batch_norm.forward_t(&hidden, training)?;
+            hidden = hidden.relu()?;
+            out.push(hidden.clone());
+        }
+        out.push(hidden.mean(D::Minus1)?);
+        Ok(out)
     }
 }

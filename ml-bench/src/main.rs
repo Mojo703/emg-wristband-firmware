@@ -1,9 +1,9 @@
-//! ESP32-S3 latency/throughput benchmark for the EMG gesture encoder.
+//! ESP32-S3 latency/throughput benchmark for the EMG gesture classifier.
 //!
-//! Runs the int8 encoder forward pass and reports: a startup self-test of the
+//! Runs the int8 classifier forward pass and reports: a startup self-test of the
 //! SIMD dot product (vs a scalar oracle), end-to-end latency/throughput, and a
 //! per-stage breakdown so each stage can be optimized in isolation.
-//! Also verifies real model correctness against a Python-exported reference.
+//! Also verifies the real model against embedded float references on real gestures.
 
 #![feature(asm_experimental_arch)]
 
@@ -15,10 +15,9 @@ mod tensor;
 
 use bench::Profile;
 use esp_idf_svc::sys;
-use layers::Requantize;
 use log::{error, info, warn};
-use model::{ForwardResult, Model, EMBED_DIM, INPUT_CH, KERNEL, STAGES};
-use tensor::{AlignedI8, I8Activation, Rng};
+use model::{ForwardResult, Model, VerifyBatch, INPUT_CH, STAGES};
+use tensor::I8Activation;
 
 const WARMUP: usize = 20;
 const ITERS: usize = 200;
@@ -31,9 +30,9 @@ fn free_heap_discontinuous() -> u32 {
 fn self_test() -> bool {
     let mut ok = true;
     for &n in &[16usize, 32, 64, 128, 256] {
-        let mut rng = Rng::new(0xC0DE + n as u32);
-        let w = AlignedI8::from_slice(&rng.fill_i8(n));
-        let x = AlignedI8::from_slice(&rng.fill_i8(n));
+        let mut rng = tensor::Rng::new(0xC0DE + n as u32);
+        let w = tensor::AlignedI8::from_slice(&rng.fill_i8(n));
+        let x = tensor::AlignedI8::from_slice(&rng.fill_i8(n));
         let s = mac::dot_i8_scalar(w.as_slice(), x.as_slice());
         let v = mac::dot_i8_simd(w.as_slice(), x.as_slice());
         if s == v {
@@ -50,20 +49,21 @@ fn self_test() -> bool {
 }
 
 fn dw_self_test() -> bool {
-    let rq = Requantize {
+    let kernel = 25;
+    let rq = layers::Requantize {
         mult: 1,
         shift: 12,
         relu: true,
     };
     let mut ok = true;
-    for &(t, c) in &[(32usize, 16usize), (64, 32), (128, 16), (256, 16)] {
-        let mut rng = Rng::new(0xDEAD + t as u32);
+    for &(t, c) in &[(32usize, 16usize), (64, 32), (125, 64), (250, 16)] {
+        let mut rng = tensor::Rng::new(0xDEAD + t as u32);
         let input = I8Activation::synthetic(t, c, 0xBEEF + t as u32);
-        let w = AlignedI8::from_slice(&rng.fill_i8(KERNEL * c));
+        let w = tensor::AlignedI8::from_slice(&rng.fill_i8(kernel * c));
         let bias = rng.fill_i32_small(c);
 
-        let ref_out = layers::depthwise_scalar(&input, &w, &bias, KERNEL, 2, rq);
-        let simd_out = layers::depthwise_simd(&input, &w, &bias, KERNEL, 2, rq);
+        let ref_out = layers::depthwise_scalar(&input, &w, &bias, kernel, 2, rq);
+        let simd_out = layers::depthwise_simd(&input, &w, &bias, kernel, 2, rq);
 
         let rs = ref_out.data.as_slice();
         let ss = simd_out.data.as_slice();
@@ -100,11 +100,27 @@ fn dw_self_test() -> bool {
     ok
 }
 
-fn cosine_sim(a: &[f32; EMBED_DIM], b: &[f32; EMBED_DIM]) -> f32 {
+fn argmax_i32(v: &[i32]) -> usize {
+    v.iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.cmp(b))
+        .map(|(i, _)| i)
+        .unwrap_or(0)
+}
+
+fn argmax_f32(v: &[f32]) -> usize {
+    v.iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+        .map(|(i, _)| i)
+        .unwrap_or(0)
+}
+
+fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
     let mut dot = 0.0f32;
     let mut na = 0.0f32;
     let mut nb = 0.0f32;
-    for i in 0..EMBED_DIM {
+    for i in 0..a.len() {
         dot += a[i] * b[i];
         na += a[i] * a[i];
         nb += b[i] * b[i];
@@ -112,11 +128,41 @@ fn cosine_sim(a: &[f32; EMBED_DIM], b: &[f32; EMBED_DIM]) -> f32 {
     dot / (na.sqrt() * nb.sqrt()).max(1e-8)
 }
 
+fn verify_real_model(model: &Model, batch: &mut VerifyBatch) -> (f32, f32, f32) {
+    let mut top1_correct = 0usize;
+    let mut agreement = 0usize;
+    let mut total_cosine = 0.0f32;
+    let mut n = 0usize;
+    while let Some(window) = batch.next_window() {
+        let result = model.forward(&window.input);
+        let ForwardResult::Logits(logits) = result;
+        let scaled: Vec<f32> = logits
+            .iter()
+            .map(|&v| v as f32 * model.logit_scale)
+            .collect();
+        let device_argmax = argmax_i32(&logits);
+        let float_argmax = argmax_f32(&window.float_logits);
+        if device_argmax == window.label as usize {
+            top1_correct += 1;
+        }
+        if device_argmax == float_argmax {
+            agreement += 1;
+        }
+        total_cosine += cosine_sim(&window.float_logits, &scaled);
+        n += 1;
+    }
+    (
+        top1_correct as f32 / n as f32,
+        agreement as f32 / n as f32,
+        total_cosine / n as f32,
+    )
+}
+
 fn main() -> anyhow::Result<()> {
     sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
 
-    info!("=== ml-bench: EMG encoder int8 forward-pass benchmark ===");
+    info!("=== ml-bench: EMG classifier int8 forward-pass benchmark ===");
 
     info!("--- SIMD self-test (scalar oracle vs ee.vmulas.s8.accx) ---");
     if !self_test() {
@@ -128,7 +174,7 @@ fn main() -> anyhow::Result<()> {
         error!("DW SIMD kernel MISMATCH");
     }
 
-    // ---- Synthetic benchmark (timing, matches prior results) ----
+    // ---- Synthetic benchmark (timing, same shapes as the real model) ----
     info!("--- Synthetic model benchmark (timing) ---");
     let heap_boot = free_heap_discontinuous();
     let synth = Model::synthetic();
@@ -156,56 +202,48 @@ fn main() -> anyhow::Result<()> {
     info!("throughput: {:.1} inferences/sec", stats.throughput_hz);
 
     // ---- Real model verification ----
-    info!("--- Real model (BN-folded, GELU, int8) ---");
+    info!("--- Real model (BN-folded, ReLU, int8) ---");
     let heap_pre = free_heap_discontinuous();
     let real_model = Model::real();
     let heap_post = free_heap_discontinuous();
     info!(
-        "real model RAM: ~{} KB | input_len: {} | free heap: {} KB",
+        "real model RAM: ~{} KB | input_len: {} | kernel: {} | free heap: {} KB",
         (heap_pre - heap_post) / 1024,
         real_model.input_len,
+        real_model.kernel,
         heap_post / 1024
     );
 
-    let test = Model::load_test_data();
+    let mut verify = Model::load_verify_batch();
     info!(
-        "test input: {}x{}, scale={:.6}",
-        test.input.t, test.input.c, test.input_scale
+        "verify batch: streaming {} windows | input scale={:.6}",
+        verify.total, verify.input_scale
     );
 
-    let result = real_model.forward(&test.input);
-    match result {
-        ForwardResult::Embedding(emb) => {
-            let sim = cosine_sim(&emb, &test.expected_emb);
-            info!("cosine similarity vs Python reference: {:.6}", sim);
-            info!(
-                "device  emb[0..4]: {:.4} {:.4} {:.4} {:.4}",
-                emb[0], emb[1], emb[2], emb[3]
-            );
-            info!(
-                "python  emb[0..4]: {:.4} {:.4} {:.4} {:.4}",
-                test.expected_emb[0],
-                test.expected_emb[1],
-                test.expected_emb[2],
-                test.expected_emb[3]
-            );
-            if sim > 0.90 {
-                info!("PASS: cosine similarity > 0.90");
-            } else if sim > 0.70 {
-                warn!("MARGINAL: cosine similarity {:.4} (expected > 0.90)", sim);
-            } else {
-                error!("FAIL: cosine similarity {:.4} (expected > 0.90)", sim);
-            }
-        }
-        ForwardResult::Logits(_) => {
-            error!("real model returned logits instead of embedding");
-        }
+    let (top1, agreement, cos) = verify_real_model(&real_model, &mut verify);
+    info!("device top-1 accuracy: {:.3}", top1);
+    info!("device/float argmax agreement: {:.3}", agreement);
+    info!("mean logit cosine vs float: {:.6}", cos);
+
+    if agreement >= 0.90 && top1 >= 0.85 {
+        info!("PASS: device agreement and top-1 match host sim");
+    } else if agreement >= 0.75 && top1 >= 0.75 {
+        warn!(
+            "MARGINAL: device agreement {:.3} / top-1 {:.3}",
+            agreement, top1
+        );
+    } else {
+        error!(
+            "FAIL: device agreement {:.3} / top-1 {:.3}",
+            agreement, top1
+        );
     }
 
     // ---- Real model benchmark ----
     info!("benchmarking real: {} warmup + {} timed...", WARMUP, ITERS);
+    let real_input = I8Activation::synthetic(real_model.input_len, INPUT_CH, 0xCAFE_1234);
     let real_stats = bench::run(WARMUP, ITERS, || {
-        let r = real_model.forward(core::hint::black_box(&test.input));
+        let r = real_model.forward(core::hint::black_box(&real_input));
         core::hint::black_box(r);
     });
     info!("---------------- real end-to-end ----------------");
@@ -223,7 +261,7 @@ fn main() -> anyhow::Result<()> {
     let mut prof = Profile::new(STAGES.len());
     for _ in 0..PROFILE_ITERS {
         core::hint::black_box(
-            real_model.forward_profiled(core::hint::black_box(&test.input), &mut prof),
+            real_model.forward_profiled(core::hint::black_box(&real_input), &mut prof),
         );
     }
     let total: u64 = prof.us.iter().sum();

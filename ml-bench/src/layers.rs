@@ -194,17 +194,6 @@ pub(crate) fn depthwise(
     depthwise_simd(x, w, bias, k, stride, rq)
 }
 
-/// Apply a 256-entry GELU lookup table element-wise: `lut[(x + 128) as usize]`.
-pub(crate) fn gelu_act(x: &I8Activation, lut: &[i8; 256]) -> I8Activation {
-    let mut out = I8Activation::zeros(x.t, x.c);
-    let src = x.data.as_slice();
-    let dst = out.data.as_mut_slice();
-    for i in 0..src.len() {
-        dst[i] = lut[(src[i] as i16 + 128) as usize];
-    }
-    out
-}
-
 /// Pointwise (1x1) conv: independent `cin -> out_ch` matmul at each time step.
 /// MAC-heavy; routes through [`mac::dot_i8`] (SIMD-capable).
 pub(crate) fn pointwise(
@@ -237,24 +226,6 @@ pub(crate) fn global_avg_pool(x: &I8Activation) -> AlignedI8 {
         *value = (s / x.t as i32).clamp(-128, 127) as i8;
     }
     v
-}
-
-/// Fully-connected `cin -> out`, requantized to int8. `v` must be 16-aligned.
-pub(crate) fn linear(
-    v: &[i8],
-    w: &AlignedI8,
-    bias: &[i32],
-    out: usize,
-    rq: Requantize,
-) -> AlignedI8 {
-    let cin = v.len();
-    let ws = w.as_slice();
-    let mut o = AlignedI8::zeroed(out);
-    let os = o.as_mut_slice();
-    for oc in 0..out {
-        os[oc] = rq.apply(bias[oc] + mac::dot_i8(&ws[oc * cin..(oc + 1) * cin], v));
-    }
-    o
 }
 
 /// Fully-connected `cin -> out` returning raw i32 logits (final head).

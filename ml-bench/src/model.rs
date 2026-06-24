@@ -1,15 +1,15 @@
-//! The EMG gesture encoder: a 4-block depthwise-separable 1D CNN.
+//! The EMG gesture classifier: a 4-block depthwise-separable 1D CNN (emg-tds).
 //!
 //! Two constructors:
-//! - `Model::synthetic()` — random weights for timing benchmarks (unchanged)
+//! - `Model::synthetic()` — random weights for timing benchmarks (deterministic)
 //! - `Model::real()` — loads int8 weights from the embedded binary blob exported
-//!   by `emg-gesture-class/scripts/export_int8.py` (BN-folded, GELU LUT)
+//!   by `emg-tds export-int8` (BN-folded, ReLU, k=25, channels 16→32→64→128→128)
 
 use crate::bench::Profile;
 use crate::layers::{self, Requantize};
 use crate::tensor::{AlignedI8, I8Activation, Rng};
 
-pub(crate) const STAGES: [&str; 11] = [
+pub(crate) const STAGES: [&str; 10] = [
     "block0.dw",
     "block0.pw",
     "block1.dw",
@@ -19,19 +19,18 @@ pub(crate) const STAGES: [&str; 11] = [
     "block3.dw",
     "block3.pw",
     "pool",
-    "proj",
     "head",
 ];
 
 pub(crate) const INPUT_CH: usize = 16;
-pub(crate) const KERNEL: usize = 15;
 pub(crate) const STRIDE: usize = 2;
-pub(crate) const EMBED_DIM: usize = 256;
 pub(crate) const NUM_CLASSES: usize = 5;
 
-const BLOCKS: [(usize, usize); 4] = [(16, 32), (32, 64), (64, 128), (128, 256)];
+const BLOCKS: [(usize, usize); 4] = [(16, 32), (32, 64), (64, 128), (128, 128)];
+const FEATURE_DIM: usize = 128;
 
-const MAGIC: u32 = 0x454D4738;
+const MAGIC: u32 = 0x454D4739;
+const VERSION: u32 = 2;
 
 const MODEL_BIN: &[u8] = include_bytes!("../data/model_int8.bin");
 
@@ -43,23 +42,30 @@ struct Block {
     pw: AlignedI8,
     pw_bias: Vec<i32>,
     pw_rq: Requantize,
-    gelu: Option<[i8; 256]>,
 }
 
 pub(crate) struct Model {
     blocks: Vec<Block>,
-    proj: AlignedI8,
-    proj_bias: Vec<i32>,
-    proj_rq: Requantize,
-    head: Option<(AlignedI8, Vec<i32>)>,
+    head: (AlignedI8, Vec<i32>),
     pub(crate) input_len: usize,
-    pub(crate) proj_scale: f32,
+    pub(crate) kernel: usize,
+    pub(crate) logit_scale: f32,
 }
 
-pub(crate) struct TestData {
+pub(crate) struct VerifyWindow {
     pub(crate) input: I8Activation,
+    pub(crate) label: u32,
+    pub(crate) float_logits: [f32; NUM_CLASSES],
+}
+
+/// Streaming reader for the embedded verification batch. Keeps only one window
+/// in RAM at a time so the full batch does not consume the limited ESP32-S3 heap.
+pub(crate) struct VerifyBatch {
+    cursor: ModelFileCursor<'static>,
     pub(crate) input_scale: f32,
-    pub(crate) expected_emb: [f32; EMBED_DIM],
+    pub(crate) total: usize,
+    remaining: usize,
+    input_len: usize,
 }
 
 struct ModelFileCursor<'a> {
@@ -95,8 +101,8 @@ impl<'a> ModelFileCursor<'a> {
     fn i32_vec(&mut self, n: usize) -> Vec<i32> {
         (0..n).map(|_| self.i32()).collect()
     }
-    fn f32_arr_256(&mut self) -> [f32; EMBED_DIM] {
-        let mut a = [0.0f32; EMBED_DIM];
+    fn f32_arr<const N: usize>(&mut self) -> [f32; N] {
+        let mut a = [0.0f32; N];
         for v in a.iter_mut() {
             *v = self.f32();
         }
@@ -112,64 +118,68 @@ impl Model {
             shift: 12,
             relu: true,
         };
+        let kernel = 25;
         let blocks = BLOCKS
             .iter()
             .map(|&(in_ch, out_ch)| Block {
                 out_ch,
-                dw: AlignedI8::from_slice(&rng.fill_i8(in_ch * KERNEL)),
+                dw: AlignedI8::from_slice(&rng.fill_i8(in_ch * kernel)),
                 dw_bias: rng.fill_i32_small(in_ch),
-                dw_rq: rq,
+                dw_rq: Requantize {
+                    mult: 1,
+                    shift: 12,
+                    relu: false,
+                },
                 pw: AlignedI8::from_slice(&rng.fill_i8(out_ch * in_ch)),
                 pw_bias: rng.fill_i32_small(out_ch),
                 pw_rq: rq,
-                gelu: None,
             })
             .collect();
         Model {
             blocks,
-            proj: AlignedI8::from_slice(&rng.fill_i8(EMBED_DIM * EMBED_DIM)),
-            proj_bias: rng.fill_i32_small(EMBED_DIM),
-            proj_rq: rq,
-            head: Some((
-                AlignedI8::from_slice(&rng.fill_i8(NUM_CLASSES * EMBED_DIM)),
+            head: (
+                AlignedI8::from_slice(&rng.fill_i8(NUM_CLASSES * FEATURE_DIM)),
                 rng.fill_i32_small(NUM_CLASSES),
-            )),
-            input_len: 256,
-            proj_scale: 1.0,
+            ),
+            input_len: 500,
+            kernel,
+            logit_scale: 1.0,
         }
     }
 
     pub(crate) fn real() -> Self {
         let mut c = ModelFileCursor::new(MODEL_BIN);
         assert_eq!(c.u32(), MAGIC, "bad magic in model_int8.bin");
-        let _version = c.u32();
+        let version = c.u32();
+        assert_eq!(
+            version, VERSION,
+            "unsupported model_int8.bin version {version}"
+        );
         let input_len = c.u32() as usize;
         let input_ch = c.u32() as usize;
         assert_eq!(input_ch, INPUT_CH);
+        let kernel = c.u32() as usize;
+        let stride = c.u32() as usize;
+        assert_eq!(stride, STRIDE);
         let n_blocks = c.u32() as usize;
-        assert_eq!(n_blocks, 4);
+        assert_eq!(n_blocks, BLOCKS.len());
+        let num_classes = c.u32() as usize;
+        assert_eq!(num_classes, NUM_CLASSES);
 
         let mut blocks = Vec::new();
         for _ in 0..n_blocks {
             let in_ch = c.u32() as usize;
             let out_ch = c.u32() as usize;
 
-            let dw_w = AlignedI8::from_slice(c.i8_slice(KERNEL * in_ch));
+            let dw_w = AlignedI8::from_slice(c.i8_slice(kernel * in_ch));
             let dw_b = c.i32_vec(in_ch);
             let dw_mult = c.i32();
             let dw_shift = c.u32();
-            let _dw_scale = c.f32();
 
             let pw_w = AlignedI8::from_slice(c.i8_slice(out_ch * in_ch));
             let pw_b = c.i32_vec(out_ch);
             let pw_mult = c.i32();
             let pw_shift = c.u32();
-            let _pw_scale = c.f32();
-
-            let mut gelu_lut = [0i8; 256];
-            let lut_bytes = c.i8_slice(256);
-            gelu_lut.copy_from_slice(lut_bytes);
-            let _gelu_scale = c.f32();
 
             blocks.push(Block {
                 out_ch,
@@ -185,65 +195,61 @@ impl Model {
                 pw_rq: Requantize {
                     mult: pw_mult,
                     shift: pw_shift,
-                    relu: false,
+                    relu: true,
                 },
-                gelu: Some(gelu_lut),
             });
         }
 
-        let proj_w = AlignedI8::from_slice(c.i8_slice(EMBED_DIM * EMBED_DIM));
-        let proj_b = c.i32_vec(EMBED_DIM);
-        let proj_mult = c.i32();
-        let proj_shift = c.u32();
-        let proj_scale = c.f32();
+        let head_w = AlignedI8::from_slice(c.i8_slice(NUM_CLASSES * FEATURE_DIM));
+        let head_b = c.i32_vec(NUM_CLASSES);
+        let logit_scale = c.f32();
 
         Model {
             blocks,
-            proj: proj_w,
-            proj_bias: proj_b,
-            proj_rq: Requantize {
-                mult: proj_mult,
-                shift: proj_shift,
-                relu: false,
-            },
-            head: None,
+            head: (head_w, head_b),
             input_len,
-            proj_scale,
+            kernel,
+            logit_scale,
         }
     }
 
-    pub(crate) fn load_test_data() -> TestData {
-        let mut c = ModelFileCursor::new(MODEL_BIN);
-        c.pos = 20; // skip header
+    pub(crate) fn load_verify_batch() -> VerifyBatch {
+        let mut header = ModelFileCursor::new(MODEL_BIN);
+        header.u32(); // magic
+        header.u32(); // version
+        let input_len = header.u32() as usize;
+        header.u32(); // input_ch
+        let kernel = header.u32() as usize;
+        header.u32(); // stride
+        let n_blocks = header.u32() as usize;
+        header.u32(); // num_classes
 
-        for _ in 0..4 {
+        let mut c = ModelFileCursor::new(MODEL_BIN);
+        // Skip the 32-byte header and the block/head weights to reach the verify batch.
+        c.pos = 32;
+        for _ in 0..n_blocks {
             let in_ch = c.u32() as usize;
             let out_ch = c.u32() as usize;
-            c.pos += KERNEL * in_ch; // dw weights
+            c.pos += kernel * in_ch; // dw weights
             c.pos += in_ch * 4; // dw bias
-            c.pos += 4 + 4 + 4; // dw mult, shift, scale
+            c.pos += 4 + 4; // dw mult, shift
             c.pos += out_ch * in_ch; // pw weights
             c.pos += out_ch * 4; // pw bias
-            c.pos += 4 + 4 + 4; // pw mult, shift, scale
-            c.pos += 256; // gelu lut
-            c.pos += 4; // gelu scale
+            c.pos += 4 + 4; // pw mult, shift
         }
+        c.pos += NUM_CLASSES * FEATURE_DIM; // head weights
+        c.pos += NUM_CLASSES * 4; // head bias
+        c.pos += 4; // logit_scale
 
-        c.pos += EMBED_DIM * EMBED_DIM; // proj weights
-        c.pos += EMBED_DIM * 4; // proj bias
-        c.pos += 4 + 4 + 4; // proj mult, shift, scale
-
-        let window = u32::from_le_bytes(MODEL_BIN[8..12].try_into().unwrap()) as usize;
-        let test_input_i8 = c.i8_slice(window * INPUT_CH);
         let input_scale = c.f32();
-        let expected_emb = c.f32_arr_256();
+        let num_verify = c.u32() as usize;
 
-        let input = I8Activation::from_i8_slice(test_input_i8, window, INPUT_CH);
-
-        TestData {
-            input,
+        VerifyBatch {
+            cursor: c,
             input_scale,
-            expected_emb,
+            total: num_verify,
+            remaining: num_verify,
+            input_len,
         }
     }
 
@@ -251,33 +257,15 @@ impl Model {
         let mut cur: Option<I8Activation> = None;
         for blk in &self.blocks {
             let xin = cur.as_ref().unwrap_or(input);
-            let d = layers::depthwise(xin, &blk.dw, &blk.dw_bias, KERNEL, STRIDE, blk.dw_rq);
+            let d = layers::depthwise(xin, &blk.dw, &blk.dw_bias, self.kernel, STRIDE, blk.dw_rq);
             let p = layers::pointwise(&d, &blk.pw, &blk.pw_bias, blk.out_ch, blk.pw_rq);
-            cur = Some(match &blk.gelu {
-                Some(lut) => layers::gelu_act(&p, lut),
-                None => p,
-            });
+            cur = Some(p);
         }
         let x = cur.expect("at least one block");
         let pooled = layers::global_avg_pool(&x);
-        let emb_i8 = layers::linear(
-            pooled.as_slice(),
-            &self.proj,
-            &self.proj_bias,
-            EMBED_DIM,
-            self.proj_rq,
-        );
-
-        match &self.head {
-            Some((hw, hb)) => {
-                let logits = layers::linear_i32(emb_i8.as_slice(), hw, hb, NUM_CLASSES);
-                ForwardResult::Logits(logits)
-            }
-            None => {
-                let emb_f32 = Box::new(l2_normalize_i8(emb_i8.as_slice(), self.proj_scale));
-                ForwardResult::Embedding(emb_f32)
-            }
-        }
+        let (hw, hb) = &self.head;
+        let logits = layers::linear_i32(pooled.as_slice(), hw, hb, NUM_CLASSES);
+        ForwardResult::Logits(logits)
     }
 
     pub(crate) fn forward_profiled(&self, input: &I8Activation, p: &mut Profile) -> ForwardResult {
@@ -286,36 +274,18 @@ impl Model {
             let d = {
                 let xin = cur.as_ref().unwrap_or(input);
                 p.time(b * 2, || {
-                    layers::depthwise(xin, &blk.dw, &blk.dw_bias, KERNEL, STRIDE, blk.dw_rq)
+                    layers::depthwise(xin, &blk.dw, &blk.dw_bias, self.kernel, STRIDE, blk.dw_rq)
                 })
             };
             cur = Some(p.time(b * 2 + 1, || {
-                let pw = layers::pointwise(&d, &blk.pw, &blk.pw_bias, blk.out_ch, blk.pw_rq);
-                match &blk.gelu {
-                    Some(lut) => layers::gelu_act(&pw, lut),
-                    None => pw,
-                }
+                layers::pointwise(&d, &blk.pw, &blk.pw_bias, blk.out_ch, blk.pw_rq)
             }));
         }
         let x = cur.expect("at least one block");
         let pooled = p.time(8, || layers::global_avg_pool(&x));
-        let emb_i8 = p.time(9, || {
-            layers::linear(
-                pooled.as_slice(),
-                &self.proj,
-                &self.proj_bias,
-                EMBED_DIM,
-                self.proj_rq,
-            )
-        });
-        let result = p.time(10, || match &self.head {
-            Some((hw, hb)) => {
-                ForwardResult::Logits(layers::linear_i32(emb_i8.as_slice(), hw, hb, NUM_CLASSES))
-            }
-            None => ForwardResult::Embedding(Box::new(l2_normalize_i8(
-                emb_i8.as_slice(),
-                self.proj_scale,
-            ))),
+        let result = p.time(9, || {
+            let (hw, hb) = &self.head;
+            ForwardResult::Logits(layers::linear_i32(pooled.as_slice(), hw, hb, NUM_CLASSES))
         });
         p.iters += 1;
         result
@@ -324,20 +294,21 @@ impl Model {
 
 pub(crate) enum ForwardResult {
     Logits(Vec<i32>),
-    Embedding(Box<[f32; EMBED_DIM]>),
 }
 
-fn l2_normalize_i8(v: &[i8], scale: f32) -> [f32; EMBED_DIM] {
-    let mut out = [0.0f32; EMBED_DIM];
-    let mut sq_sum = 0.0f32;
-    for i in 0..EMBED_DIM {
-        let f = v[i] as f32 * scale;
-        out[i] = f;
-        sq_sum += f * f;
+impl VerifyBatch {
+    pub(crate) fn next_window(&mut self) -> Option<VerifyWindow> {
+        if self.remaining == 0 {
+            return None;
+        }
+        self.remaining -= 1;
+        let input_i8 = self.cursor.i8_slice(self.input_len * INPUT_CH);
+        let label = self.cursor.u32();
+        let float_logits = self.cursor.f32_arr::<NUM_CLASSES>();
+        Some(VerifyWindow {
+            input: I8Activation::from_i8_slice(input_i8, self.input_len, INPUT_CH),
+            label,
+            float_logits,
+        })
     }
-    let norm = sq_sum.sqrt().max(1e-8);
-    for v in out.iter_mut() {
-        *v /= norm;
-    }
-    out
 }

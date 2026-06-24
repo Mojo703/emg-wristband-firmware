@@ -37,6 +37,10 @@ CUDARC_CUDA_VERSION=13020 ./target/release/emg-tds train \
 # pose-regression pretrain (per-dim z-scored targets), then head-swap finetune
 ./target/release/emg-tds pretrain --data-dir ../waveformer/data --out checkpoints/pose.safetensors
 ./target/release/emg-tds train --data-dir ../waveformer/data --init checkpoints/pose.safetensors
+
+# export the trained classifier to int8 for the ESP32-S3 runtime
+./target/release/emg-tds export-int8 --data-dir ../waveformer/data \
+  --out ../ml-bench/data/model_int8.bin --num-verify 32
 ```
 
 `forward-test` builds with random weights and runs one forward pass to check
@@ -47,6 +51,14 @@ best model to `--out`. `--augment` applies warp σ=0.3 and channel-dropout 0.1.
 reject report. `pretrain` runs pose regression on emg2pose windows with
 per-dimension z-scored targets; without the z-scoring the mean-pose error floored
 out, as log 0007 records.
+
+`export-int8` loads the float checkpoint, folds BatchNorm into the pointwise
+convs, calibrates activation ranges on a balanced training subset, quantizes to
+symmetric int8, computes fixed-point requantization params, and writes the device
+blob `../ml-bench/data/model_int8.bin`. It also embeds a balanced batch of labeled
+test windows and runs a host int8 accuracy gate before writing. The default
+activation-range calibration is 99.9 percentile (use `--percentile 100.0` for
+plain max-abs).
 
 Weight-decay, eval frequency, and the early-stop delta are constants now, not CLI
 flags; engineering-logs 0010 through 0013 record why.
