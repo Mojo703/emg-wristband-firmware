@@ -1,40 +1,63 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { on } from '../lib/socket.svelte';
-  import type { PoseFrame } from '../lib/protocol';
+  import { live, on } from '../lib/socket.svelte';
+  import type { PoseFrame, PredictionFrame, EventFrame, ClassInfo } from '../lib/protocol';
+  import Icon from '../lib/Icon.svelte';
   import type { PoseRenderer } from '../lib/PoseRenderer';
 
   let canvas: HTMLCanvasElement | undefined = $state(undefined);
-  let confidence = $state(0);
-  let format = $state('');
   let renderer: PoseRenderer | null = null;
+
+  // Live classifier state.
+  let prediction = $state<PredictionFrame | null>(null);
+  let classes = $derived<readonly ClassInfo[]>(live.hello?.classes ?? []);
+
+  // Event log, capped to keep the panel compact.
+  let events = $state<EventFrame[]>([]);
+  const MAX_EVENTS = 50;
 
   async function loadRenderer() {
     if (canvas === undefined || renderer !== null) return;
     const { createPoseRenderer } = await import('../lib/PoseRenderer');
     renderer = createPoseRenderer(canvas);
-    format = renderer.format;
   }
 
   function updatePose(pose: PoseFrame) {
-    const fmt = pose.format || 'mock_21';
     loadRenderer().then(() => {
       if (renderer === null) return;
-      confidence = pose.confidence;
-      format = fmt;
-      renderer.updatePose(fmt, pose.joints, pose.confidence);
+      renderer.updatePose(pose.format || 'mock_21', pose.joints, pose.confidence);
     });
+  }
+
+  function updatePrediction(pred: PredictionFrame) {
+    prediction = pred;
+  }
+
+  function addEvent(event: EventFrame) {
+    events = [event, ...events].slice(0, MAX_EVENTS);
+  }
+
+  function resetView() {
+    renderer?.resetView();
   }
 
   function handleResize() {
     renderer?.resize();
   }
 
+  function formatTime(t_us: number): string {
+    return `${(t_us / 1_000_000).toFixed(2)}s`;
+  }
+
   onMount(() => {
     const offPose = on('pose', updatePose);
+    const offPrediction = on('prediction', updatePrediction);
+    const offEvent = on('event', addEvent);
     window.addEventListener('resize', handleResize);
     return () => {
       offPose();
+      offPrediction();
+      offEvent();
       window.removeEventListener('resize', handleResize);
       renderer?.dispose();
     };
@@ -42,23 +65,101 @@
 </script>
 
 <h2>Pose</h2>
-<div class="row">
-  <span class="muted">{format ? `${format} · ` : ''}confidence {confidence.toFixed(2)}</span>
-</div>
 
-<div class="canvas-wrap">
-  <canvas bind:this={canvas}></canvas>
+<div class="pose-layout">
+  <div>
+    <button class="btn home-btn" onclick={resetView} aria-label="Reset view" title="Reset view">
+      <Icon name="home" size={18} />
+    </button>
+    <canvas bind:this={canvas}></canvas>
+  </div>
+
+  <aside>
+    <section>
+      <div class="row"><strong>Classifier</strong></div>
+      {#if prediction === null}
+        <span class="muted">Waiting…</span>
+      {:else}
+        <div class="bars">
+          {#each classes as cls, i}
+            {@const value = prediction.softmax[i] ?? 0}
+            <div>{cls.label}</div>
+            <div class="track">
+              <div class="fill" style:width="{`${(value * 100).toFixed(0)}%`}" style:background-color={cls.color}></div>
+            </div>
+            <div>{(value * 100).toFixed(0)}%</div>
+          {/each}
+        </div>
+      {/if}
+    </section>
+
+    <section>
+      <div class="row"><strong>Events</strong></div>
+      <ul>
+        {#if events.length === 0}
+          <li class="muted">No events yet.</li>
+        {:else}
+          {#each events as event}
+            <li style:color={event.color ?? 'inherit'}>
+              <span class="muted">{formatTime(event.t_us)}</span>
+              <strong>{event.kind}</strong>
+              {#if event.label}
+                <span class="muted">{event.label}</span>
+              {/if}
+            </li>
+          {/each}
+        {/if}
+      </ul>
+    </section>
+  </aside>
 </div>
 
 <style>
-  .canvas-wrap {
-    width: 100%;
-    height: 60vh;
+  .pose-layout {
+    display: grid;
+    grid-template-columns: 1fr minmax(240px, 25%);
+    gap: 16px;
+    height: 70vh;
     min-height: 320px;
   }
-  canvas {
+  .pose-layout > div {
+    position: relative;
+  }
+  .pose-layout > div > canvas {
     width: 100%;
     height: 100%;
-    display: block;
+  }
+  .pose-layout > aside {
+    overflow: hidden;
+    display: grid;
+    grid-template-rows: auto 1fr;
+    gap: 16px;
+  }
+  .pose-layout > aside > section {
+    overflow: hidden;
+    display: grid;
+    grid-template-rows: auto 1fr;
+    min-height: 0;
+  }
+  .pose-layout > aside ul {
+    overflow-y: auto;
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-height: 0;
+  }
+  .pose-layout > aside li {
+    display: flex;
+    gap: 8px;
+    align-items: baseline;
+  }
+
+  .home-btn {
+    position: absolute;
+    top: 12px;
+    right: 12px;
   }
 </style>

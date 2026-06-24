@@ -35,6 +35,7 @@ export interface PoseRenderer {
   readonly format: string;
   updatePose(format: string, joints: readonly (readonly [number, number, number])[], confidence: number): void;
   resize(): void;
+  resetView(): void;
   dispose(): void;
 }
 
@@ -43,8 +44,10 @@ export function createPoseRenderer(canvas: HTMLCanvasElement): PoseRenderer {
   scene.background = new THREE.Color('#0b0e14');
 
   const camera = new THREE.PerspectiveCamera(45, canvas.clientWidth / canvas.clientHeight, 0.01, 100);
-  camera.position.set(0, 0.15, 0.25);
-  camera.lookAt(0, 0.05, 0);
+  const initialCameraPosition = new THREE.Vector3(0, 0.15, 0.25);
+  const initialTarget = new THREE.Vector3(0, 0.05, 0);
+  camera.position.copy(initialCameraPosition);
+  camera.lookAt(initialTarget);
 
   const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'low-power' });
   renderer.setSize(canvas.clientWidth, canvas.clientHeight);
@@ -183,6 +186,14 @@ export function createPoseRenderer(canvas: HTMLCanvasElement): PoseRenderer {
     scheduleRender();
   }
 
+  function resetView() {
+    camera.position.copy(initialCameraPosition);
+    camera.lookAt(initialTarget);
+    controls.target.copy(initialTarget);
+    controls.update();
+    scheduleRender();
+  }
+
   function dispose() {
     document.removeEventListener('visibilitychange', onVisibilityChange);
     controls.dispose();
@@ -205,6 +216,7 @@ export function createPoseRenderer(canvas: HTMLCanvasElement): PoseRenderer {
     },
     updatePose,
     resize,
+    resetView,
     dispose,
   };
 }

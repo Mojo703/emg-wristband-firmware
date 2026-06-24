@@ -18,7 +18,8 @@ if it is temporarily unavailable.
   service proxy with reconnection.
 - `web/` — Svelte 5 + TypeScript (Vite) frontend: a panel shell + registry. Panels
   are the EMG stream viewer, inference inspector, config app (keymap + WiFi), and a
-  Three.js hand-pose viewer (code-split + orbit controls). Eval is a registered stub.
+  Three.js hand-pose viewer (code-split + orbit controls + live classifier confidence
+  + event log + home button). Eval is a registered stub.
 - `../pose-service/` — optional Python WebSocket service that consumes EMG windows
   and returns `Pose` frames. Supports a mock estimator and Meta's `emg2pose` model.
 - Shared wire types live in the sibling [`protocol`](../protocol) crate (CBOR via
