@@ -23,7 +23,7 @@ import cbor2
 import numpy as np
 import websockets
 
-from pose import PoseEstimator
+from pose import create_estimator
 
 HOST = os.environ.get("POSE_HOST", "0.0.0.0")
 PORT = int(os.environ.get("POSE_PORT", "8081"))
@@ -47,7 +47,7 @@ async def handle(websocket: websockets.ServerConnection) -> None:
     """One dashboard connection."""
     client = f"{websocket.remote_address}"
     logger.info("dashboard connected: %s", client)
-    estimator = PoseEstimator()
+    estimator = create_estimator()
 
     try:
         async for message in websocket:

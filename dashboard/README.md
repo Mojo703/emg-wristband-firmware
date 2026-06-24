@@ -8,19 +8,19 @@ hardware required; it runs against the `.npy` exports and a trained checkpoint.
 An optional pose-inference service can be attached; the backend forwards every
 `Emg` frame to it and proxies the resulting `Pose` frames to the Pose tab, so
 heavy hand-pose models live outside the Rust process and outside the firmware.
+The backend reconnects to the pose service automatically with exponential backoff
+if it is temporarily unavailable.
 
 ## Pieces
 
 - `src/` — axum backend: replay source, reject pipeline (3-of-3 smoothing +
   wake-gate), config persistence, the `/ws` session loop, and an optional pose
-  service proxy.
+  service proxy with reconnection.
 - `web/` — Svelte 5 + TypeScript (Vite) frontend: a panel shell + registry. Panels
   are the EMG stream viewer, inference inspector, config app (keymap + WiFi), and a
-  Three.js hand-pose viewer. Eval is a registered stub.
+  Three.js hand-pose viewer (code-split + orbit controls). Eval is a registered stub.
 - `../pose-service/` — optional Python WebSocket service that consumes EMG windows
-  and returns `Pose` frames. The current implementation is a mock estimator that
-  maps EMG amplitude to a simple hand curl; Meta's `emg2pose` model can be
-  plugged in as the estimator without changing the wire protocol.
+  and returns `Pose` frames. Supports a mock estimator and Meta's `emg2pose` model.
 - Shared wire types live in the sibling [`protocol`](../protocol) crate (CBOR via
   ciborium ↔ cbor-x). Inference reuses [`emg-tds`](../emg-tds)'s `Classifier`.
 
@@ -33,7 +33,9 @@ heavy hand-pose models live outside the Rust process and outside the firmware.
 
 `run.sh` is the normal path — open <http://localhost:8090>. It now also starts
 a local pose service automatically if `../pose-service/.venv` exists and no
-`EMG_POSE_URL` is set. `dev.sh` does the same for frontend iteration; open
+`EMG_POSE_URL` is set. If the Meta `emg2pose` checkpoint is present under
+`../pose-service/checkpoints/`, the real model is used; otherwise the mock
+estimator runs. `dev.sh` does the same for frontend iteration; open
 <http://localhost:5173>, which proxies `/ws` to the backend. The equivalent
 manual steps:
 
@@ -61,15 +63,29 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-To use an external pose service instead, set the URL:
+For the Meta `emg2pose` model, also run the one-time setup and start the
+dashboard normally:
+
+```bash
+cd ../pose-service
+source .venv/bin/activate
+pip install -r requirements-emg2pose.txt
+python setup_emg2pose.py          # clone repo + download checkpoint
+cd ../dashboard
+./run.sh
+```
+
+To use an external pose service, or to force the mock estimator, set the URL
+or model explicitly:
 
 ```bash
 cd ../dashboard
-EMG_POSE_URL=ws://localhost:8081 ./run.sh
+EMG_POSE_URL=ws://localhost:8081 ./run.sh   # external service
+POSE_MODEL=mock ./run.sh                    # force mock estimator
 ```
 
-See `../pose-service/README.md` for details on plugging in the real Meta
-`emg2pose` model.
+See `../pose-service/README.md` for details on estimator env vars and the
+streaming window size.
 
 ## Wire format
 
@@ -78,6 +94,7 @@ inspectable in any CBOR viewer. Bulk EMG samples ride as a little-endian `i16`
 byte blob (`serde_bytes`); browser→backend numeric controls are integers (e.g.
 `tau_permille`) so whole-number JS values survive cbor-x's integer encoding.
 
-`Pose` frames are new: `{type: "pose", t_us, joints: [[x,y,z], ...],
-confidence, format}`. The backend only proxies them; the frontend only renders
-them; the service owns the model.
+`Pose` frames are `{type: "pose", t_us, joints: [[x,y,z], ...], confidence,
+format}`. The backend only proxies them; the frontend only renders them; the
+service owns the model. `format` is `"mock_21"` or `"emg2pose_21"` and selects
+the skeleton layout used by the viewer.

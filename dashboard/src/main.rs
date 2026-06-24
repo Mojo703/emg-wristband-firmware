@@ -30,6 +30,7 @@ use futures_util::{SinkExt, StreamExt};
 use pipeline::{Decision, RejectPipeline};
 use protocol::{ClassInfo, Frame, MediaKey, ReplayAction, SensitivityLevel, StateInfo, WakeState};
 use replay::{FrameSource, Replay};
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -136,6 +137,11 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Resp
     ws.on_upgrade(|socket| handle_socket(socket, state))
 }
 
+/// Shared pose-proxy state: a bounded queue of EMG frames plus a notifier that
+/// wakes the forwarder task when new frames arrive.
+type PoseProxyQueue = Arc<tokio::sync::Mutex<VecDeque<Frame>>>;
+type PoseProxyNotify = Arc<tokio::sync::Notify>;
+
 /// Per-connection replay + inference loop.
 struct Session {
     source: String,
@@ -145,6 +151,67 @@ struct Session {
     pipeline: RejectPipeline,
     /// Previous window's wake state, for emitting transition events.
     prev_wake: WakeState,
+}
+
+async fn run_pose_proxy(
+    url: String,
+    queue: PoseProxyQueue,
+    notify: PoseProxyNotify,
+    browser_tx: tokio::sync::mpsc::UnboundedSender<Message>,
+) {
+    let mut backoff = Duration::from_secs(1);
+
+    loop {
+        match tokio_tungstenite::connect_async(&url).await {
+            Ok((ws, _)) => {
+                tracing::info!("connected to pose service at {url}");
+                backoff = Duration::from_secs(1);
+                let (mut sink, mut stream) = ws.split();
+                let queue_forwarder = queue.clone();
+                let notify_forwarder = notify.clone();
+
+                // Forward Emg frames to the pose service while the connection lasts.
+                let to_service = tokio::spawn(async move {
+                    loop {
+                        let frame = {
+                            let mut q = queue_forwarder.lock().await;
+                            q.pop_front()
+                        };
+                        if let Some(frame) = frame {
+                            if sink
+                                .send(WsMessage::Binary(frame::encode(&frame)))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        } else {
+                            notify_forwarder.notified().await;
+                        }
+                    }
+                });
+
+                // Forward Pose frames from the service back to the browser.
+                while let Some(Ok(msg)) = stream.next().await {
+                    if let WsMessage::Binary(bytes) = msg {
+                        // Only forward well-formed Pose frames; drop anything else.
+                        if let Ok(Frame::Pose { .. }) = frame::decode(&bytes) {
+                            let _ = browser_tx.send(Message::Binary(bytes));
+                        }
+                    }
+                }
+
+                to_service.abort();
+                tracing::warn!("pose service connection closed; reconnecting in {backoff:?}");
+            }
+            Err(e) => {
+                tracing::warn!("pose service connection failed ({e}); retrying in {backoff:?}");
+            }
+        }
+
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_secs(30));
+    }
 }
 
 async fn handle_socket(socket: WebSocket, state: AppState) {
@@ -167,47 +234,20 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     });
 
     // Optional pose-inference service proxy.
-    let pose_tx = if let Some(url) = std::env::var("EMG_POSE_URL").ok() {
-        let (to_service_tx, mut to_service_rx) = tokio::sync::mpsc::unbounded_channel::<Frame>();
-        let browser_tx_for_pose = browser_tx.clone();
+    // We keep a small queue of the latest EMG windows so temporary pose-service
+    // disconnects do not stall the entire dashboard; the proxy reconnects with
+    // exponential backoff and resumes forwarding.
+    const POSE_QUEUE_MAX: usize = 100;
+    let pose_proxy: Option<(PoseProxyQueue, PoseProxyNotify)> =
+        std::env::var("EMG_POSE_URL").ok().map(|url| {
+            let queue = Arc::new(tokio::sync::Mutex::new(VecDeque::new()));
+            let notify = Arc::new(tokio::sync::Notify::new());
+            let browser_tx_for_pose = browser_tx.clone();
 
-        tokio::spawn(async move {
-            match tokio_tungstenite::connect_async(&url).await {
-                Ok((ws, _)) => {
-                    tracing::info!("connected to pose service at {url}");
-                    let (mut sink, mut stream) = ws.split();
+            tokio::spawn(run_pose_proxy(url, queue.clone(), notify.clone(), browser_tx_for_pose));
 
-                    // Forward Emg frames to the pose service.
-                    let to_service = tokio::spawn(async move {
-                        while let Some(frame) = to_service_rx.recv().await {
-                            if sink.send(WsMessage::Binary(frame::encode(&frame))).await.is_err() {
-                                break;
-                            }
-                        }
-                    });
-
-                    // Forward Pose frames from the service back to the browser.
-                    while let Some(Ok(msg)) = stream.next().await {
-                        if let WsMessage::Binary(bytes) = msg {
-                            // Only forward well-formed Pose frames; drop anything else.
-                            if let Ok(Frame::Pose { .. }) = frame::decode(&bytes) {
-                                let _ = browser_tx_for_pose.send(Message::Binary(bytes));
-                            }
-                        }
-                    }
-
-                    to_service.abort();
-                }
-                Err(e) => {
-                    tracing::warn!("pose service connection failed ({e}); pose frames disabled");
-                }
-            }
+            (queue, notify)
         });
-
-        Some(to_service_tx)
-    } else {
-        None
-    };
 
     let initial_tau = tau_for_sensitivity(&state.config.lock().unwrap().sensitivity);
     let mut session = Session {
@@ -240,10 +280,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     if let Ok(frame) = frame::decode(&bytes) {
                         // On any config change, echo the authoritative snapshot back
                         // so the UI always shows what's actually in effect.
-                        if handle_incoming(frame, &mut session, &state) {
-                            if browser_tx.send(Message::Binary(frame::encode(&hello(&state)))).is_err() {
-                                return;
-                            }
+                        if handle_incoming(frame, &mut session, &state)
+                            && browser_tx.send(Message::Binary(frame::encode(&hello(&state)))).is_err()
+                        {
+                            return;
                         }
                     }
                     if session.source != tick_source {
@@ -267,9 +307,15 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             tracing::warn!("browser send failed; disconnecting");
                             return;
                         }
-                        // Forward Emg frames to the optional pose service.
-                        if let (Frame::Emg { .. }, Some(tx)) = (&produced, &pose_tx) {
-                            let _ = tx.send(produced.clone());
+                        // Forward Emg frames to the optional pose service queue.
+                        if let (Frame::Emg { .. }, Some((q, n))) = (&produced, &pose_proxy) {
+                            let mut queue = q.lock().await;
+                            if queue.len() >= POSE_QUEUE_MAX {
+                                queue.pop_front();
+                            }
+                            queue.push_back(produced.clone());
+                            drop(queue);
+                            n.notify_one();
                         }
                     }
                 }

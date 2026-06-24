@@ -10,5 +10,5 @@ export default defineConfig({
       '/ws': { target: 'ws://localhost:8090', ws: true },
     },
   },
-  build: { outDir: 'dist' },
+  build: { outDir: 'dist', chunkSizeWarningLimit: 600 },
 });

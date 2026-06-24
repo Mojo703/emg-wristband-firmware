@@ -9,7 +9,14 @@ POSE_PID=""
 # Auto-start the local pose service when no external URL is configured.
 if [ -z "${EMG_POSE_URL:-}" ]; then
   if [ -d "../pose-service" ] && [ -f "../pose-service/.venv/bin/python" ]; then
-    echo ">> starting pose service on ws://localhost:8081"
+    # Use the Meta emg2pose model if a checkpoint is present, otherwise the mock.
+    if [ -z "${POSE_MODEL:-}" ] && [ -f "../pose-service/checkpoints/tracking_vemg2pose.ckpt" ]; then
+      export POSE_MODEL=emg2pose
+      export POSE_CHECKPOINT="../pose-service/checkpoints/tracking_vemg2pose.ckpt"
+      echo ">> starting pose service with emg2pose on ws://localhost:8081"
+    else
+      echo ">> starting pose service on ws://localhost:8081"
+    fi
     (
       cd ../pose-service
       source .venv/bin/activate

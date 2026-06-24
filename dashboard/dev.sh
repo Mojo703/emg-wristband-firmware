@@ -11,7 +11,13 @@ cd "$(dirname "$0")"
 POSE_PID=""
 if [ -z "${EMG_POSE_URL:-}" ]; then
   if [ -d "../pose-service" ] && [ -f "../pose-service/.venv/bin/python" ]; then
-    echo ">> starting pose service on ws://localhost:8081"
+    if [ -z "${POSE_MODEL:-}" ] && [ -f "../pose-service/checkpoints/tracking_vemg2pose.ckpt" ]; then
+      export POSE_MODEL=emg2pose
+      export POSE_CHECKPOINT="../pose-service/checkpoints/tracking_vemg2pose.ckpt"
+      echo ">> starting pose service with emg2pose on ws://localhost:8081"
+    else
+      echo ">> starting pose service on ws://localhost:8081"
+    fi
     (
       cd ../pose-service
       source .venv/bin/activate

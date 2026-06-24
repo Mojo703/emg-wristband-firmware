@@ -1,0 +1,28 @@
+# Optional heavy dependencies for the real Meta emg2pose integration.
+#
+# Install these in the pose-service virtual environment only when you want to use
+# the emg2pose model. The mock estimator does not need them.
+#
+#   python -m venv .venv
+#   source .venv/bin/activate
+#   pip install -r requirements.txt
+#   pip install -r requirements-emg2pose.txt
+#   python setup_emg2pose.py
+
+# Core ML stack. Versions match the official emg2pose environment.yml as closely
+# as possible while staying compatible with a pip-only install.
+torch>=2.3.0
+pytorch-lightning>=2.2.0
+numpy>=1.26.0
+scipy>=1.13.0
+h5py>=3.11.0
+
+# Configuration and experiment management used by emg2pose.
+hydra-core>=1.3.2
+omegaconf>=2.3.0
+
+# UmeTrack / emg2pose setup.py leaves install_requires empty, so we also list
+# its runtime dependencies here.
+pandas>=2.2.0
+pyyaml>=6.0.1
+joblib>=1.4.0
