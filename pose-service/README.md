@@ -1,53 +1,44 @@
-# Pose inference service
+# pose-service
 
-A small WebSocket service that receives EMG windows from the dashboard and
-returns 3-D hand pose estimates. The dashboard backend forwards `Emg` frames to
-this service and proxies the resulting `Pose` frames back to the Pose tab.
-
-## Why a separate service?
-
-A hand-pose model from sEMG is too large to run on the wristband MCU (and larger
-than the lightweight classifier in the Rust dashboard). Keeping pose inference in
-its own service makes the model swappable and keeps the dashboard backend
-generic.
+A WebSocket service that receives EMG windows from the dashboard and returns 3-D
+hand-pose estimates. A hand-pose model is too large for the wristband MCU and
+heavier than the dashboard's classifier, so it runs as a separate, swappable
+process. The dashboard backend forwards `Emg` frames here and proxies the
+resulting `Pose` frames back to the Pose panel.
 
 ## Estimators
 
-The service can run two estimators, selected with the `POSE_MODEL` environment
-variable:
+Selected with the `POSE_MODEL` environment variable:
 
-- `mock` (default) — maps overall EMG amplitude to a simple hand-curl animation.
-  Lightweight and needs only `requirements.txt`.
-- `emg2pose` — Meta's `emg2pose` model wrapped for real-time streaming. Needs
+- `mock` (default) maps overall EMG amplitude to a simple hand-curl animation and
+  needs only `requirements.txt`.
+- `emg2pose` runs Meta's `emg2pose` model wrapped for real-time streaming. It needs
   the heavy dependencies in `requirements-emg2pose.txt` plus a one-time clone of
-  the upstream repository and its pre-trained checkpoint.
+  the upstream repo and its pre-trained checkpoint.
 
 ## Run (mock estimator)
 
-```bash
-cd pose-service
+```sh
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-python main.py
+python main.py                 # listens on ws://0.0.0.0:8081
 ```
 
-The service listens on `ws://0.0.0.0:8081` by default. Tell the dashboard to
-use it:
+Point the dashboard at it:
 
-```bash
+```sh
 cd ../dashboard
 EMG_POSE_URL=ws://localhost:8081 cargo run
 ```
 
 ## Run (Meta emg2pose estimator)
 
-The model checkpoint is hosted by Meta and is licensed under CC-BY-NC-SA-4.0;
-see the upstream repository for terms. Setup downloads ~350 MiB of model
-weights and a few GiB of PyTorch/CUDA wheels.
+The checkpoint is hosted by Meta and licensed CC-BY-NC-SA-4.0 (non-commercial);
+see the upstream repo for terms. Setup pulls ~350 MiB of weights plus a few GiB of
+PyTorch/CUDA wheels.
 
-```bash
-cd pose-service
+```sh
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -56,41 +47,46 @@ python setup_emg2pose.py          # clone repo + install packages + download che
 POSE_MODEL=emg2pose POSE_CHECKPOINT=checkpoints/tracking_vemg2pose.ckpt python main.py
 ```
 
-`run.sh` and `dev.sh` in the dashboard automatically set `POSE_MODEL=emg2pose`
-when the checkpoint exists, so the usual:
+The dashboard's `run.sh`/`dev.sh` set `POSE_MODEL=emg2pose` automatically when the
+checkpoint exists, so once `setup_emg2pose.py` has finished, the usual
+`cd ../dashboard && ./run.sh` uses the real model.
 
-```bash
-cd ../dashboard
-./run.sh
-```
+## Configuration
 
-will use the real model once `setup_emg2pose.py` has completed.
-
-### Tuning the streaming window
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `POSE_HOST` / `POSE_PORT` | `0.0.0.0` / `8081` | bind |
+| `POSE_MODEL` | `mock` | estimator (`mock` or `emg2pose`) |
+| `POSE_CHECKPOINT` | (none) | `emg2pose` checkpoint path |
+| `POSE_DEVICE` | `cuda` if available else `cpu` | inference device |
+| `POSE_WINDOW_LENGTH` | `11790` | rolling EMG buffer length |
+| `POSE_LOG_LEVEL` | `INFO` | logging |
 
 The `tracking_vemg2pose` checkpoint was trained on 11 790-sample windows at 2 kHz
-(~5.9 s). The pose service keeps a rolling buffer of incoming EMG and starts
-emitting real model predictions once the buffer is full. You can change the
-window length with `POSE_WINDOW_LENGTH` (default 11790); smaller values reduce
-latency but may not match the training distribution.
-
-Env: `POSE_HOST`, `POSE_PORT`, `POSE_LOG_LEVEL`, `POSE_MODEL`, `POSE_CHECKPOINT`,
-`POSE_DEVICE` (defaults to `cuda` if available, otherwise `cpu`), `POSE_WINDOW_LENGTH`.
+(~5.9 s). The service keeps a rolling buffer and starts emitting real predictions
+once it fills. Smaller `POSE_WINDOW_LENGTH` cuts latency but may drift from the
+training distribution.
 
 ## Wire format
 
-The service speaks the same CBOR frame protocol as the dashboard. It receives
-`Emg` frames and sends `Pose` frames:
+The service speaks the same CBOR frames as the dashboard (defined in
+[`../protocol`](../protocol)). It receives `Emg` frames and sends `Pose` frames:
 
 ```python
 {
     "type": "pose",
     "t_us": 1234567,
-    "joints": [[x, y, z], ...],  # 21 joints
+    "joints": [[x, y, z], ...],   # 21 joints
     "confidence": 0.85,
     "format": "mock_21" | "emg2pose_21",
 }
 ```
 
-`format` tells the frontend which skeleton layout the joints follow. The
-`emg2pose_21` layout is the 21 UmeTrack landmarks produced by the Meta model.
+`format` tells the frontend which skeleton layout the joints follow; `emg2pose_21`
+follows the 21 UmeTrack landmarks.
+
+## Source
+
+`main.py` (WebSocket server + CBOR codec), `pose.py` (`create_estimator()` and the
+estimators), `setup_emg2pose.py` (one-time model fetch), `vendor/` (cloned
+upstream, gitignored).

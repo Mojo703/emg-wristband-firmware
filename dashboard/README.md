@@ -1,101 +1,92 @@
 # dashboard
 
-Unified web dashboard for the EMG wristband: a Rust/axum backend that replays
+A host-only web dashboard for the EMG wristband. A Rust/axum backend replays
 exported EMG windows, runs the host classifier through the reject pipeline, and
-streams CBOR frames to a Svelte frontend over a WebSocket. Host-only dev tool — no
-hardware required; it runs against the `.npy` exports and a trained checkpoint.
+streams CBOR frames to a Svelte 5 frontend over a WebSocket. No hardware is needed,
+since it runs against the `.npy` exports and a trained checkpoint.
 
-An optional pose-inference service can be attached; the backend forwards every
-`Emg` frame to it and proxies the resulting `Pose` frames to the Pose tab, so
-heavy hand-pose models live outside the Rust process and outside the firmware.
-The backend reconnects to the pose service automatically with exponential backoff
-if it is temporarily unavailable.
+A pose-inference service can be attached. When one is configured, the backend
+forwards every `Emg` frame to it and proxies the resulting `Pose` frames to the
+Pose panel, so heavy hand-pose models live outside the Rust process and outside
+the firmware budget. If the pose service drops, the backend reconnects with
+exponential backoff.
 
 ## Pieces
 
-- `src/` — axum backend: replay source, reject pipeline (3-of-3 smoothing +
-  wake-gate), config persistence, the `/ws` session loop, and an optional pose
-  service proxy with reconnection.
-- `web/` — Svelte 5 + TypeScript (Vite) frontend: a panel shell + registry. Panels
-  are the EMG stream viewer, inference inspector, config app (keymap + WiFi), and a
-  Three.js hand-pose viewer (code-split + orbit controls + live classifier confidence
-  + event log + home button). Eval is a registered stub.
-- `../pose-service/` — optional Python WebSocket service that consumes EMG windows
-  and returns `Pose` frames. Supports a mock estimator and Meta's `emg2pose` model.
-- Shared wire types live in the sibling [`protocol`](../protocol) crate (CBOR via
-  ciborium ↔ cbor-x). Inference reuses [`emg-tds`](../emg-tds)'s `Classifier`.
+The `src/` directory is the axum backend: the `.npy` replay source, the reject
+pipeline (a threshold, 3-of-3 vote smoothing, and the wake-gate state machine),
+config persistence, the `/ws` session loop, and the optional pose-service proxy.
+
+The `web/` directory is the Svelte 5 and TypeScript frontend (Vite), a panel shell
+plus a registry in `web/src/lib/panels.ts`. The panels are Stream (the EMG scope,
+with the live classifier confidence track, wake-gate status, and event markers
+folded in), Config (the keymap and WiFi), Pose (a code-split Three.js hand viewer
+with orbit controls), and Eval (a registered placeholder).
+
+The optional Python pose service lives in [`../pose-service`](../pose-service).
+Shared wire types come from the sibling [`protocol`](../protocol) crate (CBOR via
+ciborium and cbor-x), and inference reuses [`emg-tds`](../emg-tds)'s `Classifier`.
 
 ## Run
 
-```
-./run.sh          # build frontend + serve app + /ws on :8090 (add --release)
-./dev.sh          # backend + Vite hot-reload dev server on :5173
-```
-
-`run.sh` is the normal path — open <http://localhost:8090>. It now also starts
-a local pose service automatically if `../pose-service/.venv` exists and no
-`EMG_POSE_URL` is set. If the Meta `emg2pose` checkpoint is present under
-`../pose-service/checkpoints/`, the real model is used; otherwise the mock
-estimator runs. `dev.sh` does the same for frontend iteration; open
-<http://localhost:5173>, which proxies `/ws` to the backend. The equivalent
-manual steps:
-
-```
-cd web && pnpm install && pnpm run check && pnpm run build  # type-check + emit web/dist
-cd .. && cargo run                                          # serves the app + /ws on :8090
+```sh
+./run.sh          # build frontend, serve app and /ws on :8090 (add --release)
+./dev.sh          # backend plus Vite hot-reload dev server on :5173
 ```
 
-Env: `DASHBOARD_ADDR` (default `0.0.0.0:8090`), `EMG_DATA_DIR` (default
-`../waveformer/data`), `EMG_CHECKPOINT` (default
-`../emg-tds/checkpoints/best.safetensors`), `DASHBOARD_WEB` (default `web/dist`),
-`EMG_POSE_URL` (optional, e.g. `ws://localhost:8081`).
-Without a checkpoint the EMG stream still runs; predictions are skipped.
-Without `EMG_POSE_URL` the Pose tab still renders but receives no frames.
+`run.sh` is the normal path; open <http://localhost:8090>. It also starts a local
+pose service when `../pose-service/.venv` exists and `EMG_POSE_URL` is unset. If
+the Meta `emg2pose` checkpoint is present under `../pose-service/checkpoints/`, the
+real model runs, otherwise the mock. `dev.sh` does the same for frontend
+iteration; open <http://localhost:5173>, which proxies `/ws` to the backend.
 
-## Pose service
+The frontend uses pnpm, not npm. The manual steps are:
 
-`run.sh` and `dev.sh` auto-start the local Python service when no external URL
-is configured. To set it up once:
+```sh
+cd web && pnpm install && pnpm run check && pnpm run build   # type-check, emit web/dist
+cd .. && cargo run                                           # serve app and /ws on :8090
+```
 
-```bash
+To set up the pose service once:
+
+```sh
 cd ../pose-service
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-```
-
-For the Meta `emg2pose` model, also run the one-time setup and start the
-dashboard normally:
-
-```bash
-cd ../pose-service
-source .venv/bin/activate
+# for the Meta emg2pose model, also:
 pip install -r requirements-emg2pose.txt
-python setup_emg2pose.py          # clone repo + download checkpoint
-cd ../dashboard
-./run.sh
+python setup_emg2pose.py          # clone repo, download checkpoint
 ```
 
-To use an external pose service, or to force the mock estimator, set the URL
-or model explicitly:
+To point at an external service or force the mock:
 
-```bash
-cd ../dashboard
+```sh
 EMG_POSE_URL=ws://localhost:8081 ./run.sh   # external service
-POSE_MODEL=mock ./run.sh                    # force mock estimator
+POSE_MODEL=mock ./run.sh                     # force the mock estimator
 ```
 
-See `../pose-service/README.md` for details on estimator env vars and the
-streaming window size.
+See [`../pose-service/README.md`](../pose-service/README.md) for the estimator env
+vars and the streaming-window size.
+
+## Environment
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `DASHBOARD_ADDR` | `0.0.0.0:8090` | bind address |
+| `EMG_DATA_DIR` | `../waveformer/data` | replay `.npy` windows |
+| `EMG_CHECKPOINT` | `../emg-tds/checkpoints/best.safetensors` | classifier weights |
+| `DASHBOARD_WEB` | `web/dist` | static frontend dir |
+| `EMG_POSE_URL` | (unset) | optional pose service WebSocket |
+
+Without a checkpoint the EMG stream still runs and predictions are skipped. Without
+a pose URL the Pose panel renders but receives no frames.
 
 ## Wire format
 
-Frames are internally-tagged CBOR maps (`{type: "emg", ...}`) — compact but
-inspectable in any CBOR viewer. Bulk EMG samples ride as a little-endian `i16`
-byte blob (`serde_bytes`); browser→backend numeric controls are integers (e.g.
-`tau_permille`) so whole-number JS values survive cbor-x's integer encoding.
-
-`Pose` frames are `{type: "pose", t_us, joints: [[x,y,z], ...], confidence,
-format}`. The backend only proxies them; the frontend only renders them; the
-service owns the model. `format` is `"mock_21"` or `"emg2pose_21"` and selects
-the skeleton layout used by the viewer.
+Wire types live in [`../protocol`](../protocol); the dashboard adds no framing of
+its own. Two dashboard-specific notes. Browser-to-backend numeric controls are
+integers (for example `tau_permille`) so whole-number JS values survive cbor-x's
+integer encoding. And `Pose` frames are only passed through: the backend forwards
+them and the frontend renders them, while the pose service owns the model and the
+`format` tag (`mock_21` or `emg2pose_21`).

@@ -1,27 +1,57 @@
-# EMG Wristband Firmware
+# EMG Wristband
 
-Rust firmware for the sEMG gesture-recognition wristband (capstone S1). Each
-project here is self-contained (no shared workspace) so team members can develop
-in parallel and merge at the integration phase.
+A full-stack surface-EMG gesture system (capstone S1). It spans firmware for an
+ESP32-S3 wristband, the host-side machine learning that trains and shrinks the
+gesture model, a browser dashboard for inspecting the pipeline, and a
+pose-inference service. The end goal is a wristband that reads forearm muscle
+signals, works out which gesture you made, and acts on it. For now the action is
+driving an iPhone's media controls over BLE.
 
-The first milestone is the OTA update system below, to make all later firmware
-work faster to ship.
+Each subproject stands on its own. Every one has its own `Cargo.toml` with an
+empty `[workspace]` table and its own toolchain, so team members can work in
+parallel and integrate later. There is deliberately no shared Cargo workspace.
 
-> IMPORTANT! Keep this tree at a location without spaces in the path, because ESP-IDF refuses to build under paths containing spaces
+> Keep this tree at a path without spaces. ESP-IDF refuses to build under any path
+> containing a space.
 
-## Projects
+## Layout
 
-- `ota-client/`: ESP32-S3 firmware (std / `esp-idf-svc`). Connects to WiFi,
-  pulls a firmware image over HTTP, writes it to the inactive OTA slot, and
-  reboots into it. Uses the ESP-IDF `esp_https_ota`-style flow via `EspOta`.
-- `ota-server/`: Minimal `axum` HTTP server (runs on your dev machine) that
-  hosts firmware `.bin` images for the client to download.
-- `ble-media/`: ESP32-S3 BLE HID media remote (`esp32-nimble`). Bonds with
-  an iPhone and sends media keys (play/pause, next, volume); serial-console
-  driven for bring-up, gesture-driven later. See `ble-media/README.md`.
+Firmware (ESP32-S3, Xtensa toolchain):
 
-## Dev Environment
-## Development Environment
+| Path | What it is |
+|------|------------|
+| [`ota-client/`](ota-client) | OTA update client. Pulls a firmware image over HTTP and reboots into it. The first milestone, since it makes every later firmware change faster to ship. |
+| [`ota-server/`](ota-server) | Dev-machine HTTP server that hosts firmware `.bin` images for the client. Plain host Rust, no ESP toolchain. |
+| [`ble-media/`](ble-media) | BLE HID media remote. Bonds with an iPhone and sends media keys. Serial-driven for bring-up, gesture-driven later. |
+| [`ml-bench/`](ml-bench) | On-device latency and throughput benchmark for the int8 gesture model, including the hand-written ESP32-S3 SIMD kernels. |
+
+Machine learning and tooling (host, plain Rust or Python):
+
+| Path | What it is |
+|------|------------|
+| [`emg-tds/`](emg-tds) | The current gesture model: a depthwise-separable (TDS) conv encoder in Rust/candle, with swappable classifier and pose heads. Trains, evaluates, and exports. |
+| [`waveformer/`](waveformer) | A retired accuracy-ceiling experiment (WaveFormer port). Kept for reference; the encoder in `emg-tds` superseded it. |
+| [`dashboard/`](dashboard) | Web dashboard. An axum backend replays exported EMG windows through the host classifier and streams CBOR frames to a Svelte frontend. Host-only, no hardware needed. |
+| [`pose-service/`](pose-service) | Python WebSocket service that turns EMG windows into 3-D hand pose. Runs a mock estimator or Meta's `emg2pose` model. |
+| [`protocol/`](protocol) | A `no_std` crate of the CBOR frame types shared by the dashboard backend, the browser, and (later) the firmware. |
+| [`engineering-logs/`](engineering-logs) | Dated log of the ML and on-device optimisation work, one goal, method, measurement, and analysis per entry. Read it first to learn why the model is what it is. |
+
+## Conventions
+
+No shared workspace. Every Cargo project carries an empty `[workspace]` table so
+cargo treats it as its own root and does not try to attach it to a parent. Build
+each project from inside its own directory.
+
+Two toolchains. The firmware projects (`ota-client`, `ble-media`, `ml-bench`) use
+the Espressif Rust fork; their `rust-toolchain.toml` pins `channel = "esp"`, and
+every build shell must first source `. ~/export-esp.sh`. The host projects build
+with ordinary stable or nightly Rust.
+
+The dashboard frontend uses pnpm, not npm. Identifiers are spelled out, with no
+acronyms or abbreviations. Cross-process messages are CBOR frames defined once in
+`protocol/`, and bulk EMG rides as a little-endian `i16` byte blob.
+
+## Development environment
 
 | Tool | Version |
 |------|---------|
@@ -37,35 +67,18 @@ work faster to ship.
 
 ## Target hardware
 
-- ESP32-S3-Zero (Waveshare), 4 MB flash, native USB (USB-Serial-JTAG over USB-C).
-- We will move to a custom board later, so nothing here is board-pinned beyond the
-  partition table (`ota-client/partitions.csv`) sized for 4 MB flash.
+ESP32-S3-Zero (Waveshare): 4 MB flash, no PSRAM, native USB (USB-Serial-JTAG over
+USB-C). Nothing here is board-pinned beyond the 4 MB partition tables, so a move to
+a custom board later stays contained.
 
-## How the OTA works
+## Where to start
 
-The 4 MB flash holds two equal app slots (`ota_0`, `ota_1`) plus an `otadata`
-region that records which slot to boot. The client connects to WiFi, downloads
-an app image from `ota-server` over HTTP, writes it to whichever slot isn't
-running, flips `otadata`, and reboots into it. The boot banner prints
-`FW_VERSION` and the active slot, so a successful update shows both changing.
-Full detail is in `ota-client/README.md`.
+For firmware bring-up and OTA, read [`ota-client/README.md`](ota-client/README.md).
+It has the one-time Xtensa toolchain setup that every firmware project shares,
+including the Arch `libxml2` workaround, plus the end-to-end OTA verification.
 
-Status: verified end-to-end on hardware, v1.0.0 updated to v1.0.1 over WiFi,
-slot `ota_0 → ota_1`, no re-flash.
+For the model and its history, read [`engineering-logs/`](engineering-logs) for the
+decisions and [`emg-tds/`](emg-tds) for the code.
 
-## End-to-end verification for OTA
-
-This is a summary. The exact commands and expected logs are in `ota-client/README.md`.
-
-1. Install the Xtensa toolchain and apply the Arch `libxml2` symlink
-   (`ota-client/README.md`).
-2. Start the server (`cd ota-server && cargo run`) with `firmware/` empty, and
-   open port 8080 if a host firewall is running
-   (`sudo firewall-cmd --add-port=8080/tcp`).
-3. Fill in `ota-client/cfg.toml` (2.4 GHz SSID/PSK + `ota_url` with the dev
-   machine's LAN IP).
-4. Flash v1 (`cd ota-client && cargo run`). Empty server → device logs a clean
-   `HTTP 404` and stays on v1.0.0: WiFi + HTTP + graceful-failure confirmed.
-5. Bump `FW_VERSION`, `cargo build --release`, `espflash save-image` the `.bin`
-   into `ota-server/firmware/`, then reset the board (don't re-flash). It updates
-   over the air and reboots into the new version.
+To see it run without hardware, use [`dashboard/`](dashboard): run `./run.sh` and
+open <http://localhost:8090>.
