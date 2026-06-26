@@ -40,6 +40,21 @@
   let spanSec = $state<number>(DEFAULT_SPAN);
   let stream: StreamState | null = $state(null);
 
+  // The canvas paints only signal (traces, curves, band fills, event lines and
+  // glyphs). Everything textual or chrome-like — channel/region labels, the τ
+  // marker, event labels, and the sweep cursor — lives in a DOM overlay sized to
+  // the same box. These reactive values are written each frame from render() so
+  // the overlay tracks the plot without the canvas ever drawing text.
+  let plotHeight = $state(0);
+  let cursorX = $state(0);
+  interface EventLabel {
+    readonly key: string;
+    readonly x: number;
+    readonly label: string;
+    readonly color: string;
+  }
+  let eventLabels = $state<EventLabel[]>([]);
+
   interface StoredPrediction {
     readonly seq: number;
     readonly softmax: Float32Array;
@@ -185,6 +200,41 @@
     return classInfo[cls]?.color ?? NEUTRAL;
   }
 
+  // Region geometry, the single source of truth for both the canvas signal draw
+  // and the DOM overlay. Derived from the plot box and the backend descriptors so
+  // the two layers can never disagree on where a lane or band sits.
+  interface LaneLabel {
+    readonly ch: number;
+    readonly y: number;
+  }
+  const chrome = $derived.by(() => {
+    const height = plotHeight;
+    const channels = stream?.channels ?? 0;
+    const trackHeight = classInfo.length > 0 ? Math.min(120, height * 0.28) : 0;
+    const emgHeight = height - trackHeight;
+    const laneHeight = channels > 0 ? emgHeight / channels : 0;
+    const lanes: LaneLabel[] = Array.from({ length: channels }, (_, ch) => ({
+      ch,
+      y: ch * laneHeight,
+    }));
+    // Mirror drawTrack's vertical reservations so the τ / region labels land on
+    // their lines exactly.
+    const confBottom = height - BAND_HEIGHT;
+    const confHeight = trackHeight - BAND_HEIGHT;
+    const tauLine = live.prediction?.tau ?? config?.tau ?? 0.5;
+    const tauY = confBottom - tauLine * (confHeight - 6) - 3;
+    return {
+      hasTrack: trackHeight > 0,
+      trackHeight,
+      emgHeight,
+      lanes,
+      trackTop: emgHeight,
+      confBottom,
+      tauY,
+      eventLabelY: height - BAND_HEIGHT - 8,
+    };
+  });
+
   function render(): void {
     if (canvas === undefined) return;
     const dpr = window.devicePixelRatio || 1;
@@ -206,6 +256,8 @@
 
     const width = cssWidth;
     const height = cssHeight;
+    // Publish the box height so the overlay's geometry (chrome) tracks the canvas.
+    plotHeight = height;
     const spanMs = spanSec * 1000;
     const now = performance.now();
 
@@ -213,9 +265,9 @@
     const phaseX = (tMs: number): number =>
       ((((tMs % spanMs) + spanMs) % spanMs) / spanMs) * width;
     const xNow = phaseX(now);
+    cursorX = xNow;
 
-    const trackHeight = classInfo.length > 0 ? Math.min(120, height * 0.28) : 0;
-    const emgHeight = height - trackHeight;
+    const { trackHeight, emgHeight, hasTrack } = chrome;
 
     // Draw only the current sweep pass: [passStart, now] maps to [0, xNow]. Data
     // older than passStart belongs to the previous pass and is left blank, so
@@ -229,17 +281,18 @@
     if (stream !== null && stream.channels > 0) {
       drawChannels(ctx, width, emgHeight, spanMs, now, passStart);
     }
-    if (trackHeight > 0) {
+    if (hasTrack) {
       drawTrack(ctx, width, emgHeight, trackHeight, now, passStart, phaseX);
     }
-    drawEvents(ctx, width, height, now, passStart, phaseX, rowCenterY);
-    drawSweep(ctx, xNow, height, width);
+    eventLabels = drawEvents(ctx, width, height, now, passStart, phaseX, rowCenterY);
   }
 
   // Generic decision events: a dashed full-height line for temporal context plus a
   // glyph centred on the streak row. The glyph is the event colour with a light
   // contrast ring so it stays visible even on the same-coloured active band. The
   // frontend knows nothing about each kind — it draws what the backend sent.
+  // Draws each visible event's context line and streak-row glyph, and returns the
+  // labels for the DOM overlay to position (the canvas no longer paints text).
   function drawEvents(
     ctx: CanvasRenderingContext2D,
     _width: number,
@@ -248,10 +301,9 @@
     passStart: number,
     phaseX: (tMs: number) => number,
     rowCenterY: number,
-  ): void {
-    if (stream === null || stream.anchorMs === null) return;
-    ctx.font = '13px system-ui, sans-serif';
-    ctx.textAlign = 'center';
+  ): EventLabel[] {
+    if (stream === null || stream.anchorMs === null) return [];
+    const labels: EventLabel[] = [];
     for (const e of events) {
       const t = stream.anchorMs + e.tUs / 1000;
       if (t < passStart || t > now) continue;
@@ -285,13 +337,11 @@
       ctx.lineWidth = 0.75;
       ctx.stroke();
 
-      // Label just above the band, centred on the line.
       if (e.label !== null) {
-        ctx.fillStyle = '#e5e7ebee';
-        ctx.fillText(e.label, x, rowCenterY - BAND_HEIGHT / 2 - 8);
+        labels.push({ key: `${e.tUs}:${e.kind}`, x, label: e.label, color });
       }
     }
-    ctx.textAlign = 'start';
+    return labels;
   }
 
   function drawTimeGrid(
@@ -301,9 +351,7 @@
     _spanMs: number,
   ): void {
     ctx.strokeStyle = '#ffffff14';
-    ctx.fillStyle = '#ffffff44';
     ctx.lineWidth = 1;
-    ctx.font = '13px system-ui, sans-serif';
     // Vertical lines at second boundaries (sweep x is fixed for a given offset).
     for (let s = 0; s <= spanSec; s++) {
       const x = (s / spanSec) * width;
@@ -345,7 +393,6 @@
     const useEnvelope = samplesPerColumn >= 8;
     const stride = Math.max(1, Math.round(samplesPerColumn / 2)); // ~2 points/column
 
-    ctx.font = '13px system-ui, sans-serif';
     for (let ch = 0; ch < stream.channels; ch++) {
       const laneTop = ch * laneHeight;
       const midY = laneTop + laneHeight / 2;
@@ -429,10 +476,6 @@
         }
       }
       ctx.stroke();
-
-      // Channel label, top-left of its lane.
-      ctx.fillStyle = '#ffffff77';
-      ctx.fillText(`CH${ch}`, 6, laneTop + 13);
     }
   }
 
@@ -541,11 +584,9 @@
     ctx.moveTo(0, yFor(0.5));
     ctx.lineTo(width, yFor(0.5));
     ctx.stroke();
-    ctx.fillStyle = '#ffffff66';
-    ctx.font = '13px system-ui, sans-serif';
-    ctx.fillText('Class Confidence', 6, top + 13);
 
-    // τ threshold line (the per-window trigger level) — plain dashed line.
+    // τ threshold line (the per-window trigger level) — plain dashed line. The
+    // "τ" label itself is drawn by the DOM overlay (chrome.tauY).
     const yTau = yFor(tauLine);
     ctx.strokeStyle = '#e5e7eb55';
     ctx.setLineDash([4, 4]);
@@ -554,8 +595,6 @@
     ctx.lineTo(width, yTau);
     ctx.stroke();
     ctx.setLineDash([]);
-    ctx.fillStyle = '#e5e7eb99';
-    ctx.fillText('τ', width - 14, yTau - 3);
 
     if (classCount === 0) return;
     if (stream === null || stream.anchorMs === null) return;
@@ -631,28 +670,6 @@
       ctx.fillRect(a.x, bandTop, Math.max(0, x1 - a.x), bandHeight);
     }
     ctx.globalAlpha = 1;
-
-    ctx.fillStyle = '#ffffff66';
-    ctx.font = '13px system-ui, sans-serif';
-    ctx.fillText('State', 6, bandTop + 13);
-  }
-
-  function drawSweep(
-    ctx: CanvasRenderingContext2D,
-    xNow: number,
-    height: number,
-    width: number,
-  ): void {
-    // Dim the whole future region (right of the present) — empty, less-emphasis.
-    ctx.fillStyle = '#0b0e1466';
-    ctx.fillRect(xNow, 0, Math.max(0, width - xNow), height);
-    // The present.
-    ctx.strokeStyle = '#e5e7eb';
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(xNow, 0);
-    ctx.lineTo(xNow, height);
-    ctx.stroke();
   }
 </script>
 
@@ -667,7 +684,37 @@
   <span class="muted">{stream?.channels ?? 0} channels @{stream?.sampleRate ?? 0}Hz</span>
 </div>
 
-<canvas bind:this={canvas}></canvas>
+<div class="plot">
+  <canvas bind:this={canvas}></canvas>
+
+  <!-- Text and chrome layer: positioned over the canvas, sized to the same box.
+       The canvas paints signal only; everything legible lives here as real DOM. -->
+  <div class="overlay">
+    {#each chrome.lanes as lane (lane.ch)}
+      <span class="chan-label" style:top="{lane.y}px">CH{lane.ch}</span>
+    {/each}
+
+    {#if chrome.hasTrack}
+      <span class="region-label" style:top="{chrome.trackTop}px">Class Confidence</span>
+      <span class="tau-label" style:top="{chrome.tauY}px">τ</span>
+      <span class="region-label" style:top="{chrome.confBottom}px">State</span>
+    {/if}
+
+    {#each eventLabels as event (event.key)}
+      <span
+        class="event-label"
+        style:left="{event.x}px"
+        style:top="{chrome.eventLabelY}px"
+        style:color={event.color}
+      >{event.label}</span>
+    {/each}
+
+    <!-- Future region (right of the present) dimmed; the present is a thin bar.
+         Both move every frame via the cursor, decoupled from the signal draw. -->
+    <div class="future" style:left="{cursorX}px"></div>
+    <div class="cursor" style:transform="translateX({cursorX}px)"></div>
+  </div>
+</div>
 
 {#if classInfo.length > 0}
   <div class="legend">
@@ -681,6 +728,58 @@
 {/if}
 
 <style>
+  /* The plot is the positioning context shared by the signal canvas and the DOM
+     overlay; both fill the same box so overlay coordinates match canvas pixels. */
+  .plot {
+    position: relative;
+  }
+  .overlay {
+    position: absolute;
+    inset: 0;
+    overflow: hidden;
+    pointer-events: none;
+    font: 13px system-ui, sans-serif;
+  }
+  .overlay span {
+    position: absolute;
+    white-space: nowrap;
+    line-height: 1;
+    padding-top: 2px;
+  }
+  .chan-label {
+    left: 6px;
+    color: #ffffff77;
+  }
+  .region-label {
+    left: 6px;
+    color: #ffffff66;
+  }
+  .tau-label {
+    right: 14px;
+    color: #e5e7eb99;
+    transform: translateY(-100%);
+  }
+  .event-label {
+    color: #e5e7eb;
+    transform: translate(-50%, -100%);
+    text-shadow: 0 0 3px #0b0e14;
+  }
+  .future {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    right: 0;
+    background: #0b0e1466;
+  }
+  .cursor {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    width: 1px;
+    background: #e5e7eb;
+  }
+
   .legend {
     display: flex;
     flex-wrap: wrap;
