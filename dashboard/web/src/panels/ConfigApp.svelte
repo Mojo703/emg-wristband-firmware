@@ -2,6 +2,8 @@
   import { live, api } from '../lib/socket.svelte';
   import { MediaKey, isMediaKey, type Binding } from '../lib/protocol';
   import Icon from '../lib/Icon.svelte';
+  import Select from '../lib/ui/Select.svelte';
+  import Button from '../lib/ui/Button.svelte';
 
   const KEYS: readonly { value: MediaKey; label: string }[] = [
     { value: MediaKey.PlayPause, label: 'Play/Pause' },
@@ -11,6 +13,7 @@
     { value: MediaKey.VolumeDown, label: 'Volume down' },
     { value: MediaKey.Mute, label: 'Mute' },
   ];
+  const keyOptions = KEYS.map((option) => ({ value: option.value as string, label: option.label }));
 
   // The discrete settings reflect the backend's live config directly — no local
   // draft. Each change applies immediately; the backend echoes a fresh Hello, so
@@ -19,6 +22,7 @@
   const gestures = $derived(config?.gestures ?? 0);
   const keymap = $derived(config?.keymap ?? []);
   const levels = $derived(config?.sensitivity_levels ?? []);
+  const levelOptions = $derived(levels.map((level) => ({ value: level.id, label: level.label })));
   const gestureIndices = $derived(Array.from({ length: gestures }, (_, i) => i));
 
   function keyFor(gesture: number): MediaKey {
@@ -37,10 +41,8 @@
     api.keymap(next);
   }
 
-  function handleKeyChange(gesture: number, event: Event & { currentTarget: HTMLSelectElement }): void {
-    const key = event.currentTarget.value;
-    if (!isMediaKey(key)) return;
-    setKey(gesture, key);
+  function onKeyChange(gesture: number, value: string): void {
+    if (isMediaKey(value)) setKey(gesture, value);
   }
 
   // WiFi is the exception: free-text credentials are entered as a set and committed
@@ -55,10 +57,6 @@
     ssid = config.wifi_ssid ?? '';
   });
   const saveWifi = () => api.wifi(ssid, psk);
-
-  function handleSensitivityChange(event: Event & { currentTarget: HTMLSelectElement }): void {
-    api.sensitivity(event.currentTarget.value);
-  }
 </script>
 
 <h2>Config</h2>
@@ -69,11 +67,12 @@
   <div class="row">
     <label>
       Trigger sensitivity
-      <select value={config?.sensitivity ?? ''} onchange={handleSensitivityChange}>
-        {#each levels as level}
-          <option value={level.id}>{level.label}</option>
-        {/each}
-      </select>
+      <Select
+        value={config?.sensitivity ?? ''}
+        options={levelOptions}
+        onChange={(value) => api.sensitivity(value)}
+        placeholder="Select…"
+      />
     </label>
     <span class="muted">Higher = commands trigger more easily.</span>
   </div>
@@ -87,11 +86,11 @@
         <tr>
           <td>Gesture {gesture}</td>
           <td>
-            <select value={keyFor(gesture)} onchange={(event) => handleKeyChange(gesture, event)}>
-              {#each KEYS as option}
-                <option value={option.value}>{option.label}</option>
-              {/each}
-            </select>
+            <Select
+              value={keyFor(gesture)}
+              options={keyOptions}
+              onChange={(value) => onKeyChange(gesture, value)}
+            />
           </td>
         </tr>
       {/each}
@@ -106,7 +105,7 @@
     <label>Password<input type="password" bind:value={psk} placeholder="••••••" /></label>
   </div>
   <div class="row">
-    <button class="btn" onclick={saveWifi}>Save WiFi</button>
+    <Button onclick={saveWifi}>Save WiFi</Button>
     <span class="muted">Credentials are committed together; the password is write-only.</span>
   </div>
 </section>

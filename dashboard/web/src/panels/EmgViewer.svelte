@@ -11,8 +11,10 @@
   import { onMount } from 'svelte';
   import { live, on } from '../lib/socket.svelte';
   import { WakeState, type ClassInfo, type DecodedEmg, type EventFrame, type PredictionFrame, type StateInfo } from '../lib/protocol';
+  import Select from '../lib/ui/Select.svelte';
 
   const SPANS = [1, 2, 5, 10, 15, 20, 30] as const; // ring sizes; the visible span is a subset
+  const SPAN_OPTIONS = SPANS.map((s) => ({ value: String(s), label: `${s}s` }));
   const MAX_SPAN_SEC = Math.max(...SPANS);
   const BAND_HEIGHT = 24; // wake-state / streak row at the bottom of the track
   const BG = '#0b0e14';
@@ -675,11 +677,12 @@
 
 <h2>Stream</h2>
 <div class="row">
-  <select bind:value={spanSec} title="Timeline Period">
-    {#each SPANS as s}
-      <option value={s}>{s}s</option>
-    {/each}
-  </select>
+  <Select
+    value={String(spanSec)}
+    options={SPAN_OPTIONS}
+    onChange={(value) => (spanSec = Number(value))}
+    title="Timeline Period"
+  />
 
   <span class="muted">{stream?.channels ?? 0} channels @{stream?.sampleRate ?? 0}Hz</span>
 </div>

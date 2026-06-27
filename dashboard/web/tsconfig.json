@@ -4,6 +4,10 @@
     "target": "ESNext",
     "module": "ESNext",
     "moduleResolution": "bundler",
+    "paths": {
+      "$lib": ["./src/lib"],
+      "$lib/*": ["./src/lib/*"]
+    },
     "resolveJsonModule": true,
     "verbatimModuleSyntax": true,
     "isolatedModules": true,
@@ -32,7 +36,7 @@
     "allowUnusedLabels": false,
     "allowUnreachableCode": false,
     "forceConsistentCasingInFileNames": true,
-    "skipLibCheck": false
+    "skipLibCheck": true
   },
   "include": ["src/**/*.ts", "src/**/*.svelte", "src/**/*.d.ts"]
 }

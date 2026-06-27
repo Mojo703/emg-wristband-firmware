@@ -3,6 +3,8 @@
   import { live, on } from '../lib/socket.svelte';
   import type { PoseFrame, PredictionFrame, EventFrame, ClassInfo } from '../lib/protocol';
   import Icon from '../lib/Icon.svelte';
+  import Meter from '../lib/ui/Meter.svelte';
+  import Tooltip from '../lib/ui/Tooltip.svelte';
   import type { PoseRenderer } from '../lib/PoseRenderer';
 
   let canvas: HTMLCanvasElement | undefined = $state(undefined);
@@ -68,9 +70,9 @@
 
 <div class="pose-layout">
   <div>
-    <button class="btn home-btn" onclick={resetView} aria-label="Reset view" title="Reset view">
+    <Tooltip text="Reset view" class="btn home-btn" onclick={resetView} aria-label="Reset view">
       <Icon name="home" size={18} />
-    </button>
+    </Tooltip>
     <canvas bind:this={canvas}></canvas>
   </div>
 
@@ -84,9 +86,7 @@
           {#each classes as cls, i}
             {@const value = prediction.softmax[i] ?? 0}
             <div>{cls.label}</div>
-            <div class="track">
-              <div class="fill" style:width="{`${(value * 100).toFixed(0)}%`}" style:background-color={cls.color}></div>
-            </div>
+            <Meter {value} color={cls.color} />
             <div>{(value * 100).toFixed(0)}%</div>
           {/each}
         </div>
@@ -155,11 +155,5 @@
     display: flex;
     gap: 8px;
     align-items: baseline;
-  }
-
-  .home-btn {
-    position: absolute;
-    top: 12px;
-    right: 12px;
   }
 </style>
