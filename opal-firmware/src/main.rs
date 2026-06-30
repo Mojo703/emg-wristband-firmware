@@ -58,10 +58,24 @@ fn main() -> anyhow::Result<()> {
     let mut provider = Provider::new();
     let mut pipeline = RejectPipeline::new(NUM_CLASSES, tau_for(&settings.sensitivity));
 
+    let window_us = model.input_len as u64 * 1_000_000 / SAMPLE_RATE as u64;
+    let mut seq: u32 = 0;
+    let mut prev_wake = WakeState::Idle;
+    let mut ctx = Loop {
+        model: &model,
+        provider: &mut provider,
+        pipeline: &mut pipeline,
+        store: &store,
+        settings: &mut settings,
+        device_id: &device_id,
+        window_us,
+        seq: &mut seq,
+        prev_wake: &mut prev_wake,
+    };
+
     // Choose the link: wifi when credentials are set, else the serial link (which is
-    // used to provision wifi for the next boot). The wifi handle must outlive the loop.
-    let mut _wifi_guard = None;
-    let mut transport: Box<dyn Transport> = if settings.wifi_ssid.is_empty() {
+    // used to provision wifi for the next boot).
+    if ctx.settings.wifi_ssid.is_empty() {
         info!("no wifi configured; using serial link");
         let uart = UartDriver::new(
             peripherals.uart1,
@@ -71,67 +85,95 @@ fn main() -> anyhow::Result<()> {
             Option::<AnyIOPin>::None,
             &UartConfig::default().baudrate(Hertz(SERIAL_BAUD)),
         )?;
-        Box::new(SerialTransport::new(uart))
+        let mut transport = SerialTransport::new(uart);
+        // Serial never disconnects; serve forever (and re-announce if serve returns).
+        loop {
+            serve(&mut transport, &mut ctx);
+            FreeRtos::delay_ms(1000);
+        }
     } else {
-        info!("connecting to wifi '{}'", settings.wifi_ssid);
-        let handle = wifi::connect(
+        info!("connecting to wifi '{}'", ctx.settings.wifi_ssid);
+        // Keep the handle alive for the program's lifetime; dropping it tears wifi down.
+        let _wifi = wifi::connect(
             peripherals.modem,
             sysloop,
             nvs_partition,
-            &settings.wifi_ssid,
-            &settings.wifi_psk,
+            &ctx.settings.wifi_ssid,
+            &ctx.settings.wifi_psk,
         )?;
-        _wifi_guard = Some(handle);
-        info!("dialing dashboard at {}", settings.server_addr);
-        Box::new(TcpTransport::connect(&settings.server_addr)?)
-    };
+        // Dial the dashboard, stream until the link drops, then retry — so the device
+        // waits for the dashboard to come up and survives it restarting.
+        loop {
+            match TcpTransport::connect(&ctx.settings.server_addr) {
+                Ok(mut transport) => {
+                    info!("connected to dashboard at {}", ctx.settings.server_addr);
+                    serve(&mut transport, &mut ctx);
+                    warn!("dashboard link lost; reconnecting");
+                }
+                Err(e) => warn!("dial {} failed ({e}); retrying", ctx.settings.server_addr),
+            }
+            FreeRtos::delay_ms(2000);
+        }
+    }
+}
 
-    // Announce identity + config.
-    announce(transport.as_mut(), &device_id, &settings);
+/// The mutable state the serve loop carries across reconnects.
+struct Loop<'a> {
+    model: &'a Model,
+    provider: &'a mut Provider,
+    pipeline: &'a mut RejectPipeline,
+    store: &'a Store,
+    settings: &'a mut Settings,
+    device_id: &'a str,
+    window_us: u64,
+    seq: &'a mut u32,
+    prev_wake: &'a mut WakeState,
+}
 
-    let window_us = model.input_len as u64 * 1_000_000 / SAMPLE_RATE as u64;
-    let mut seq: u32 = 0;
-    let mut prev_wake = WakeState::Idle;
-
+/// Announce identity, then produce/inference/emit on each window until a send fails
+/// (the link dropped), at which point it returns so the caller can reconnect.
+fn serve(transport: &mut dyn Transport, ctx: &mut Loop) {
+    if announce(transport, ctx.device_id, ctx.settings).is_err() {
+        return;
+    }
     loop {
         // Apply pending control frames (browser → backend → device).
-        while let Some(frame) = transport.poll() {
-            if apply_control(frame, &mut settings, &mut pipeline, &store) {
-                announce(transport.as_mut(), &device_id, &settings);
+        while let Some(control) = transport.poll() {
+            if apply_control(control, ctx.settings, ctx.pipeline, ctx.store)
+                && announce(transport, ctx.device_id, ctx.settings).is_err()
+            {
+                return;
             }
         }
 
-        let window = provider.next_window();
-        let ForwardResult::Logits(logits) = model.forward(&window.input);
-        let logits: Vec<f32> = logits.iter().map(|&v| v as f32 * model.logit_scale).collect();
+        let window = ctx.provider.next_window();
+        let ForwardResult::Logits(logits) = ctx.model.forward(&window.input);
+        let logits: Vec<f32> = logits.iter().map(|&v| v as f32 * ctx.model.logit_scale).collect();
         let softmax = softmax(&logits);
-        let decision = pipeline.step(&softmax);
-        let t_us = (seq as u64 + 1) * window_us;
+        let decision = ctx.pipeline.step(&softmax);
+        let t_us = (*ctx.seq as u64 + 1) * ctx.window_us;
 
-        let _ = transport.send(&frames::emg(
-            seq,
-            &window.input,
-            provider.input_scale(),
-            model.input_len,
-            SAMPLE_RATE,
-        ));
-        let _ = transport.send(&frames::prediction(seq, logits, softmax, &decision, pipeline.tau));
-        for event in frames::events(prev_wake, &decision, &settings, t_us) {
-            let _ = transport.send(&event);
+        let emg = frames::emg(*ctx.seq, &window.input, ctx.provider.input_scale(), ctx.model.input_len, SAMPLE_RATE);
+        let prediction = frames::prediction(*ctx.seq, logits, softmax, &decision, ctx.pipeline.tau);
+        let events = frames::events(*ctx.prev_wake, &decision, ctx.settings, t_us);
+        if transport.send(&emg).is_err() || transport.send(&prediction).is_err() {
+            return;
+        }
+        for event in events {
+            if transport.send(&event).is_err() {
+                return;
+            }
         }
 
-        prev_wake = decision.wake_state;
-        seq = seq.wrapping_add(1);
-        FreeRtos::delay_ms((window_us / 1000) as u32);
+        *ctx.prev_wake = decision.wake_state;
+        *ctx.seq = ctx.seq.wrapping_add(1);
+        FreeRtos::delay_ms((ctx.window_us / 1000) as u32);
     }
 }
 
 /// Send the current identity + functional config.
-fn announce(transport: &mut dyn Transport, device_id: &str, settings: &Settings) {
-    let frame = Frame::DeviceHello { device_id: device_id.into(), config: settings.to_wire() };
-    if let Err(e) = transport.send(&frame) {
-        warn!("announce failed: {e}");
-    }
+fn announce(transport: &mut dyn Transport, device_id: &str, settings: &Settings) -> anyhow::Result<()> {
+    transport.send(&Frame::DeviceHello { device_id: device_id.into(), config: settings.to_wire() })
 }
 
 /// Apply a control frame; returns true when it changed persisted config (so the
