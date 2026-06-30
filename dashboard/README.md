@@ -74,8 +74,8 @@ vars and the streaming-window size.
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `DASHBOARD_ADDR` | `0.0.0.0:8090` | bind address |
-| `EMG_DATA_DIR` | `../waveformer/data` | replay `.npy` windows |
-| `EMG_CHECKPOINT` | `../emg-tds/checkpoints/best.safetensors` | classifier weights |
+| `EMG_DATA_DIR` | `../emg-tds/data` | replay `.npy` windows |
+| `EMG_CHECKPOINT` | `../emg-tds/models/gesture-classifier-v1.safetensors` | classifier weights |
 | `DASHBOARD_WEB` | `web/dist` | static frontend dir |
 | `EMG_POSE_URL` | (unset) | optional pose service WebSocket |
 

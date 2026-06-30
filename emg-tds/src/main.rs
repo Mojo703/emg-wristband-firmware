@@ -42,11 +42,12 @@ enum Command {
     ForwardTest,
     /// Export the trained classifier to int8 for the ESP32-S3 runtime.
     ExportInt8 {
-        /// Float checkpoint to quantize.
-        #[arg(long, default_value = "checkpoints/best.safetensors")]
+        /// Float checkpoint to quantize (defaults to the tracked release; pass a
+        /// checkpoints/ path to export a fresh training run instead).
+        #[arg(long, default_value = "models/gesture-classifier-v1.safetensors")]
         checkpoint: PathBuf,
         /// Directory containing train_x|y.npy and test_x|y.npy.
-        #[arg(long, default_value = "../waveformer/data")]
+        #[arg(long, default_value = "data")]
         data_dir: PathBuf,
         /// Output path for the device-ready int8 blob.
         #[arg(long, default_value = "../ml-bench/data/model_int8.bin")]

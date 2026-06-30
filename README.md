@@ -29,8 +29,7 @@ Machine learning and tooling (host, plain Rust or Python):
 
 | Path | What it is |
 |------|------------|
-| [`emg-tds/`](emg-tds) | The current gesture model: a depthwise-separable (TDS) conv encoder in Rust/candle, with swappable classifier and pose heads. Trains, evaluates, and exports. |
-| [`waveformer/`](waveformer) | A retired accuracy-ceiling experiment (WaveFormer port). Kept for reference; the encoder in `emg-tds` superseded it. |
+| [`emg-tds/`](emg-tds) | The current gesture model: a depthwise-separable (TDS) conv encoder in Rust/candle, with swappable classifier and pose heads. Trains, evaluates, and exports. The `.npy` training/eval/pose windows live in its `data/` directory. |
 | [`dashboard/`](dashboard) | Web dashboard. An axum backend replays exported EMG windows through the host classifier and streams CBOR frames to a Svelte frontend. Host-only, no hardware needed. |
 | [`pose-service/`](pose-service) | Python WebSocket service that turns EMG windows into 3-D hand pose. Runs a mock estimator or Meta's `emg2pose` model. |
 | [`protocol/`](protocol) | A `no_std` crate of the CBOR frame types shared by the dashboard backend, the browser, and (later) the firmware. |

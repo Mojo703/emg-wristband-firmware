@@ -3,7 +3,7 @@
   import { MediaKey, isMediaKey, type Binding } from '../lib/protocol';
   import Icon from '../lib/Icon.svelte';
   import Select from '../lib/ui/Select.svelte';
-  import Button from '../lib/ui/Button.svelte';
+  import { Button } from '$lib/components/ui/button/index.js';
 
   const KEYS: readonly { value: MediaKey; label: string }[] = [
     { value: MediaKey.PlayPause, label: 'Play/Pause' },

@@ -26,21 +26,19 @@ CUDARC_CUDA_VERSION=13020 cargo build --release --features cuda
 
 ```sh
 # supervised classifier with the winning warp + channel-dropout, early-stopped
+# (windows default to ./data; pass --data-dir to override)
 CUDARC_CUDA_VERSION=13020 ./target/release/emg-tds train \
-  --data-dir ../waveformer/data --epochs 300 --augment \
-  --out checkpoints/best.safetensors
+  --epochs 300 --augment --out checkpoints/best.safetensors
 
 # open-set: 5 commands plus grouped negatives, balanced, with the reject report
-./target/release/emg-tds train --data-dir ../waveformer/data \
-  --n-commands 5 --balance --augment
+./target/release/emg-tds train --n-commands 5 --balance --augment
 
 # pose-regression pretrain (per-dim z-scored targets), then head-swap finetune
-./target/release/emg-tds pretrain --data-dir ../waveformer/data --out checkpoints/pose.safetensors
-./target/release/emg-tds train --data-dir ../waveformer/data --init checkpoints/pose.safetensors
+./target/release/emg-tds pretrain --out checkpoints/pose.safetensors
+./target/release/emg-tds train --init checkpoints/pose.safetensors
 
 # export the trained classifier to int8 for the ESP32-S3 runtime
-./target/release/emg-tds export-int8 --data-dir ../waveformer/data \
-  --out ../ml-bench/data/model_int8.bin --num-verify 32
+./target/release/emg-tds export-int8 --out ../ml-bench/data/model_int8.bin --num-verify 32
 ```
 
 `forward-test` builds with random weights and runs one forward pass to check
@@ -51,6 +49,12 @@ best model to `--out`. `--augment` applies warp σ=0.3 and channel-dropout 0.1.
 reject report. `pretrain` runs pose regression on emg2pose windows with
 per-dimension z-scored targets; without the z-scoring the mean-pose error floored
 out, as log 0007 records.
+
+`checkpoints/` is local training scratch (gitignored): every `train` run writes
+there. When a run is worth keeping, promote it into [`models/`](models) under a
+descriptive, versioned name — that directory holds the tracked releases that
+downstream defaults point at (the dashboard's `EMG_CHECKPOINT`, and the float
+source the int8 export quantizes).
 
 `export-int8` loads the float checkpoint, folds BatchNorm into the pointwise
 convs, calibrates activation ranges on a balanced training subset, quantizes to
@@ -80,7 +84,7 @@ CNN's 70%.
 
 ## Data and source
 
-Data lives in [`../waveformer/data`](../waveformer): `train_x|y.npy` and
+Data lives in `data/`: `train_x|y.npy` and
 `test_x|y.npy` for classification, `pose_x|y.npy` for pretrain. The source is
 `src/model.rs` for the encoder and heads, `src/data.rs` for
 the loaders, `src/augment.rs` for the warp and channel-dropout, `src/lib.rs` for

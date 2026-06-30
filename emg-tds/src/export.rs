@@ -34,8 +34,8 @@ pub(crate) struct ExportArgs {
 impl Default for ExportArgs {
     fn default() -> Self {
         Self {
-            checkpoint: std::path::PathBuf::from("checkpoints/best.safetensors"),
-            data_dir: std::path::PathBuf::from("../waveformer/data"),
+            checkpoint: std::path::PathBuf::from("models/gesture-classifier-v1.safetensors"),
+            data_dir: std::path::PathBuf::from("data"),
             out: std::path::PathBuf::from("../ml-bench/data/model_int8.bin"),
             calib_windows: 256,
             num_verify: 32,

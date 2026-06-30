@@ -1,0 +1,9 @@
+# Build artifacts and toolchain checkouts. Each subproject also has its own
+# .gitignore; this catches the same junk at the repo root (e.g. a stray
+# firmware build directory) so it never gets committed by accident.
+/target
+target/
+/firmware
+.embuild/
+node_modules/
+dist/

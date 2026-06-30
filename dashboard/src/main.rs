@@ -5,8 +5,8 @@
 //! built Svelte app from `web/dist`. Host-only dev tool.
 //!
 //! Env: `DASHBOARD_ADDR` (bind, default 0.0.0.0:8090), `EMG_DATA_DIR` (replay npy,
-//! default ../waveformer/data), `EMG_CHECKPOINT` (classifier, default
-//! ../emg-tds/checkpoints/best.safetensors), `DASHBOARD_WEB` (static dir, default
+//! default ../emg-tds/data), `EMG_CHECKPOINT` (classifier, default
+//! ../emg-tds/models/gesture-classifier-v1.safetensors), `DASHBOARD_WEB` (static dir, default
 //! web/dist), `EMG_POSE_URL` (optional pose inference service WebSocket).
 //!
 //! When `EMG_POSE_URL` is set, the backend connects to a separate pose-inference
@@ -78,13 +78,13 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let data_dir =
-        PathBuf::from(std::env::var("EMG_DATA_DIR").unwrap_or_else(|_| "../waveformer/data".into()));
+        PathBuf::from(std::env::var("EMG_DATA_DIR").unwrap_or_else(|_| "../emg-tds/data".into()));
     let replay = Arc::new(Replay::load(&data_dir, &["train", "test"])?);
 
     let num_commands = 5;
     let checkpoint = PathBuf::from(
         std::env::var("EMG_CHECKPOINT")
-            .unwrap_or_else(|_| "../emg-tds/checkpoints/best.safetensors".into()),
+            .unwrap_or_else(|_| "../emg-tds/models/gesture-classifier-v1.safetensors".into()),
     );
     let classifier = if checkpoint.exists() {
         match Classifier::load(&checkpoint, 16, num_commands) {

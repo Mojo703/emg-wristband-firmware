@@ -1,1 +1,8 @@
 /target
+# Training/eval/pose .npy windows (~2 GB, plus the open-set variant sets data_*).
+# Regenerable, so never committed.
+/data
+/data_*
+# checkpoints/ is local training scratch — every run writes here. Curated, named
+# releases are promoted into models/ (tracked); the raw scratch stays out of git.
+/checkpoints

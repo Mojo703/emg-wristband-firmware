@@ -2,8 +2,7 @@
 //! into candle tensors. Inputs: f32 [N,16,T] → model input [N,1,16,T]. Classification
 //! labels: i64 [N] class ids → u32. Pose targets: f32 [N,20] regression targets.
 //!
-//! Identical on-disk format to the retired `waveformer/` crate, so the same
-//! `data/` directory feeds both.
+//! The windows live in this crate's `data/` directory.
 
 use anyhow::{Context, Result};
 use candle_core::{Device, Tensor};
