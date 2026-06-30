@@ -1,5 +1,14 @@
-//! Wire-protocol types shared across the dashboard backend, the browser, and (later)
-//! the firmware. Frames are CBOR: ciborium on the Rust side, cbor-x in the browser.
+//! Wire-protocol types shared across the device firmware, the dashboard backend, and
+//! the browser. Frames are CBOR: ciborium on the device and backend, cbor-x in the
+//! browser. The backend is a relay: it forwards a device's data frames to the browsers
+//! viewing it, and forwards browser control frames back to the device.
+//!
+//! Ownership: the device is the source of functional truth and works standalone, so it
+//! owns [`DeviceConfig`] (gestures, keymap, sensitivity presets and their thresholds,
+//! the active threshold, the streak goal). The backend owns only cosmetics the firmware
+//! has no reason to carry — the per-class colours in [`ClassInfo`] and the wake-state
+//! colours/intensities in [`StateInfo`] — which it layers on top to build the browser
+//! [`Frame::Hello`].
 //!
 //! Two design points the owner cares about:
 //! - **Bandwidth:** bulk EMG samples ride as a raw little-endian `i16` byte blob
@@ -23,28 +32,32 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Frame {
-    /// Backend → browser on connect: current config snapshot.
+    /// Backend → browser: the complete view state. Re-sent whenever the device set,
+    /// the selection, or the selected device's config changes. `config` is the
+    /// selected device's own functional truth; `classes`/`states` are the backend's
+    /// cosmetic projection (colours/labels) layered on top.
     Hello {
-        /// Number of gesture classes the model emits (commands are 0..n).
-        gestures: u8,
-        /// Available replay sources (e.g. "train", "test").
-        sources: Vec<String>,
-        keymap: Vec<Binding>,
-        wifi_ssid: Option<String>,
-        /// The reject threshold currently in effect (resolved from `sensitivity`).
-        tau: f32,
-        /// Consecutive above-τ windows a command needs to latch (the streak goal).
-        needed: u8,
-        /// Selectable sensitivity presets and the id of the active one. The backend
-        /// owns the preset → threshold mapping; the frontend only shows the labels.
-        sensitivity_levels: Vec<SensitivityLevel>,
-        sensitivity: String,
-        /// Display descriptor per softmax class (label/colour/role) so the frontend
-        /// needs no built-in palette or command/reject knowledge.
+        /// Every device currently connected to the backend — the picker list.
+        devices: Vec<DeviceInfo>,
+        /// Which device the config/classes below describe, if one is selected.
+        selected_device: Option<String>,
+        /// The selected device's functional config; `None` when nothing is selected.
+        config: Option<DeviceConfig>,
+        /// Render hints per softmax class for the selected device (label/colour/role)
+        /// so the frontend needs no built-in palette or command/reject knowledge.
+        /// Empty when no device is selected.
         classes: Vec<ClassInfo>,
-        /// Display descriptor per wake-gate state (colour/label/intensity) so the
-        /// frontend hardcodes none of the state vocabulary.
+        /// Render hints per wake-gate state (colour/label/intensity) so the frontend
+        /// hardcodes none of the state vocabulary.
         states: Vec<StateInfo>,
+    },
+
+    /// Device → backend on connect: identity plus the device's functional config. The
+    /// backend stores it, layers cosmetics on top, and projects it into `Hello`.
+    DeviceHello {
+        /// Stable, MAC-derived id, e.g. "opal-1a2b3c".
+        device_id: String,
+        config: DeviceConfig,
     },
 
     /// Bulk EMG window. `samples` is little-endian `i16`, channel-major:
@@ -106,24 +119,57 @@ pub enum Frame {
         format: String,
     },
 
-    /// Replay transport (browser → backend).
-    Replay { action: ReplayAction },
+    /// Select which connected device to view (browser → backend).
+    SelectDevice { device_id: String },
 
-    /// Select a sensitivity preset by id (browser → backend). The backend resolves
-    /// it to a reject threshold; the frontend never sees raw τ values here.
+    /// Select a sensitivity preset by id (browser → backend). The backend forwards it
+    /// to the selected device, which owns the preset → threshold mapping.
     SetSensitivity { level: String },
 
     /// Persist a gesture→action keymap (browser → backend).
     SetKeymap { bindings: Vec<Binding> },
 
-    /// Persist WiFi credentials for the device (browser → backend).
+    /// Set WiFi credentials (browser → backend → device). The device persists them
+    /// and uses them to reach the backend over wifi on the next boot.
     SetWifi { ssid: String, psk: String },
+}
+
+/// A connected device, as shown in the browser's device picker.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeviceInfo {
+    /// Stable, MAC-derived id, e.g. "opal-1a2b3c". Also used in `SelectDevice`.
+    pub id: String,
+    /// Human-friendly name for the picker (the device chooses it; defaults to `id`).
+    pub label: String,
+}
+
+/// A device's functional configuration — the source of truth it carries standalone.
+/// Sent device → backend in [`Frame::DeviceHello`] and projected, unchanged, into the
+/// browser [`Frame::Hello`]. The backend never invents these values; it only adds
+/// cosmetics ([`ClassInfo`]/[`StateInfo`]) alongside.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeviceConfig {
+    /// Number of gesture classes the model emits (commands are `0..gestures`).
+    pub gestures: u8,
+    /// Gesture → media-key bindings the device acts on.
+    pub keymap: Vec<Binding>,
+    /// Configured WiFi network name, if any (the password is write-only, never sent).
+    pub wifi_ssid: Option<String>,
+    /// Id of the active sensitivity preset (one of `sensitivity_levels`).
+    pub sensitivity: String,
+    /// Selectable sensitivity presets. The device owns each preset's threshold; the
+    /// browser only shows the labels and echoes the chosen `id` back via `SetSensitivity`.
+    pub sensitivity_levels: Vec<SensitivityLevel>,
+    /// The reject threshold currently in effect (resolved from `sensitivity`).
+    pub tau: f32,
+    /// Consecutive above-τ windows a command needs to latch (the streak goal).
+    pub needed: u8,
 }
 
 /// One sensitivity preset the user can pick. `id` is echoed back in
 /// `SetSensitivity`; `label` is what the dropdown shows. The threshold each maps
-/// to lives in the backend.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// to lives on the device.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SensitivityLevel {
     pub id: String,
     pub label: String,
@@ -167,22 +213,8 @@ pub enum WakeState {
     Active,
 }
 
-/// Replay transport actions.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "action", rename_all = "snake_case")]
-pub enum ReplayAction {
-    Play,
-    Pause,
-    /// Jump to a window index in the current source.
-    Seek { window: u32 },
-    /// Windows streamed per second (integer; see `SetThreshold`).
-    Rate { fps: u16 },
-    /// Switch replay source (e.g. "train", "test").
-    Source { name: String },
-}
-
 /// One gesture→media-key binding. `gesture` is the class index (0..gestures).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Binding {
     pub gesture: u8,
     pub key: MediaKey,
@@ -262,11 +294,32 @@ mod tests {
 
     #[test]
     fn control_frame_roundtrips() {
-        let frame = Frame::Replay { action: ReplayAction::Seek { window: 42 } };
+        let frame = Frame::SelectDevice { device_id: "opal-1a2b3c".into() };
         assert!(matches!(
             roundtrip(&frame),
-            Frame::Replay { action: ReplayAction::Seek { window: 42 } }
+            Frame::SelectDevice { device_id } if device_id == "opal-1a2b3c"
         ));
+    }
+
+    #[test]
+    fn device_hello_roundtrips() {
+        let config = DeviceConfig {
+            gestures: 5,
+            keymap: vec![Binding { gesture: 0, key: MediaKey::PlayPause }],
+            wifi_ssid: Some("lab".into()),
+            sensitivity: "medium".into(),
+            sensitivity_levels: vec![SensitivityLevel { id: "medium".into(), label: "Medium".into() }],
+            tau: 0.5,
+            needed: 3,
+        };
+        let frame = Frame::DeviceHello { device_id: "opal-1a2b3c".into(), config: config.clone() };
+        match roundtrip(&frame) {
+            Frame::DeviceHello { device_id, config: out } => {
+                assert_eq!(device_id, "opal-1a2b3c");
+                assert_eq!(out, config);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
     }
 
     #[test]
