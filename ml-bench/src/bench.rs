@@ -1,5 +1,6 @@
 //! Timing harness using the microsecond `esp_timer`.
 
+use emg_runtime::model::StageTimer;
 use esp_idf_svc::sys;
 
 pub(crate) struct Stats {
@@ -31,12 +32,15 @@ impl Profile {
             iters: 0,
         }
     }
+}
 
+/// Charges each profiled stage to its slot via the microsecond `esp_timer`.
+impl StageTimer for Profile {
     #[inline]
-    pub(crate) fn time<T>(&mut self, slot: usize, f: impl FnOnce() -> T) -> T {
+    fn stage<T>(&mut self, index: usize, f: impl FnOnce() -> T) -> T {
         let t0 = now_us();
         let r = f();
-        self.us[slot] += (now_us() - t0) as u64;
+        self.us[index] += (now_us() - t0) as u64;
         r
     }
 }

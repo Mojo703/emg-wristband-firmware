@@ -5,23 +5,23 @@
 //! per-stage breakdown so each stage can be optimized in isolation.
 //! Also verifies the real model against embedded float references on real gestures.
 
-#![feature(asm_experimental_arch)]
-
 mod bench;
-mod layers;
-mod mac;
-mod model;
-mod tensor;
 
 use bench::Profile;
+use emg_runtime::model::{INPUT_CH, STAGES};
+use emg_runtime::{layers, mac, model, tensor};
 use esp_idf_svc::sys;
 use log::{error, info, warn};
-use model::{ForwardResult, Model, VerifyBatch, INPUT_CH, STAGES};
+use model::{ForwardResult, Model, VerifyBatch};
 use tensor::I8Activation;
 
 const WARMUP: usize = 20;
 const ITERS: usize = 200;
 const PROFILE_ITERS: usize = 50;
+
+/// The int8 model blob exported by `emg-tds export-int8`. Embedded here and handed
+/// to `emg-runtime`, which carries no model data of its own.
+const MODEL_BIN: &[u8] = include_bytes!("../data/model_int8.bin");
 
 fn free_heap_discontinuous() -> u32 {
     unsafe { sys::esp_get_free_heap_size() }
@@ -65,8 +65,8 @@ fn dw_self_test() -> bool {
         let ref_out = layers::depthwise_scalar(&input, &w, &bias, kernel, 2, rq);
         let simd_out = layers::depthwise_simd(&input, &w, &bias, kernel, 2, rq);
 
-        let rs = ref_out.data.as_slice();
-        let ss = simd_out.data.as_slice();
+        let rs = ref_out.as_slice();
+        let ss = simd_out.as_slice();
         if rs.len() != ss.len() {
             error!(
                 "dw-test t={} c={}: length mismatch {} vs {}",
@@ -204,7 +204,7 @@ fn main() -> anyhow::Result<()> {
     // ---- Real model verification ----
     info!("--- Real model (BN-folded, ReLU, int8) ---");
     let heap_pre = free_heap_discontinuous();
-    let real_model = Model::real();
+    let real_model = Model::load(MODEL_BIN);
     let heap_post = free_heap_discontinuous();
     info!(
         "real model RAM: ~{} KB | input_len: {} | kernel: {} | free heap: {} KB",
@@ -214,7 +214,7 @@ fn main() -> anyhow::Result<()> {
         heap_post / 1024
     );
 
-    let mut verify = Model::load_verify_batch();
+    let mut verify = VerifyBatch::new(MODEL_BIN);
     info!(
         "verify batch: streaming {} windows | input scale={:.6}",
         verify.total, verify.input_scale
@@ -263,6 +263,7 @@ fn main() -> anyhow::Result<()> {
         core::hint::black_box(
             real_model.forward_profiled(core::hint::black_box(&real_input), &mut prof),
         );
+        prof.iters += 1;
     }
     let total: u64 = prof.us.iter().sum();
     info!(

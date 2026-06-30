@@ -179,14 +179,8 @@ function send(frame: OutgoingFrame): void {
 }
 
 export const api = {
-  play: () => send({ type: 'replay', action: { action: 'play' } }),
-  pause: () => send({ type: 'replay', action: { action: 'pause' } }),
-  seek: (window: number) =>
-    send({ type: 'replay', action: { action: 'seek', window } }),
-  rate: (fps: number) =>
-    send({ type: 'replay', action: { action: 'rate', fps } }),
-  source: (name: string) =>
-    send({ type: 'replay', action: { action: 'source', name } }),
+  selectDevice: (deviceId: string) =>
+    send({ type: 'select_device', device_id: deviceId }),
   sensitivity: (level: string) =>
     send({ type: 'set_sensitivity', level }),
   keymap: (bindings: readonly Binding[]) =>

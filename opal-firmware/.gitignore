@@ -1,0 +1,5 @@
+/target
+# Managed ESP-IDF checkout + tools (downloaded on first build, ~GBs).
+/.embuild
+# Contains the WiFi password in plaintext once filled in.
+/cfg.toml

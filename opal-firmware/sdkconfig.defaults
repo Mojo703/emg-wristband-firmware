@@ -1,0 +1,16 @@
+# 4 MB flash on the ESP32-S3-Zero.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
+
+# Custom partition table (see partitions.csv): one large app slot + nvs (config).
+# Path via PROJECT_DIR env var because esp-idf-sys runs cmake from a generated dir.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="$ENV{PROJECT_DIR}/partitions.csv"
+
+# Full clock for real-time inference headroom.
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=240
+
+# The Rust main task runs inference + framing; give it a generous stack.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=24000
+CONFIG_FREERTOS_HZ=1000

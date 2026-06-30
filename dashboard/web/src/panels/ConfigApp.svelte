@@ -15,10 +15,10 @@
   ];
   const keyOptions = KEYS.map((option) => ({ value: option.value as string, label: option.label }));
 
-  // The discrete settings reflect the backend's live config directly — no local
-  // draft. Each change applies immediately; the backend echoes a fresh Hello, so
-  // what's shown is always what's active.
-  const config = $derived(live.hello);
+  // The discrete settings reflect the selected device's live config directly — no
+  // local draft. Each change applies immediately; the device re-announces and the
+  // backend echoes a fresh Hello, so what's shown is always what's active.
+  const config = $derived(live.hello?.config ?? null);
   const gestures = $derived(config?.gestures ?? 0);
   const keymap = $derived(config?.keymap ?? []);
   const levels = $derived(config?.sensitivity_levels ?? []);

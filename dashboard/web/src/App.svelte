@@ -3,11 +3,20 @@
   import { Tabs } from 'bits-ui';
   import * as Tooltip from '$lib/components/ui/tooltip/index.js';
   import { panels } from './lib/panels';
-  import { connect, live } from './lib/socket.svelte';
+  import { connect, live, api } from './lib/socket.svelte';
   import Icon from './lib/Icon.svelte';
+  import Select from './lib/ui/Select.svelte';
 
   const firstPanel = panels[0]!;
   let active = $state<string>(firstPanel.id);
+
+  // Which device the dashboard is viewing. The list and selection are owned by the
+  // backend (it tracks every connected device); selecting one routes its stream and
+  // our control frames to it.
+  const deviceOptions = $derived(
+    (live.hello?.devices ?? []).map((device) => ({ value: device.id, label: device.label })),
+  );
+  const selectedDevice = $derived(live.hello?.selected_device ?? '');
 
   onMount(connect);
 </script>
@@ -18,6 +27,18 @@
       <div class="brand">
         <span class="name">Opal</span>
         <span class="company">Cairn Kinetics</span>
+      </div>
+      <div class="device">
+        {#if deviceOptions.length > 0}
+          <Select
+            value={selectedDevice}
+            options={deviceOptions}
+            onChange={(id) => api.selectDevice(id)}
+            placeholder="Select device…"
+          />
+        {:else}
+          <span class="muted">No devices</span>
+        {/if}
       </div>
       <Tabs.List class="nav">
         {#each panels as panel (panel.id)}

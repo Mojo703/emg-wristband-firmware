@@ -1,6 +1,7 @@
-//! Host port of the firmware reject spine: a confidence threshold, 3-of-3 vote
-//! smoothing, and the wake-gate state machine. Kept here (not in the model) so the
-//! same logic can be lifted to the device later.
+//! The reject spine: a confidence threshold, 3-of-3 vote smoothing, and the
+//! wake-gate state machine. Model-free, so it lives beside the inference rather
+//! than inside it. The 3-of-3 smoothing is a deliberate decision spine, not an
+//! accuracy patch (see the repo's root guidance).
 
 use protocol::WakeState;
 
@@ -14,9 +15,9 @@ pub struct Decision {
     pub streak: u8,
 }
 
-/// Per-session reject pipeline. Commands are classes `0..num_commands`; the reject
-/// score is the max softmax over those. A command must clear `tau` for `needed`
-/// consecutive windows before it latches (Active); a miss drops back to Idle.
+/// Reject pipeline. Commands are classes `0..num_commands`; the reject score is the
+/// max softmax over those. A command must clear `tau` for `needed` consecutive
+/// windows before it latches (Active); a miss drops back to Idle.
 pub struct RejectPipeline {
     num_commands: usize,
     pub tau: f32,

@@ -32,7 +32,7 @@ export const FrameType = {
   Prediction: 'prediction',
   Event: 'event',
   Pose: 'pose',
-  Replay: 'replay',
+  SelectDevice: 'select_device',
   SetSensitivity: 'set_sensitivity',
   SetKeymap: 'set_keymap',
   SetWifi: 'set_wifi',
@@ -67,20 +67,33 @@ export interface Binding {
   readonly key: MediaKey;
 }
 
+/// A connected device in the picker.
+export interface DeviceInfo {
+  readonly id: string;
+  readonly label: string;
+}
+
+/// A device's functional config (its own source of truth). The backend passes this
+/// through unchanged in Hello and layers `classes`/`states` cosmetics alongside.
+export interface DeviceConfig {
+  readonly gestures: number;
+  readonly keymap: readonly Binding[];
+  readonly wifi_ssid: string | null;
+  readonly sensitivity: string;
+  readonly sensitivity_levels: readonly SensitivityLevel[];
+  readonly tau: number;
+  readonly needed: number;
+}
+
 // ---------------------------------------------------------------------------
 // Frames
 // ---------------------------------------------------------------------------
 
 export interface HelloFrame {
   readonly type: 'hello';
-  readonly gestures: number;
-  readonly sources: readonly string[];
-  readonly keymap: readonly Binding[];
-  readonly wifi_ssid: string | null;
-  readonly tau: number;
-  readonly needed: number;
-  readonly sensitivity_levels: readonly SensitivityLevel[];
-  readonly sensitivity: string;
+  readonly devices: readonly DeviceInfo[];
+  readonly selected_device: string | null;
+  readonly config: DeviceConfig | null;
   readonly classes: readonly ClassInfo[];
   readonly states: readonly StateInfo[];
 }
@@ -134,39 +147,9 @@ export interface PoseFrame {
   readonly format: string;
 }
 
-export interface ReplayActionPlay {
-  readonly action: 'play';
-}
-
-export interface ReplayActionPause {
-  readonly action: 'pause';
-}
-
-export interface ReplayActionSeek {
-  readonly action: 'seek';
-  readonly window: number;
-}
-
-export interface ReplayActionRate {
-  readonly action: 'rate';
-  readonly fps: number;
-}
-
-export interface ReplayActionSource {
-  readonly action: 'source';
-  readonly name: string;
-}
-
-export type ReplayAction =
-  | ReplayActionPlay
-  | ReplayActionPause
-  | ReplayActionSeek
-  | ReplayActionRate
-  | ReplayActionSource;
-
-export interface ReplayFrame {
-  readonly type: 'replay';
-  readonly action: ReplayAction;
+export interface SelectDeviceFrame {
+  readonly type: 'select_device';
+  readonly device_id: string;
 }
 
 export interface SetSensitivityFrame {
@@ -186,7 +169,7 @@ export interface SetWifiFrame {
 }
 
 export type OutgoingFrame =
-  | ReplayFrame
+  | SelectDeviceFrame
   | SetSensitivityFrame
   | SetKeymapFrame
   | SetWifiFrame;
@@ -230,10 +213,6 @@ function isString(value: unknown): value is string {
 
 function isOptionalString(value: unknown): value is string | null | undefined {
   return value === null || value === undefined || isString(value);
-}
-
-function isStringArray(value: unknown): value is readonly string[] {
-  return Array.isArray(value) && value.every(isString);
 }
 
 function isNumberArray(value: unknown): value is readonly number[] {
@@ -303,18 +282,34 @@ export function isWakeState(value: unknown): value is WakeState {
   return Object.values<string>(WakeState).includes(value);
 }
 
+function isDeviceInfo(value: unknown): value is DeviceInfo {
+  return isObject(value) && isString(value['id']) && isString(value['label']);
+}
+
+function isDeviceInfoArray(value: unknown): value is readonly DeviceInfo[] {
+  return Array.isArray(value) && value.every(isDeviceInfo);
+}
+
+function isDeviceConfig(value: unknown): value is DeviceConfig {
+  return (
+    isObject(value) &&
+    isNumber(value['gestures']) &&
+    isBindingArray(value['keymap']) &&
+    isOptionalString(value['wifi_ssid']) &&
+    isString(value['sensitivity']) &&
+    isSensitivityLevelArray(value['sensitivity_levels']) &&
+    isNumber(value['tau']) &&
+    isNumber(value['needed'])
+  );
+}
+
 export function isHelloFrame(value: unknown): value is HelloFrame {
   return (
     hasType(value, 'hello') &&
     isObject(value) &&
-    isNumber(value['gestures']) &&
-    isStringArray(value['sources']) &&
-    isBindingArray(value['keymap']) &&
-    isOptionalString(value['wifi_ssid']) &&
-    isNumber(value['tau']) &&
-    isNumber(value['needed']) &&
-    isSensitivityLevelArray(value['sensitivity_levels']) &&
-    isString(value['sensitivity']) &&
+    isDeviceInfoArray(value['devices']) &&
+    isOptionalString(value['selected_device']) &&
+    (value['config'] === null || isDeviceConfig(value['config'])) &&
     isClassInfoArray(value['classes']) &&
     isStateInfoArray(value['states'])
   );
@@ -381,30 +376,11 @@ export function isPoseFrame(value: unknown): value is PoseFrame {
   );
 }
 
-export function isReplayAction(value: unknown): value is ReplayAction {
-  if (!isObject(value)) return false;
-  const action = value['action'];
-  if (!isString(action)) return false;
-  switch (action) {
-    case 'play':
-    case 'pause':
-      return true;
-    case 'seek':
-      return isNumber(value['window']);
-    case 'rate':
-      return isNumber(value['fps']);
-    case 'source':
-      return isString(value['name']);
-    default:
-      return false;
-  }
-}
-
 export function isOutgoingFrame(value: unknown): value is OutgoingFrame {
   if (!isObject(value)) return false;
   switch (value['type']) {
-    case 'replay':
-      return isReplayAction(value['action']);
+    case 'select_device':
+      return isString(value['device_id']);
     case 'set_sensitivity':
       return isString(value['level']);
     case 'set_keymap':

@@ -1,23 +1,24 @@
 //! Int8 layer kernels for a depthwise-separable 1D CNN.
 //!
 //! Accumulate in i32, then requantize to int8 (fixed-point multiply/shift +
-//! optional ReLU). The requant params are placeholders that keep values in
-//! range — representative of the *cost*, which is what the benchmark measures.
-//! Replace with the model's real per-channel scales when validating accuracy.
+//! optional ReLU). The requant params come from the exported model blob (folded
+//! per-tensor scales); the synthetic model uses placeholders that keep values in
+//! range, representative of the *cost* the benchmark measures.
 
 use crate::mac;
 use crate::tensor::{AlignedI8, I8Activation};
+use alloc::vec::Vec;
 
 #[derive(Clone, Copy)]
-pub(crate) struct Requantize {
-    pub(crate) mult: i32,
-    pub(crate) shift: u32,
-    pub(crate) relu: bool,
+pub struct Requantize {
+    pub mult: i32,
+    pub shift: u32,
+    pub relu: bool,
 }
 
 impl Requantize {
     #[inline]
-    pub(crate) fn apply(&self, acc: i32) -> i8 {
+    pub fn apply(&self, acc: i32) -> i8 {
         let mut v = ((acc as i64 * self.mult as i64) >> self.shift) as i32;
         if self.relu {
             v = v.max(0);
@@ -38,7 +39,7 @@ fn pad_input(x: &I8Activation, pad: usize) -> I8Activation {
 /// Scalar depthwise 1D conv. Weight layout `[K, C]`: `ws[j * c + ch]`.
 /// Pre-pads input to avoid inner-loop bounds checks. Retained as the
 /// correctness oracle for the SIMD self-test.
-pub(crate) fn depthwise_scalar(
+pub fn depthwise_scalar(
     x: &I8Activation,
     w: &AlignedI8,
     bias: &[i32],
@@ -67,11 +68,13 @@ pub(crate) fn depthwise_scalar(
     out
 }
 
+#[cfg(target_arch = "xtensa")]
 #[inline]
 fn sext20(v: u32) -> i32 {
     ((v & 0xFFFFF) as i32) << 12 >> 12
 }
 
+#[cfg(target_arch = "xtensa")]
 fn extract_qacc_half(data: &[u8], out: &mut [i32]) {
     let w = |i: usize| u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
     let w0 = w(0);
@@ -92,7 +95,7 @@ fn extract_qacc_half(data: &[u8], out: &mut [i32]) {
 /// SIMD depthwise using QACC (16 independent 20-bit accumulators). Processes
 /// 16 channels per vector instruction. Weight layout `[K, C]`.
 #[cfg(target_arch = "xtensa")]
-pub(crate) fn depthwise_simd(
+pub fn depthwise_simd(
     x: &I8Activation,
     w: &AlignedI8,
     bias: &[i32],
@@ -170,7 +173,7 @@ pub(crate) fn depthwise_simd(
 }
 
 #[cfg(not(target_arch = "xtensa"))]
-pub(crate) fn depthwise_simd(
+pub fn depthwise_simd(
     x: &I8Activation,
     w: &AlignedI8,
     bias: &[i32],
@@ -183,7 +186,7 @@ pub(crate) fn depthwise_simd(
 
 /// Depthwise 1D conv: SIMD on ESP32-S3, scalar fallback off-target.
 /// Weight layout `[K, C]`: `ws[j * c + ch]`.
-pub(crate) fn depthwise(
+pub fn depthwise(
     x: &I8Activation,
     w: &AlignedI8,
     bias: &[i32],
@@ -196,7 +199,7 @@ pub(crate) fn depthwise(
 
 /// Pointwise (1x1) conv: independent `cin -> out_ch` matmul at each time step.
 /// MAC-heavy; routes through [`mac::dot_i8`] (SIMD-capable).
-pub(crate) fn pointwise(
+pub fn pointwise(
     x: &I8Activation,
     w: &AlignedI8,
     bias: &[i32],
@@ -218,7 +221,7 @@ pub(crate) fn pointwise(
 }
 
 /// Global average pool over time: `[T, C] -> [C]`.
-pub(crate) fn global_avg_pool(x: &I8Activation) -> AlignedI8 {
+pub fn global_avg_pool(x: &I8Activation) -> AlignedI8 {
     let mut v = AlignedI8::zeroed(x.c);
     let vs = v.as_mut_slice();
     for (ch, value) in vs.iter_mut().enumerate().take(x.c) {
@@ -229,7 +232,7 @@ pub(crate) fn global_avg_pool(x: &I8Activation) -> AlignedI8 {
 }
 
 /// Fully-connected `cin -> out` returning raw i32 logits (final head).
-pub(crate) fn linear_i32(v: &[i8], w: &AlignedI8, bias: &[i32], out: usize) -> Vec<i32> {
+pub fn linear_i32(v: &[i8], w: &AlignedI8, bias: &[i32], out: usize) -> Vec<i32> {
     let cin = v.len();
     let ws = w.as_slice();
     (0..out)

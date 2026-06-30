@@ -3,31 +3,34 @@
 [workspace]
 
 [package]
-name = "ml-bench"
+name = "opal-firmware"
 version = "0.1.0"
 edition = "2021"
 resolver = "2"
 rust-version = "1.77"
-description = "ESP32-S3 latency/throughput benchmark for the EMG gesture encoder (int8)"
+description = "ESP32-S3 EMG wristband device: fake provider → int8 inference → reject pipeline, streamed to the dashboard over wifi or serial"
 
 [[bin]]
-name = "ml-bench"
+name = "opal-firmware"
 harness = false
 
-# Benchmark with --release. opt-level 3 (speed), NOT "s": this is compute we are
-# timing, so optimize for speed.
 [profile.release]
 opt-level = 3
 
-# Keep a debug build merely usable; real numbers come from --release.
 [profile.dev]
 opt-level = 1
+debug = true
 
 [dependencies]
 emg-runtime = { path = "../emg-runtime" }
-log = "0.4"
+protocol = { path = "../protocol" }
 esp-idf-svc = "0.52"
+log = "0.4"
 anyhow = "1"
+ciborium = "0.2"
+serde = { version = "1", features = ["derive"] }
+toml-cfg = "0.2"
 
 [build-dependencies]
 embuild = "0.33"
+toml-cfg = "0.2"

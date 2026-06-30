@@ -189,9 +189,10 @@
     }
   });
 
-  // Display descriptors come entirely from the backend (labels, colours, the
-  // command/reject split, state vocabulary). The frontend just looks them up.
+  // Cosmetics (labels, colours, the command/reject split, state vocabulary) come
+  // from the backend; functional values (τ, the streak goal) from the device config.
   const config = $derived(live.hello);
+  const deviceConfig = $derived(live.hello?.config ?? null);
   const classInfo = $derived<readonly ClassInfo[]>(config?.classes ?? []);
   const stateByName = $derived<Record<string, StateInfo>>(
     config === null ? {} : Object.fromEntries(
@@ -223,7 +224,7 @@
     // their lines exactly.
     const confBottom = height - BAND_HEIGHT;
     const confHeight = trackHeight - BAND_HEIGHT;
-    const tauLine = live.prediction?.tau ?? config?.tau ?? 0.5;
+    const tauLine = live.prediction?.tau ?? deviceConfig?.tau ?? 0.5;
     const tauY = confBottom - tauLine * (confHeight - 6) - 3;
     return {
       hasTrack: trackHeight > 0,
@@ -565,10 +566,10 @@
     phaseX: (tMs: number) => number,
   ): void {
     const classCount = classInfo.length;
-    const needed = config?.needed ?? 3;
+    const needed = deviceConfig?.needed ?? 3;
     // Authoritative τ from the backend (per-window prediction, or Hello before the
     // first prediction lands). The sensitivity control lives in Config.
-    const tauLine = live.prediction?.tau ?? config?.tau ?? 0.5;
+    const tauLine = live.prediction?.tau ?? deviceConfig?.tau ?? 0.5;
     const top = trackTop;
     const bottom = trackTop + trackHeight;
     // Reserve a bottom strip for the wake-gate band; the confidence curves live

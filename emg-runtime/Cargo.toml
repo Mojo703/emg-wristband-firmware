@@ -1,0 +1,21 @@
+# Empty workspace table makes this a workspace root so cargo doesn't attach it
+# to an unrelated Cargo.toml higher up the directory tree.
+[workspace]
+
+[package]
+name = "emg-runtime"
+version = "0.1.0"
+edition = "2021"
+resolver = "2"
+rust-version = "1.77"
+description = "On-device EMG gesture inference (int8 + ESP32-S3 SIMD) and the reject pipeline"
+
+# no_std + alloc, no esp dependencies: pure compute plus the model-free decision
+# spine. Builds on the host (scalar kernels) for verification and on Xtensa (SIMD
+# kernels) when pulled in by a firmware crate, which supplies the esp toolchain.
+[dependencies]
+protocol = { path = "../protocol" }
+
+# Speed, not size: this is the compute the firmware's latency budget rides on.
+[profile.release]
+opt-level = 3
