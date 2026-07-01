@@ -10,6 +10,7 @@ use serde::Deserialize;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::mpsc;
+use std::sync::Arc;
 
 /// The control frames the device accepts (browser → backend → device). A dedicated,
 /// float-free mirror of the relevant `protocol::Frame` variants: decoding the full
@@ -47,16 +48,20 @@ fn decode(bytes: &[u8]) -> Option<Control> {
 
 /// Dials the dashboard over TCP. A reader thread decodes inbound frames into a
 /// channel so [`Transport::poll`] stays non-blocking.
+///
+/// The socket is shared through an `Arc` rather than duplicated: `TcpStream::try_clone`
+/// maps to `dup()`, which lwIP does not implement (ENOSYS) on ESP-IDF. `Read` and
+/// `Write` are both available on `&TcpStream`, so one fd serves both threads.
 pub struct TcpTransport {
-    writer: TcpStream,
+    writer: Arc<TcpStream>,
     rx: mpsc::Receiver<Control>,
 }
 
 impl TcpTransport {
     pub fn connect(addr: &str) -> Result<Self> {
-        let stream = TcpStream::connect(addr)?;
+        let stream = Arc::new(TcpStream::connect(addr)?);
         stream.set_nodelay(true).ok();
-        let reader = stream.try_clone()?;
+        let reader = Arc::clone(&stream);
         let (tx, rx) = mpsc::channel();
         std::thread::Builder::new()
             .stack_size(6144)
@@ -65,7 +70,8 @@ impl TcpTransport {
     }
 }
 
-fn read_loop(mut reader: TcpStream, tx: mpsc::Sender<Control>) {
+fn read_loop(reader: Arc<TcpStream>, tx: mpsc::Sender<Control>) {
+    let mut reader = &*reader;
     loop {
         let mut len = [0u8; 4];
         if reader.read_exact(&mut len).is_err() {
@@ -86,8 +92,9 @@ fn read_loop(mut reader: TcpStream, tx: mpsc::Sender<Control>) {
 impl Transport for TcpTransport {
     fn send(&mut self, frame: &Frame) -> Result<()> {
         let bytes = encode(frame);
-        self.writer.write_all(&(bytes.len() as u32).to_le_bytes())?;
-        self.writer.write_all(&bytes)?;
+        let mut writer: &TcpStream = &self.writer;
+        writer.write_all(&(bytes.len() as u32).to_le_bytes())?;
+        writer.write_all(&bytes)?;
         Ok(())
     }
 

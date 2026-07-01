@@ -3,3 +3,5 @@
 /.embuild
 # Contains the WiFi password in plaintext once filled in.
 /cfg.toml
+# Local bring-up hotspot script (contains a plaintext AP password).
+/start-opal-hotspot.sh
