@@ -1,0 +1,32 @@
+# Empty workspace table makes this a workspace root so cargo doesn't attach it
+# to an unrelated Cargo.toml higher up the directory tree.
+[workspace]
+
+[package]
+name = "semg-daq"
+version = "0.1.0"
+edition = "2021"
+resolver = "2"
+rust-version = "1.77"
+description = "ESP32-S3 sEMG data-acquisition firmware (x2 ADS1298 daisy-chained over SPI)"
+
+[[bin]]
+name = "semg-daq"
+harness = false
+
+[profile.release]
+opt-level = "s"
+
+[profile.dev]
+debug = true
+opt-level = "z"
+
+[dependencies]
+log = "0.4"
+esp-idf-svc = "0.52"
+anyhow = "1"
+toml-cfg = "0.2"
+
+[build-dependencies]
+embuild = "0.33"
+toml-cfg = "0.2"

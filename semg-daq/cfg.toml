@@ -1,0 +1,7 @@
+# Device configuration, read at compile time by toml-cfg (see src/config.rs).
+# No secrets here, so this file is committed.
+[semg-daq]
+# Target output data rate. Must match whatever CONFIG1.DR gets programmed to in
+# ads1298.rs once register configuration is implemented. 
+# For now this only paces the acquisition loop's logging.
+sample_rate_hz = 500
