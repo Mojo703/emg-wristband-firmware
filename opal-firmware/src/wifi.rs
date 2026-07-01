@@ -27,6 +27,17 @@ pub fn connect(
 
     wifi.start()?;
     info!("wifi started");
+
+    // Disable modem power-save: the default (WIFI_PS_MIN_MODEM) parks the radio between
+    // DTIM beacons, adding hundreds of ms of latency to each TCP send. A continuous stream
+    // wants the radio awake.
+    let ps_result =
+        unsafe { esp_idf_svc::sys::esp_wifi_set_ps(esp_idf_svc::sys::wifi_ps_type_t_WIFI_PS_NONE) };
+    if ps_result != esp_idf_svc::sys::ESP_OK {
+        return Err(anyhow!("esp_wifi_set_ps failed: {ps_result}"));
+    }
+    info!("wifi power-save disabled");
+
     wifi.connect()?;
     info!("wifi associated, waiting for IP...");
     wifi.wait_netif_up()?;

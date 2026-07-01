@@ -29,6 +29,11 @@ const cbor = new Encoder({ useRecords: false, mapsAsObjects: true, tagUint8Array
 class LiveStateManager {
   status = $state<'offline' | 'handshake' | 'online'>('offline');
   connected = $derived(this.status !== 'offline');
+  // EMG frames per second reaching the browser — the whole device→backend→browser pipe's
+  // throughput. Recomputed once a second by `tickStreamRate`.
+  fps = $state(0);
+  streaming = $derived(this.status === 'online' && this.fps > 0);
+  #emgSinceTick = 0;
   #hello = $state<HelloFrame | null>(null);
   #emg = $state<DecodedEmg | null>(null);
   #prediction = $state<PredictionFrame | null>(null);
@@ -59,6 +64,12 @@ class LiveStateManager {
 
   setEmg(value: DecodedEmg | null): void {
     this.#emg = value;
+    this.#emgSinceTick += 1;
+  }
+
+  tickStreamRate(): void {
+    this.fps = this.#emgSinceTick;
+    this.#emgSinceTick = 0;
   }
 
   setPrediction(value: PredictionFrame | null): void {
@@ -75,6 +86,8 @@ class LiveStateManager {
     this.#emg = null;
     this.#prediction = null;
     this.#pose = null;
+    this.fps = 0;
+    this.#emgSinceTick = 0;
   }
 
   setOffline(): void {
@@ -83,10 +96,13 @@ class LiveStateManager {
     this.#emg = null;
     this.#prediction = null;
     this.#pose = null;
+    this.fps = 0;
+    this.#emgSinceTick = 0;
   }
 }
 
 export const live = new LiveStateManager();
+setInterval(() => live.tickStreamRate(), 1000);
 
 // Streaming frames (emg/prediction) also fan out to imperative subscribers so a
 // continuous renderer sees every window. These callbacks fire once per frame,

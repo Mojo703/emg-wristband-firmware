@@ -11,6 +11,7 @@ use protocol::Frame;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{broadcast, mpsc};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
@@ -18,6 +19,28 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 type PoseQueue = Arc<tokio::sync::Mutex<VecDeque<Frame>>>;
 type PoseNotify = Arc<tokio::sync::Notify>;
 const POSE_QUEUE_MAX: usize = 100;
+
+/// Bound on frames queued toward one browser: slack for a momentary stall, not an
+/// unbounded backlog.
+const OUTBOUND_CAP: usize = 256;
+
+/// A message headed for the browser socket. `Reliable` frames (device list/config,
+/// discrete `Event`s) are delivered in order; `Live` frames (EMG, predictions, poses) are
+/// coalesced to the latest when the browser falls behind.
+enum Out {
+    Reliable(Message),
+    Live(Message),
+}
+
+/// Both return `false` only when the socket has closed (so the caller can stop); a full
+/// channel drops the frame — rare for reliable, the intended backpressure for live.
+fn send_reliable(tx: &mpsc::Sender<Out>, msg: Message) -> bool {
+    !matches!(tx.try_send(Out::Reliable(msg)), Err(TrySendError::Closed(_)))
+}
+
+fn send_live(tx: &mpsc::Sender<Out>, msg: Message) -> bool {
+    !matches!(tx.try_send(Out::Live(msg)), Err(TrySendError::Closed(_)))
+}
 
 /// The complete browser view: device list, the selection, the selected device's
 /// functional config, and the cosmetic projection of it.
@@ -62,14 +85,34 @@ pub async fn handle_browser(socket: WebSocket, registry: Arc<Registry>, pose_url
     tracing::info!("browser connected");
     let (browser_sink, mut browser_stream) = socket.split();
 
-    // All outbound browser traffic funnels through this channel so the pose proxy can
-    // send without contending for the split sink.
-    let (browser_tx, mut browser_rx) = mpsc::unbounded_channel::<Message>();
+    // All outbound browser traffic funnels through this channel so the pose proxy doesn't
+    // contend for the split sink.
+    let (browser_tx, mut browser_rx) = mpsc::channel::<Out>(OUTBOUND_CAP);
     let forwarder = tokio::spawn(async move {
         let mut sink = browser_sink;
-        while let Some(msg) = browser_rx.recv().await {
-            if sink.send(msg).await.is_err() {
-                break;
+        while let Some(first) = browser_rx.recv().await {
+            // Drain what's queued now: reliable frames in order, live frames coalesced to
+            // the most recent, so a browser that fell behind jumps to current data.
+            let mut latest_live: Option<Message> = None;
+            let mut item = Some(first);
+            loop {
+                match item.take().expect("item present") {
+                    Out::Reliable(msg) => {
+                        if sink.send(msg).await.is_err() {
+                            return;
+                        }
+                    }
+                    Out::Live(msg) => latest_live = Some(msg),
+                }
+                match browser_rx.try_recv() {
+                    Ok(next) => item = Some(next),
+                    Err(_) => break,
+                }
+            }
+            if let Some(msg) = latest_live {
+                if sink.send(msg).await.is_err() {
+                    return;
+                }
             }
         }
     });
@@ -77,15 +120,16 @@ pub async fn handle_browser(socket: WebSocket, registry: Arc<Registry>, pose_url
     let pose = pose_url.map(|url| {
         let queue: PoseQueue = Arc::new(tokio::sync::Mutex::new(VecDeque::new()));
         let notify: PoseNotify = Arc::new(tokio::sync::Notify::new());
-        tokio::spawn(run_pose_proxy(url, queue.clone(), notify.clone(), browser_tx.clone()));
-        (queue, notify)
+        let handle =
+            tokio::spawn(run_pose_proxy(url, queue.clone(), notify.clone(), browser_tx.clone()));
+        (queue, notify, handle)
     });
 
     let mut selected: Option<String> = None;
     reconcile(&registry, &mut selected);
     let mut sub = selected.as_ref().and_then(|id| registry.subscribe(id));
     let mut changed = registry.watch();
-    if browser_tx.send(Message::Binary(frame::encode(&view(&registry, &selected)))).is_err() {
+    if !send_reliable(&browser_tx, Message::Binary(frame::encode(&view(&registry, &selected)))) {
         return;
     }
 
@@ -99,7 +143,7 @@ pub async fn handle_browser(socket: WebSocket, registry: Arc<Registry>, pose_url
                             selected = Some(device_id);
                             reconcile(&registry, &mut selected);
                             sub = selected.as_ref().and_then(|id| registry.subscribe(id));
-                            if browser_tx.send(Message::Binary(frame::encode(&view(&registry, &selected)))).is_err() {
+                            if !send_reliable(&browser_tx, Message::Binary(frame::encode(&view(&registry, &selected)))) {
                                 break;
                             }
                         }
@@ -120,7 +164,7 @@ pub async fn handle_browser(socket: WebSocket, registry: Arc<Registry>, pose_url
             },
             frame = next_frame(&mut sub) => {
                 // Mirror EMG frames into the pose queue before forwarding.
-                if let (Frame::Emg { .. }, Some((queue, notify))) = (&frame, &pose) {
+                if let (Frame::Emg { .. }, Some((queue, notify, _))) = (&frame, &pose) {
                     let mut q = queue.lock().await;
                     if q.len() >= POSE_QUEUE_MAX {
                         q.pop_front();
@@ -129,19 +173,24 @@ pub async fn handle_browser(socket: WebSocket, registry: Arc<Registry>, pose_url
                     drop(q);
                     notify.notify_one();
                 }
-                if browser_tx.send(Message::Binary(frame::encode(&frame))).is_err() {
+                // Discrete events must not be coalesced away; the timeseries may be.
+                let msg = Message::Binary(frame::encode(&frame));
+                let ok = if matches!(frame, Frame::Event { .. }) {
+                    send_reliable(&browser_tx, msg)
+                } else {
+                    send_live(&browser_tx, msg)
+                };
+                if !ok {
                     break;
                 }
             }
             _ = changed.recv() => {
-                // A device connected or disconnected: keep a valid selection and
-                // refresh the browser's picker + config.
-                let before = selected.clone();
+                // A device came or went: keep a valid selection and refresh the picker.
                 reconcile(&registry, &mut selected);
-                if selected != before {
-                    sub = selected.as_ref().and_then(|id| registry.subscribe(id));
-                }
-                if browser_tx.send(Message::Binary(frame::encode(&view(&registry, &selected)))).is_err() {
+                // Re-subscribe unconditionally: a reconnect keeps its id but gets a fresh
+                // broadcast channel, so the old receiver would go silent otherwise.
+                sub = selected.as_ref().and_then(|id| registry.subscribe(id));
+                if !send_reliable(&browser_tx, Message::Binary(frame::encode(&view(&registry, &selected)))) {
                     break;
                 }
             }
@@ -150,6 +199,11 @@ pub async fn handle_browser(socket: WebSocket, registry: Arc<Registry>, pose_url
 
     tracing::info!("browser disconnected");
     forwarder.abort();
+    // The pose proxy reconnects forever on its own; abort it so it doesn't outlive the
+    // browser it feeds.
+    if let Some((_, _, handle)) = pose {
+        handle.abort();
+    }
 }
 
 /// Proxy EMG frames to a pose-inference service and forward `Pose` frames back to the
@@ -159,7 +213,7 @@ async fn run_pose_proxy(
     url: String,
     queue: PoseQueue,
     notify: PoseNotify,
-    browser_tx: mpsc::UnboundedSender<Message>,
+    browser_tx: mpsc::Sender<Out>,
 ) {
     let mut backoff = Duration::from_secs(1);
     loop {
@@ -190,7 +244,7 @@ async fn run_pose_proxy(
                 while let Some(Ok(msg)) = stream.next().await {
                     if let WsMessage::Binary(bytes) = msg {
                         if let Ok(Frame::Pose { .. }) = frame::decode(&bytes) {
-                            let _ = browser_tx.send(Message::Binary(bytes));
+                            let _ = send_live(&browser_tx, Message::Binary(bytes));
                         }
                     }
                 }

@@ -5,6 +5,7 @@
 
 use protocol::{DeviceConfig, DeviceInfo, Frame};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use tokio::sync::{broadcast, mpsc};
 
@@ -17,6 +18,9 @@ struct DeviceEntry {
     config: DeviceConfig,
     frames: broadcast::Sender<Frame>,
     control: mpsc::UnboundedSender<Frame>,
+    /// Identifies this connection, so a reconnect under the same id can't be evicted by
+    /// the old session. See [`Registry::deregister`].
+    token: u64,
 }
 
 /// Handed to a device's ingest task on registration: it pushes data frames into
@@ -24,12 +28,14 @@ struct DeviceEntry {
 pub struct DeviceHandle {
     pub frames: broadcast::Sender<Frame>,
     pub control_rx: mpsc::UnboundedReceiver<Frame>,
+    pub token: u64,
 }
 
 #[derive(Default)]
 pub struct Registry {
     devices: Mutex<HashMap<String, DeviceEntry>>,
     changed: ChangeSignal,
+    next_token: AtomicU64,
 }
 
 struct ChangeSignal(broadcast::Sender<()>);
@@ -59,12 +65,13 @@ impl Registry {
     pub fn register(&self, id: String, label: String, config: DeviceConfig) -> DeviceHandle {
         let (frames, _) = broadcast::channel(FRAME_BUFFER);
         let (control, control_rx) = mpsc::unbounded_channel();
+        let token = self.next_token.fetch_add(1, Ordering::Relaxed);
         self.devices.lock().unwrap().insert(
             id,
-            DeviceEntry { label, config, frames: frames.clone(), control },
+            DeviceEntry { label, config, frames: frames.clone(), control, token },
         );
         self.notify();
-        DeviceHandle { frames, control_rx }
+        DeviceHandle { frames, control_rx, token }
     }
 
     /// Update a device's config after a re-announced `DeviceHello`.
@@ -75,10 +82,15 @@ impl Registry {
         self.notify();
     }
 
-    /// Remove a device whose connection has closed.
-    pub fn deregister(&self, id: &str) {
-        self.devices.lock().unwrap().remove(id);
-        self.notify();
+    /// Remove a device whose connection closed, but only if `token` still matches the
+    /// live entry — so a stale session can't evict a newer reconnection under the same id.
+    pub fn deregister(&self, id: &str, token: u64) {
+        let mut devices = self.devices.lock().unwrap();
+        if devices.get(id).map(|entry| entry.token) == Some(token) {
+            devices.remove(id);
+            drop(devices);
+            self.notify();
+        }
     }
 
     /// The picker list, sorted by id for stable ordering.

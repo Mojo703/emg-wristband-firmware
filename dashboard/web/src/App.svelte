@@ -48,9 +48,15 @@
           </Tabs.Trigger>
         {/each}
       </Tabs.List>
-      <div class="status" class:on={live.connected}>
-        <Icon name="wifi" size={14} />
-        {live.connected ? 'connected' : 'offline'}
+      <!-- Backend link (not device presence — devices live in the picker above). -->
+      <div class="status" class:on={live.connected} title="Dashboard's connection to the backend server">
+        <Icon name="server" size={14} />
+        {live.connected ? 'backend online' : 'backend offline'}
+      </div>
+      <!-- Live throughput of the device→backend→browser pipe. -->
+      <div class="status" class:on={live.streaming} title="EMG frames per second reaching the browser">
+        <Icon name="activity" size={14} />
+        {live.streaming ? `${live.fps} fps` : 'no stream'}
       </div>
     </div>
 

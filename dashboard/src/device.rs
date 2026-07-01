@@ -32,7 +32,7 @@ async fn device_session(
     };
     tracing::info!("device '{device_id}' connected ({} gestures)", config.gestures);
 
-    let DeviceHandle { frames, mut control_rx } =
+    let DeviceHandle { frames, mut control_rx, token } =
         registry.register(device_id.clone(), device_id.clone(), config);
 
     // Forward control frames (browser → device) to the transport writer.
@@ -57,14 +57,18 @@ async fn device_session(
     }
 
     control_task.abort();
-    registry.deregister(&device_id);
+    registry.deregister(&device_id, token);
     tracing::info!("device '{device_id}' disconnected");
 }
 
 /// Wrap a byte-stream reader/writer as length-prefixed CBOR frames and run a device
 /// session over it. Shared by the TCP and serial transports.
-async fn framed_session<R, W>(reader: R, writer: W, registry: Arc<Registry>)
-where
+async fn framed_session<R, W>(
+    reader: R,
+    writer: W,
+    registry: Arc<Registry>,
+    idle_timeout: Option<Duration>,
+) where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
@@ -75,11 +79,11 @@ where
         let mut reader = reader;
         loop {
             let mut len = [0u8; 4];
-            if reader.read_exact(&mut len).await.is_err() {
+            if !read_exact_within(&mut reader, &mut len, idle_timeout).await {
                 break;
             }
             let mut buf = vec![0u8; u32::from_le_bytes(len) as usize];
-            if reader.read_exact(&mut buf).await.is_err() {
+            if !read_exact_within(&mut reader, &mut buf, idle_timeout).await {
                 break;
             }
             if let Ok(frame) = frame::decode(&buf) {
@@ -105,6 +109,27 @@ where
     write_task.abort();
 }
 
+/// Read exactly `buf.len()` bytes, returning `false` on EOF, error, or — when
+/// `idle_timeout` is set — too long a silence. The device streams continuously, so a gap
+/// that long means a dead link (e.g. wifi dropped without a FIN); without it a half-open
+/// socket would keep the session alive forever.
+async fn read_exact_within<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    buf: &mut [u8],
+    idle_timeout: Option<Duration>,
+) -> bool {
+    match idle_timeout {
+        Some(dur) => {
+            matches!(tokio::time::timeout(dur, reader.read_exact(buf)).await, Ok(Ok(_)))
+        }
+        None => reader.read_exact(buf).await.is_ok(),
+    }
+}
+
+/// Silence on a TCP link this long means the device is gone. It streams every window, so
+/// this only trips on a genuine drop (typically wifi vanishing with no FIN).
+const DEVICE_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Accept devices dialing in over TCP (the wifi path). Each connection is one device.
 pub async fn run_tcp(addr: String, registry: Arc<Registry>) {
     let listener = match TcpListener::bind(&addr).await {
@@ -121,7 +146,12 @@ pub async fn run_tcp(addr: String, registry: Arc<Registry>) {
                 tracing::info!("device dialed in from {peer}");
                 let _ = stream.set_nodelay(true);
                 let (reader, writer) = stream.into_split();
-                tokio::spawn(framed_session(reader, writer, registry.clone()));
+                tokio::spawn(framed_session(
+                    reader,
+                    writer,
+                    registry.clone(),
+                    Some(DEVICE_IDLE_TIMEOUT),
+                ));
             }
             Err(e) => tracing::warn!("device accept failed: {e}"),
         }
@@ -135,7 +165,7 @@ pub async fn run_serial(path: String, baud: u32, registry: Arc<Registry>) {
             Ok(port) => {
                 tracing::info!("reading device from serial {path} @ {baud}");
                 let (reader, writer) = tokio::io::split(port);
-                framed_session(reader, writer, registry.clone()).await;
+                framed_session(reader, writer, registry.clone(), None).await;
                 tracing::warn!("serial {path} closed; reopening shortly");
             }
             Err(e) => tracing::warn!("serial {path} open failed ({e}); retrying"),

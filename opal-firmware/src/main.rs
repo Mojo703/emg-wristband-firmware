@@ -137,6 +137,7 @@ fn serve(transport: &mut dyn Transport, ctx: &mut Loop) {
         return;
     }
     loop {
+        let iter_start = std::time::Instant::now();
         // Apply pending control frames (browser → backend → device).
         while let Some(control) = transport.poll() {
             if apply_control(control, ctx.settings, ctx.pipeline, ctx.store)
@@ -167,7 +168,13 @@ fn serve(transport: &mut dyn Transport, ctx: &mut Loop) {
 
         *ctx.prev_wake = decision.wake_state;
         *ctx.seq = ctx.seq.wrapping_add(1);
-        FreeRtos::delay_ms((ctx.window_us / 1000) as u32);
+
+        // Pace to real time: sleep only what's left of the window after this iteration's
+        // compute and send. If the work already overran the window, don't sleep.
+        let window = std::time::Duration::from_micros(ctx.window_us);
+        if let Some(remaining) = window.checked_sub(iter_start.elapsed()) {
+            FreeRtos::delay_ms(remaining.as_millis() as u32);
+        }
     }
 }
 
