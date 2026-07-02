@@ -40,7 +40,7 @@
     {#if live.logs.length === 0}
       <div class="muted empty">No log frames from the selected device yet.</div>
     {:else}
-      {#each live.logs as log, index (index)}
+      {#each live.logs as log (log)}
         <div class="line level-{log.level}">
           <span class="t">{uptime(log.t_us)}</span>
           <span class="level">{log.level.toUpperCase().padEnd(5)}</span>

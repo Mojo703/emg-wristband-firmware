@@ -16,6 +16,7 @@ use crate::frame;
 use crate::registry::{DeviceHandle, Registry};
 use protocol::{Frame, FrameScanner};
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -225,7 +226,7 @@ pub async fn run_serial_discovery(registry: Arc<Registry>) {
 /// writes time out. Blocking reads with a timeout are immune, and the threads bridge
 /// into [`device_session`] through the same channels the TCP path uses.
 async fn serial_session(path: &str, registry: Arc<Registry>) {
-    let reader_port = match tokio_serial::new(path, 921_600)
+    let mut reader_port = match tokio_serial::new(path, 921_600)
         .timeout(Duration::from_millis(100))
         .open()
     {
@@ -235,6 +236,16 @@ async fn serial_session(path: &str, registry: Arc<Registry>) {
             return;
         }
     };
+    // DTR asserted + RTS deasserted is the line state under which the CDC channel is
+    // known to move data in both directions (any other combination has been observed
+    // to stall reads or writes, and the pair also drives the chip's reset circuit —
+    // espflash-style toggling would reboot the device just for connecting to it).
+    if let Err(e) = reader_port
+        .write_data_terminal_ready(true)
+        .and_then(|()| reader_port.write_request_to_send(false))
+    {
+        tracing::warn!("serial {path} line state setup failed ({e})");
+    }
     let writer_port = match reader_port.try_clone() {
         Ok(port) => port,
         Err(e) => {
@@ -265,36 +276,77 @@ async fn serial_session(path: &str, registry: Arc<Registry>) {
         })
     };
 
-    std::thread::spawn(move || {
-        let mut port = reader_port;
-        let mut scanner = FrameScanner::new();
-        let mut chunk = [0u8; 4096];
-        loop {
-            match port.read(&mut chunk) {
-                Ok(n) => {
-                    scanner.extend(&chunk[..n]);
-                    while let Some(payload) = scanner.next_frame() {
-                        if let Some(frame) = decode_wire_frame(&payload) {
-                            if in_tx.send(frame).is_err() {
-                                return;
+    // If either thread dies the whole session must end: a session whose writer is
+    // gone is a zombie — its heartbeats have stopped, so the device will never
+    // (re-)claim the link, yet the live reader keeps the port occupied and discovery
+    // never reopens it.
+    let writer_dead = Arc::new(AtomicBool::new(false));
+
+    {
+        let writer_dead = writer_dead.clone();
+        std::thread::spawn(move || {
+            let mut port = reader_port;
+            let mut scanner = FrameScanner::new();
+            let mut chunk = [0u8; 4096];
+            let mut bytes_read: u64 = 0;
+            let mut last_report = std::time::Instant::now();
+            loop {
+                // The read timeout paces this check; a dead writer ends the session.
+                if writer_dead.load(Ordering::SeqCst) {
+                    return;
+                }
+                if last_report.elapsed() > Duration::from_secs(2) {
+                    tracing::info!("serial reader: {bytes_read} bytes in the last 2s");
+                    bytes_read = 0;
+                    last_report = std::time::Instant::now();
+                }
+                match port.read(&mut chunk) {
+                    Ok(n) => {
+                        bytes_read += n as u64;
+                        scanner.extend(&chunk[..n]);
+                        while let Some(payload) = scanner.next_frame() {
+                            if let Some(frame) = decode_wire_frame(&payload) {
+                                if in_tx.send(frame).is_err() {
+                                    return;
+                                }
                             }
                         }
                     }
+                    Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+                    Err(e) => {
+                        // Unplugged (or the port vanished); session ends.
+                        tracing::warn!("serial read failed ({e}); ending session");
+                        return;
+                    }
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => continue,
-                Err(_) => return, // unplugged (or the port vanished); session ends
             }
-        }
-    });
+        });
+    }
     std::thread::spawn(move || {
         let mut port = writer_port;
         let mut out_rx = out_rx;
-        while let Some(frame) = out_rx.blocking_recv() {
+        // Opening the port can bounce the device's reset line, so the first writes may
+        // land while it reboots and its CDC accepts nothing. Ride out a few seconds of
+        // failures before declaring the link dead; a torn frame from a partial write
+        // is fine, the device's scanner resyncs on the next magic.
+        const WRITE_ATTEMPTS: u32 = 8;
+        'session: while let Some(frame) = out_rx.blocking_recv() {
             let bytes = protocol::frame_bytes(&frame::encode(&frame));
-            if port.write_all(&bytes).is_err() {
-                return;
+            for attempt in 1.. {
+                match port.write_all(&bytes) {
+                    Ok(()) => break,
+                    Err(e) if attempt < WRITE_ATTEMPTS => {
+                        tracing::debug!("serial write failed ({e}); retrying");
+                        std::thread::sleep(Duration::from_millis(500));
+                    }
+                    Err(e) => {
+                        tracing::warn!("serial write failed ({e}); ending session");
+                        break 'session;
+                    }
+                }
             }
         }
+        writer_dead.store(true, Ordering::SeqCst);
     });
 
     device_session(in_rx, out_tx, registry).await;

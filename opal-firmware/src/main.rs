@@ -50,10 +50,19 @@ pub const MODEL_BIN: &[u8] = include_bytes!("../../ml-bench/data/model_int8.bin"
 /// arriving within this window (they come every ~2 s).
 const SERIAL_CLAIM_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// After a stalled serial write releases the claim, plain heartbeats may not re-claim
+/// the link until this much time has passed. The backend heartbeats every ~2 s whether
+/// or not it is draining the port, so without the cooldown a stalled link flaps
+/// claimed/stalled/claimed and starves the wifi fallback. A stall is also evidence
+/// serial can't sustain the stream right now, so the cooldown is long — wifi carries
+/// the data meanwhile. A probe (a dashboard freshly opening the port) still claims
+/// immediately.
+const SERIAL_RECLAIM_COOLDOWN: Duration = Duration::from_secs(60);
+
 fn main() -> anyhow::Result<()> {
     esp_idf_svc::sys::link_patches();
     logger::init();
-    info!("=== opal-firmware booting ===");
+    info!("=== opal-firmware booting ({}) ===", reset_reason());
 
     let peripherals = Peripherals::take()?;
     let sysloop = EspSystemEventLoop::take()?;
@@ -102,14 +111,25 @@ fn main() -> anyhow::Result<()> {
         info!("no wifi configured; serial only");
     }
 
+    // The main loop paces at one window (~244 ms); if it ever stops feeding the task
+    // watchdog (default 5 s), something below hung on I/O and the chip must reboot
+    // rather than sit dead until unplugged. The boot log names the reset reason.
+    unsafe {
+        esp_idf_svc::sys::esp_task_wdt_add(std::ptr::null_mut());
+    }
+
     let window_us = model.input_len as u64 * 1_000_000 / SAMPLE_RATE as u64;
     let mut tcp: Option<TcpTransport> = None;
     let mut serial_claim: Option<Instant> = None;
+    let mut serial_stall: Option<Instant> = None;
     let mut seq: u32 = 0;
     let mut prev_wake = WakeState::Idle;
 
     loop {
         let iter_start = Instant::now();
+        unsafe {
+            esp_idf_svc::sys::esp_task_wdt_reset();
+        }
 
         // A freshly dialed TCP link. If a dashboard claimed serial in the meantime,
         // discard it (dropping closes the socket; the thread stays stood down).
@@ -130,11 +150,20 @@ fn main() -> anyhow::Result<()> {
             match control {
                 // A probe is an explicit claim; a heartbeat on an unclaimed link is
                 // one too (the device rebooted under an already-open dashboard
-                // session, which only probes at open). A probe always re-announces
-                // because it means a fresh session that is waiting for the hello.
+                // session, which only probes at open) — unless a stalled write just
+                // released the claim, in which case heartbeats sit out the cooldown.
+                // A probe always re-announces because it means a fresh session that
+                // is waiting for the hello.
                 Control::Probe {} | Control::Heartbeat {} => {
                     let fresh_claim = serial_claim.is_none();
                     let is_probe = matches!(control, Control::Probe {});
+                    if fresh_claim
+                        && !is_probe
+                        && serial_stall.is_some_and(|at| at.elapsed() < SERIAL_RECLAIM_COOLDOWN)
+                    {
+                        continue;
+                    }
+                    serial_stall = None;
                     serial_claim = Some(Instant::now());
                     if fresh_claim {
                         info!("serial link claimed by dashboard");
@@ -191,27 +220,47 @@ fn main() -> anyhow::Result<()> {
                 if serial_active { &mut serial } else { tcp.as_mut().expect("tcp checked above") };
 
             let mut ok = true;
-            for log_frame in logger::drain() {
-                ok &= active.send(&log_frame).is_ok();
+            // Logs are the record of what went wrong, so a dead link must not eat
+            // them: put the failed record and everything behind it back for the
+            // next link.
+            let mut pending_logs = logger::drain().into_iter();
+            while let Some(log_frame) = pending_logs.next() {
+                if active.send(&log_frame).is_err() {
+                    let mut unsent = vec![log_frame];
+                    unsent.extend(pending_logs);
+                    logger::restore(unsent);
+                    ok = false;
+                    break;
+                }
             }
-            if config_changed {
-                ok &= active
+            // Stop at the first failure: every further send would block its full
+            // timeout against the same dead link (and the data is a live stream —
+            // this window is stale by the next iteration anyway).
+            if ok && config_changed {
+                ok = active
                     .send(&Frame::DeviceHello {
                         device_id: device_id.clone(),
                         config: settings.to_wire(),
                     })
                     .is_ok();
             }
-            ok &= active.send(&emg).is_ok();
-            ok &= active.send(&prediction).is_ok();
+            if ok {
+                ok = active.send(&emg).is_ok();
+            }
+            if ok {
+                ok = active.send(&prediction).is_ok();
+            }
             for event in &events {
-                ok &= active.send(event).is_ok();
+                if ok {
+                    ok = active.send(event).is_ok();
+                }
             }
 
             if !ok {
                 if serial_active {
                     info!("serial write stalled; releasing claim");
                     serial_claim = None;
+                    serial_stall = Some(Instant::now());
                     want_tcp.store(true, Ordering::SeqCst);
                 } else {
                     warn!("dashboard link lost; redialing");
@@ -332,6 +381,26 @@ fn softmax(logits: &[f32]) -> Vec<f32> {
     let exps: Vec<f32> = logits.iter().map(|v| (v - max).exp()).collect();
     let sum: f32 = exps.iter().sum();
     exps.iter().map(|v| v / sum).collect()
+}
+
+/// Why the chip (re)started, so a crash-reboot is visible in the log stream — there
+/// is no console for the panic message itself.
+fn reset_reason() -> &'static str {
+    match unsafe { esp_idf_svc::sys::esp_reset_reason() } {
+        esp_idf_svc::sys::esp_reset_reason_t_ESP_RST_POWERON => "power-on",
+        esp_idf_svc::sys::esp_reset_reason_t_ESP_RST_SW => "software reset",
+        esp_idf_svc::sys::esp_reset_reason_t_ESP_RST_PANIC => "panic",
+        esp_idf_svc::sys::esp_reset_reason_t_ESP_RST_INT_WDT => "interrupt watchdog",
+        esp_idf_svc::sys::esp_reset_reason_t_ESP_RST_TASK_WDT => "task watchdog",
+        esp_idf_svc::sys::esp_reset_reason_t_ESP_RST_WDT => "other watchdog",
+        esp_idf_svc::sys::esp_reset_reason_t_ESP_RST_BROWNOUT => "brownout",
+        esp_idf_svc::sys::esp_reset_reason_t_ESP_RST_USB => "usb reset",
+        other => {
+            // Rare sources (deep sleep, SDIO, JTAG, ...) just show the raw code.
+            log::debug!("reset reason code {other}");
+            "other"
+        }
+    }
 }
 
 /// A stable id derived from the factory MAC, e.g. "opal-1a2b3c".

@@ -38,3 +38,8 @@ CONFIG_LWIP_IRAM_OPTIMIZATION=y
 # Secondary console off too, or ESP-IDF would put one right back on the CDC.
 CONFIG_ESP_CONSOLE_NONE=y
 CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+
+# A hung task must reboot the chip, not print an (invisible, console-less) warning.
+# The main loop subscribes itself to the task watchdog and feeds it every window
+# (src/main.rs); the boot log's reset reason then names the hang.
+CONFIG_ESP_TASK_WDT_PANIC=y

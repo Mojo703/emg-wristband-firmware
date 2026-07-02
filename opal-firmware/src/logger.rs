@@ -59,3 +59,16 @@ pub fn init() {
 pub fn drain() -> Vec<Frame> {
     BUFFER.lock().unwrap().drain(..).collect()
 }
+
+/// Put back records that a dead link failed to send, so the next drain retries them
+/// on whichever link comes up. They keep their place ahead of anything logged since;
+/// the cap still applies, spilling the oldest.
+pub fn restore(frames: Vec<Frame>) {
+    let mut buffer = BUFFER.lock().unwrap();
+    for frame in frames.into_iter().rev() {
+        buffer.push_front(frame);
+    }
+    while buffer.len() > BUFFER_CAP {
+        buffer.pop_front();
+    }
+}

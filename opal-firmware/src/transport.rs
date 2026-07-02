@@ -77,9 +77,9 @@ struct SendQueue {
 ///
 /// The socket is shared through an `Arc` rather than duplicated: `TcpStream::try_clone`
 /// maps to `dup()`, which lwIP does not implement (ENOSYS) on ESP-IDF. `Read` and
-/// `Write` are both available on `&TcpStream`, so one fd serves both threads.
+/// `Write` are both available on `&TcpStream`, so one fd serves both threads — and
+/// only those threads; the handle here deliberately holds no reference to it.
 pub struct TcpTransport {
-    stream: Arc<TcpStream>,
     queue: Arc<(Mutex<SendQueue>, Condvar)>,
     rx: mpsc::Receiver<Control>,
     alive: Arc<AtomicBool>,
@@ -95,11 +95,13 @@ impl TcpTransport {
         let alive = Arc::new(AtomicBool::new(true));
         let (tx, rx) = mpsc::channel();
 
+        // Both threads run lwIP internals and (on error paths) the logger's
+        // formatting; 6 KB stacks were within canary distance of overflow.
         {
             let reader = Arc::clone(&stream);
             let queue = Arc::clone(&queue);
             let alive = Arc::clone(&alive);
-            std::thread::Builder::new().stack_size(6144).spawn(move || {
+            std::thread::Builder::new().stack_size(8192).spawn(move || {
                 read_loop(&reader, tx);
                 mark_closed(&queue, &alive);
             })?;
@@ -108,14 +110,14 @@ impl TcpTransport {
             let writer = Arc::clone(&stream);
             let queue = Arc::clone(&queue);
             let alive = Arc::clone(&alive);
-            std::thread::Builder::new().stack_size(6144).spawn(move || {
+            std::thread::Builder::new().stack_size(8192).spawn(move || {
                 write_loop(&writer, &queue);
                 alive.store(false, Ordering::SeqCst);
                 // Unblock the reader so it exits too and the socket is released.
                 let _ = writer.shutdown(std::net::Shutdown::Both);
             })?;
         }
-        Ok(Self { stream, queue, rx, alive, dropped: 0 })
+        Ok(Self { queue, rx, alive, dropped: 0 })
     }
 
     /// Shared liveness flag, so the link-management thread can see the transport die
@@ -222,9 +224,11 @@ impl Transport for TcpTransport {
 
 impl Drop for TcpTransport {
     fn drop(&mut self) {
+        // Only flag the closure — never touch the socket from here. Drop runs on the
+        // main task, and calling into lwIP from a thread that doesn't own the socket
+        // I/O can block indefinitely. The writer thread wakes on the condvar, sees
+        // `closed`, and does the shutdown itself, which in turn unblocks the reader.
         mark_closed(&self.queue, &self.alive);
-        // Wake the reader out of its blocking read so both threads exit.
-        let _ = self.stream.shutdown(std::net::Shutdown::Both);
     }
 }
 
@@ -233,9 +237,12 @@ impl Drop for TcpTransport {
 // ----------------------------------------------------------------------------
 
 /// How long one frame write may block before the host is presumed gone. When a
-/// dashboard is attached and reading, an EMG window drains in ~10 ms; hitting this
-/// means nobody is emptying the CDC buffer.
-const SERIAL_WRITE_TIMEOUT_MS: u32 = 100;
+/// dashboard is attached and reading, an EMG window drains in ~10 ms — but the reader
+/// is an ordinary desktop process, and a scheduling hiccup of 100 ms is routine, so
+/// presuming it gone that quickly made the link flap between serial and wifi. Worst
+/// case this blocks the main loop for one timeout per frame until the stale claim
+/// expires (~5 s).
+const SERIAL_WRITE_TIMEOUT_MS: u32 = 500;
 
 /// Reads/writes framed CBOR over the USB-Serial-JTAG CDC channel — the same USB port
 /// used for flashing and JTAG debugging (the CDC and JTAG are independent interfaces

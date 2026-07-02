@@ -69,6 +69,12 @@ class LiveStateManager {
   }
 
   appendLog(value: LogFrame): void {
+    // The backend replays retained logs after every hello while live frames keep
+    // flowing, so a record can arrive twice around a reconnect or device switch.
+    // The microsecond timestamp makes an accidental collision implausible.
+    if (this.logs.some((log) => log.t_us === value.t_us && log.message === value.message)) {
+      return;
+    }
     const MAX_LOGS = 500;
     this.logs = this.logs.length >= MAX_LOGS
       ? [...this.logs.slice(this.logs.length - MAX_LOGS + 1), value]
