@@ -10,15 +10,16 @@ use emg_runtime::Decision;
 use protocol::{Frame, MediaKey, WakeState};
 
 /// The bulk EMG window for the scope. `input` is the int8 activation, time-major
-/// `[t, c]`; the wire format is channel-major little-endian i16, so we transpose.
-/// `scale_uv` is µV per count.
+/// `[t, c]`; the raw wire layout is channel-major little-endian i16, so we transpose. The
+/// blob is then delta+varint packed for the link (the backend unpacks it); see
+/// [`protocol::pack_samples`]. `scale_uv` is µV per count.
 pub fn emg(seq: u32, input: &I8Activation, scale_uv: f32, input_len: usize, sample_rate: u32) -> Frame {
     let data = input.as_slice(); // [t * c], time-major
-    let mut samples = Vec::with_capacity(input_len * INPUT_CH * 2);
+    let mut raw = Vec::with_capacity(input_len * INPUT_CH * 2);
     for ch in 0..INPUT_CH {
         for ti in 0..input_len {
             let value = data[ti * INPUT_CH + ch] as i16;
-            samples.extend_from_slice(&value.to_le_bytes());
+            raw.extend_from_slice(&value.to_le_bytes());
         }
     }
     let window_us = input_len as u64 * 1_000_000 / sample_rate as u64;
@@ -28,7 +29,7 @@ pub fn emg(seq: u32, input: &I8Activation, scale_uv: f32, input_len: usize, samp
         channels: INPUT_CH as u16,
         sample_rate,
         scale_uv,
-        samples,
+        samples: protocol::pack_samples(&raw),
     }
 }
 

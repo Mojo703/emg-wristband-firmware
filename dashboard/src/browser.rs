@@ -24,12 +24,25 @@ const POSE_QUEUE_MAX: usize = 100;
 /// unbounded backlog.
 const OUTBOUND_CAP: usize = 256;
 
+/// Which live stream a frame belongs to. Live frames are coalesced *per kind* when the
+/// browser falls behind: the device emits each EMG window immediately followed by its
+/// prediction, so a single "latest live frame" slot would race the pair and near-always
+/// discard the EMG half of the stream.
+#[derive(Clone, Copy)]
+enum LiveKind {
+    Emg = 0,
+    Prediction = 1,
+    Pose = 2,
+    Other = 3,
+}
+const LIVE_KINDS: usize = 4;
+
 /// A message headed for the browser socket. `Reliable` frames (device list/config,
 /// discrete `Event`s) are delivered in order; `Live` frames (EMG, predictions, poses) are
-/// coalesced to the latest when the browser falls behind.
+/// coalesced to the latest of their kind when the browser falls behind.
 enum Out {
     Reliable(Message),
-    Live(Message),
+    Live(LiveKind, Message),
 }
 
 /// Both return `false` only when the socket has closed (so the caller can stop); a full
@@ -38,8 +51,8 @@ fn send_reliable(tx: &mpsc::Sender<Out>, msg: Message) -> bool {
     !matches!(tx.try_send(Out::Reliable(msg)), Err(TrySendError::Closed(_)))
 }
 
-fn send_live(tx: &mpsc::Sender<Out>, msg: Message) -> bool {
-    !matches!(tx.try_send(Out::Live(msg)), Err(TrySendError::Closed(_)))
+fn send_live(tx: &mpsc::Sender<Out>, kind: LiveKind, msg: Message) -> bool {
+    !matches!(tx.try_send(Out::Live(kind, msg)), Err(TrySendError::Closed(_)))
 }
 
 /// The complete browser view: device list, the selection, the selected device's
@@ -92,8 +105,9 @@ pub async fn handle_browser(socket: WebSocket, registry: Arc<Registry>, pose_url
         let mut sink = browser_sink;
         while let Some(first) = browser_rx.recv().await {
             // Drain what's queued now: reliable frames in order, live frames coalesced to
-            // the most recent, so a browser that fell behind jumps to current data.
-            let mut latest_live: Option<Message> = None;
+            // the most recent of each kind, so a browser that fell behind jumps to
+            // current data without losing one stream to another.
+            let mut latest_live: [Option<Message>; LIVE_KINDS] = Default::default();
             let mut item = Some(first);
             loop {
                 match item.take().expect("item present") {
@@ -102,14 +116,14 @@ pub async fn handle_browser(socket: WebSocket, registry: Arc<Registry>, pose_url
                             return;
                         }
                     }
-                    Out::Live(msg) => latest_live = Some(msg),
+                    Out::Live(kind, msg) => latest_live[kind as usize] = Some(msg),
                 }
                 match browser_rx.try_recv() {
                     Ok(next) => item = Some(next),
                     Err(_) => break,
                 }
             }
-            if let Some(msg) = latest_live {
+            for msg in latest_live.into_iter().flatten() {
                 if sink.send(msg).await.is_err() {
                     return;
                 }
@@ -175,10 +189,11 @@ pub async fn handle_browser(socket: WebSocket, registry: Arc<Registry>, pose_url
                 }
                 // Discrete events must not be coalesced away; the timeseries may be.
                 let msg = Message::Binary(frame::encode(&frame));
-                let ok = if matches!(frame, Frame::Event { .. }) {
-                    send_reliable(&browser_tx, msg)
-                } else {
-                    send_live(&browser_tx, msg)
+                let ok = match &frame {
+                    Frame::Event { .. } => send_reliable(&browser_tx, msg),
+                    Frame::Emg { .. } => send_live(&browser_tx, LiveKind::Emg, msg),
+                    Frame::Prediction { .. } => send_live(&browser_tx, LiveKind::Prediction, msg),
+                    _ => send_live(&browser_tx, LiveKind::Other, msg),
                 };
                 if !ok {
                     break;
@@ -244,7 +259,7 @@ async fn run_pose_proxy(
                 while let Some(Ok(msg)) = stream.next().await {
                     if let WsMessage::Binary(bytes) = msg {
                         if let Ok(Frame::Pose { .. }) = frame::decode(&bytes) {
-                            let _ = send_live(&browser_tx, Message::Binary(bytes));
+                            let _ = send_live(&browser_tx, LiveKind::Pose, Message::Binary(bytes));
                         }
                     }
                 }

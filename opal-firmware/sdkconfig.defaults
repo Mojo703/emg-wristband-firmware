@@ -14,3 +14,21 @@ CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=240
 # The Rust main task runs inference + framing; give it a generous stack.
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=24000
 CONFIG_FREERTOS_HZ=1000
+
+# TCP throughput to the dashboard. The lwIP default send buffer (5760 B, 4 segments)
+# caps the stream well below one EMG window per window period: each ~8.5 KB frame
+# needed several buffer-drain round trips, the writer fell behind, and the transport
+# queue dropped half the windows. 16 KB holds a whole window plus slack in flight.
+# Heap is tight (the model + a 16 KB window blob live alongside): 32 KB send buffer
+# and 64 dynamic TX buffers ran the device out of memory, so don't raise these
+# without watching free heap.
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=16384
+CONFIG_LWIP_TCP_WND_DEFAULT=8960
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=16
+
+# A wider TX block-ack window so the radio can aggregate the burst instead of
+# trickling it out; buffer counts stay at the defaults for heap headroom.
+CONFIG_ESP_WIFI_TX_BA_WIN=16
+
+# lwIP hot path in IRAM (~13 KB of IRAM for a solid throughput bump).
+CONFIG_LWIP_IRAM_OPTIMIZATION=y

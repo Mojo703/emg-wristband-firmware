@@ -86,7 +86,12 @@ async fn framed_session<R, W>(
             if !read_exact_within(&mut reader, &mut buf, idle_timeout).await {
                 break;
             }
-            if let Ok(frame) = frame::decode(&buf) {
+            if let Ok(mut frame) = frame::decode(&buf) {
+                // EMG samples arrive delta+varint packed (see protocol::pack_samples);
+                // unpack once here so everything downstream sees the raw i16 blob.
+                if let Frame::Emg { samples, .. } = &mut frame {
+                    *samples = protocol::unpack_samples(samples);
+                }
                 if in_tx.send(frame).is_err() {
                     break;
                 }

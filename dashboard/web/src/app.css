@@ -105,7 +105,8 @@
 .nav-item { display: flex; align-items: center; gap: 8px; padding: 8px; border: none; background: none; text-align: left; cursor: pointer; border-radius: var(--radius); font: inherit; color: inherit; width: 100%; }
 .nav-item:hover { background: var(--muted); }
 .nav-item[data-state="active"] { background: color-mix(in oklab, var(--brand) 22%, transparent); color: oklch(0.92 0.04 262); }
-.sidebar .status { margin-top: auto; padding: 8px; font-size: 12px; color: var(--muted-foreground); display: flex; align-items: center; gap: 6px; }
+.sidebar .statusbar { margin-top: auto; display: flex; flex-direction: column; }
+.sidebar .status { padding: 8px; font-size: 12px; color: var(--muted-foreground); display: flex; align-items: center; gap: 6px; }
 .sidebar .status.on { color: var(--success); }
 
 main { flex: 1; overflow: auto; padding: 16px; }

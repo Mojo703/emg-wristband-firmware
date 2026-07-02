@@ -262,6 +262,59 @@ impl MediaKey {
     }
 }
 
+/// Lossless delta + zigzag + varint packing for the bulk EMG `samples` blob, applied on
+/// the device→backend hop only. The blob is little-endian `i16`; consecutive samples sit
+/// close together, so storing zigzag-varint deltas shrinks it while keeping every bit —
+/// so a higher-resolution ADC still round-trips. State is O(1), so it's cheap on the
+/// device. The backend calls [`unpack_samples`] before fanning out, so the browser and
+/// Python consumers still receive the raw `i16` blob and need no change.
+pub fn pack_samples(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len() / 2 + 8);
+    let mut prev = 0i32;
+    for chunk in raw.chunks_exact(2) {
+        let sample = i16::from_le_bytes([chunk[0], chunk[1]]) as i32;
+        let delta = sample - prev;
+        prev = sample;
+        let mut zigzag = ((delta << 1) ^ (delta >> 31)) as u32;
+        loop {
+            let byte = (zigzag & 0x7f) as u8;
+            zigzag >>= 7;
+            if zigzag == 0 {
+                out.push(byte);
+                break;
+            }
+            out.push(byte | 0x80);
+        }
+    }
+    out
+}
+
+/// Inverse of [`pack_samples`]: reconstruct the little-endian `i16` blob. Stops at the end
+/// of `packed`; a truncated trailing varint is simply ignored.
+pub fn unpack_samples(packed: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(packed.len() * 2);
+    let mut prev = 0i32;
+    let mut bytes = packed.iter();
+    'samples: loop {
+        let mut zigzag = 0u32;
+        let mut shift = 0u32;
+        loop {
+            let Some(&byte) = bytes.next() else {
+                break 'samples;
+            };
+            zigzag |= ((byte & 0x7f) as u32) << shift;
+            if byte & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+        }
+        let delta = ((zigzag >> 1) as i32) ^ -((zigzag & 1) as i32);
+        prev += delta;
+        out.extend_from_slice(&(prev as i16).to_le_bytes());
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,6 +343,30 @@ mod tests {
             }
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn pack_samples_roundtrips() {
+        // Empty, a single sample, and the full i16 range including the extremes so the
+        // delta and zigzag paths are all exercised.
+        for raw in [
+            Vec::new(),
+            42i16.to_le_bytes().to_vec(),
+            [i16::MIN, i16::MAX, 0, -1, 1, i16::MAX, i16::MIN]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<u8>>(),
+            (-200..200i16).flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
+        ] {
+            assert_eq!(unpack_samples(&pack_samples(&raw)), raw);
+        }
+    }
+
+    #[test]
+    fn pack_samples_shrinks_slowly_varying_data() {
+        // int8-range values widened to i16 (today's data): packing must be smaller.
+        let raw: Vec<u8> = (0..500).flat_map(|i| ((i % 40 - 20) as i16).to_le_bytes()).collect();
+        assert!(pack_samples(&raw).len() < raw.len());
     }
 
     #[test]

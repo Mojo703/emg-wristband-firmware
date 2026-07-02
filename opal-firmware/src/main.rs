@@ -58,6 +58,12 @@ fn main() -> anyhow::Result<()> {
     let mut provider = Provider::new();
     let mut pipeline = RejectPipeline::new(NUM_CLASSES, tau_for(&settings.sensitivity));
 
+    // Heap headroom is the constraint when sizing wifi/lwIP buffers (see
+    // sdkconfig.defaults); log it so an out-of-memory abort is diagnosable.
+    info!("free heap after model load: {} KB", unsafe {
+        esp_idf_svc::sys::esp_get_free_heap_size() / 1024
+    });
+
     let window_us = model.input_len as u64 * 1_000_000 / SAMPLE_RATE as u64;
     let mut seq: u32 = 0;
     let mut prev_wake = WakeState::Idle;
@@ -94,7 +100,7 @@ fn main() -> anyhow::Result<()> {
     } else {
         info!("connecting to wifi '{}'", ctx.settings.wifi_ssid);
         // Keep the handle alive for the program's lifetime; dropping it tears wifi down.
-        let _wifi = wifi::connect(
+        let mut wifi = wifi::connect(
             peripherals.modem,
             sysloop,
             nvs_partition,
@@ -104,6 +110,11 @@ fn main() -> anyhow::Result<()> {
         // Dial the dashboard, stream until the link drops, then retry — so the device
         // waits for the dashboard to come up and survives it restarting.
         loop {
+            // The AP may have bounced while we streamed; re-associate before dialing.
+            if !wifi::ensure_connected(&mut wifi) {
+                FreeRtos::delay_ms(2000);
+                continue;
+            }
             match TcpTransport::connect(&ctx.settings.server_addr) {
                 Ok(mut transport) => {
                     info!("connected to dashboard at {}", ctx.settings.server_addr);

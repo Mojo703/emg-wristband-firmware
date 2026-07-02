@@ -6,6 +6,7 @@
   import { connect, live, api } from './lib/socket.svelte';
   import Icon from './lib/Icon.svelte';
   import Select from './lib/ui/Select.svelte';
+  import StreamMonitor from './lib/StreamMonitor.svelte';
 
   const firstPanel = panels[0]!;
   let active = $state<string>(firstPanel.id);
@@ -48,15 +49,13 @@
           </Tabs.Trigger>
         {/each}
       </Tabs.List>
-      <!-- Backend link (not device presence — devices live in the picker above). -->
-      <div class="status" class:on={live.connected} title="Dashboard's connection to the backend server">
-        <Icon name="server" size={14} />
-        {live.connected ? 'backend online' : 'backend offline'}
-      </div>
-      <!-- Live throughput of the device→backend→browser pipe. -->
-      <div class="status" class:on={live.streaming} title="EMG frames per second reaching the browser">
-        <Icon name="activity" size={14} />
-        {live.streaming ? `${live.fps} fps` : 'no stream'}
+      <div class="statusbar">
+        <!-- Backend link (not device presence — devices live in the picker above). -->
+        <div class="status" class:on={live.connected} title="Dashboard's connection to the backend server">
+          <Icon name="server" size={14} />
+          {live.connected ? 'backend online' : 'backend offline'}
+        </div>
+        <StreamMonitor />
       </div>
     </div>
 
