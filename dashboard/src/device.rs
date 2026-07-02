@@ -1,18 +1,27 @@
 //! Device ingest. A device reaches the backend over one of two byte pipes — a TCP
-//! socket (wifi) or a serial port — carrying the *same* framing: a 4-byte
-//! little-endian length, then that many CBOR bytes. Both reduce to a reader/writer
-//! pair handed to [`framed_session`], so the link is genuinely transport-independent;
-//! only [`device_session`] knows about the registry, and it knows nothing of bytes.
+//! socket (wifi) or a serial port (the device's USB-Serial-JTAG CDC) — carrying the
+//! *same* framing: `protocol::FRAME_MAGIC`, a 4-byte little-endian length, then that
+//! many CBOR bytes, with resynchronization on garbage (the ESP32 ROM bootloader
+//! prints text on the CDC at reset). Both reduce to a reader/writer pair handed to
+//! [`framed_session`], so the link is genuinely transport-independent; only
+//! [`device_session`] knows about the registry, and it knows nothing of bytes.
+//!
+//! Serial ports are discovered, not configured: every USB-Serial-JTAG device
+//! (VID:PID 303a:1001) is opened and probed. The probe tells the device a dashboard
+//! now owns the link (it answers `DeviceHello` and routes its stream here), and a
+//! heartbeat keeps that claim alive — a serial port has no connection semantics, so
+//! the protocol invents them.
 
 use crate::frame;
 use crate::registry::{DeviceHandle, Registry};
-use protocol::Frame;
-use std::sync::Arc;
+use protocol::{Frame, FrameScanner};
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
-use tokio_serial::SerialPortBuilderExt;
+use tokio_serial::SerialPortType;
 
 /// Drive one device connection: wait for its `DeviceHello`, register it, fan its data
 /// frames out to viewers, and funnel control frames back. `incoming` yields decoded
@@ -49,8 +58,12 @@ async fn device_session(
             // Re-announced config (e.g. after honoring a SetSensitivity).
             Frame::DeviceHello { config, .. } => registry.update_config(&device_id, config),
             // Everything else is a data frame to fan out. `send` errs only when no
-            // browser is subscribed, which is fine — drop it.
+            // browser is subscribed, which is fine — drop it. Logs are additionally
+            // retained so a browser opened later still sees them.
             other => {
+                if matches!(other, Frame::Log { .. }) {
+                    registry.push_log(&device_id, other.clone());
+                }
                 let _ = frames.send(other);
             }
         }
@@ -61,8 +74,18 @@ async fn device_session(
     tracing::info!("device '{device_id}' disconnected");
 }
 
-/// Wrap a byte-stream reader/writer as length-prefixed CBOR frames and run a device
-/// session over it. Shared by the TCP and serial transports.
+/// Decode one wire payload, unpacking EMG samples (they arrive delta+varint packed,
+/// see `protocol::pack_samples`) so everything downstream sees the raw i16 blob.
+fn decode_wire_frame(payload: &[u8]) -> Option<Frame> {
+    let mut frame = frame::decode(payload).ok()?;
+    if let Frame::Emg { samples, .. } = &mut frame {
+        *samples = protocol::unpack_samples(samples);
+    }
+    Some(frame)
+}
+
+/// Wrap an async byte-stream reader/writer as framed CBOR and run a device session
+/// over it (the TCP path).
 async fn framed_session<R, W>(
     reader: R,
     writer: W,
@@ -77,23 +100,19 @@ async fn framed_session<R, W>(
 
     let read_task = tokio::spawn(async move {
         let mut reader = reader;
+        let mut scanner = FrameScanner::new();
+        let mut chunk = vec![0u8; 4096];
         loop {
-            let mut len = [0u8; 4];
-            if !read_exact_within(&mut reader, &mut len, idle_timeout).await {
-                break;
-            }
-            let mut buf = vec![0u8; u32::from_le_bytes(len) as usize];
-            if !read_exact_within(&mut reader, &mut buf, idle_timeout).await {
-                break;
-            }
-            if let Ok(mut frame) = frame::decode(&buf) {
-                // EMG samples arrive delta+varint packed (see protocol::pack_samples);
-                // unpack once here so everything downstream sees the raw i16 blob.
-                if let Frame::Emg { samples, .. } = &mut frame {
-                    *samples = protocol::unpack_samples(samples);
-                }
-                if in_tx.send(frame).is_err() {
-                    break;
+            let n = match read_within(&mut reader, &mut chunk, idle_timeout).await {
+                Some(n) if n > 0 => n,
+                _ => break,
+            };
+            scanner.extend(&chunk[..n]);
+            while let Some(payload) = scanner.next_frame() {
+                if let Some(frame) = decode_wire_frame(&payload) {
+                    if in_tx.send(frame).is_err() {
+                        return;
+                    }
                 }
             }
         }
@@ -101,9 +120,8 @@ async fn framed_session<R, W>(
     let write_task = tokio::spawn(async move {
         let mut writer = writer;
         while let Some(frame) = out_rx.recv().await {
-            let bytes = frame::encode(&frame);
-            let len = (bytes.len() as u32).to_le_bytes();
-            if writer.write_all(&len).await.is_err() || writer.write_all(&bytes).await.is_err() {
+            let bytes = protocol::frame_bytes(&frame::encode(&frame));
+            if writer.write_all(&bytes).await.is_err() {
                 break;
             }
         }
@@ -114,20 +132,19 @@ async fn framed_session<R, W>(
     write_task.abort();
 }
 
-/// Read exactly `buf.len()` bytes, returning `false` on EOF, error, or — when
-/// `idle_timeout` is set — too long a silence. The device streams continuously, so a gap
-/// that long means a dead link (e.g. wifi dropped without a FIN); without it a half-open
-/// socket would keep the session alive forever.
-async fn read_exact_within<R: AsyncRead + Unpin>(
+/// Read some bytes, returning `None` on EOF, error, or — when `idle_timeout` is set —
+/// too long a silence. The device streams continuously, so a gap that long means a
+/// dead link (e.g. wifi dropped without a FIN); without it a half-open socket would
+/// keep the session alive forever.
+async fn read_within<R: AsyncRead + Unpin>(
     reader: &mut R,
     buf: &mut [u8],
     idle_timeout: Option<Duration>,
-) -> bool {
+) -> Option<usize> {
+    let read = reader.read(buf);
     match idle_timeout {
-        Some(dur) => {
-            matches!(tokio::time::timeout(dur, reader.read_exact(buf)).await, Ok(Ok(_)))
-        }
-        None => reader.read_exact(buf).await.is_ok(),
+        Some(dur) => tokio::time::timeout(dur, read).await.ok()?.ok(),
+        None => read.await.ok(),
     }
 }
 
@@ -163,18 +180,124 @@ pub async fn run_tcp(addr: String, registry: Arc<Registry>) {
     }
 }
 
-/// Read a single device from a serial port, reopening on error.
-pub async fn run_serial(path: String, baud: u32, registry: Arc<Registry>) {
+/// The ESP32-S3's built-in USB-Serial-JTAG identity — every opal device enumerates
+/// with it, so it is the discovery filter.
+const USB_SERIAL_JTAG_VID: u16 = 0x303a;
+const USB_SERIAL_JTAG_PID: u16 = 0x1001;
+
+/// Discover serial-attached devices: scan for USB-Serial-JTAG ports, open each new
+/// one, and run a probed session on it until it dies (unplug, or the device ignores
+/// us). The baud rate is nominal — a CDC channel ignores it.
+pub async fn run_serial_discovery(registry: Arc<Registry>) {
+    let open_ports: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    tracing::info!("serial discovery running (USB-Serial-JTAG {USB_SERIAL_JTAG_VID:04x}:{USB_SERIAL_JTAG_PID:04x})");
     loop {
-        match tokio_serial::new(&path, baud).open_native_async() {
-            Ok(port) => {
-                tracing::info!("reading device from serial {path} @ {baud}");
-                let (reader, writer) = tokio::io::split(port);
-                framed_session(reader, writer, registry.clone(), None).await;
-                tracing::warn!("serial {path} closed; reopening shortly");
+        let candidates: Vec<String> = tokio_serial::available_ports()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|port| match &port.port_type {
+                SerialPortType::UsbPort(usb) => {
+                    usb.vid == USB_SERIAL_JTAG_VID && usb.pid == USB_SERIAL_JTAG_PID
+                }
+                _ => false,
+            })
+            .map(|port| port.port_name)
+            .collect();
+
+        for path in candidates {
+            if !open_ports.lock().unwrap().insert(path.clone()) {
+                continue; // already running a session on it
             }
-            Err(e) => tracing::warn!("serial {path} open failed ({e}); retrying"),
+            let registry = registry.clone();
+            let open_ports = open_ports.clone();
+            tokio::spawn(async move {
+                serial_session(&path, registry).await;
+                open_ports.lock().unwrap().remove(&path);
+            });
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
+}
+
+/// One serial device session. The port I/O is *blocking*, on two dedicated threads —
+/// the async serial stack (mio-serial) silently stops delivering read readiness under
+/// bursty traffic, and a stalled reader backs the device's CDC buffer up until its
+/// writes time out. Blocking reads with a timeout are immune, and the threads bridge
+/// into [`device_session`] through the same channels the TCP path uses.
+async fn serial_session(path: &str, registry: Arc<Registry>) {
+    let reader_port = match tokio_serial::new(path, 921_600)
+        .timeout(Duration::from_millis(100))
+        .open()
+    {
+        Ok(port) => port,
+        Err(e) => {
+            tracing::warn!("serial {path} open failed ({e})");
+            return;
+        }
+    };
+    let writer_port = match reader_port.try_clone() {
+        Ok(port) => port,
+        Err(e) => {
+            tracing::warn!("serial {path} clone failed ({e})");
+            return;
+        }
+    };
+    tracing::info!("probing serial device at {path}");
+
+    let (in_tx, in_rx) = mpsc::unbounded_channel();
+    let (out_tx, out_rx) = mpsc::unbounded_channel::<Frame>();
+
+    // Claim the link, then keep the claim alive. A quiet port needs no idle timeout:
+    // the device may simply be streaming over wifi; unplug surfaces as a read error.
+    let heartbeat_task = {
+        let out_tx = out_tx.clone();
+        tokio::spawn(async move {
+            if out_tx.send(Frame::Probe {}).is_err() {
+                return;
+            }
+            let mut ticks = tokio::time::interval(Duration::from_secs(2));
+            loop {
+                ticks.tick().await;
+                if out_tx.send(Frame::Heartbeat {}).is_err() {
+                    return;
+                }
+            }
+        })
+    };
+
+    std::thread::spawn(move || {
+        let mut port = reader_port;
+        let mut scanner = FrameScanner::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match port.read(&mut chunk) {
+                Ok(n) => {
+                    scanner.extend(&chunk[..n]);
+                    while let Some(payload) = scanner.next_frame() {
+                        if let Some(frame) = decode_wire_frame(&payload) {
+                            if in_tx.send(frame).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => continue,
+                Err(_) => return, // unplugged (or the port vanished); session ends
+            }
+        }
+    });
+    std::thread::spawn(move || {
+        let mut port = writer_port;
+        let mut out_rx = out_rx;
+        while let Some(frame) = out_rx.blocking_recv() {
+            let bytes = protocol::frame_bytes(&frame::encode(&frame));
+            if port.write_all(&bytes).is_err() {
+                return;
+            }
+        }
+    });
+
+    device_session(in_rx, out_tx, registry).await;
+    heartbeat_task.abort();
+    tracing::info!("serial device at {path} closed");
 }

@@ -3,13 +3,21 @@
 //! Does the work of the final device: a fake provider replays embedded Hyser windows
 //! (no ADC yet), the int8 model classifies each window, the reject pipeline smooths
 //! it into a wake-gate decision, and the result streams to the dashboard as EMG +
-//! prediction + event frames. The device owns its functional config (sensitivity,
-//! keymap, wifi) and honors browser control frames, persisting them to NVS. The link
-//! is wifi (TCP) when credentials are configured, else serial — used to provision
-//! wifi for the next boot. Identical CBOR framing over both.
+//! prediction + event + log frames. The device owns its functional config
+//! (sensitivity, keymap, wifi) and honors browser control frames, persisting them to
+//! NVS.
+//!
+//! Links: the USB-Serial-JTAG CDC transport exists from boot and is always polled, so
+//! provisioning over USB works no matter what wifi is doing. When wifi credentials
+//! are configured, a link thread associates and dials the dashboard in the
+//! background. Exactly one link carries the data stream at a time, and the most
+//! recently established link wins: a dashboard probing the serial port claims it
+//! (heartbeats keep the claim alive; silence or unplug releases it), and TCP carries
+//! the stream otherwise.
 
 mod config;
 mod frames;
+mod logger;
 mod provider;
 mod transport;
 mod wifi;
@@ -19,14 +27,15 @@ use emg_runtime::model::{Model, NUM_CLASSES};
 use emg_runtime::{ForwardResult, RejectPipeline};
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::delay::FreeRtos;
-use esp_idf_svc::hal::gpio::AnyIOPin;
 use esp_idf_svc::hal::peripherals::Peripherals;
-use esp_idf_svc::hal::uart::{config::Config as UartConfig, UartDriver};
-use esp_idf_svc::hal::units::Hertz;
+use esp_idf_svc::hal::usb_serial::{UsbSerialConfig, UsbSerialDriver};
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use log::{info, warn};
 use protocol::{Frame, WakeState};
 use provider::Provider;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+use std::time::{Duration, Instant};
 use transport::{Control, SerialTransport, TcpTransport, Transport};
 
 /// Hyser acquisition rate; the window duration paces the stream.
@@ -37,12 +46,13 @@ const SAMPLE_RATE: u32 = 2048;
 /// data. Shared with `ml-bench`.
 pub const MODEL_BIN: &[u8] = include_bytes!("../../ml-bench/data/model_int8.bin");
 
-/// UART baud for the serial link (irrelevant for USB-Serial-JTAG, used for a real UART).
-const SERIAL_BAUD: u32 = 921_600;
+/// A probed serial link stays the data link as long as dashboard heartbeats keep
+/// arriving within this window (they come every ~2 s).
+const SERIAL_CLAIM_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn main() -> anyhow::Result<()> {
     esp_idf_svc::sys::link_patches();
-    esp_idf_svc::log::EspLogger::initialize_default();
+    logger::init();
     info!("=== opal-firmware booting ===");
 
     let peripherals = Peripherals::take()?;
@@ -64,129 +74,217 @@ fn main() -> anyhow::Result<()> {
         esp_idf_svc::sys::esp_get_free_heap_size() / 1024
     });
 
-    let window_us = model.input_len as u64 * 1_000_000 / SAMPLE_RATE as u64;
-    let mut seq: u32 = 0;
-    let mut prev_wake = WakeState::Idle;
-    let mut ctx = Loop {
-        model: &model,
-        provider: &mut provider,
-        pipeline: &mut pipeline,
-        store: &store,
-        settings: &mut settings,
-        device_id: &device_id,
-        window_us,
-        seq: &mut seq,
-        prev_wake: &mut prev_wake,
-    };
+    // The serial link exists from boot: dashboard discovery, provisioning, and the
+    // wifi-less data path all ride the USB-Serial-JTAG CDC channel.
+    let mut serial = SerialTransport::new(UsbSerialDriver::new(
+        peripherals.usb_serial,
+        peripherals.pins.gpio19,
+        peripherals.pins.gpio20,
+        &UsbSerialConfig::new().tx_buffer_size(8192).rx_buffer_size(1024),
+    )?);
 
-    // Choose the link: wifi when credentials are set, else the serial link (which is
-    // used to provision wifi for the next boot).
-    if ctx.settings.wifi_ssid.is_empty() {
-        info!("no wifi configured; using serial link");
-        let uart = UartDriver::new(
-            peripherals.uart1,
-            peripherals.pins.gpio17,
-            peripherals.pins.gpio18,
-            Option::<AnyIOPin>::None,
-            Option::<AnyIOPin>::None,
-            &UartConfig::default().baudrate(Hertz(SERIAL_BAUD)),
-        )?;
-        let mut transport = SerialTransport::new(uart);
-        // Serial never disconnects; serve forever (and re-announce if serve returns).
-        loop {
-            serve(&mut transport, &mut ctx);
-            FreeRtos::delay_ms(1000);
-        }
-    } else {
-        info!("connecting to wifi '{}'", ctx.settings.wifi_ssid);
-        // Keep the handle alive for the program's lifetime; dropping it tears wifi down.
-        let mut wifi = wifi::connect(
+    // The link thread owns wifi and delivers connected TCP transports; `want_tcp`
+    // stands it down while a dashboard holds the serial link.
+    let want_tcp = Arc::new(AtomicBool::new(!settings.wifi_ssid.is_empty()));
+    let (tcp_tx, tcp_rx) = mpsc::channel::<TcpTransport>();
+    if !settings.wifi_ssid.is_empty() {
+        spawn_link_thread(
             peripherals.modem,
             sysloop,
             nvs_partition,
-            &ctx.settings.wifi_ssid,
-            &ctx.settings.wifi_psk,
+            settings.wifi_ssid.clone(),
+            settings.wifi_psk.clone(),
+            settings.server_addr.clone(),
+            Arc::clone(&want_tcp),
+            tcp_tx,
         )?;
-        // Dial the dashboard, stream until the link drops, then retry — so the device
-        // waits for the dashboard to come up and survives it restarting.
-        loop {
-            // The AP may have bounced while we streamed; re-associate before dialing.
-            if !wifi::ensure_connected(&mut wifi) {
-                FreeRtos::delay_ms(2000);
-                continue;
-            }
-            match TcpTransport::connect(&ctx.settings.server_addr) {
-                Ok(mut transport) => {
-                    info!("connected to dashboard at {}", ctx.settings.server_addr);
-                    serve(&mut transport, &mut ctx);
-                    warn!("dashboard link lost; reconnecting");
-                }
-                Err(e) => warn!("dial {} failed ({e}); retrying", ctx.settings.server_addr),
-            }
-            FreeRtos::delay_ms(2000);
-        }
+    } else {
+        info!("no wifi configured; serial only");
     }
-}
 
-/// The mutable state the serve loop carries across reconnects.
-struct Loop<'a> {
-    model: &'a Model,
-    provider: &'a mut Provider,
-    pipeline: &'a mut RejectPipeline,
-    store: &'a Store,
-    settings: &'a mut Settings,
-    device_id: &'a str,
-    window_us: u64,
-    seq: &'a mut u32,
-    prev_wake: &'a mut WakeState,
-}
+    let window_us = model.input_len as u64 * 1_000_000 / SAMPLE_RATE as u64;
+    let mut tcp: Option<TcpTransport> = None;
+    let mut serial_claim: Option<Instant> = None;
+    let mut seq: u32 = 0;
+    let mut prev_wake = WakeState::Idle;
 
-/// Announce identity, then produce/inference/emit on each window until a send fails
-/// (the link dropped), at which point it returns so the caller can reconnect.
-fn serve(transport: &mut dyn Transport, ctx: &mut Loop) {
-    if announce(transport, ctx.device_id, ctx.settings).is_err() {
-        return;
-    }
     loop {
-        let iter_start = std::time::Instant::now();
-        // Apply pending control frames (browser → backend → device).
-        while let Some(control) = transport.poll() {
-            if apply_control(control, ctx.settings, ctx.pipeline, ctx.store)
-                && announce(transport, ctx.device_id, ctx.settings).is_err()
-            {
-                return;
+        let iter_start = Instant::now();
+
+        // A freshly dialed TCP link. If a dashboard claimed serial in the meantime,
+        // discard it (dropping closes the socket; the thread stays stood down).
+        if let Ok(transport) = tcp_rx.try_recv() {
+            if serial_claim.is_some() {
+                drop(transport);
+            } else {
+                tcp = Some(transport);
+                if let Some(t) = tcp.as_mut() {
+                    let _ = announce(t, &device_id, &settings);
+                }
             }
         }
 
-        let window = ctx.provider.next_window();
-        let ForwardResult::Logits(logits) = ctx.model.forward(&window.input);
-        let logits: Vec<f32> = logits.iter().map(|&v| v as f32 * ctx.model.logit_scale).collect();
+        // Drain controls from both links; link management first, config second.
+        let mut config_changed = false;
+        while let Some(control) = serial.poll() {
+            match control {
+                // A probe is an explicit claim; a heartbeat on an unclaimed link is
+                // one too (the device rebooted under an already-open dashboard
+                // session, which only probes at open). A probe always re-announces
+                // because it means a fresh session that is waiting for the hello.
+                Control::Probe {} | Control::Heartbeat {} => {
+                    let fresh_claim = serial_claim.is_none();
+                    let is_probe = matches!(control, Control::Probe {});
+                    serial_claim = Some(Instant::now());
+                    if fresh_claim {
+                        info!("serial link claimed by dashboard");
+                        want_tcp.store(false, Ordering::SeqCst);
+                        tcp = None; // dropping hangs up; the backend sees a clean close
+                    }
+                    if is_probe || fresh_claim {
+                        let _ = announce(&mut serial, &device_id, &settings);
+                    }
+                }
+                other => config_changed |= apply_control(other, &mut settings, &mut pipeline, &store),
+            }
+        }
+        if let Some(t) = tcp.as_mut() {
+            while let Some(control) = t.poll() {
+                match control {
+                    Control::Probe {} | Control::Heartbeat {} => {} // serial-only frames
+                    other => {
+                        config_changed |= apply_control(other, &mut settings, &mut pipeline, &store)
+                    }
+                }
+            }
+        }
+
+        // Expire a serial claim when heartbeats stop or the cable is gone.
+        if let Some(claimed_at) = serial_claim {
+            if claimed_at.elapsed() > SERIAL_CLAIM_TIMEOUT || !serial.host_present() {
+                info!("serial link released; resuming wifi");
+                serial_claim = None;
+                want_tcp.store(true, Ordering::SeqCst);
+            }
+        }
+
+        // One window of work.
+        let window = provider.next_window();
+        let ForwardResult::Logits(logits) = model.forward(&window.input);
+        let logits: Vec<f32> = logits.iter().map(|&v| v as f32 * model.logit_scale).collect();
         let softmax = softmax(&logits);
-        let decision = ctx.pipeline.step(&softmax);
-        let t_us = (*ctx.seq as u64 + 1) * ctx.window_us;
+        let decision = pipeline.step(&softmax);
+        let t_us = (seq as u64 + 1) * window_us;
 
-        let emg = frames::emg(*ctx.seq, &window.input, ctx.provider.input_scale(), ctx.model.input_len, SAMPLE_RATE);
-        let prediction = frames::prediction(*ctx.seq, logits, softmax, &decision, ctx.pipeline.tau);
-        let events = frames::events(*ctx.prev_wake, &decision, ctx.settings, t_us);
-        if transport.send(&emg).is_err() || transport.send(&prediction).is_err() {
-            return;
-        }
-        for event in events {
-            if transport.send(&event).is_err() {
-                return;
+        let emg = frames::emg(seq, &window.input, provider.input_scale(), model.input_len, SAMPLE_RATE);
+        let prediction = frames::prediction(seq, logits, softmax, &decision, pipeline.tau);
+        let events = frames::events(prev_wake, &decision, &settings, t_us);
+
+        // Route everything over the active link: a claimed serial link wins, TCP
+        // otherwise. With neither, skip sending — frames for this window are lost
+        // (they're a live stream) but logs stay queued in their bounded buffer for
+        // whichever link appears first. Logs go first (reliable, tiny), then the
+        // announce for any config change, then the window's data.
+        let serial_active = serial_claim.is_some();
+        if serial_active || tcp.is_some() {
+            let active: &mut dyn Transport =
+                if serial_active { &mut serial } else { tcp.as_mut().expect("tcp checked above") };
+
+            let mut ok = true;
+            for log_frame in logger::drain() {
+                ok &= active.send(&log_frame).is_ok();
+            }
+            if config_changed {
+                ok &= active
+                    .send(&Frame::DeviceHello {
+                        device_id: device_id.clone(),
+                        config: settings.to_wire(),
+                    })
+                    .is_ok();
+            }
+            ok &= active.send(&emg).is_ok();
+            ok &= active.send(&prediction).is_ok();
+            for event in &events {
+                ok &= active.send(event).is_ok();
+            }
+
+            if !ok {
+                if serial_active {
+                    info!("serial write stalled; releasing claim");
+                    serial_claim = None;
+                    want_tcp.store(true, Ordering::SeqCst);
+                } else {
+                    warn!("dashboard link lost; redialing");
+                }
             }
         }
+        if tcp.as_ref().is_some_and(|t| !t.alive_handle().load(Ordering::SeqCst)) {
+            tcp = None;
+        }
 
-        *ctx.prev_wake = decision.wake_state;
-        *ctx.seq = ctx.seq.wrapping_add(1);
+        prev_wake = decision.wake_state;
+        seq = seq.wrapping_add(1);
 
-        // Pace to real time: sleep only what's left of the window after this iteration's
-        // compute and send. If the work already overran the window, don't sleep.
-        let window = std::time::Duration::from_micros(ctx.window_us);
+        // Pace to real time: sleep only what's left of the window after this
+        // iteration's compute and send. If the work already overran, don't sleep.
+        let window = Duration::from_micros(window_us);
         if let Some(remaining) = window.checked_sub(iter_start.elapsed()) {
             FreeRtos::delay_ms(remaining.as_millis() as u32);
         }
     }
+}
+
+/// The background thread that keeps wifi associated and delivers dialed TCP
+/// transports to the serve loop. Stands down (and stays associated but idle) while
+/// `want_tcp` is false — i.e. while a dashboard holds the serial link.
+#[allow(clippy::too_many_arguments)]
+fn spawn_link_thread(
+    modem: esp_idf_svc::hal::modem::Modem<'static>,
+    sysloop: EspSystemEventLoop,
+    nvs: EspDefaultNvsPartition,
+    ssid: String,
+    psk: String,
+    server_addr: String,
+    want_tcp: Arc<AtomicBool>,
+    deliveries: mpsc::Sender<TcpTransport>,
+) -> anyhow::Result<()> {
+    // Wifi bring-up and association run deep into esp-idf; they previously lived on
+    // the 24 KB main task, so give this thread real headroom (8 KB overflowed).
+    std::thread::Builder::new().stack_size(20480).spawn(move || {
+        let mut wifi = match wifi::start(modem, sysloop, nvs, &ssid, &psk) {
+            Ok(wifi) => wifi,
+            Err(e) => {
+                warn!("wifi failed to start ({e}); serial only");
+                return;
+            }
+        };
+        let mut current: Option<Arc<AtomicBool>> = None;
+        loop {
+            let delivered_alive = current.as_ref().is_some_and(|alive| alive.load(Ordering::SeqCst));
+            if !want_tcp.load(Ordering::SeqCst) || delivered_alive {
+                FreeRtos::delay_ms(500);
+                continue;
+            }
+            if !wifi::ensure_connected(&mut wifi) {
+                FreeRtos::delay_ms(3000);
+                continue;
+            }
+            match TcpTransport::connect(&server_addr) {
+                Ok(transport) => {
+                    info!("connected to dashboard at {server_addr}");
+                    current = Some(transport.alive_handle());
+                    if deliveries.send(transport).is_err() {
+                        return;
+                    }
+                }
+                Err(e) => {
+                    warn!("dial {server_addr} failed ({e}); retrying");
+                    FreeRtos::delay_ms(2000);
+                }
+            }
+        }
+    })?;
+    Ok(())
 }
 
 /// Send the current identity + functional config.
@@ -225,6 +323,7 @@ fn apply_control(
             info!("wifi credentials stored; reboot to connect over wifi");
             true
         }
+        Control::Probe {} | Control::Heartbeat {} => false, // handled by the caller
     }
 }
 

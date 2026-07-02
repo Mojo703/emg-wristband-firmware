@@ -32,3 +32,9 @@ CONFIG_ESP_WIFI_TX_BA_WIN=16
 
 # lwIP hot path in IRAM (~13 KB of IRAM for a solid throughput bump).
 CONFIG_LWIP_IRAM_OPTIMIZATION=y
+
+# No text console: the USB-Serial-JTAG CDC channel carries the framed CBOR dashboard
+# link (src/transport.rs), and logs ride the protocol as Frame::Log (src/logger.rs).
+# Secondary console off too, or ESP-IDF would put one right back on the CDC.
+CONFIG_ESP_CONSOLE_NONE=y
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y

@@ -3,6 +3,7 @@
 import type { Component } from 'svelte';
 import EmgViewer from '../panels/EmgViewer.svelte';
 import ConfigApp from '../panels/ConfigApp.svelte';
+import LogViewer from '../panels/LogViewer.svelte';
 import PoseViewer from '../panels/PoseViewer.svelte';
 import Stub from '../panels/Stub.svelte';
 
@@ -20,4 +21,6 @@ export const panels: readonly Panel[] = [
   { id: 'config', title: 'Config', icon: 'sliders', component: ConfigApp },
   { id: 'eval', title: 'Eval', icon: 'chart', component: Stub, props: { title: 'Eval dashboard' } },
   { id: 'pose', title: 'Pose', icon: 'scan', component: PoseViewer },
+  // The device's log console (replaces the serial text monitor).
+  { id: 'logs', title: 'Logs', icon: 'terminal', component: LogViewer },
 ];

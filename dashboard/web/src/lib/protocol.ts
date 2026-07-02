@@ -26,12 +26,22 @@ export const WakeState = {
 
 export type WakeState = (typeof WakeState)[keyof typeof WakeState];
 
+export const LogLevel = {
+  Error: 'error',
+  Warn: 'warn',
+  Info: 'info',
+  Debug: 'debug',
+} as const;
+
+export type LogLevel = (typeof LogLevel)[keyof typeof LogLevel];
+
 export const FrameType = {
   Hello: 'hello',
   Emg: 'emg',
   Prediction: 'prediction',
   Event: 'event',
   Pose: 'pose',
+  Log: 'log',
   SelectDevice: 'select_device',
   SetSensitivity: 'set_sensitivity',
   SetKeymap: 'set_keymap',
@@ -147,6 +157,14 @@ export interface PoseFrame {
   readonly format: string;
 }
 
+/** A device log record; `t_us` is microseconds since device boot. */
+export interface LogFrame {
+  readonly type: 'log';
+  readonly t_us: number;
+  readonly level: LogLevel;
+  readonly message: string;
+}
+
 export interface SelectDeviceFrame {
   readonly type: 'select_device';
   readonly device_id: string;
@@ -179,7 +197,8 @@ export type IncomingFrame =
   | EmgFrame
   | PredictionFrame
   | EventFrame
-  | PoseFrame;
+  | PoseFrame
+  | LogFrame;
 
 export type Frame = IncomingFrame | OutgoingFrame;
 
@@ -376,6 +395,21 @@ export function isPoseFrame(value: unknown): value is PoseFrame {
   );
 }
 
+export function isLogLevel(value: unknown): value is LogLevel {
+  if (!isString(value)) return false;
+  return Object.values<string>(LogLevel).includes(value);
+}
+
+export function isLogFrame(value: unknown): value is LogFrame {
+  return (
+    hasType(value, 'log') &&
+    isObject(value) &&
+    isNumber(value['t_us']) &&
+    isLogLevel(value['level']) &&
+    isString(value['message'])
+  );
+}
+
 export function isOutgoingFrame(value: unknown): value is OutgoingFrame {
   if (!isObject(value)) return false;
   switch (value['type']) {
@@ -398,6 +432,7 @@ export function asIncomingFrame(value: unknown): IncomingFrame | null {
   if (isPredictionFrame(value)) return value;
   if (isEventFrame(value)) return value;
   if (isPoseFrame(value)) return value;
+  if (isLogFrame(value)) return value;
   return null;
 }
 

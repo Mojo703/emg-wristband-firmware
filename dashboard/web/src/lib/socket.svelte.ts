@@ -19,6 +19,7 @@ import {
   type DecodedEmg,
   type EventFrame,
   type HelloFrame,
+  type LogFrame,
   type OutgoingFrame,
   type PoseFrame,
   type PredictionFrame,
@@ -38,6 +39,10 @@ class LiveStateManager {
   #emg = $state<DecodedEmg | null>(null);
   #prediction = $state<PredictionFrame | null>(null);
   #pose = $state<PoseFrame | null>(null);
+  // Device log scrollback. Lives here (not in the Logs panel) because only the
+  // active panel is mounted; cleared on every hello, which the backend follows
+  // with a replay of the selected device's retained logs.
+  logs = $state<readonly LogFrame[]>([]);
 
   get hello(): HelloFrame | null {
     return this.status === 'online' ? this.#hello : null;
@@ -57,9 +62,17 @@ class LiveStateManager {
 
   setHello(value: HelloFrame): void {
     this.#hello = value;
+    this.logs = [];
     if (this.status === 'handshake') {
       this.status = 'online';
     }
+  }
+
+  appendLog(value: LogFrame): void {
+    const MAX_LOGS = 500;
+    this.logs = this.logs.length >= MAX_LOGS
+      ? [...this.logs.slice(this.logs.length - MAX_LOGS + 1), value]
+      : [...this.logs, value];
   }
 
   setEmg(value: DecodedEmg | null): void {
@@ -86,6 +99,7 @@ class LiveStateManager {
     this.#emg = null;
     this.#prediction = null;
     this.#pose = null;
+    this.logs = [];
     this.fps = 0;
     this.#emgSinceTick = 0;
   }
@@ -96,6 +110,7 @@ class LiveStateManager {
     this.#emg = null;
     this.#prediction = null;
     this.#pose = null;
+    this.logs = [];
     this.fps = 0;
     this.#emgSinceTick = 0;
   }
@@ -111,12 +126,14 @@ type EmgHandler = (emg: DecodedEmg) => void;
 type PredictionHandler = (prediction: PredictionFrame) => void;
 type EventHandler = (event: EventFrame) => void;
 type PoseHandler = (pose: PoseFrame) => void;
+type LogHandler = (log: LogFrame) => void;
 
 interface ListenerMap {
   emg: Set<EmgHandler>;
   prediction: Set<PredictionHandler>;
   event: Set<EventHandler>;
   pose: Set<PoseHandler>;
+  log: Set<LogHandler>;
 }
 
 const listeners: ListenerMap = {
@@ -124,6 +141,7 @@ const listeners: ListenerMap = {
   prediction: new Set<PredictionHandler>(),
   event: new Set<EventHandler>(),
   pose: new Set<PoseHandler>(),
+  log: new Set<LogHandler>(),
 };
 
 type HandlerFor<T extends keyof ListenerMap> = T extends 'emg'
@@ -132,7 +150,9 @@ type HandlerFor<T extends keyof ListenerMap> = T extends 'emg'
     ? PredictionHandler
     : T extends 'pose'
       ? PoseHandler
-      : EventHandler;
+      : T extends 'log'
+        ? LogHandler
+        : EventHandler;
 
 export function on<T extends keyof ListenerMap>(
   type: T,
@@ -181,6 +201,9 @@ export function connect(): void {
       for (const cb of listeners.pose) cb(frame);
     } else if (frame.type === 'event') {
       for (const cb of listeners.event) cb(frame);
+    } else if (frame.type === 'log') {
+      live.appendLog(frame);
+      for (const cb of listeners.log) cb(frame);
     }
   };
 }
@@ -206,4 +229,4 @@ export const api = {
 } as const;
 
 // Re-export protocol types so panels can import everything from the socket module.
-export type { Binding, DecodedEmg, EventFrame, HelloFrame, PoseFrame, PredictionFrame } from './protocol';
+export type { Binding, DecodedEmg, EventFrame, HelloFrame, LogFrame, PoseFrame, PredictionFrame } from './protocol';

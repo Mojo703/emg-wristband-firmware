@@ -132,6 +132,39 @@ pub enum Frame {
     /// Set WiFi credentials (browser → backend → device). The device persists them
     /// and uses them to reach the backend over wifi on the next boot.
     SetWifi { ssid: String, psk: String },
+
+    /// A device log record (device → backend → browser). Replaces the serial text
+    /// console: the USB byte pipe carries only frames, so logs ride the protocol and
+    /// land in the dashboard's log panel instead of a terminal.
+    Log {
+        /// Microseconds since device boot (`esp_timer` epoch, not the EMG timeline).
+        t_us: u64,
+        level: LogLevel,
+        message: String,
+    },
+
+    /// Backend → device over a freshly opened serial port: "a dashboard is now on
+    /// this link — announce yourself and make it the active data link." The device
+    /// replies with `DeviceHello` on the same link. TCP needs no probe (connecting
+    /// *is* the claim); serial has no connection semantics, so this invents them.
+    Probe {},
+
+    /// Backend → device keepalive for a probed serial link, sent every couple of
+    /// seconds. Silence means the dashboard is gone (process died, port closed) and
+    /// the device falls back to wifi. The reply direction needs no heartbeat: the
+    /// data stream itself is the liveness signal.
+    Heartbeat {},
+}
+
+/// Severity of a [`Frame::Log`] record. Mirrors the `log` crate's levels the
+/// firmware actually emits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
 }
 
 /// A connected device, as shown in the browser's device picker.
@@ -262,6 +295,87 @@ impl MediaKey {
     }
 }
 
+/// Byte-pipe framing (TCP and serial): each frame on the wire is
+/// `FRAME_MAGIC ++ u32 little-endian length ++ that many CBOR bytes`. The magic exists
+/// for the serial path: the ESP32-S3's ROM bootloader prints text on the USB CDC at
+/// every reset, so a reader must be able to resynchronize mid-stream rather than
+/// trusting the next byte to be a length. Both magic bytes are outside printable
+/// ASCII, so console text can never begin a frame.
+pub const FRAME_MAGIC: [u8; 2] = [0xA5, 0x5A];
+
+/// Upper bound a reader accepts for one frame's length; anything larger is treated as
+/// garbage from a failed resync and scanning continues. Generously above the largest
+/// real frame (an EMG window is ~16 KB raw).
+pub const FRAME_MAX_LEN: usize = 1 << 20;
+
+/// Incremental parser for the byte-pipe framing, shared by every reader (firmware and
+/// backend, serial and TCP). Feed raw bytes with [`FrameScanner::extend`], take complete
+/// CBOR payloads with [`FrameScanner::next_frame`]. Garbage between frames (bootloader
+/// text, a torn frame after reconnect) is skipped by scanning to the next magic.
+#[derive(Default)]
+pub struct FrameScanner {
+    buffer: Vec<u8>,
+}
+
+impl FrameScanner {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn extend(&mut self, bytes: &[u8]) {
+        self.buffer.extend_from_slice(bytes);
+    }
+
+    /// The next complete frame's CBOR payload, if the buffer holds one.
+    pub fn next_frame(&mut self) -> Option<Vec<u8>> {
+        loop {
+            // Drop everything before the first magic byte pair (or keep a trailing
+            // lone first-magic-byte, which may be the start of a pair still arriving).
+            let start = self
+                .buffer
+                .windows(2)
+                .position(|pair| pair == FRAME_MAGIC)
+                .unwrap_or_else(|| {
+                    if self.buffer.last() == Some(&FRAME_MAGIC[0]) {
+                        self.buffer.len() - 1
+                    } else {
+                        self.buffer.len()
+                    }
+                });
+            self.buffer.drain(0..start);
+
+            const HEADER: usize = 2 + 4; // magic + little-endian u32 length
+            if self.buffer.len() < HEADER {
+                return None;
+            }
+            let length =
+                u32::from_le_bytes([self.buffer[2], self.buffer[3], self.buffer[4], self.buffer[5]])
+                    as usize;
+            if length > FRAME_MAX_LEN {
+                // Not a real header — a magic pair inside garbage. Skip it, rescan.
+                self.buffer.drain(0..2);
+                continue;
+            }
+            if self.buffer.len() < HEADER + length {
+                return None;
+            }
+            let payload = self.buffer[HEADER..HEADER + length].to_vec();
+            self.buffer.drain(0..HEADER + length);
+            return Some(payload);
+        }
+    }
+}
+
+/// Wrap one encoded frame for a byte pipe: magic, length, payload in a single buffer
+/// (single-write, so `TCP_NODELAY` sees one frame per send).
+pub fn frame_bytes(payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(2 + 4 + payload.len());
+    out.extend_from_slice(&FRAME_MAGIC);
+    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
 /// Lossless delta + zigzag + varint packing for the bulk EMG `samples` blob, applied on
 /// the device→backend hop only. The blob is little-endian `i16`; consecutive samples sit
 /// close together, so storing zigzag-varint deltas shrinks it while keeping every bit —
@@ -343,6 +457,38 @@ mod tests {
             }
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn frame_scanner_resyncs_over_garbage() {
+        let frame_a = frame_bytes(b"hello");
+        let frame_b = frame_bytes(b"world");
+        let mut wire = Vec::new();
+        wire.extend_from_slice(b"ESP-ROM:esp32s3 boot text\r\n"); // bootloader noise
+        wire.extend_from_slice(&frame_a);
+        wire.extend_from_slice(&[FRAME_MAGIC[0]]); // torn: lone first magic byte
+        wire.extend_from_slice(b"more noise");
+        wire.extend_from_slice(&frame_b);
+
+        let mut scanner = FrameScanner::new();
+        // Feed in awkward chunk sizes to exercise partial-header paths.
+        let mut frames = Vec::new();
+        for chunk in wire.chunks(3) {
+            scanner.extend(chunk);
+            while let Some(frame) = scanner.next_frame() {
+                frames.push(frame);
+            }
+        }
+        assert_eq!(frames, alloc::vec![b"hello".to_vec(), b"world".to_vec()]);
+    }
+
+    #[test]
+    fn frame_scanner_rejects_absurd_length() {
+        let mut scanner = FrameScanner::new();
+        scanner.extend(&FRAME_MAGIC);
+        scanner.extend(&(u32::MAX).to_le_bytes()); // garbage that happens to start with magic
+        scanner.extend(&frame_bytes(b"ok"));
+        assert_eq!(scanner.next_frame(), Some(b"ok".to_vec()));
     }
 
     #[test]

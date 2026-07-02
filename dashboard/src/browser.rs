@@ -69,6 +69,18 @@ fn view(registry: &Registry, selected: &Option<String>) -> Frame {
     }
 }
 
+/// Send a device's retained logs to a browser that just started (or switched to)
+/// viewing it, so the log panel has scrollback instead of starting empty.
+fn replay_logs(registry: &Registry, selected: &Option<String>, tx: &mpsc::Sender<Out>) {
+    if let Some(id) = selected {
+        for frame in registry.logs_of(id) {
+            if !send_reliable(tx, Message::Binary(frame::encode(&frame))) {
+                return;
+            }
+        }
+    }
+}
+
 /// Keep `selected` pointing at a live device: prefer the current choice, else the
 /// first available, else nothing.
 fn reconcile(registry: &Registry, selected: &mut Option<String>) {
@@ -146,6 +158,7 @@ pub async fn handle_browser(socket: WebSocket, registry: Arc<Registry>, pose_url
     if !send_reliable(&browser_tx, Message::Binary(frame::encode(&view(&registry, &selected)))) {
         return;
     }
+    replay_logs(&registry, &selected, &browser_tx);
 
     loop {
         tokio::select! {
@@ -160,6 +173,7 @@ pub async fn handle_browser(socket: WebSocket, registry: Arc<Registry>, pose_url
                             if !send_reliable(&browser_tx, Message::Binary(frame::encode(&view(&registry, &selected)))) {
                                 break;
                             }
+                            replay_logs(&registry, &selected, &browser_tx);
                         }
                         // Forward control frames to the selected device.
                         control @ (Frame::SetSensitivity { .. }
@@ -190,7 +204,8 @@ pub async fn handle_browser(socket: WebSocket, registry: Arc<Registry>, pose_url
                 // Discrete events must not be coalesced away; the timeseries may be.
                 let msg = Message::Binary(frame::encode(&frame));
                 let ok = match &frame {
-                    Frame::Event { .. } => send_reliable(&browser_tx, msg),
+                    // Discrete records must arrive complete and ordered.
+                    Frame::Event { .. } | Frame::Log { .. } => send_reliable(&browser_tx, msg),
                     Frame::Emg { .. } => send_live(&browser_tx, LiveKind::Emg, msg),
                     Frame::Prediction { .. } => send_live(&browser_tx, LiveKind::Prediction, msg),
                     _ => send_live(&browser_tx, LiveKind::Other, msg),
@@ -208,6 +223,8 @@ pub async fn handle_browser(socket: WebSocket, registry: Arc<Registry>, pose_url
                 if !send_reliable(&browser_tx, Message::Binary(frame::encode(&view(&registry, &selected)))) {
                     break;
                 }
+                // The browser clears its log panel on every hello; refill it.
+                replay_logs(&registry, &selected, &browser_tx);
             }
         }
     }

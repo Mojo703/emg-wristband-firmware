@@ -1,5 +1,7 @@
-//! WiFi station bring-up. Blocks until an IP is acquired. The returned handle must
-//! be kept alive — dropping it tears the connection down.
+//! WiFi station bring-up. `start` configures and starts the radio without blocking on
+//! association; `ensure_connected` associates (or re-associates) and is meant to be
+//! called from the link-management thread, where blocking is fine. The returned handle
+//! must be kept alive — dropping it tears the connection down.
 
 use anyhow::{anyhow, Result};
 use esp_idf_svc::eventloop::EspSystemEventLoop;
@@ -8,7 +10,7 @@ use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::wifi::{AuthMethod, BlockingWifi, ClientConfiguration, Configuration, EspWifi};
 use log::{info, warn};
 
-pub fn connect(
+pub fn start(
     modem: Modem<'static>,
     sysloop: EspSystemEventLoop,
     nvs: EspDefaultNvsPartition,
@@ -27,25 +29,7 @@ pub fn connect(
 
     wifi.start()?;
     info!("wifi started");
-
     disable_power_save();
-
-    // Retry association forever: a headless device must outlast a hotspot that is
-    // still coming up (or bounces) rather than exit on the first failure.
-    loop {
-        match wifi.connect().and_then(|()| wifi.wait_netif_up()) {
-            Ok(()) => break,
-            Err(e) => {
-                warn!("wifi connect failed ({e}); retrying");
-                let _ = wifi.disconnect();
-                esp_idf_svc::hal::delay::FreeRtos::delay_ms(5000);
-            }
-        }
-    }
-    disable_power_save();
-    info!("wifi associated, waiting for IP...");
-    let ip_info = wifi.wifi().sta_netif().get_ip_info()?;
-    info!("wifi up, ip = {}", ip_info.ip);
     Ok(wifi)
 }
 
@@ -63,22 +47,22 @@ fn disable_power_save() {
     }
 }
 
-/// True when the station is associated; when it isn't (the AP restarted or the link
-/// dropped mid-run), attempt one re-association and report whether it worked. The
-/// caller retries on its own cadence.
+/// True when the station is associated with an IP; otherwise attempt one
+/// (re-)association and report whether it worked. The caller retries on its own
+/// cadence — a headless device must outlast an AP that is down or bouncing.
 pub fn ensure_connected(wifi: &mut BlockingWifi<EspWifi<'static>>) -> bool {
     if wifi.is_connected().unwrap_or(false) {
         return true;
     }
-    warn!("wifi dropped; re-associating");
     match wifi.connect().and_then(|()| wifi.wait_netif_up()) {
         Ok(()) => {
-            info!("wifi re-associated");
             disable_power_save();
+            let ip = wifi.wifi().sta_netif().get_ip_info().map(|info| info.ip);
+            info!("wifi up, ip = {:?}", ip);
             true
         }
         Err(e) => {
-            warn!("wifi re-association failed ({e})");
+            warn!("wifi connect failed ({e})");
             let _ = wifi.disconnect();
             false
         }

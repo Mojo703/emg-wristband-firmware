@@ -4,7 +4,7 @@
 //! refresh their picker when devices come and go.
 
 use protocol::{DeviceConfig, DeviceInfo, Frame};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use tokio::sync::{broadcast, mpsc};
@@ -18,10 +18,17 @@ struct DeviceEntry {
     config: DeviceConfig,
     frames: broadcast::Sender<Frame>,
     control: mpsc::UnboundedSender<Frame>,
+    /// Recent `Frame::Log`s, retained so a browser opened after the fact still sees
+    /// them (the broadcast only reaches subscribers that existed at send time).
+    logs: VecDeque<Frame>,
     /// Identifies this connection, so a reconnect under the same id can't be evicted by
     /// the old session. See [`Registry::deregister`].
     token: u64,
 }
+
+/// Retained log lines per device — enough scrollback to cover a boot and a few
+/// reconnects without growing forever.
+const LOG_RETENTION: usize = 200;
 
 /// Handed to a device's ingest task on registration: it pushes data frames into
 /// `frames` and drains `control_rx` to the device's transport.
@@ -66,10 +73,15 @@ impl Registry {
         let (frames, _) = broadcast::channel(FRAME_BUFFER);
         let (control, control_rx) = mpsc::unbounded_channel();
         let token = self.next_token.fetch_add(1, Ordering::Relaxed);
-        self.devices.lock().unwrap().insert(
+        // A reconnect (same id) keeps its retained logs; boot logs from the previous
+        // session are exactly what you want to read after a crash.
+        let mut devices = self.devices.lock().unwrap();
+        let logs = devices.remove(&id).map(|old| old.logs).unwrap_or_default();
+        devices.insert(
             id,
-            DeviceEntry { label, config, frames: frames.clone(), control, token },
+            DeviceEntry { label, config, frames: frames.clone(), control, logs, token },
         );
+        drop(devices);
         self.notify();
         DeviceHandle { frames, control_rx, token }
     }
@@ -111,6 +123,26 @@ impl Registry {
     /// Subscribe a browser to a device's data-frame stream.
     pub fn subscribe(&self, id: &str) -> Option<broadcast::Receiver<Frame>> {
         self.devices.lock().unwrap().get(id).map(|entry| entry.frames.subscribe())
+    }
+
+    /// Retain a device's log frame for later subscribers.
+    pub fn push_log(&self, id: &str, frame: Frame) {
+        if let Some(entry) = self.devices.lock().unwrap().get_mut(id) {
+            if entry.logs.len() >= LOG_RETENTION {
+                entry.logs.pop_front();
+            }
+            entry.logs.push_back(frame);
+        }
+    }
+
+    /// The retained log frames of a device, oldest first.
+    pub fn logs_of(&self, id: &str) -> Vec<Frame> {
+        self.devices
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|entry| entry.logs.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Forward a control frame to a device (no-op if it has disconnected).

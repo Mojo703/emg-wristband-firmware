@@ -10,9 +10,9 @@
 //!
 //! Env: `DASHBOARD_ADDR` (browser/static bind, default 0.0.0.0:8090),
 //! `EMG_DEVICE_ADDR` (device TCP bind, default 0.0.0.0:9000), `DASHBOARD_WEB` (static
-//! dir, default web/dist), `EMG_SERIAL` (optional serial port to read a device from,
-//! e.g. /dev/ttyACM0), `EMG_SERIAL_BAUD` (default 921600), `EMG_POSE_URL` (optional
-//! pose inference service WebSocket the backend proxies EMG frames to).
+//! dir, default web/dist), `EMG_NO_SERIAL` (set to disable USB serial discovery, e.g.
+//! while flashing), `EMG_POSE_URL` (optional pose inference service WebSocket the
+//! backend proxies EMG frames to).
 
 mod browser;
 mod device;
@@ -54,13 +54,11 @@ async fn main() -> anyhow::Result<()> {
         std::env::var("EMG_DEVICE_ADDR").unwrap_or_else(|_| "0.0.0.0:9000".into());
     tokio::spawn(device::run_tcp(device_addr, registry.clone()));
 
-    // Optional serial-attached device: read it directly, same relay path as wifi.
-    if let Ok(path) = std::env::var("EMG_SERIAL") {
-        let baud = std::env::var("EMG_SERIAL_BAUD")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(921_600);
-        tokio::spawn(device::run_serial(path, baud, registry.clone()));
+    // Serial-attached devices are discovered by USB identity and probed; no
+    // configuration needed. Set EMG_NO_SERIAL=1 to keep the backend off the ports
+    // (e.g. while flashing firmware with espflash).
+    if std::env::var("EMG_NO_SERIAL").is_err() {
+        tokio::spawn(device::run_serial_discovery(registry.clone()));
     }
 
     let state = AppState { registry, pose_url };
