@@ -7,8 +7,19 @@ runner = "espflash flash --monitor --partition-table partitions.csv"
 rustflags = ["--cfg", "espidf_time64"]
 
 [unstable]
-build-std = ["std", "panic_abort"]
+# "test" (libtest) so `cargo test` can build the on-device test harness.
+build-std = ["std", "panic_abort", "test"]
 
 [env]
 MCU = "esp32s3"
 ESP_IDF_VERSION = "v5.2.2"
+
+[alias]
+# On-device tests need the console re-enabled (see sdkconfig.test); a plain
+# `cargo test` runs them but shows no output. Cargo won't let an alias shadow
+# the built-in `test`, hence the separate name.
+test-device = [
+    "test",
+    "--config",
+    'env.ESP_IDF_SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.test"',
+]

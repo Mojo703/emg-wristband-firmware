@@ -1,0 +1,9 @@
+# Overrides for on-device `cargo test` runs, layered after sdkconfig.defaults:
+#
+#   ESP_IDF_SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.test" cargo test
+#
+# The normal firmware disables the console because the USB-Serial-JTAG channel
+# carries the framed CBOR dashboard link. The libtest harness reports over stdout,
+# so tests re-enable the console; watch the espflash monitor for `test result:`.
+CONFIG_ESP_CONSOLE_NONE=n
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y

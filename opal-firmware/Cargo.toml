@@ -10,9 +10,11 @@ resolver = "2"
 rust-version = "1.77"
 description = "ESP32-S3 EMG wristband device: fake provider → int8 inference → reject pipeline, streamed to the dashboard over wifi or serial"
 
+# The default test harness stays on (the esp template disables it): `cargo test`
+# runs on the device via the espflash runner. See src/link_policy.rs for the
+# invocation.
 [[bin]]
 name = "opal-firmware"
-harness = false
 
 [profile.release]
 opt-level = 3

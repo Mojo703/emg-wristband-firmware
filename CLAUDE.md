@@ -15,13 +15,16 @@ There is no shared Cargo workspace. Every Rust project has its own `Cargo.toml`
 with an empty `[workspace]` table so cargo treats it as its own root. Always build
 and run from inside the relevant subproject directory, never from the repo root.
 
-The subprojects are `ota-client`, `ota-server`, `ble-media`, and `ml-bench` on the
-firmware side; `emg-tds`, `dashboard`, `pose-service`, and `protocol` on the host
-side; and `engineering-logs` for the written record.
+The subprojects are `ota-client`, `ota-server`, `ble-media`, `ml-bench`, and
+`opal-firmware` on the firmware side; `emg-tds`, `dashboard`, `pose-service`, and
+`protocol` on the host side; `emg-runtime`, which the firmware consumes but which
+also builds on the host; and `engineering-logs` for the written record. Prefer a
+module in an existing crate over a new crate.
 
 ## Two toolchains
 
-The firmware projects (`ota-client`, `ble-media`, `ml-bench`) target the Xtensa
+The firmware projects (`ota-client`, `ble-media`, `ml-bench`, `opal-firmware`)
+target the Xtensa
 ESP32-S3. Their `rust-toolchain.toml` pins `channel = "esp"`, and every build
 shell must first run `. ~/export-esp.sh`. The one-time setup (espup, espflash,
 ldproxy, and on Arch a `libxml2.so.2` compat symlink) is in
@@ -34,8 +37,10 @@ use ordinary stable or nightly Rust. `pose-service` is Python.
 ## Build and test commands
 
 For a host Rust project, run `cargo build`, `cargo run`, or `cargo test` from its
-directory. `protocol` holds the only unit tests (`cargo test`) and is `no_std`
-plus `alloc`. For ML training in `emg-tds` on GPU, build with
+directory. Unit tests live in `protocol` (`no_std` plus `alloc`; `cargo test` on
+the host) and in `opal-firmware`'s `link_policy` module, which tests on the device:
+`cargo test-device` flashes the libtest binary and reports on the espflash monitor
+(see `opal-firmware/README.md`). For ML training in `emg-tds` on GPU, build with
 `--features cuda` and set `CUDARC_CUDA_VERSION=13020`, since CUDA 13.3 is
 ABI-compatible with cudarc's 13.2 target but auto-detect rejects 13.3; CPU works
 without the feature. Firmware uses `cargo run` to flash and open the serial

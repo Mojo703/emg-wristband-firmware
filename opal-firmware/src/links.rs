@@ -1,0 +1,267 @@
+//! Link routing: exactly one link carries the data stream at a time, and the most
+//! recently established link wins. A dashboard probing the serial port claims it
+//! (heartbeats keep the claim alive; silence, unplug, or a stalled write releases
+//! it), and TCP carries the stream otherwise. The claim/stall/cooldown decisions
+//! live in the `link_policy` module, tested on-device; this module owns the
+//! transports and the wifi dialer thread and applies those decisions.
+
+use crate::config::Settings;
+use crate::link_policy::{ClaimOutcome, SerialClaimPolicy};
+use crate::logger;
+use crate::transport::{
+    Control, SerialTransport, TcpTransport, Transport, SERIAL_CLAIM_TIMEOUT,
+    SERIAL_RECLAIM_COOLDOWN,
+};
+use crate::wifi;
+use esp_idf_svc::eventloop::EspSystemEventLoop;
+use esp_idf_svc::hal::delay::FreeRtos;
+use esp_idf_svc::hal::modem::Modem;
+use esp_idf_svc::nvs::EspDefaultNvsPartition;
+use log::{info, warn};
+use protocol::Frame;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+use std::time::Instant;
+
+/// Owns both dashboard links and routes the stream over the active one.
+pub struct Links {
+    serial: SerialTransport,
+    tcp: Option<TcpTransport>,
+    tcp_deliveries: mpsc::Receiver<TcpTransport>,
+    /// Stands the dialer thread down while a dashboard holds the serial link.
+    want_tcp: Arc<AtomicBool>,
+    claim: SerialClaimPolicy,
+}
+
+impl Links {
+    /// Take ownership of the serial link and, when wifi credentials are configured,
+    /// spawn the background thread that keeps wifi associated and dials the
+    /// dashboard.
+    pub fn new(
+        serial: SerialTransport,
+        modem: Modem<'static>,
+        sysloop: EspSystemEventLoop,
+        nvs: EspDefaultNvsPartition,
+        settings: &Settings,
+    ) -> anyhow::Result<Self> {
+        let want_tcp = Arc::new(AtomicBool::new(!settings.wifi_ssid.is_empty()));
+        let (deliveries_sender, tcp_deliveries) = mpsc::channel();
+        if !settings.wifi_ssid.is_empty() {
+            spawn_link_thread(
+                modem,
+                sysloop,
+                nvs,
+                settings,
+                Arc::clone(&want_tcp),
+                deliveries_sender,
+            )?;
+        } else {
+            info!("no wifi configured; serial only");
+        }
+        Ok(Self {
+            serial,
+            tcp: None,
+            tcp_deliveries,
+            want_tcp,
+            claim: SerialClaimPolicy::new(SERIAL_CLAIM_TIMEOUT, SERIAL_RECLAIM_COOLDOWN),
+        })
+    }
+
+    /// One iteration of link upkeep: adopt or discard a freshly dialed TCP link,
+    /// drain controls from both links, and expire a stale serial claim. Link
+    /// management (probes and heartbeats) is handled here, announcing with the
+    /// current `settings`; config controls are returned in arrival order for the
+    /// caller to apply.
+    pub fn poll(&mut self, device_id: &str, settings: &Settings) -> Vec<Control> {
+        // A freshly dialed TCP link. If a dashboard claimed serial in the meantime,
+        // discard it (dropping closes the socket; the thread stays stood down).
+        if let Ok(transport) = self.tcp_deliveries.try_recv() {
+            if self.claim.is_claimed() {
+                drop(transport);
+            } else {
+                self.tcp = Some(transport);
+                if let Some(transport) = self.tcp.as_mut() {
+                    let _ = announce(transport, device_id, settings);
+                }
+            }
+        }
+
+        let mut config_controls = Vec::new();
+        while let Some(control) = self.serial.poll() {
+            match control {
+                Control::Probe {} => {
+                    let outcome = self.claim.on_probe(Instant::now());
+                    self.apply_claim_outcome(outcome, device_id, settings);
+                }
+                Control::Heartbeat {} => {
+                    if let Some(outcome) = self.claim.on_heartbeat(Instant::now()) {
+                        self.apply_claim_outcome(outcome, device_id, settings);
+                    }
+                }
+                other => config_controls.push(other),
+            }
+        }
+        if let Some(transport) = self.tcp.as_mut() {
+            while let Some(control) = transport.poll() {
+                match control {
+                    Control::Probe {} | Control::Heartbeat {} => {} // serial-only frames
+                    other => config_controls.push(other),
+                }
+            }
+        }
+
+        // Expire a serial claim when heartbeats stop or the cable is gone.
+        if self
+            .claim
+            .expire(Instant::now(), self.serial.host_present())
+        {
+            info!("serial link released; resuming wifi");
+            self.want_tcp.store(true, Ordering::SeqCst);
+        }
+
+        config_controls
+    }
+
+    /// Route one window's frames over the active link: a claimed serial link wins,
+    /// TCP otherwise. With neither, skip sending — frames for this window are lost
+    /// (they're a live stream) but logs stay queued in their bounded buffer for
+    /// whichever link appears first. Logs go first (reliable, tiny), then `hello`
+    /// (present when config changed), then the window's data.
+    pub fn send_window(&mut self, hello: Option<&Frame>, frames: &[Frame]) {
+        let serial_active = self.claim.is_claimed();
+        if serial_active || self.tcp.is_some() {
+            let active: &mut dyn Transport = if serial_active {
+                &mut self.serial
+            } else {
+                self.tcp.as_mut().expect("tcp checked above")
+            };
+
+            let mut ok = true;
+            // Logs are the record of what went wrong, so a dead link must not eat
+            // them: put the failed record and everything behind it back for the
+            // next link.
+            let mut pending_logs = logger::drain().into_iter();
+            while let Some(log_frame) = pending_logs.next() {
+                if active.send(&log_frame).is_err() {
+                    let mut unsent = vec![log_frame];
+                    unsent.extend(pending_logs);
+                    logger::restore(unsent);
+                    ok = false;
+                    break;
+                }
+            }
+            // Stop at the first failure: every further send would block its full
+            // timeout against the same dead link (and the data is a live stream —
+            // this window is stale by the next iteration anyway).
+            if ok {
+                if let Some(hello) = hello {
+                    ok = active.send(hello).is_ok();
+                }
+            }
+            for frame in frames {
+                if ok {
+                    ok = active.send(frame).is_ok();
+                }
+            }
+
+            if !ok {
+                if serial_active {
+                    info!("serial write stalled; releasing claim");
+                    self.claim.on_stall(Instant::now());
+                    self.want_tcp.store(true, Ordering::SeqCst);
+                } else {
+                    warn!("dashboard link lost; redialing");
+                }
+            }
+        }
+        if self
+            .tcp
+            .as_ref()
+            .is_some_and(|transport| !transport.alive_handle().load(Ordering::SeqCst))
+        {
+            self.tcp = None;
+        }
+    }
+
+    /// Act on an accepted probe or heartbeat: on a fresh claim, hang up TCP and
+    /// stand the dialer down; announce when the policy asks for the hello.
+    fn apply_claim_outcome(&mut self, outcome: ClaimOutcome, device_id: &str, settings: &Settings) {
+        if outcome.became_claimed {
+            info!("serial link claimed by dashboard");
+            self.want_tcp.store(false, Ordering::SeqCst);
+            self.tcp = None; // dropping hangs up; the backend sees a clean close
+        }
+        if outcome.announce {
+            let _ = announce(&mut self.serial, device_id, settings);
+        }
+    }
+}
+
+/// The background thread that keeps wifi associated and delivers dialed TCP
+/// transports to the serve loop. Stands down (and stays associated but idle) while
+/// `want_tcp` is false — i.e. while a dashboard holds the serial link.
+fn spawn_link_thread(
+    modem: Modem<'static>,
+    sysloop: EspSystemEventLoop,
+    nvs: EspDefaultNvsPartition,
+    settings: &Settings,
+    want_tcp: Arc<AtomicBool>,
+    deliveries: mpsc::Sender<TcpTransport>,
+) -> anyhow::Result<()> {
+    let ssid = settings.wifi_ssid.clone();
+    let psk = settings.wifi_psk.clone();
+    let server_addr = settings.server_addr.clone();
+    // Wifi bring-up and association run deep into esp-idf; they previously lived on
+    // the 24 KB main task, so give this thread real headroom (8 KB overflowed).
+    std::thread::Builder::new()
+        .stack_size(20480)
+        .spawn(move || {
+            let mut wifi = match wifi::start(modem, sysloop, nvs, &ssid, &psk) {
+                Ok(wifi) => wifi,
+                Err(e) => {
+                    warn!("wifi failed to start ({e}); serial only");
+                    return;
+                }
+            };
+            let mut current: Option<Arc<AtomicBool>> = None;
+            loop {
+                let delivered_alive = current
+                    .as_ref()
+                    .is_some_and(|alive| alive.load(Ordering::SeqCst));
+                if !want_tcp.load(Ordering::SeqCst) || delivered_alive {
+                    FreeRtos::delay_ms(500);
+                    continue;
+                }
+                if !wifi::ensure_connected(&mut wifi) {
+                    FreeRtos::delay_ms(3000);
+                    continue;
+                }
+                match TcpTransport::connect(&server_addr) {
+                    Ok(transport) => {
+                        info!("connected to dashboard at {server_addr}");
+                        current = Some(transport.alive_handle());
+                        if deliveries.send(transport).is_err() {
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        warn!("dial {server_addr} failed ({e}); retrying");
+                        FreeRtos::delay_ms(2000);
+                    }
+                }
+            }
+        })?;
+    Ok(())
+}
+
+/// Send the current identity + functional config.
+fn announce(
+    transport: &mut dyn Transport,
+    device_id: &str,
+    settings: &Settings,
+) -> anyhow::Result<()> {
+    transport.send(&Frame::DeviceHello {
+        device_id: device_id.into(),
+        config: settings.to_wire(),
+    })
+}
