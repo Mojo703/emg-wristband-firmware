@@ -174,6 +174,18 @@ pub struct DeviceInfo {
     pub id: String,
     /// Human-friendly name for the picker (the device chooses it; defaults to `id`).
     pub label: String,
+    /// Which byte pipe this device's session reached the backend over.
+    pub transport: DeviceTransport,
+}
+
+/// The byte pipe carrying a device session: the USB serial port or a TCP socket
+/// (wifi). The backend knows this from which ingest path the session arrived on;
+/// the device itself never reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DeviceTransport {
+    Serial,
+    Wifi,
 }
 
 /// A device's functional configuration — the source of truth it carries standalone.

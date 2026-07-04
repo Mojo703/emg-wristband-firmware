@@ -14,7 +14,7 @@
 
 use crate::frame;
 use crate::registry::{DeviceHandle, Registry};
-use protocol::{Frame, FrameScanner};
+use protocol::{DeviceTransport, Frame, FrameScanner};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -31,6 +31,7 @@ async fn device_session(
     mut incoming: mpsc::UnboundedReceiver<Frame>,
     outgoing: mpsc::UnboundedSender<Frame>,
     registry: Arc<Registry>,
+    transport: DeviceTransport,
 ) {
     // A connection is anonymous until it identifies itself.
     let (device_id, config) = loop {
@@ -40,10 +41,16 @@ async fn device_session(
             None => return,      // closed before identifying
         }
     };
-    tracing::info!("device '{device_id}' connected ({} gestures)", config.gestures);
+    tracing::info!(
+        "device '{device_id}' connected ({} gestures)",
+        config.gestures
+    );
 
-    let DeviceHandle { frames, mut control_rx, token } =
-        registry.register(device_id.clone(), device_id.clone(), config);
+    let DeviceHandle {
+        frames,
+        mut control_rx,
+        token,
+    } = registry.register(device_id.clone(), device_id.clone(), transport, config);
 
     // Forward control frames (browser → device) to the transport writer.
     let control_task = tokio::spawn(async move {
@@ -91,6 +98,7 @@ async fn framed_session<R, W>(
     reader: R,
     writer: W,
     registry: Arc<Registry>,
+    transport: DeviceTransport,
     idle_timeout: Option<Duration>,
 ) where
     R: AsyncRead + Unpin + Send + 'static,
@@ -128,7 +136,7 @@ async fn framed_session<R, W>(
         }
     });
 
-    device_session(in_rx, out_tx, registry).await;
+    device_session(in_rx, out_tx, registry, transport).await;
     read_task.abort();
     write_task.abort();
 }
@@ -173,6 +181,7 @@ pub async fn run_tcp(addr: String, registry: Arc<Registry>) {
                     reader,
                     writer,
                     registry.clone(),
+                    DeviceTransport::Wifi,
                     Some(DEVICE_IDLE_TIMEOUT),
                 ));
             }
@@ -288,21 +297,13 @@ async fn serial_session(path: &str, registry: Arc<Registry>) {
             let mut port = reader_port;
             let mut scanner = FrameScanner::new();
             let mut chunk = [0u8; 4096];
-            let mut bytes_read: u64 = 0;
-            let mut last_report = std::time::Instant::now();
             loop {
                 // The read timeout paces this check; a dead writer ends the session.
                 if writer_dead.load(Ordering::SeqCst) {
                     return;
                 }
-                if last_report.elapsed() > Duration::from_secs(2) {
-                    tracing::info!("serial reader: {bytes_read} bytes in the last 2s");
-                    bytes_read = 0;
-                    last_report = std::time::Instant::now();
-                }
                 match port.read(&mut chunk) {
                     Ok(n) => {
-                        bytes_read += n as u64;
                         scanner.extend(&chunk[..n]);
                         while let Some(payload) = scanner.next_frame() {
                             if let Some(frame) = decode_wire_frame(&payload) {
@@ -349,7 +350,7 @@ async fn serial_session(path: &str, registry: Arc<Registry>) {
         writer_dead.store(true, Ordering::SeqCst);
     });
 
-    device_session(in_rx, out_tx, registry).await;
+    device_session(in_rx, out_tx, registry, DeviceTransport::Serial).await;
     heartbeat_task.abort();
     tracing::info!("serial device at {path} closed");
 }

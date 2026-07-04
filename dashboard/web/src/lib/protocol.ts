@@ -77,10 +77,14 @@ export interface Binding {
   readonly key: MediaKey;
 }
 
+/// The byte pipe a device's session reached the backend over.
+export type DeviceTransport = 'serial' | 'wifi';
+
 /// A connected device in the picker.
 export interface DeviceInfo {
   readonly id: string;
   readonly label: string;
+  readonly transport: DeviceTransport;
 }
 
 /// A device's functional config (its own source of truth). The backend passes this
@@ -302,7 +306,12 @@ export function isWakeState(value: unknown): value is WakeState {
 }
 
 function isDeviceInfo(value: unknown): value is DeviceInfo {
-  return isObject(value) && isString(value['id']) && isString(value['label']);
+  return (
+    isObject(value) &&
+    isString(value['id']) &&
+    isString(value['label']) &&
+    (value['transport'] === 'serial' || value['transport'] === 'wifi')
+  );
 }
 
 function isDeviceInfoArray(value: unknown): value is readonly DeviceInfo[] {

@@ -19,6 +19,17 @@
   let stroke = 'rgba(120,160,255,0.9)';
   let line = 'rgba(160,160,170,0.7)';
 
+  // The selected device's transport, e.g. "Serial" or "Wifi (myhome)", so the pipe
+  // this panel monitors is named. Null while no device is selected.
+  const transport = $derived.by(() => {
+    const hello = live.hello;
+    const device = hello?.devices.find((entry) => entry.id === hello.selected_device);
+    if (device === undefined) return null;
+    if (device.transport === 'serial') return 'Serial';
+    const ssid = hello?.config?.wifi_ssid;
+    return ssid ? `Wifi (${ssid})` : 'Wifi';
+  });
+
   onMount(() => {
     const css = getComputedStyle(document.documentElement);
     const brand = css.getPropertyValue('--brand').trim();
@@ -98,7 +109,7 @@
 
 <div class="stream-monitor" title="EMG frames/s — dashed line is the real-time target, fill is what the browser receives">
   <div class="stream-head">
-    <span>pipe</span>
+    <span>{transport === null ? 'pipe' : `pipe via ${transport}`}</span>
     <span class="stream-rate" class:on={live.streaming}>
       {target > 0 ? `${live.fps} / ${Math.round(target)} fps` : 'no stream'}
     </span>

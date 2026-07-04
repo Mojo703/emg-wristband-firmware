@@ -3,7 +3,7 @@
 //! control frames funnel back to the device). A change signal lets browser sessions
 //! refresh their picker when devices come and go.
 
-use protocol::{DeviceConfig, DeviceInfo, Frame};
+use protocol::{DeviceConfig, DeviceInfo, DeviceTransport, Frame};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -15,6 +15,7 @@ const FRAME_BUFFER: usize = 256;
 
 struct DeviceEntry {
     label: String,
+    transport: DeviceTransport,
     config: DeviceConfig,
     frames: broadcast::Sender<Frame>,
     control: mpsc::UnboundedSender<Frame>,
@@ -69,7 +70,13 @@ impl Registry {
 
     /// Register a freshly connected device, replacing any stale entry with the same
     /// id. Returns the channels its ingest task drives.
-    pub fn register(&self, id: String, label: String, config: DeviceConfig) -> DeviceHandle {
+    pub fn register(
+        &self,
+        id: String,
+        label: String,
+        transport: DeviceTransport,
+        config: DeviceConfig,
+    ) -> DeviceHandle {
         let (frames, _) = broadcast::channel(FRAME_BUFFER);
         let (control, control_rx) = mpsc::unbounded_channel();
         let token = self.next_token.fetch_add(1, Ordering::Relaxed);
@@ -79,11 +86,23 @@ impl Registry {
         let logs = devices.remove(&id).map(|old| old.logs).unwrap_or_default();
         devices.insert(
             id,
-            DeviceEntry { label, config, frames: frames.clone(), control, logs, token },
+            DeviceEntry {
+                label,
+                transport,
+                config,
+                frames: frames.clone(),
+                control,
+                logs,
+                token,
+            },
         );
         drop(devices);
         self.notify();
-        DeviceHandle { frames, control_rx, token }
+        DeviceHandle {
+            frames,
+            control_rx,
+            token,
+        }
     }
 
     /// Update a device's config after a re-announced `DeviceHello`.
@@ -110,19 +129,31 @@ impl Registry {
         let devices = self.devices.lock().unwrap();
         let mut out: Vec<DeviceInfo> = devices
             .iter()
-            .map(|(id, entry)| DeviceInfo { id: id.clone(), label: entry.label.clone() })
+            .map(|(id, entry)| DeviceInfo {
+                id: id.clone(),
+                label: entry.label.clone(),
+                transport: entry.transport,
+            })
             .collect();
         out.sort_by(|a, b| a.id.cmp(&b.id));
         out
     }
 
     pub fn config_of(&self, id: &str) -> Option<DeviceConfig> {
-        self.devices.lock().unwrap().get(id).map(|entry| entry.config.clone())
+        self.devices
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|entry| entry.config.clone())
     }
 
     /// Subscribe a browser to a device's data-frame stream.
     pub fn subscribe(&self, id: &str) -> Option<broadcast::Receiver<Frame>> {
-        self.devices.lock().unwrap().get(id).map(|entry| entry.frames.subscribe())
+        self.devices
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|entry| entry.frames.subscribe())
     }
 
     /// Retain a device's log frame for later subscribers.
