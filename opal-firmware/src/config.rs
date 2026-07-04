@@ -24,8 +24,11 @@ pub struct CompileConfig {
 /// The device's sensitivity presets: (id, label, reject threshold τ). Lower τ ⇒
 /// easier to trigger. The device owns this because it must gate commands with no
 /// dashboard attached.
-pub const SENSITIVITY_LEVELS: [(&str, &str, f32); 3] =
-    [("low", "Low", 0.7), ("medium", "Medium", 0.5), ("high", "High", 0.3)];
+pub const SENSITIVITY_LEVELS: [(&str, &str, f32); 3] = [
+    ("low", "Low", 0.7),
+    ("medium", "Medium", 0.5),
+    ("high", "High", 0.3),
+];
 const DEFAULT_SENSITIVITY: &str = "medium";
 
 /// Resolve a preset id to its threshold (defaults if unknown).
@@ -70,7 +73,10 @@ impl Settings {
             sensitivity: self.sensitivity.clone(),
             sensitivity_levels: SENSITIVITY_LEVELS
                 .iter()
-                .map(|(id, label, _)| SensitivityLevel { id: (*id).into(), label: (*label).into() })
+                .map(|(id, label, _)| SensitivityLevel {
+                    id: (*id).into(),
+                    label: (*label).into(),
+                })
                 .collect(),
             tau: tau_for(&self.sensitivity),
             needed: RejectPipeline::NEEDED as u8,
@@ -99,14 +105,18 @@ const BLOB_MAX: usize = 1024;
 
 impl Store {
     pub fn open(partition: EspDefaultNvsPartition) -> Result<Self> {
-        Ok(Self { nvs: EspDefaultNvs::new(partition, NVS_NAMESPACE, true)? })
+        Ok(Self {
+            nvs: EspDefaultNvs::new(partition, NVS_NAMESPACE, true)?,
+        })
     }
 
     /// Load saved settings, falling back to defaults on a missing or unreadable blob.
     pub fn load(&self) -> Settings {
         let mut buf = [0u8; BLOB_MAX];
         match self.nvs.get_blob(NVS_KEY, &mut buf) {
-            Ok(Some(bytes)) => ciborium::from_reader(bytes).unwrap_or_else(|_| Settings::defaults()),
+            Ok(Some(bytes)) => {
+                ciborium::from_reader(bytes).unwrap_or_else(|_| Settings::defaults())
+            }
             _ => Settings::defaults(),
         }
     }

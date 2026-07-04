@@ -13,14 +13,17 @@ use std::sync::Mutex;
 /// this is minutes of headroom.
 const BUFFER_CAP: usize = 64;
 
-static BUFFER: Mutex<VecDeque<Frame>> = Mutex::new(VecDeque::new());
-static LOGGER: FrameLogger = FrameLogger;
+static LOGGER: FrameLogger = FrameLogger {
+    buffer: Mutex::new(VecDeque::new()),
+};
 
-struct FrameLogger;
+struct FrameLogger {
+    buffer: Mutex<VecDeque<Frame>>,
+}
 
 impl Log for FrameLogger {
     fn enabled(&self, metadata: &Metadata) -> bool {
-        metadata.level() <= Level::Info
+        metadata.level() <= log::max_level()
     }
 
     fn log(&self, record: &Record) {
@@ -38,7 +41,7 @@ impl Log for FrameLogger {
             level,
             message: format!("{}", record.args()),
         };
-        let mut buffer = BUFFER.lock().unwrap();
+        let mut buffer = self.buffer.lock().unwrap();
         if buffer.len() >= BUFFER_CAP {
             buffer.pop_front();
         }
@@ -57,14 +60,14 @@ pub fn init() {
 
 /// Take everything logged since the last drain, oldest first.
 pub fn drain() -> Vec<Frame> {
-    BUFFER.lock().unwrap().drain(..).collect()
+    LOGGER.buffer.lock().unwrap().drain(..).collect()
 }
 
 /// Put back records that a dead link failed to send, so the next drain retries them
 /// on whichever link comes up. They keep their place ahead of anything logged since;
 /// the cap still applies, spilling the oldest.
 pub fn restore(frames: Vec<Frame>) {
-    let mut buffer = BUFFER.lock().unwrap();
+    let mut buffer = LOGGER.buffer.lock().unwrap();
     for frame in frames.into_iter().rev() {
         buffer.push_front(frame);
     }

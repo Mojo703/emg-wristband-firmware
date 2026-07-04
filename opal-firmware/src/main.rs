@@ -36,7 +36,10 @@ use provider::Provider;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
-use transport::{Control, SerialTransport, TcpTransport, Transport};
+use transport::{
+    Control, SerialTransport, TcpTransport, Transport, SERIAL_CLAIM_TIMEOUT,
+    SERIAL_RECLAIM_COOLDOWN,
+};
 
 /// Hyser acquisition rate; the window duration paces the stream.
 const SAMPLE_RATE: u32 = 2048;
@@ -45,19 +48,6 @@ const SAMPLE_RATE: u32 = 2048;
 /// `emg-runtime`, which also reads its embedded verify windows as the fake provider's
 /// data. Shared with `ml-bench`.
 pub const MODEL_BIN: &[u8] = include_bytes!("../../ml-bench/data/model_int8.bin");
-
-/// A probed serial link stays the data link as long as dashboard heartbeats keep
-/// arriving within this window (they come every ~2 s).
-const SERIAL_CLAIM_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// After a stalled serial write releases the claim, plain heartbeats may not re-claim
-/// the link until this much time has passed. The backend heartbeats every ~2 s whether
-/// or not it is draining the port, so without the cooldown a stalled link flaps
-/// claimed/stalled/claimed and starves the wifi fallback. A stall is also evidence
-/// serial can't sustain the stream right now, so the cooldown is long — wifi carries
-/// the data meanwhile. A probe (a dashboard freshly opening the port) still claims
-/// immediately.
-const SERIAL_RECLAIM_COOLDOWN: Duration = Duration::from_secs(60);
 
 fn main() -> anyhow::Result<()> {
     esp_idf_svc::sys::link_patches();
@@ -89,7 +79,9 @@ fn main() -> anyhow::Result<()> {
         peripherals.usb_serial,
         peripherals.pins.gpio19,
         peripherals.pins.gpio20,
-        &UsbSerialConfig::new().tx_buffer_size(8192).rx_buffer_size(1024),
+        &UsbSerialConfig::new()
+            .tx_buffer_size(8192)
+            .rx_buffer_size(1024),
     )?);
 
     // The link thread owns wifi and delivers connected TCP transports; `want_tcp`
@@ -174,7 +166,9 @@ fn main() -> anyhow::Result<()> {
                         let _ = announce(&mut serial, &device_id, &settings);
                     }
                 }
-                other => config_changed |= apply_control(other, &mut settings, &mut pipeline, &store),
+                other => {
+                    config_changed |= apply_control(other, &mut settings, &mut pipeline, &store)
+                }
             }
         }
         if let Some(t) = tcp.as_mut() {
@@ -200,12 +194,21 @@ fn main() -> anyhow::Result<()> {
         // One window of work.
         let window = provider.next_window();
         let ForwardResult::Logits(logits) = model.forward(&window.input);
-        let logits: Vec<f32> = logits.iter().map(|&v| v as f32 * model.logit_scale).collect();
+        let logits: Vec<f32> = logits
+            .iter()
+            .map(|&v| v as f32 * model.logit_scale)
+            .collect();
         let softmax = softmax(&logits);
         let decision = pipeline.step(&softmax);
         let t_us = (seq as u64 + 1) * window_us;
 
-        let emg = frames::emg(seq, &window.input, provider.input_scale(), model.input_len, SAMPLE_RATE);
+        let emg = frames::emg(
+            seq,
+            &window.input,
+            provider.input_scale(),
+            model.input_len,
+            SAMPLE_RATE,
+        );
         let prediction = frames::prediction(seq, logits, softmax, &decision, pipeline.tau);
         let events = frames::events(prev_wake, &decision, &settings, t_us);
 
@@ -216,8 +219,11 @@ fn main() -> anyhow::Result<()> {
         // announce for any config change, then the window's data.
         let serial_active = serial_claim.is_some();
         if serial_active || tcp.is_some() {
-            let active: &mut dyn Transport =
-                if serial_active { &mut serial } else { tcp.as_mut().expect("tcp checked above") };
+            let active: &mut dyn Transport = if serial_active {
+                &mut serial
+            } else {
+                tcp.as_mut().expect("tcp checked above")
+            };
 
             let mut ok = true;
             // Logs are the record of what went wrong, so a dead link must not eat
@@ -267,7 +273,10 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        if tcp.as_ref().is_some_and(|t| !t.alive_handle().load(Ordering::SeqCst)) {
+        if tcp
+            .as_ref()
+            .is_some_and(|t| !t.alive_handle().load(Ordering::SeqCst))
+        {
             tcp = None;
         }
 
@@ -299,46 +308,57 @@ fn spawn_link_thread(
 ) -> anyhow::Result<()> {
     // Wifi bring-up and association run deep into esp-idf; they previously lived on
     // the 24 KB main task, so give this thread real headroom (8 KB overflowed).
-    std::thread::Builder::new().stack_size(20480).spawn(move || {
-        let mut wifi = match wifi::start(modem, sysloop, nvs, &ssid, &psk) {
-            Ok(wifi) => wifi,
-            Err(e) => {
-                warn!("wifi failed to start ({e}); serial only");
-                return;
-            }
-        };
-        let mut current: Option<Arc<AtomicBool>> = None;
-        loop {
-            let delivered_alive = current.as_ref().is_some_and(|alive| alive.load(Ordering::SeqCst));
-            if !want_tcp.load(Ordering::SeqCst) || delivered_alive {
-                FreeRtos::delay_ms(500);
-                continue;
-            }
-            if !wifi::ensure_connected(&mut wifi) {
-                FreeRtos::delay_ms(3000);
-                continue;
-            }
-            match TcpTransport::connect(&server_addr) {
-                Ok(transport) => {
-                    info!("connected to dashboard at {server_addr}");
-                    current = Some(transport.alive_handle());
-                    if deliveries.send(transport).is_err() {
-                        return;
+    std::thread::Builder::new()
+        .stack_size(20480)
+        .spawn(move || {
+            let mut wifi = match wifi::start(modem, sysloop, nvs, &ssid, &psk) {
+                Ok(wifi) => wifi,
+                Err(e) => {
+                    warn!("wifi failed to start ({e}); serial only");
+                    return;
+                }
+            };
+            let mut current: Option<Arc<AtomicBool>> = None;
+            loop {
+                let delivered_alive = current
+                    .as_ref()
+                    .is_some_and(|alive| alive.load(Ordering::SeqCst));
+                if !want_tcp.load(Ordering::SeqCst) || delivered_alive {
+                    FreeRtos::delay_ms(500);
+                    continue;
+                }
+                if !wifi::ensure_connected(&mut wifi) {
+                    FreeRtos::delay_ms(3000);
+                    continue;
+                }
+                match TcpTransport::connect(&server_addr) {
+                    Ok(transport) => {
+                        info!("connected to dashboard at {server_addr}");
+                        current = Some(transport.alive_handle());
+                        if deliveries.send(transport).is_err() {
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        warn!("dial {server_addr} failed ({e}); retrying");
+                        FreeRtos::delay_ms(2000);
                     }
                 }
-                Err(e) => {
-                    warn!("dial {server_addr} failed ({e}); retrying");
-                    FreeRtos::delay_ms(2000);
-                }
             }
-        }
-    })?;
+        })?;
     Ok(())
 }
 
 /// Send the current identity + functional config.
-fn announce(transport: &mut dyn Transport, device_id: &str, settings: &Settings) -> anyhow::Result<()> {
-    transport.send(&Frame::DeviceHello { device_id: device_id.into(), config: settings.to_wire() })
+fn announce(
+    transport: &mut dyn Transport,
+    device_id: &str,
+    settings: &Settings,
+) -> anyhow::Result<()> {
+    transport.send(&Frame::DeviceHello {
+        device_id: device_id.into(),
+        config: settings.to_wire(),
+    })
 }
 
 /// Apply a control frame; returns true when it changed persisted config (so the
@@ -351,7 +371,10 @@ fn apply_control(
 ) -> bool {
     match control {
         Control::SetSensitivity { level } => {
-            if config::SENSITIVITY_LEVELS.iter().any(|(id, _, _)| *id == level) {
+            if config::SENSITIVITY_LEVELS
+                .iter()
+                .any(|(id, _, _)| *id == level)
+            {
                 settings.sensitivity = level;
                 pipeline.tau = tau_for(&settings.sensitivity);
                 store.save(settings);

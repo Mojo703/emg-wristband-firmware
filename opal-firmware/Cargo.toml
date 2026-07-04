@@ -25,6 +25,8 @@ debug = true
 emg-runtime = { path = "../emg-runtime" }
 protocol = { path = "../protocol" }
 esp-idf-svc = "0.52"
+# Only for naming esp-idf-svc's config-string error type; keep in lockstep with it.
+heapless = "0.9"
 log = "0.4"
 anyhow = "1"
 ciborium = "0.2"

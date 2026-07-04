@@ -12,6 +12,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::time::Duration;
 
 /// The control frames the device accepts (browser → backend → device, plus the
 /// backend's serial link-management frames). A dedicated, float-free mirror of the
@@ -22,9 +23,16 @@ use std::sync::{mpsc, Arc, Condvar, Mutex};
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Control {
-    SetSensitivity { level: String },
-    SetKeymap { bindings: Vec<Binding> },
-    SetWifi { ssid: String, psk: String },
+    SetSensitivity {
+        level: String,
+    },
+    SetKeymap {
+        bindings: Vec<Binding>,
+    },
+    SetWifi {
+        ssid: String,
+        psk: String,
+    },
     /// A dashboard opened the serial link: announce and make serial the data link.
     Probe {},
     /// Serial-link keepalive; silence for a few seconds means the dashboard is gone.
@@ -101,23 +109,32 @@ impl TcpTransport {
             let reader = Arc::clone(&stream);
             let queue = Arc::clone(&queue);
             let alive = Arc::clone(&alive);
-            std::thread::Builder::new().stack_size(8192).spawn(move || {
-                read_loop(&reader, tx);
-                mark_closed(&queue, &alive);
-            })?;
+            std::thread::Builder::new()
+                .stack_size(8192)
+                .spawn(move || {
+                    read_loop(&reader, tx);
+                    mark_closed(&queue, &alive);
+                })?;
         }
         {
             let writer = Arc::clone(&stream);
             let queue = Arc::clone(&queue);
             let alive = Arc::clone(&alive);
-            std::thread::Builder::new().stack_size(8192).spawn(move || {
-                write_loop(&writer, &queue);
-                alive.store(false, Ordering::SeqCst);
-                // Unblock the reader so it exits too and the socket is released.
-                let _ = writer.shutdown(std::net::Shutdown::Both);
-            })?;
+            std::thread::Builder::new()
+                .stack_size(8192)
+                .spawn(move || {
+                    write_loop(&writer, &queue);
+                    alive.store(false, Ordering::SeqCst);
+                    // Unblock the reader so it exits too and the socket is released.
+                    let _ = writer.shutdown(std::net::Shutdown::Both);
+                })?;
         }
-        Ok(Self { queue, rx, alive, dropped: 0 })
+        Ok(Self {
+            queue,
+            rx,
+            alive,
+            dropped: 0,
+        })
     }
 
     /// Shared liveness flag, so the link-management thread can see the transport die
@@ -182,7 +199,10 @@ fn write_loop(writer: &TcpStream, queue: &(Mutex<SendQueue>, Condvar)) {
         }
         let elapsed_ms = write_start.elapsed().as_millis();
         if elapsed_ms > 100 {
-            log::warn!("slow socket write: {elapsed_ms}ms for {} bytes", bytes.len());
+            log::warn!(
+                "slow socket write: {elapsed_ms}ms for {} bytes",
+                bytes.len()
+            );
         }
     }
 }
@@ -236,6 +256,19 @@ impl Drop for TcpTransport {
 // Serial (USB-Serial-JTAG CDC)
 // ----------------------------------------------------------------------------
 
+/// A probed serial link stays the data link as long as dashboard heartbeats keep
+/// arriving within this window (they come every ~2 s).
+pub const SERIAL_CLAIM_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// After a stalled serial write releases the claim, plain heartbeats may not re-claim
+/// the link until this much time has passed. The backend heartbeats every ~2 s whether
+/// or not it is draining the port, so without the cooldown a stalled link flaps
+/// claimed/stalled/claimed and starves the wifi fallback. A stall is also evidence
+/// serial can't sustain the stream right now, so the cooldown is long — wifi carries
+/// the data meanwhile. A probe (a dashboard freshly opening the port) still claims
+/// immediately.
+pub const SERIAL_RECLAIM_COOLDOWN: Duration = Duration::from_secs(60);
+
 /// How long one frame write may block before the host is presumed gone. When a
 /// dashboard is attached and reading, an EMG window drains in ~10 ms — but the reader
 /// is an ordinary desktop process, and a scheduling hiccup of 100 ms is routine, so
@@ -256,7 +289,10 @@ pub struct SerialTransport {
 
 impl SerialTransport {
     pub fn new(driver: UsbSerialDriver<'static>) -> Self {
-        Self { driver, scanner: FrameScanner::new() }
+        Self {
+            driver,
+            scanner: FrameScanner::new(),
+        }
     }
 
     /// Whether a USB host is attached (not necessarily reading).
@@ -270,9 +306,10 @@ impl Transport for SerialTransport {
         let bytes = encode(frame);
         let mut remaining = bytes.as_slice();
         while !remaining.is_empty() {
-            let written = self
-                .driver
-                .write(remaining, delay::TickType::new_millis(SERIAL_WRITE_TIMEOUT_MS as u64).ticks())?;
+            let written = self.driver.write(
+                remaining,
+                delay::TickType::new_millis(SERIAL_WRITE_TIMEOUT_MS as u64).ticks(),
+            )?;
             if written == 0 {
                 anyhow::bail!("serial write stalled (no host reading)");
             }

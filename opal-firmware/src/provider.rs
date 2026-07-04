@@ -32,7 +32,14 @@ impl Provider {
                 counts[label] += 1;
             }
         }
-        Self { counts, input_scale, rng: 0x6f70_616c, label: 0, run_left: 0, index: 0 }
+        Self {
+            counts,
+            input_scale,
+            rng: 0x6f70_616c,
+            label: 0,
+            run_left: 0,
+            index: 0,
+        }
     }
 
     /// µV per int8 count, for the scope frame's `scale_uv`.

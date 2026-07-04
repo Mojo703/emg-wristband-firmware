@@ -1060,6 +1060,7 @@ dependencies = [
  "embuild",
  "emg-runtime",
  "esp-idf-svc",
+ "heapless 0.9.3",
  "log",
  "protocol",
  "serde",

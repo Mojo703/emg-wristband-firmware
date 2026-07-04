@@ -13,7 +13,13 @@ use protocol::{Frame, MediaKey, WakeState};
 /// `[t, c]`; the raw wire layout is channel-major little-endian i16, so we transpose. The
 /// blob is then delta+varint packed for the link (the backend unpacks it); see
 /// [`protocol::pack_samples`]. `scale_uv` is µV per count.
-pub fn emg(seq: u32, input: &I8Activation, scale_uv: f32, input_len: usize, sample_rate: u32) -> Frame {
+pub fn emg(
+    seq: u32,
+    input: &I8Activation,
+    scale_uv: f32,
+    input_len: usize,
+    sample_rate: u32,
+) -> Frame {
     let data = input.as_slice(); // [t * c], time-major
     let mut raw = Vec::with_capacity(input_len * INPUT_CH * 2);
     for ch in 0..INPUT_CH {
@@ -34,7 +40,13 @@ pub fn emg(seq: u32, input: &I8Activation, scale_uv: f32, input_len: usize, samp
 }
 
 /// The classifier output for one window.
-pub fn prediction(seq: u32, logits: Vec<f32>, softmax: Vec<f32>, decision: &Decision, tau: f32) -> Frame {
+pub fn prediction(
+    seq: u32,
+    logits: Vec<f32>,
+    softmax: Vec<f32>,
+    decision: &Decision,
+    tau: f32,
+) -> Frame {
     Frame::Prediction {
         seq,
         logits,
@@ -63,7 +75,12 @@ pub fn events(prev: WakeState, decision: &Decision, settings: &Settings, t_us: u
         });
     }
     if now == WakeState::Idle && prev != WakeState::Idle {
-        out.push(Frame::Event { t_us, kind: "release".into(), label: None, color: None });
+        out.push(Frame::Event {
+            t_us,
+            kind: "release".into(),
+            label: None,
+            color: None,
+        });
     }
     out
 }

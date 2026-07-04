@@ -19,10 +19,18 @@ pub fn start(
 ) -> Result<BlockingWifi<EspWifi<'static>>> {
     let mut wifi = BlockingWifi::wrap(EspWifi::new(modem, sysloop.clone(), Some(nvs))?, sysloop)?;
 
-    let auth_method = if psk.is_empty() { AuthMethod::None } else { AuthMethod::WPA2Personal };
+    let auth_method = if psk.is_empty() {
+        AuthMethod::None
+    } else {
+        AuthMethod::WPA2Personal
+    };
     wifi.set_configuration(&Configuration::Client(ClientConfiguration {
-        ssid: ssid.try_into().map_err(|_| anyhow!("SSID too long (max 32 bytes)"))?,
-        password: psk.try_into().map_err(|_| anyhow!("WiFi password too long (max 64 bytes)"))?,
+        ssid: ssid
+            .try_into()
+            .map_err(|_: heapless::CapacityError| anyhow!("SSID too long (max 32 bytes)"))?,
+        password: psk.try_into().map_err(|_: heapless::CapacityError| {
+            anyhow!("WiFi password too long (max 64 bytes)")
+        })?,
         auth_method,
         ..Default::default()
     }))?;
