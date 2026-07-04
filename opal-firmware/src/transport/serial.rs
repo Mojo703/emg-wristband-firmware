@@ -20,13 +20,21 @@ pub const SERIAL_CLAIM_TIMEOUT: Duration = Duration::from_secs(5);
 /// immediately.
 pub const SERIAL_RECLAIM_COOLDOWN: Duration = Duration::from_secs(60);
 
-/// How long one frame write may block before the host is presumed gone. When a
+/// How long one write call may block before the host is presumed gone. When a
 /// dashboard is attached and reading, an EMG window drains in ~10 ms — but the reader
 /// is an ordinary desktop process, and a scheduling hiccup of 100 ms is routine, so
 /// presuming it gone that quickly made the link flap between serial and wifi. Worst
-/// case this blocks the main loop for one timeout per frame until the stale claim
+/// case this blocks the main loop for one timeout per chunk until the stale claim
 /// expires (~5 s).
 const SERIAL_WRITE_TIMEOUT_MS: u32 = 500;
+
+/// The largest slice handed to the driver in one write call. The ESP-IDF
+/// USB-Serial-JTAG driver's write is all-or-nothing against its transmit ring
+/// buffer's current free space — never partial — so a slice must be well under the
+/// ring's 8192 bytes to reliably make progress. An EMG frame (up to ~8.4 KB) handed
+/// over whole can exceed the ring's total capacity and then no attempt ever
+/// succeeds, which read as a dead host and dropped the serial link once per claim.
+const SERIAL_WRITE_CHUNK_BYTES: usize = 2048;
 
 /// Reads/writes framed CBOR over the USB-Serial-JTAG CDC channel — the same USB port
 /// used for flashing and JTAG debugging (the CDC and JTAG are independent interfaces
@@ -57,8 +65,9 @@ impl Transport for SerialTransport {
         let bytes = encode(frame);
         let mut remaining = bytes.as_slice();
         while !remaining.is_empty() {
+            let chunk_len = remaining.len().min(SERIAL_WRITE_CHUNK_BYTES);
             let written = self.driver.write(
-                remaining,
+                &remaining[..chunk_len],
                 delay::TickType::new_millis(SERIAL_WRITE_TIMEOUT_MS as u64).ticks(),
             )?;
             if written == 0 {
