@@ -5,6 +5,21 @@
 
 use protocol::WakeState;
 
+/// Softmax over one window's logits, max-subtracted for numeric stability. Lives
+/// beside the pipeline because [`RejectPipeline::step`] consumes its output.
+pub fn softmax<const N: usize>(logits: &[f32; N]) -> [f32; N] {
+    let max = logits.iter().copied().fold(f32::MIN, f32::max);
+    let mut out = [0.0f32; N];
+    for (exp, &logit) in out.iter_mut().zip(logits) {
+        *exp = libm::expf(logit - max);
+    }
+    let sum: f32 = out.iter().sum();
+    for exp in &mut out {
+        *exp /= sum;
+    }
+    out
+}
+
 /// One window's decision after smoothing.
 pub struct Decision {
     pub argmax: u8,
@@ -32,7 +47,14 @@ impl RejectPipeline {
     pub const NEEDED: usize = 3;
 
     pub fn new(num_commands: usize, tau: f32) -> Self {
-        Self { num_commands, tau, needed: Self::NEEDED, last_command: None, streak: 0, latched: false }
+        Self {
+            num_commands,
+            tau,
+            needed: Self::NEEDED,
+            last_command: None,
+            streak: 0,
+            latched: false,
+        }
     }
 
     pub fn step(&mut self, softmax: &[f32]) -> Decision {

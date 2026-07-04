@@ -293,6 +293,20 @@ impl MediaKey {
     pub const fn press_report(self) -> [u8; 2] {
         self.usage().to_le_bytes()
     }
+
+    /// The wire id of this key as a plain string, for consumers that need it outside
+    /// a serialized frame (e.g. event labels). Must equal the serde encoding above;
+    /// a unit test holds the two together.
+    pub const fn id(self) -> &'static str {
+        match self {
+            MediaKey::PlayPause => "play_pause",
+            MediaKey::NextTrack => "next_track",
+            MediaKey::PrevTrack => "prev_track",
+            MediaKey::VolumeUp => "volume_up",
+            MediaKey::VolumeDown => "volume_down",
+            MediaKey::Mute => "mute",
+        }
+    }
 }
 
 /// Byte-pipe framing (TCP and serial): each frame on the wire is
@@ -348,9 +362,12 @@ impl FrameScanner {
             if self.buffer.len() < HEADER {
                 return None;
             }
-            let length =
-                u32::from_le_bytes([self.buffer[2], self.buffer[3], self.buffer[4], self.buffer[5]])
-                    as usize;
+            let length = u32::from_le_bytes([
+                self.buffer[2],
+                self.buffer[3],
+                self.buffer[4],
+                self.buffer[5],
+            ]) as usize;
             if length > FRAME_MAX_LEN {
                 // Not a real header — a magic pair inside garbage. Skip it, rescan.
                 self.buffer.drain(0..2);
@@ -433,6 +450,17 @@ pub fn unpack_samples(packed: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn media_key_id_matches_serde_encoding() {
+        for key in MediaKey::ALL {
+            let mut as_enum = Vec::new();
+            ciborium::into_writer(&key, &mut as_enum).unwrap();
+            let mut as_id = Vec::new();
+            ciborium::into_writer(&key.id(), &mut as_id).unwrap();
+            assert_eq!(as_enum, as_id, "id() diverged from serde for {key:?}");
+        }
+    }
+
     fn roundtrip(frame: &Frame) -> Frame {
         let mut buf = Vec::new();
         ciborium::into_writer(frame, &mut buf).unwrap();
@@ -451,7 +479,9 @@ mod tests {
             samples: samples.clone(),
         };
         match roundtrip(&frame) {
-            Frame::Emg { seq, samples: out, .. } => {
+            Frame::Emg {
+                seq, samples: out, ..
+            } => {
                 assert_eq!(seq, 7);
                 assert_eq!(out, samples);
             }
@@ -502,7 +532,9 @@ mod tests {
                 .iter()
                 .flat_map(|v| v.to_le_bytes())
                 .collect::<Vec<u8>>(),
-            (-200..200i16).flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
+            (-200..200i16)
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<u8>>(),
         ] {
             assert_eq!(unpack_samples(&pack_samples(&raw)), raw);
         }
@@ -511,13 +543,17 @@ mod tests {
     #[test]
     fn pack_samples_shrinks_slowly_varying_data() {
         // int8-range values widened to i16 (today's data): packing must be smaller.
-        let raw: Vec<u8> = (0..500).flat_map(|i| ((i % 40 - 20) as i16).to_le_bytes()).collect();
+        let raw: Vec<u8> = (0..500)
+            .flat_map(|i| ((i % 40 - 20) as i16).to_le_bytes())
+            .collect();
         assert!(pack_samples(&raw).len() < raw.len());
     }
 
     #[test]
     fn control_frame_roundtrips() {
-        let frame = Frame::SelectDevice { device_id: "opal-1a2b3c".into() };
+        let frame = Frame::SelectDevice {
+            device_id: "opal-1a2b3c".into(),
+        };
         assert!(matches!(
             roundtrip(&frame),
             Frame::SelectDevice { device_id } if device_id == "opal-1a2b3c"
@@ -528,16 +564,28 @@ mod tests {
     fn device_hello_roundtrips() {
         let config = DeviceConfig {
             gestures: 5,
-            keymap: vec![Binding { gesture: 0, key: MediaKey::PlayPause }],
+            keymap: vec![Binding {
+                gesture: 0,
+                key: MediaKey::PlayPause,
+            }],
             wifi_ssid: Some("lab".into()),
             sensitivity: "medium".into(),
-            sensitivity_levels: vec![SensitivityLevel { id: "medium".into(), label: "Medium".into() }],
+            sensitivity_levels: vec![SensitivityLevel {
+                id: "medium".into(),
+                label: "Medium".into(),
+            }],
             tau: 0.5,
             needed: 3,
         };
-        let frame = Frame::DeviceHello { device_id: "opal-1a2b3c".into(), config: config.clone() };
+        let frame = Frame::DeviceHello {
+            device_id: "opal-1a2b3c".into(),
+            config: config.clone(),
+        };
         match roundtrip(&frame) {
-            Frame::DeviceHello { device_id, config: out } => {
+            Frame::DeviceHello {
+                device_id,
+                config: out,
+            } => {
                 assert_eq!(device_id, "opal-1a2b3c");
                 assert_eq!(out, config);
             }
@@ -554,7 +602,12 @@ mod tests {
             format: "umetrack_21".into(),
         };
         match roundtrip(&frame) {
-            Frame::Pose { t_us, joints, confidence, format } => {
+            Frame::Pose {
+                t_us,
+                joints,
+                confidence,
+                format,
+            } => {
                 assert_eq!(t_us, 1_000_000);
                 assert_eq!(joints.len(), 2);
                 assert!((confidence - 0.95).abs() < 1e-6);

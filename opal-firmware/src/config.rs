@@ -21,23 +21,50 @@ pub struct CompileConfig {
     pub server_addr: &'static str,
 }
 
-/// The device's sensitivity presets: (id, label, reject threshold τ). Lower τ ⇒
-/// easier to trigger. The device owns this because it must gate commands with no
-/// dashboard attached.
-pub const SENSITIVITY_LEVELS: [(&str, &str, f32); 3] = [
-    ("low", "Low", 0.7),
-    ("medium", "Medium", 0.5),
-    ("high", "High", 0.3),
-];
-const DEFAULT_SENSITIVITY: &str = "medium";
+/// The device's sensitivity presets. Each maps to the reject threshold τ that gates
+/// commands (lower τ ⇒ easier to trigger); the device owns this because it must gate
+/// commands with no dashboard attached. The serde encoding must equal [`Self::id`] —
+/// saved NVS blobs and the wire both carry the id string.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Sensitivity {
+    Low,
+    Medium,
+    High,
+}
 
-/// Resolve a preset id to its threshold (defaults if unknown).
-pub fn tau_for(id: &str) -> f32 {
-    SENSITIVITY_LEVELS
-        .iter()
-        .find(|(level, _, _)| *level == id)
-        .map(|(_, _, tau)| *tau)
-        .unwrap_or(0.5)
+impl Sensitivity {
+    pub const ALL: [Sensitivity; 3] = [Sensitivity::Low, Sensitivity::Medium, Sensitivity::High];
+
+    /// Resolve a wire id; unknown ids are rejected (`None`), never defaulted.
+    pub fn from_id(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|level| level.id() == id)
+    }
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Sensitivity::Low => "low",
+            Sensitivity::Medium => "medium",
+            Sensitivity::High => "high",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Sensitivity::Low => "Low",
+            Sensitivity::Medium => "Medium",
+            Sensitivity::High => "High",
+        }
+    }
+
+    /// The reject threshold τ this preset gates commands with.
+    pub fn tau(self) -> f32 {
+        match self {
+            Sensitivity::Low => 0.7,
+            Sensitivity::Medium => 0.5,
+            Sensitivity::High => 0.3,
+        }
+    }
 }
 
 /// Persisted, mutable device settings. Secrets (the wifi password) live here and are
@@ -45,23 +72,41 @@ pub fn tau_for(id: &str) -> f32 {
 /// config.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Settings {
-    pub sensitivity: String,
+    pub sensitivity: Sensitivity,
     pub keymap: Vec<Binding>,
     pub wifi_ssid: String,
     pub wifi_psk: String,
     pub server_addr: String,
 }
 
-impl Settings {
-    pub fn defaults() -> Self {
+impl Default for Settings {
+    /// First-boot settings: compile-time wifi from `cfg.toml`, and a starting keymap
+    /// binding each gesture to a distinct media key, cycling.
+    fn default() -> Self {
         let cfg = COMPILE_CONFIG;
         Self {
-            sensitivity: DEFAULT_SENSITIVITY.into(),
-            keymap: default_keymap(),
+            sensitivity: Sensitivity::Medium,
+            keymap: (0..NUM_CLASSES as u8)
+                .map(|gesture| Binding {
+                    gesture,
+                    key: MediaKey::ALL[gesture as usize % MediaKey::ALL.len()],
+                })
+                .collect(),
             wifi_ssid: cfg.wifi_ssid.into(),
             wifi_psk: cfg.wifi_psk.into(),
             server_addr: cfg.server_addr.into(),
         }
+    }
+}
+
+impl Settings {
+    /// The media key bound to a gesture (PlayPause if unbound).
+    pub fn key_for(&self, gesture: u8) -> MediaKey {
+        self.keymap
+            .iter()
+            .find(|binding| binding.gesture == gesture)
+            .map(|binding| binding.key)
+            .unwrap_or(MediaKey::PlayPause)
     }
 
     /// Project the functional config onto the wire (no secrets).
@@ -70,28 +115,18 @@ impl Settings {
             gestures: NUM_CLASSES as u8,
             keymap: self.keymap.clone(),
             wifi_ssid: (!self.wifi_ssid.is_empty()).then(|| self.wifi_ssid.clone()),
-            sensitivity: self.sensitivity.clone(),
-            sensitivity_levels: SENSITIVITY_LEVELS
+            sensitivity: self.sensitivity.id().into(),
+            sensitivity_levels: Sensitivity::ALL
                 .iter()
-                .map(|(id, label, _)| SensitivityLevel {
-                    id: (*id).into(),
-                    label: (*label).into(),
+                .map(|level| SensitivityLevel {
+                    id: level.id().into(),
+                    label: level.label().into(),
                 })
                 .collect(),
-            tau: tau_for(&self.sensitivity),
+            tau: self.sensitivity.tau(),
             needed: RejectPipeline::NEEDED as u8,
         }
     }
-}
-
-/// A starting keymap: each gesture bound to a distinct media key, cycling.
-fn default_keymap() -> Vec<Binding> {
-    (0..NUM_CLASSES as u8)
-        .map(|gesture| Binding {
-            gesture,
-            key: MediaKey::ALL[gesture as usize % MediaKey::ALL.len()],
-        })
-        .collect()
 }
 
 /// NVS-backed persistence for [`Settings`], stored as one CBOR blob.
@@ -114,10 +149,8 @@ impl Store {
     pub fn load(&self) -> Settings {
         let mut buf = [0u8; BLOB_MAX];
         match self.nvs.get_blob(NVS_KEY, &mut buf) {
-            Ok(Some(bytes)) => {
-                ciborium::from_reader(bytes).unwrap_or_else(|_| Settings::defaults())
-            }
-            _ => Settings::defaults(),
+            Ok(Some(bytes)) => ciborium::from_reader(bytes).unwrap_or_default(),
+            _ => Settings::default(),
         }
     }
 

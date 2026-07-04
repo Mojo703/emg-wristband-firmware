@@ -22,9 +22,9 @@ mod provider;
 mod transport;
 mod wifi;
 
-use config::{tau_for, Settings, Store};
+use config::{Sensitivity, Settings, Store};
 use emg_runtime::model::{Model, NUM_CLASSES};
-use emg_runtime::{ForwardResult, RejectPipeline};
+use emg_runtime::{softmax, ForwardResult, RejectPipeline};
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::delay::FreeRtos;
 use esp_idf_svc::hal::peripherals::Peripherals;
@@ -65,7 +65,7 @@ fn main() -> anyhow::Result<()> {
 
     let model = Model::load(MODEL_BIN);
     let mut provider = Provider::new();
-    let mut pipeline = RejectPipeline::new(NUM_CLASSES, tau_for(&settings.sensitivity));
+    let mut pipeline = RejectPipeline::new(NUM_CLASSES, settings.sensitivity.tau());
 
     // Heap headroom is the constraint when sizing wifi/lwIP buffers (see
     // sdkconfig.defaults); log it so an out-of-memory abort is diagnosable.
@@ -93,9 +93,7 @@ fn main() -> anyhow::Result<()> {
             peripherals.modem,
             sysloop,
             nvs_partition,
-            settings.wifi_ssid.clone(),
-            settings.wifi_psk.clone(),
-            settings.server_addr.clone(),
+            &settings,
             Arc::clone(&want_tcp),
             tcp_tx,
         )?;
@@ -193,11 +191,9 @@ fn main() -> anyhow::Result<()> {
 
         // One window of work.
         let window = provider.next_window();
-        let ForwardResult::Logits(logits) = model.forward(&window.input);
-        let logits: Vec<f32> = logits
-            .iter()
-            .map(|&v| v as f32 * model.logit_scale)
-            .collect();
+        let ForwardResult::Logits(raw_logits) = model.forward(&window.input);
+        let logits: [f32; NUM_CLASSES] =
+            std::array::from_fn(|class| raw_logits[class] as f32 * model.logit_scale);
         let softmax = softmax(&logits);
         let decision = pipeline.step(&softmax);
         let t_us = (seq as u64 + 1) * window_us;
@@ -295,17 +291,17 @@ fn main() -> anyhow::Result<()> {
 /// The background thread that keeps wifi associated and delivers dialed TCP
 /// transports to the serve loop. Stands down (and stays associated but idle) while
 /// `want_tcp` is false — i.e. while a dashboard holds the serial link.
-#[allow(clippy::too_many_arguments)]
 fn spawn_link_thread(
     modem: esp_idf_svc::hal::modem::Modem<'static>,
     sysloop: EspSystemEventLoop,
     nvs: EspDefaultNvsPartition,
-    ssid: String,
-    psk: String,
-    server_addr: String,
+    settings: &Settings,
     want_tcp: Arc<AtomicBool>,
     deliveries: mpsc::Sender<TcpTransport>,
 ) -> anyhow::Result<()> {
+    let ssid = settings.wifi_ssid.clone();
+    let psk = settings.wifi_psk.clone();
+    let server_addr = settings.server_addr.clone();
     // Wifi bring-up and association run deep into esp-idf; they previously lived on
     // the 24 KB main task, so give this thread real headroom (8 KB overflowed).
     std::thread::Builder::new()
@@ -370,19 +366,15 @@ fn apply_control(
     store: &Store,
 ) -> bool {
     match control {
-        Control::SetSensitivity { level } => {
-            if config::SENSITIVITY_LEVELS
-                .iter()
-                .any(|(id, _, _)| *id == level)
-            {
+        Control::SetSensitivity { level } => match Sensitivity::from_id(&level) {
+            Some(level) => {
                 settings.sensitivity = level;
-                pipeline.tau = tau_for(&settings.sensitivity);
+                pipeline.tau = level.tau();
                 store.save(settings);
                 true
-            } else {
-                false
             }
-        }
+            None => false,
+        },
         Control::SetKeymap { bindings } => {
             settings.keymap = bindings;
             store.save(settings);
@@ -397,13 +389,6 @@ fn apply_control(
         }
         Control::Probe {} | Control::Heartbeat {} => false, // handled by the caller
     }
-}
-
-fn softmax(logits: &[f32]) -> Vec<f32> {
-    let max = logits.iter().copied().fold(f32::MIN, f32::max);
-    let exps: Vec<f32> = logits.iter().map(|v| (v - max).exp()).collect();
-    let sum: f32 = exps.iter().sum();
-    exps.iter().map(|v| v / sum).collect()
 }
 
 /// Why the chip (re)started, so a crash-reboot is visible in the log stream — there

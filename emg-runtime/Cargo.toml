@@ -15,6 +15,8 @@ description = "On-device EMG gesture inference (int8 + ESP32-S3 SIMD) and the re
 # kernels) when pulled in by a firmware crate, which supplies the esp toolchain.
 [dependencies]
 protocol = { path = "../protocol" }
+# Float math (expf for the softmax) without std, which no_std forbids.
+libm = "0.2"
 
 # Speed, not size: this is the compute the firmware's latency budget rides on.
 [profile.release]

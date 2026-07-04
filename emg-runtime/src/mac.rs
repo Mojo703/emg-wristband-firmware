@@ -65,8 +65,8 @@ pub fn dot_i8_simd(w: &[i8], x: &[i8]) -> i32 {
         );
     }
     let chunks = rem; // consumed below alongside the post-incremented pointers
-    // The asm writes the post-incremented pointers / decremented counter back;
-    // we don't need them, but consume them so the lint stays quiet.
+                      // The asm writes the post-incremented pointers / decremented counter back;
+                      // we don't need them, but consume them so the lint stays quiet.
     let _ = (wp, xp, chunks);
     acc
 }

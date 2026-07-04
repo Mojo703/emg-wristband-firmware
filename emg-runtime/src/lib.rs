@@ -24,4 +24,4 @@ pub mod pipeline;
 pub mod tensor;
 
 pub use model::{ForwardResult, Model, VerifyBatch, VerifyWindow};
-pub use pipeline::{Decision, RejectPipeline};
+pub use pipeline::{softmax, Decision, RejectPipeline};

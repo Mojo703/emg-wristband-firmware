@@ -4,10 +4,10 @@
 //! happened.
 
 use crate::config::Settings;
-use emg_runtime::model::INPUT_CH;
+use emg_runtime::model::{INPUT_CH, NUM_CLASSES};
 use emg_runtime::tensor::I8Activation;
 use emg_runtime::Decision;
-use protocol::{Frame, MediaKey, WakeState};
+use protocol::{Frame, WakeState};
 
 /// The bulk EMG window for the scope. `input` is the int8 activation, time-major
 /// `[t, c]`; the raw wire layout is channel-major little-endian i16, so we transpose. The
@@ -42,15 +42,15 @@ pub fn emg(
 /// The classifier output for one window.
 pub fn prediction(
     seq: u32,
-    logits: Vec<f32>,
-    softmax: Vec<f32>,
+    logits: [f32; NUM_CLASSES],
+    softmax: [f32; NUM_CLASSES],
     decision: &Decision,
     tau: f32,
 ) -> Frame {
     Frame::Prediction {
         seq,
-        logits,
-        softmax,
+        logits: logits.to_vec(),
+        softmax: softmax.to_vec(),
         reject_score: decision.reject_score,
         argmax: decision.argmax,
         accepted: decision.accepted,
@@ -70,7 +70,9 @@ pub fn events(prev: WakeState, decision: &Decision, settings: &Settings, t_us: u
         out.push(Frame::Event {
             t_us,
             kind: "commit".into(),
-            label: Some(key_name(settings, decision.argmax).into()),
+            // The functional fact of which command fired; the dashboard maps the key
+            // id to a pretty label.
+            label: Some(settings.key_for(decision.argmax).id().into()),
             color: None,
         });
     }
@@ -83,23 +85,4 @@ pub fn events(prev: WakeState, decision: &Decision, settings: &Settings, t_us: u
         });
     }
     out
-}
-
-/// The protocol id of the media key bound to a gesture (the functional fact of which
-/// command fired; the dashboard maps it to a pretty label).
-fn key_name(settings: &Settings, gesture: u8) -> &'static str {
-    let key = settings
-        .keymap
-        .iter()
-        .find(|binding| binding.gesture == gesture)
-        .map(|binding| binding.key)
-        .unwrap_or(MediaKey::PlayPause);
-    match key {
-        MediaKey::PlayPause => "play_pause",
-        MediaKey::NextTrack => "next_track",
-        MediaKey::PrevTrack => "prev_track",
-        MediaKey::VolumeUp => "volume_up",
-        MediaKey::VolumeDown => "volume_down",
-        MediaKey::Mute => "mute",
-    }
 }
