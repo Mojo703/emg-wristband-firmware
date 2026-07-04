@@ -44,7 +44,7 @@ fn main() -> Result<()> {
     // baudrate will likely be configured higher once SPI
     // communication is confirmed 
     let spi_config = SpiConfig::new()
-        .baudrate(1.MHz())
+        .baudrate(1000000.Hz())
         .data_mode(esp_idf_svc::hal::spi::config::MODE_1);
     let spi_dev1 = SpiDeviceDriver::new(&spi_driver, Some(pins.gpio10), &spi_config)?; // CS 1
     let spi_dev2 = SpiDeviceDriver::new(&spi_driver, Some(pins.gpio6), &spi_config)?; // CS 2
