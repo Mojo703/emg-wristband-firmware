@@ -15,7 +15,7 @@ pub const RESET: u8 = 0x06;
 pub const START: u8 = 0x08;
 
 #[allow(dead_code)]
-pub const STOP: u8 = 0x0A
+pub const STOP: u8 = 0x0A;
 
 pub const RDATAC: u8 = 0x10;
 pub const SDATAC: u8 = 0x11;

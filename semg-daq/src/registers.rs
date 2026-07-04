@@ -1,8 +1,9 @@
 //! ADS1298 register map
+//!
+//! Only a subset is being used by the current bring-up sequence.
+//! The rest is kept as a reference for when lead-off detection, gain, 
+//! and reference config get implemented.
 
-/// Register map (datasheet Table 14). Only a subset is exercised by the
-/// current bring-up sequence; the rest is kept as a reference for when lead-off
-/// detection, gain, and reference config get implemented.
 #[allow(dead_code)]
 #[repr(u8)]
 #[derive(Clone, Copy, Debug)]
@@ -35,9 +36,8 @@ pub enum Register {
     Wct2 = 0x19,
 }
 
-impl register {
+impl Register {
     pub const fn addr(self) -> u8 {
         self as u8
     }
-
 }
