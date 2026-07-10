@@ -22,7 +22,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
-use tokio_serial::SerialPortType;
+use tokio_serial::{ErrorKind as SerialErrorKind, SerialPortType};
 
 /// Drive one device connection: wait for its `DeviceHello`, register it, fan its data
 /// frames out to viewers, and funnel control frames back. `incoming` yields decoded
@@ -191,28 +191,72 @@ pub async fn run_tcp(addr: String, registry: Arc<Registry>) {
 }
 
 /// The ESP32-S3's built-in USB-Serial-JTAG identity — every opal device enumerates
-/// with it, so it is the discovery filter.
+/// with it, so it is the auto-discovery filter.
 const USB_SERIAL_JTAG_VID: u16 = 0x303a;
 const USB_SERIAL_JTAG_PID: u16 = 0x1001;
 
-/// Discover serial-attached devices: scan for USB-Serial-JTAG ports, open each new
-/// one, and run a probed session on it until it dies (unplug, or the device ignores
-/// us). The baud rate is nominal — a CDC channel ignores it.
+/// Force discovery onto one specific serial port instead of auto-selecting by USB
+/// identity. Accepts any path — a `/dev/tty*`, a stable `/dev/serial/by-id/…` symlink,
+/// or a USB-serial adapter with a different VID:PID. When unset (or the path is not
+/// present), fall back to auto-discovery. This exists because the port name is not
+/// portable across machines: the same board is `/dev/ttyACM0` on one host and
+/// `/dev/ttyUSB0` on another.
+const SERIAL_PORT_ENV: &str = "EMG_SERIAL_PORT";
+
+/// Every attached USB-Serial-JTAG port, matched by USB identity — the auto-discovery
+/// candidate set. Multiple boards are supported, so this is a list, not a single pick.
+fn auto_discover_ports() -> Vec<String> {
+    tokio_serial::available_ports()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|port| match &port.port_type {
+            SerialPortType::UsbPort(usb) => {
+                usb.vid == USB_SERIAL_JTAG_VID && usb.pid == USB_SERIAL_JTAG_PID
+            }
+            _ => false,
+        })
+        .map(|port| port.port_name)
+        .collect()
+}
+
+/// Discover serial-attached devices and run a probed session on each until it dies
+/// (unplug, or the device ignores us). An explicit `EMG_SERIAL_PORT` override wins
+/// whenever it names a path that exists; otherwise auto-select by USB identity. The
+/// baud rate is nominal — a CDC channel ignores it.
 pub async fn run_serial_discovery(registry: Arc<Registry>) {
+    let override_port = std::env::var(SERIAL_PORT_ENV).ok().filter(|s| !s.is_empty());
+    match &override_port {
+        Some(path) => tracing::info!("serial discovery forced onto {path} (from {SERIAL_PORT_ENV})"),
+        None => tracing::info!(
+            "serial discovery running (USB-Serial-JTAG {USB_SERIAL_JTAG_VID:04x}:{USB_SERIAL_JTAG_PID:04x})"
+        ),
+    }
+    // Ports we already run a session on, and ports whose open we've already explained
+    // (a permission failure repeats every scan; warn about it once).
     let open_ports: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
-    tracing::info!("serial discovery running (USB-Serial-JTAG {USB_SERIAL_JTAG_VID:04x}:{USB_SERIAL_JTAG_PID:04x})");
+    let warned_ports: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    let mut warned_missing_override = false;
     loop {
-        let candidates: Vec<String> = tokio_serial::available_ports()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|port| match &port.port_type {
-                SerialPortType::UsbPort(usb) => {
-                    usb.vid == USB_SERIAL_JTAG_VID && usb.pid == USB_SERIAL_JTAG_PID
+        let candidates = match override_port.as_deref() {
+            // A valid override is the whole candidate set; ignore USB identity so any
+            // adapter or symlink works.
+            Some(path) if std::path::Path::new(path).exists() => {
+                warned_missing_override = false;
+                vec![path.to_string()]
+            }
+            // Override named but absent (not plugged in yet, or a typo): fall back to
+            // auto-discovery so a matching board still connects, and say so once.
+            Some(path) => {
+                if !warned_missing_override {
+                    tracing::warn!(
+                        "{SERIAL_PORT_ENV}={path} is not present; auto-discovering by USB identity until it appears"
+                    );
+                    warned_missing_override = true;
                 }
-                _ => false,
-            })
-            .map(|port| port.port_name)
-            .collect();
+                auto_discover_ports()
+            }
+            None => auto_discover_ports(),
+        };
 
         for path in candidates {
             if !open_ports.lock().unwrap().insert(path.clone()) {
@@ -220,8 +264,9 @@ pub async fn run_serial_discovery(registry: Arc<Registry>) {
             }
             let registry = registry.clone();
             let open_ports = open_ports.clone();
+            let warned_ports = warned_ports.clone();
             tokio::spawn(async move {
-                serial_session(&path, registry).await;
+                serial_session(&path, registry, &warned_ports).await;
                 open_ports.lock().unwrap().remove(&path);
             });
         }
@@ -234,17 +279,33 @@ pub async fn run_serial_discovery(registry: Arc<Registry>) {
 /// bursty traffic, and a stalled reader backs the device's CDC buffer up until its
 /// writes time out. Blocking reads with a timeout are immune, and the threads bridge
 /// into [`device_session`] through the same channels the TCP path uses.
-async fn serial_session(path: &str, registry: Arc<Registry>) {
+async fn serial_session(path: &str, registry: Arc<Registry>, warned_ports: &Mutex<HashSet<String>>) {
     let mut reader_port = match tokio_serial::new(path, 921_600)
         .timeout(Duration::from_millis(100))
         .open()
     {
         Ok(port) => port,
+        // Discovery retries every scan, so a persistent failure (above all the classic
+        // "the port exists but this user can't open it") would otherwise spam the log —
+        // explain each path's failure once.
         Err(e) => {
-            tracing::warn!("serial {path} open failed ({e})");
+            if warned_ports.lock().unwrap().insert(path.to_string()) {
+                if matches!(e.kind(), SerialErrorKind::Io(std::io::ErrorKind::PermissionDenied)) {
+                    tracing::warn!(
+                        "serial {path}: permission denied. Add your user to the port's group \
+                         (`sudo usermod -aG uucp $USER` on Arch, `dialout` on Debian/Ubuntu) and \
+                         log back in, or set {SERIAL_PORT_ENV} to a port you can open."
+                    );
+                } else {
+                    tracing::warn!("serial {path} open failed ({e})");
+                }
+            }
             return;
         }
     };
+    // A later successful open means the earlier failure was transient — allow it to be
+    // reported again if it recurs.
+    warned_ports.lock().unwrap().remove(path);
     // DTR asserted + RTS deasserted is the line state under which the CDC channel is
     // known to move data in both directions (any other combination has been observed
     // to stall reads or writes, and the pair also drives the chip's reset circuit —
