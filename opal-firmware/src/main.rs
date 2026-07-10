@@ -177,6 +177,14 @@ fn apply_control(
             info!("wifi credentials stored; reboot to connect over wifi");
             true
         }
+        Control::SetServer { addr } => {
+            settings.server_addr = addr;
+            store.save(settings);
+            // The wifi task samples server_addr once at bring-up, so a live change
+            // only takes on the next boot — same contract as SetWifi.
+            info!("server address stored; reboot to connect over wifi");
+            true
+        }
         Control::Probe {} | Control::Heartbeat {} => false, // handled by the caller
     }
 }

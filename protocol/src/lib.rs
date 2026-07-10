@@ -50,6 +50,10 @@ pub enum Frame {
         /// Render hints per wake-gate state (colour/label/intensity) so the frontend
         /// hardcodes none of the state vocabulary.
         states: Vec<StateInfo>,
+        /// Candidate dashboard addresses (this host's own reachable IPv4s paired with
+        /// the device-listener port), best-guess first, so the config UI can pre-fill
+        /// the device's server address instead of the user hunting for the host's IP.
+        server_suggestions: Vec<String>,
     },
 
     /// Device → backend on connect: identity plus the device's functional config. The
@@ -132,6 +136,13 @@ pub enum Frame {
     /// Set WiFi credentials (browser → backend → device). The device persists them
     /// and uses them to reach the backend over wifi on the next boot.
     SetWifi { ssid: String, psk: String },
+
+    /// Set the dashboard address the device dials over wifi (browser → backend →
+    /// device), e.g. `"10.42.0.1:9000"`. The device persists it and connects there on
+    /// the next boot. The server address is otherwise a compile-time default, so this
+    /// is the only way to retarget a device without reflashing — needed when the
+    /// dashboard host's IP is not portable across networks (a laptop hotspot, say).
+    SetServer { addr: String },
 
     /// A device log record (device → backend → browser). Replaces the serial text
     /// console: the USB byte pipe carries only frames, so logs ride the protocol and

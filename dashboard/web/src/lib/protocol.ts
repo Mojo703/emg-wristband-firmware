@@ -46,6 +46,7 @@ export const FrameType = {
   SetSensitivity: 'set_sensitivity',
   SetKeymap: 'set_keymap',
   SetWifi: 'set_wifi',
+  SetServer: 'set_server',
 } as const;
 
 export type FrameType = (typeof FrameType)[keyof typeof FrameType];
@@ -110,6 +111,9 @@ export interface HelloFrame {
   readonly config: DeviceConfig | null;
   readonly classes: readonly ClassInfo[];
   readonly states: readonly StateInfo[];
+  // Backend-suggested dashboard addresses (host IPs + device port), best guess first,
+  // for pre-filling the device's server address in the config panel.
+  readonly server_suggestions: readonly string[];
 }
 
 export interface EmgFrame {
@@ -190,11 +194,17 @@ export interface SetWifiFrame {
   readonly psk: string;
 }
 
+export interface SetServerFrame {
+  readonly type: 'set_server';
+  readonly addr: string;
+}
+
 export type OutgoingFrame =
   | SelectDeviceFrame
   | SetSensitivityFrame
   | SetKeymapFrame
-  | SetWifiFrame;
+  | SetWifiFrame
+  | SetServerFrame;
 
 export type IncomingFrame =
   | HelloFrame
@@ -240,6 +250,10 @@ function isOptionalString(value: unknown): value is string | null | undefined {
 
 function isNumberArray(value: unknown): value is readonly number[] {
   return Array.isArray(value) && value.every(isNumber);
+}
+
+function isStringArray(value: unknown): value is readonly string[] {
+  return Array.isArray(value) && value.every(isString);
 }
 
 function isUint8Array(value: unknown): value is Uint8Array {
@@ -339,7 +353,8 @@ export function isHelloFrame(value: unknown): value is HelloFrame {
     isOptionalString(value['selected_device']) &&
     (value['config'] === null || isDeviceConfig(value['config'])) &&
     isClassInfoArray(value['classes']) &&
-    isStateInfoArray(value['states'])
+    isStateInfoArray(value['states']) &&
+    isStringArray(value['server_suggestions'])
   );
 }
 

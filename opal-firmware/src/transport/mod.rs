@@ -32,6 +32,9 @@ pub enum Control {
         ssid: String,
         psk: String,
     },
+    SetServer {
+        addr: String,
+    },
     /// A dashboard opened the serial link: announce and make serial the data link.
     Probe {},
     /// Serial-link keepalive; silence for a few seconds means the dashboard is gone.

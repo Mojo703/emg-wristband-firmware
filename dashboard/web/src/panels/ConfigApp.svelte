@@ -57,10 +57,26 @@
     ssid = config.wifi_ssid ?? '';
   });
   const saveWifi = () => api.wifi(ssid, psk);
+
+  // The dashboard address the device dials over wifi. The backend suggests its own
+  // reachable addresses (best guess first); until the user edits the field, mirror the
+  // top suggestion, which tracks the backend's live networks (e.g. a hotspot coming
+  // up). The value is write-only — the device never echoes it back.
+  const serverSuggestions = $derived(live.hello?.server_suggestions ?? []);
+  let server = $state('');
+  let serverEdited = false;
+  $effect(() => {
+    if (serverEdited) return;
+    const best = serverSuggestions[0];
+    if (best !== undefined) server = best;
+  });
+  const saveServer = () => {
+    const addr = server.trim();
+    if (addr) api.server(addr);
+  };
 </script>
 
 <h2>Config</h2>
-<p class="muted">Changes apply immediately.</p>
 
 <section>
   <div class="row"><Icon name="sliders" /><strong>Sensitivity</strong></div>
@@ -74,7 +90,6 @@
         placeholder="Select…"
       />
     </label>
-    <span class="muted">Higher = commands trigger more easily.</span>
   </div>
 </section>
 
@@ -106,6 +121,25 @@
   </div>
   <div class="row">
     <Button onclick={saveWifi}>Save WiFi</Button>
-    <span class="muted">Credentials are committed together; the password is write-only.</span>
+  </div>
+  <div class="row">
+    <label>
+      Server
+      <input
+        type="text"
+        bind:value={server}
+        oninput={() => (serverEdited = true)}
+        list="server-suggestions"
+        placeholder="10.42.0.1:9000"
+      />
+      <datalist id="server-suggestions">
+        {#each serverSuggestions as suggestion}
+          <option value={suggestion}></option>
+        {/each}
+      </datalist>
+    </label>
+  </div>
+  <div class="row">
+    <Button onclick={saveServer}>Save Server</Button>
   </div>
 </section>

@@ -9,6 +9,7 @@ use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
 use protocol::Frame;
 use std::collections::VecDeque;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::error::TrySendError;
@@ -57,7 +58,7 @@ fn send_live(tx: &mpsc::Sender<Out>, kind: LiveKind, msg: Message) -> bool {
 
 /// The complete browser view: device list, the selection, the selected device's
 /// functional config, and the cosmetic projection of it.
-fn view(registry: &Registry, selected: &Option<String>) -> Frame {
+fn view(registry: &Registry, selected: &Option<String>, device_port: u16) -> Frame {
     let config = selected.as_ref().and_then(|id| registry.config_of(id));
     let classes = config.as_ref().map(looks::classes_for).unwrap_or_default();
     Frame::Hello {
@@ -66,7 +67,52 @@ fn view(registry: &Registry, selected: &Option<String>) -> Frame {
         config,
         classes,
         states: looks::states(),
+        server_suggestions: server_suggestions(device_port),
     }
+}
+
+/// Interface-name prefixes for virtual/overlay links a device on the LAN can't route
+/// to — docker bridges, veth pairs, VPN/overlay tunnels. Their addresses would only
+/// mislead as a dashboard target, so they're left out of the suggestions.
+const VIRTUAL_INTERFACE_PREFIXES: [&str; 6] = ["docker", "br-", "veth", "zt", "tun", "tap"];
+
+/// This host's own reachable IPv4 addresses paired with the device-listener `port`,
+/// as `ip:port` strings for the config UI to pre-fill the device's server address.
+/// Ranked most-likely-first: a NetworkManager shared/hotspot subnet (`10.42.x.x`)
+/// above other private ranges above the rest, because on a laptop hotspot the device
+/// must dial the laptop's hotspot IP, which it cannot otherwise discover. Enumerated
+/// live (not cached) so a hotspot brought up after startup appears on the next view.
+fn server_suggestions(port: u16) -> Vec<String> {
+    fn rank(ip: Ipv4Addr) -> u8 {
+        match ip.octets() {
+            [10, 42, ..] => 0,                            // NM shared / hotspot subnet
+            [192, 168, ..] | [10, ..] => 1,               // other private ranges
+            [172, b, ..] if (16..=31).contains(&b) => 1,
+            _ => 2,
+        }
+    }
+    let mut addresses: Vec<Ipv4Addr> = if_addrs::get_if_addrs()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|interface| {
+            interface.is_oper_up()
+                && !interface.is_loopback()
+                && !interface.is_link_local()
+                && !VIRTUAL_INTERFACE_PREFIXES
+                    .iter()
+                    .any(|prefix| interface.name.starts_with(prefix))
+        })
+        .filter_map(|interface| match interface.ip() {
+            IpAddr::V4(ip) => Some(ip),
+            IpAddr::V6(_) => None,
+        })
+        .collect();
+    addresses.sort_by_key(|ip| (rank(*ip), ip.octets()));
+    addresses.dedup();
+    addresses
+        .into_iter()
+        .map(|ip| format!("{ip}:{port}"))
+        .collect()
 }
 
 /// Send a device's retained logs to a browser that just started (or switched to)
@@ -106,7 +152,12 @@ async fn next_frame(sub: &mut Option<broadcast::Receiver<Frame>>) -> Frame {
     }
 }
 
-pub async fn handle_browser(socket: WebSocket, registry: Arc<Registry>, pose_url: Option<String>) {
+pub async fn handle_browser(
+    socket: WebSocket,
+    registry: Arc<Registry>,
+    pose_url: Option<String>,
+    device_port: u16,
+) {
     tracing::info!("browser connected");
     let (browser_sink, mut browser_stream) = socket.split();
 
@@ -155,7 +206,7 @@ pub async fn handle_browser(socket: WebSocket, registry: Arc<Registry>, pose_url
     reconcile(&registry, &mut selected);
     let mut sub = selected.as_ref().and_then(|id| registry.subscribe(id));
     let mut changed = registry.watch();
-    if !send_reliable(&browser_tx, Message::Binary(frame::encode(&view(&registry, &selected)))) {
+    if !send_reliable(&browser_tx, Message::Binary(frame::encode(&view(&registry, &selected, device_port)))) {
         return;
     }
     replay_logs(&registry, &selected, &browser_tx);
@@ -170,7 +221,7 @@ pub async fn handle_browser(socket: WebSocket, registry: Arc<Registry>, pose_url
                             selected = Some(device_id);
                             reconcile(&registry, &mut selected);
                             sub = selected.as_ref().and_then(|id| registry.subscribe(id));
-                            if !send_reliable(&browser_tx, Message::Binary(frame::encode(&view(&registry, &selected)))) {
+                            if !send_reliable(&browser_tx, Message::Binary(frame::encode(&view(&registry, &selected, device_port)))) {
                                 break;
                             }
                             replay_logs(&registry, &selected, &browser_tx);
@@ -178,7 +229,8 @@ pub async fn handle_browser(socket: WebSocket, registry: Arc<Registry>, pose_url
                         // Forward control frames to the selected device.
                         control @ (Frame::SetSensitivity { .. }
                         | Frame::SetKeymap { .. }
-                        | Frame::SetWifi { .. }) => {
+                        | Frame::SetWifi { .. }
+                        | Frame::SetServer { .. }) => {
                             if let Some(id) = &selected {
                                 registry.send_control(id, control);
                             }
@@ -220,7 +272,7 @@ pub async fn handle_browser(socket: WebSocket, registry: Arc<Registry>, pose_url
                 // Re-subscribe unconditionally: a reconnect keeps its id but gets a fresh
                 // broadcast channel, so the old receiver would go silent otherwise.
                 sub = selected.as_ref().and_then(|id| registry.subscribe(id));
-                if !send_reliable(&browser_tx, Message::Binary(frame::encode(&view(&registry, &selected)))) {
+                if !send_reliable(&browser_tx, Message::Binary(frame::encode(&view(&registry, &selected, device_port)))) {
                     break;
                 }
                 // The browser clears its log panel on every hello; refill it.

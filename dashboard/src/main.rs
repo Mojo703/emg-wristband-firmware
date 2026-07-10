@@ -37,6 +37,9 @@ use tower_http::trace::TraceLayer;
 struct AppState {
     registry: Arc<Registry>,
     pose_url: Option<String>,
+    /// The port devices dial over wifi (from `EMG_DEVICE_ADDR`), used to build the
+    /// server-address suggestions offered to the config UI.
+    device_port: u16,
 }
 
 #[tokio::main]
@@ -54,6 +57,13 @@ async fn main() -> anyhow::Result<()> {
     // Devices dialing in over wifi land on this TCP port.
     let device_addr =
         std::env::var("EMG_DEVICE_ADDR").unwrap_or_else(|_| "0.0.0.0:9000".into());
+    // The port a device dials over wifi — the bind's own port, regardless of the
+    // (usually wildcard) bind host. Suggestions pair it with each of our IPs.
+    let device_port = device_addr
+        .rsplit(':')
+        .next()
+        .and_then(|port| port.parse::<u16>().ok())
+        .unwrap_or(9000);
     tokio::spawn(device::run_tcp(device_addr, registry.clone()));
 
     // Serial-attached devices are discovered by USB identity and probed; no
@@ -63,7 +73,7 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(device::run_serial_discovery(registry.clone()));
     }
 
-    let state = AppState { registry, pose_url };
+    let state = AppState { registry, pose_url, device_port };
 
     let web_dir = std::env::var("DASHBOARD_WEB").unwrap_or_else(|_| "web/dist".into());
     let static_files =
@@ -86,5 +96,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn browser_ws(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
-    ws.on_upgrade(move |socket| browser::handle_browser(socket, state.registry, state.pose_url))
+    ws.on_upgrade(move |socket| {
+        browser::handle_browser(socket, state.registry, state.pose_url, state.device_port)
+    })
 }

@@ -232,6 +232,8 @@ export const api = {
     send({ type: 'set_keymap', bindings }),
   wifi: (ssid: string, psk: string) =>
     send({ type: 'set_wifi', ssid, psk }),
+  server: (addr: string) =>
+    send({ type: 'set_server', addr }),
 } as const;
 
 // Re-export protocol types so panels can import everything from the socket module.
