@@ -7,3 +7,4 @@ target/
 .embuild/
 node_modules/
 dist/
+/tmp

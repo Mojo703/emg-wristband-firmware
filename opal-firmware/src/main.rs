@@ -42,6 +42,50 @@ use transport::{Control, SerialTransport};
 /// Hyser acquisition rate; the window duration paces the stream.
 const SAMPLE_RATE: u32 = 2048;
 
+/// Windows between periodic performance log lines (~31 s at the 244 ms window
+/// period). Long enough that the log stays single events, not spam.
+const PERF_LOG_INTERVAL: u32 = 128;
+
+/// Running inference-latency, total-processing-latency, and loop-throughput stats
+/// between periodic log lines. "Total" is inference plus the reject-pipeline
+/// decision, CBOR frame build, and transport write -- everything the device itself
+/// contributes to onset-to-output latency, short of the acquisition front end (no
+/// ADC yet) and BLE dispatch (not wired into this firmware yet).
+#[derive(Default)]
+struct PerfStats {
+    interval_start: Option<Instant>,
+    count: u32,
+    infer_sum_us: u64,
+    infer_max_us: u64,
+    total_sum_us: u64,
+    total_max_us: u64,
+}
+
+impl PerfStats {
+    /// Record one window's inference time and total processing time (inference
+    /// through frame send, excluding the intentional real-time pacing sleep);
+    /// logs and resets every [`PERF_LOG_INTERVAL`] windows.
+    fn record(&mut self, infer_us: u64, total_us: u64) {
+        let start = *self.interval_start.get_or_insert_with(Instant::now);
+        self.count += 1;
+        self.infer_sum_us += infer_us;
+        self.infer_max_us = self.infer_max_us.max(infer_us);
+        self.total_sum_us += total_us;
+        self.total_max_us = self.total_max_us.max(total_us);
+
+        if self.count >= PERF_LOG_INTERVAL {
+            let infer_mean_us = self.infer_sum_us / self.count as u64;
+            let total_mean_us = self.total_sum_us / self.count as u64;
+            let throughput_hz = self.count as f64 / start.elapsed().as_secs_f64();
+            info!(
+                "inference: mean {infer_mean_us} us | max {} us || total processing: mean {total_mean_us} us | max {} us || throughput {throughput_hz:.1} windows/sec (over {} windows)",
+                self.infer_max_us, self.total_max_us, self.count
+            );
+            *self = PerfStats::default();
+        }
+    }
+}
+
 /// The int8 model blob exported by `emg-tds export-int8`. Embedded and handed to
 /// `emg-runtime`, which also reads its embedded verify windows as the fake provider's
 /// data. Shared with `ml-bench`.
@@ -94,6 +138,7 @@ fn main() -> anyhow::Result<()> {
     let window_us = model.input_len as u64 * 1_000_000 / SAMPLE_RATE as u64;
     let mut seq: u32 = 0;
     let mut prev_wake = WakeState::Idle;
+    let mut perf = PerfStats::default();
 
     loop {
         let iter_start = Instant::now();
@@ -108,9 +153,14 @@ fn main() -> anyhow::Result<()> {
             config_changed |= apply_control(control, &mut settings, &mut pipeline, &store);
         }
 
-        // One window of work.
+        // One window of work. `infer_start` marks where the device's own
+        // contribution to onset-to-output latency begins (acquisition happens
+        // upstream of this, on hardware that doesn't exist yet); `perf.record`
+        // below closes it out after the frames are on the wire.
         let window = provider.next_window();
+        let infer_start = Instant::now();
         let ForwardResult::Logits(raw_logits) = model.forward(&window.input);
+        let infer_us = infer_start.elapsed().as_micros() as u64;
         let logits: [f32; NUM_CLASSES] =
             std::array::from_fn(|class| raw_logits[class] as f32 * model.logit_scale);
         let softmax = softmax(&logits);
@@ -134,6 +184,7 @@ fn main() -> anyhow::Result<()> {
             config: settings.to_wire(),
         });
         links.send_window(hello.as_ref(), &window_frames);
+        perf.record(infer_us, infer_start.elapsed().as_micros() as u64);
 
         prev_wake = decision.wake_state;
         seq = seq.wrapping_add(1);
