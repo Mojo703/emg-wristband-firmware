@@ -1,11 +1,12 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { live, on } from '../lib/socket.svelte';
+  import { theme } from '../lib/theme.svelte';
   import type { PoseFrame, PredictionFrame, EventFrame, ClassInfo } from '../lib/protocol';
   import Icon from '../lib/Icon.svelte';
   import Meter from '../lib/ui/Meter.svelte';
   import Tooltip from '../lib/ui/Tooltip.svelte';
-  import type { PoseRenderer } from '../lib/PoseRenderer';
+  import type { PoseColors, PoseRenderer } from '../lib/PoseRenderer';
 
   let canvas: HTMLCanvasElement | undefined = $state(undefined);
   let renderer: PoseRenderer | null = null;
@@ -18,11 +19,24 @@
   let events = $state<EventFrame[]>([]);
   const MAX_EVENTS = 50;
 
+  // The 3-D scene draws with real WebGL materials, not CSS, so it resolves the same
+  // --surface / palette 'green'/'gray' tokens the 2-D canvas panels use and is kept
+  // in sync whenever the theme flips (see the $effect below).
+  function poseColors(): PoseColors {
+    const surface = getComputedStyle(document.documentElement).getPropertyValue('--surface').trim();
+    return { background: surface, joint: theme.color('green'), bone: theme.color('gray') };
+  }
+
   async function loadRenderer() {
     if (canvas === undefined || renderer !== null) return;
     const { createPoseRenderer } = await import('../lib/PoseRenderer');
-    renderer = createPoseRenderer(canvas);
+    renderer = createPoseRenderer(canvas, poseColors());
   }
+
+  $effect(() => {
+    theme.effective; // reactive dependency
+    renderer?.setColors(poseColors());
+  });
 
   function updatePose(pose: PoseFrame) {
     loadRenderer().then(() => {
@@ -86,7 +100,7 @@
           {#each classes as cls, i}
             {@const value = prediction.softmax[i] ?? 0}
             <div>{cls.label}</div>
-            <Meter {value} color={cls.color} />
+            <Meter {value} color={theme.color(cls.color)} />
             <div>{(value * 100).toFixed(0)}%</div>
           {/each}
         </div>
@@ -100,7 +114,7 @@
           <li class="muted">No events yet.</li>
         {:else}
           {#each events as event}
-            <li style:color={event.color ?? 'inherit'}>
+            <li style:color={theme.color(event.color)}>
               <span class="muted">{formatTime(event.t_us)}</span>
               <strong>{event.kind}</strong>
               {#if event.label}

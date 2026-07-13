@@ -1,7 +1,7 @@
 //! Build the wire frames the device emits: the bulk EMG scope frame, the per-window
-//! prediction, and wake-gate transition events. Colours are the dashboard's concern
-//! (it owns cosmetics), so events carry none here — the device only states what
-//! happened.
+//! prediction, and wake-gate transition events. Colours (named palette keys, not CSS
+//! values — see `protocol::Frame::Event::color`) are the dashboard's concern (it owns
+//! cosmetics), so events carry none here — the device only states what happened.
 
 use crate::config::Settings;
 use emg_runtime::model::{INPUT_CH, NUM_CLASSES};

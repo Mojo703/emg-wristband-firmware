@@ -10,6 +10,7 @@
   // smear the trace. Re-anchor only on a stream reset or a large drift.
   import { onMount } from 'svelte';
   import { live, on } from '../lib/socket.svelte';
+  import { theme } from '../lib/theme.svelte';
   import { WakeState, type ClassInfo, type DecodedEmg, type EventFrame, type PredictionFrame, type StateInfo } from '../lib/protocol';
   import Select from '../lib/ui/Select.svelte';
 
@@ -17,10 +18,48 @@
   const SPAN_OPTIONS = SPANS.map((s) => ({ value: String(s), label: `${s}s` }));
   const MAX_SPAN_SEC = Math.max(...SPANS);
   const BAND_HEIGHT = 24; // wake-state / streak row at the bottom of the track
-  const BG = '#0b0e14';
-  const NEUTRAL = '#6b7280'; // fallback when a backend colour is missing
-  const TRACE = '#8593a8'; // EMG line accent (cosmetic; not class-related)
   const DEFAULT_SPAN = SPANS[Math.floor(SPANS.length / 2)] ?? 10;
+
+  // Chrome colours (background, gridlines, text — anything not per-class) come from
+  // app.css's --canvas-* custom properties, so canvas draws stay in sync with the
+  // active theme. Re-read only when the theme flips (not every frame): canvas 2D
+  // can't reference CSS variables directly, so this is the one place that resolves
+  // them to literal colours for ctx.fillStyle/strokeStyle.
+  interface ChromeColors {
+    readonly bg: string;
+    readonly grid: string;
+    readonly gridFaint: string;
+    readonly label: string;
+    readonly labelFaint: string;
+    readonly labelStrong: string;
+    readonly textStrong: string;
+    readonly tauLine: string;
+    readonly dimOverlay: string;
+    readonly trace: string;
+  }
+  const EMPTY_CHROME: ChromeColors = {
+    bg: '', grid: '', gridFaint: '', label: '', labelFaint: '', labelStrong: '',
+    textStrong: '', tauLine: '', dimOverlay: '', trace: '',
+  };
+  const chromeColors = $derived.by((): ChromeColors => {
+    theme.effective; // reactive dependency: recompute when the theme flips
+    if (canvas === undefined) return EMPTY_CHROME;
+    const cs = getComputedStyle(canvas);
+    const read = (name: keyof ChromeColors): string =>
+      cs.getPropertyValue(`--canvas-${name.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`)}`).trim();
+    return {
+      bg: read('bg'),
+      grid: read('grid'),
+      gridFaint: read('gridFaint'),
+      label: read('label'),
+      labelFaint: read('labelFaint'),
+      labelStrong: read('labelStrong'),
+      textStrong: read('textStrong'),
+      tauLine: read('tauLine'),
+      dimOverlay: read('dimOverlay'),
+      trace: read('trace'),
+    };
+  });
 
   // All per-stream mutable state is grouped into one struct: it is either fully
   // present or fully absent, so there is no chance of `rings` existing while
@@ -200,7 +239,7 @@
     ),
   );
   function classColor(cls: number): string {
-    return classInfo[cls]?.color ?? NEUTRAL;
+    return theme.color(classInfo[cls]?.color);
   }
 
   // Region geometry, the single source of truth for both the canvas signal draw
@@ -254,7 +293,7 @@
     if (ctx === null) return;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0); // draw in CSS pixels
     ctx.clearRect(0, 0, cssWidth, cssHeight);
-    ctx.fillStyle = BG;
+    ctx.fillStyle = chromeColors.bg;
     ctx.fillRect(0, 0, cssWidth, cssHeight);
 
     const width = cssWidth;
@@ -311,7 +350,7 @@
       const t = stream.anchorMs + e.tUs / 1000;
       if (t < passStart || t > now) continue;
       const x = phaseX(t);
-      const color = e.color ?? NEUTRAL;
+      const color = theme.color(e.color);
 
       // Context line down the plot.
       ctx.strokeStyle = color + 'ee';
@@ -333,10 +372,10 @@
       ctx.closePath();
       ctx.fillStyle = color;
       ctx.fill();
-      ctx.strokeStyle = '#0b0e14';
+      ctx.strokeStyle = chromeColors.bg;
       ctx.lineWidth = 1.5;
       ctx.stroke();
-      ctx.strokeStyle = '#e5e7eb';
+      ctx.strokeStyle = chromeColors.textStrong;
       ctx.lineWidth = 0.75;
       ctx.stroke();
 
@@ -353,7 +392,7 @@
     height: number,
     _spanMs: number,
   ): void {
-    ctx.strokeStyle = '#ffffff14';
+    ctx.strokeStyle = chromeColors.grid;
     ctx.lineWidth = 1;
     // Vertical lines at second boundaries (sweep x is fixed for a given offset).
     for (let s = 0; s <= spanSec; s++) {
@@ -402,7 +441,7 @@
       const ring = stream.rings[ch]!; // ch < channels by loop invariant
 
       // Faint baseline + lane separator: this is the "empty / future" look.
-      ctx.strokeStyle = '#ffffff10';
+      ctx.strokeStyle = chromeColors.gridFaint;
       ctx.beginPath();
       ctx.moveTo(0, midY);
       ctx.lineTo(width, midY);
@@ -421,7 +460,7 @@
       }
       const gain = (laneHeight * 0.42) / peak;
 
-      ctx.strokeStyle = TRACE;
+      ctx.strokeStyle = chromeColors.trace;
       ctx.lineWidth = 1;
       ctx.beginPath();
       if (useEnvelope) {
@@ -580,7 +619,7 @@
     const yFor = (v: number): number => confBottom - v * (confHeight - 6) - 3;
 
     // Confidence frame + 50% line.
-    ctx.strokeStyle = '#ffffff14';
+    ctx.strokeStyle = chromeColors.grid;
     ctx.beginPath();
     ctx.moveTo(0, top);
     ctx.lineTo(width, top);
@@ -591,7 +630,7 @@
     // τ threshold line (the per-window trigger level) — plain dashed line. The
     // "τ" label itself is drawn by the DOM overlay (chrome.tauY).
     const yTau = yFor(tauLine);
-    ctx.strokeStyle = '#e5e7eb55';
+    ctx.strokeStyle = chromeColors.tauLine;
     ctx.setLineDash([4, 4]);
     ctx.beginPath();
     ctx.moveTo(0, yTau);
@@ -669,7 +708,7 @@
       const x1 = i + 1 < visible.length ? visible[i + 1]!.x : xNow;
       const progress = Math.min(a.streak / needed, 1); // 0 → idle, 1 → latched
       ctx.globalAlpha = idleAlpha + (activeAlpha - idleAlpha) * progress;
-      ctx.fillStyle = a.streak === 0 ? NEUTRAL : classColor(a.argmax);
+      ctx.fillStyle = a.streak === 0 ? theme.color(null) : classColor(a.argmax);
       ctx.fillRect(a.x, bandTop, Math.max(0, x1 - a.x), bandHeight);
     }
     ctx.globalAlpha = 1;
@@ -724,7 +763,7 @@
   <div class="legend">
     {#each classInfo as info}
       <span class="legend-item">
-        <span class="swatch" style="background: {info.color}"></span>
+        <span class="swatch" style:background={theme.color(info.color)}></span>
         {info.label}
       </span>
     {/each}
@@ -752,28 +791,28 @@
   }
   .chan-label {
     left: 6px;
-    color: #ffffff77;
+    color: var(--canvas-label);
   }
   .region-label {
     left: 6px;
-    color: #ffffff66;
+    color: var(--canvas-label-faint);
   }
   .tau-label {
     right: 14px;
-    color: #e5e7eb99;
+    color: var(--canvas-label-strong);
     transform: translateY(-100%);
   }
   .event-label {
-    color: #e5e7eb;
+    color: var(--canvas-text-strong);
     transform: translate(-50%, -100%);
-    text-shadow: 0 0 3px #0b0e14;
+    text-shadow: 0 0 3px var(--canvas-bg);
   }
   .future {
     position: absolute;
     top: 0;
     bottom: 0;
     right: 0;
-    background: #0b0e1466;
+    background: var(--canvas-dim-overlay);
   }
   .cursor {
     position: absolute;
@@ -781,7 +820,7 @@
     bottom: 0;
     left: 0;
     width: 1px;
-    background: #e5e7eb;
+    background: var(--canvas-text-strong);
   }
 
   .legend {

@@ -3,10 +3,20 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <!-- The dashboard ships its own dark theme; tell Dark Reader to stay out so it
-         doesn't recolor form controls (it was tinting selects/inputs red). -->
+    <!-- The dashboard ships its own light/dark theme; tell Dark Reader to stay out so
+         it doesn't recolor form controls (it was tinting selects/inputs red). -->
     <meta name="darkreader-lock" />
     <title>Opal · Cairn Kinetics</title>
+    <!-- Stamp data-theme before first paint so there's no flash of the wrong theme;
+         lib/theme.svelte.ts owns this logic afterward and keeps the attribute synced. -->
+    <script>
+      (function () {
+        var stored = localStorage.getItem('opal-theme');
+        var choice = stored === 'light' || stored === 'dark' ? stored : 'system';
+        var dark = choice === 'system' ? matchMedia('(prefers-color-scheme: dark)').matches : choice === 'dark';
+        document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
+      })();
+    </script>
   </head>
   <body>
     <div id="app"></div>

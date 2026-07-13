@@ -104,7 +104,9 @@ pub enum Frame {
         kind: String,
         /// Optional text to render beside the line (e.g. the media key that fired).
         label: Option<String>,
-        /// Optional CSS colour; the frontend falls back to a neutral default.
+        /// Optional named palette colour (see `dashboard/src/looks.rs` and the
+        /// frontend's `lib/palette.ts`); the frontend falls back to a neutral
+        /// default for `None` or an unrecognised name.
         color: Option<String>,
     },
 
@@ -237,7 +239,9 @@ pub struct SensitivityLevel {
 pub struct ClassInfo {
     /// Human label, e.g. "C0 · Play/Pause" or "reject".
     pub label: String,
-    /// CSS colour for this class's confidence line, legend swatch, and band fill.
+    /// Named palette colour (see `dashboard/src/looks.rs` and the frontend's
+    /// `lib/palette.ts`) for this class's confidence line, legend swatch, and band
+    /// fill.
     pub color: String,
     /// True for a real command class, false for reject/rest classes.
     pub command: bool,
@@ -251,7 +255,8 @@ pub struct StateInfo {
     /// Matches the `WakeState` snake_case name ("idle"/"arming"/"active").
     pub name: String,
     pub label: String,
-    /// CSS colour for the status badge.
+    /// Named palette colour (see `dashboard/src/looks.rs` and the frontend's
+    /// `lib/palette.ts`) for the status badge.
     pub color: String,
     /// Band opacity 0..=1 for this state.
     pub intensity: f32,

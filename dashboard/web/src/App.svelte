@@ -4,12 +4,19 @@
   import * as Tooltip from '$lib/components/ui/tooltip/index.js';
   import { panels } from './lib/panels';
   import { connect, live, api } from './lib/socket.svelte';
+  import { theme, type ThemeChoice } from './lib/theme.svelte';
   import Icon from './lib/Icon.svelte';
   import Select from './lib/ui/Select.svelte';
   import StreamMonitor from './lib/StreamMonitor.svelte';
 
   const firstPanel = panels[0]!;
   let active = $state<string>(firstPanel.id);
+
+  const THEME_CHOICES: readonly { readonly value: ThemeChoice; readonly icon: string; readonly title: string }[] = [
+    { value: 'system', icon: 'monitor', title: 'Follow system theme' },
+    { value: 'light', icon: 'sun', title: 'Light theme' },
+    { value: 'dark', icon: 'moon', title: 'Dark theme' },
+  ];
 
   // Which device the dashboard is viewing. The list and selection are owned by the
   // backend (it tracks every connected device); selecting one routes its stream and
@@ -56,6 +63,18 @@
           {live.connected ? 'backend online' : 'backend offline'}
         </div>
         <StreamMonitor />
+        <div class="theme-toggle" role="group" aria-label="Colour theme">
+          {#each THEME_CHOICES as { value, icon, title } (value)}
+            <button
+              type="button"
+              title={title}
+              aria-pressed={theme.choice === value}
+              onclick={() => theme.set(value)}
+            >
+              <Icon name={icon} size={14} />
+            </button>
+          {/each}
+        </div>
       </div>
     </div>
 

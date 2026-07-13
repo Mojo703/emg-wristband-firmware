@@ -3,12 +3,24 @@
 @import "shadcn-svelte/tailwind.css";
 @import "@fontsource-variable/inter";
 
-/* shadcn-svelte neutral theme, dark values in :root — the dashboard is dark only,
-   so there is no light mode to toggle. Two non-shadcn tokens are kept: --surface
-   (the signal canvas backdrop) and --success (the live-connection accent). */
+/* Tailwind's `dark:` variant defaults to `prefers-color-scheme`. The dashboard's
+   theme is a user choice (system/light/dark) stamped onto <html data-theme="…"> by
+   lib/theme.svelte.ts, so repoint `dark:` at that attribute — this keeps shadcn-svelte
+   primitives (button, select, …) in sync with the same choice as everything else. */
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
 :root {
-  color-scheme: dark;
   --radius: 0.625rem;
+}
+
+/* shadcn-svelte neutral theme. Both light and dark are full token sets (not diffs)
+   so each theme's contrast can be tuned independently rather than inherited. Two
+   non-shadcn tokens are kept: --surface (the signal canvas backdrop) and --success
+   (the live-connection accent). Canvas-only tokens (--canvas-*) are defined once,
+   below both blocks, mostly via color-mix against --foreground/--background so they
+   track the theme automatically without their own literal per theme. */
+:root[data-theme="dark"] {
+  color-scheme: dark;
   --background: oklch(0.145 0 0);
   --foreground: oklch(0.985 0 0);
   --card: oklch(0.205 0 0);
@@ -42,12 +54,73 @@
   --sidebar-ring: var(--brand);
 
   /* Cairn Kinetics brand. The logo navy (#1b2541) is too dark to read as an accent
-     on a dark UI, so the accent is its hue lifted to a usable lightness. --surface
-     is the signal-canvas backdrop; --success is the live-connection green. */
+     on a dark UI, so the accent is its hue lifted to a usable lightness. */
   --brand: oklch(0.62 0.13 262);
   --brand-foreground: oklch(0.985 0 0);
+  /* Foreground used for text sitting on a pale --brand-tinted highlight (the active
+     nav item) — needs its own value per theme since it must contrast the tint, not
+     the page background. */
+  --brand-tint-foreground: oklch(0.92 0.04 262);
   --surface: #0b0e14;
   --success: #22c55e;
+
+  /* Log-level text (LogViewer.svelte). */
+  --log-error: #f87171;
+  --log-warn: #fbbf24;
+  --log-info: #60a5fa;
+
+  /* EMG line accent (EmgViewer/StreamMonitor canvas trace) — cosmetic, not
+     class-related, so it lives here rather than in palette.ts. */
+  --canvas-trace: #8593a8;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.145 0 0);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.145 0 0);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.145 0 0);
+  --primary: var(--brand);
+  --primary-foreground: var(--brand-foreground);
+  --secondary: oklch(0.97 0 0);
+  --secondary-foreground: oklch(0.205 0 0);
+  --muted: oklch(0.97 0 0);
+  --muted-foreground: oklch(0.556 0 0);
+  --accent: oklch(0.97 0 0);
+  --accent-foreground: oklch(0.205 0 0);
+  --destructive: oklch(0.577 0.245 27.325);
+  --border: oklch(0.922 0 0);
+  --input: oklch(0.922 0 0);
+  --ring: var(--brand);
+  --chart-1: oklch(0.646 0.222 41.116);
+  --chart-2: oklch(0.6 0.118 184.704);
+  --chart-3: oklch(0.398 0.07 227.392);
+  --chart-4: oklch(0.828 0.189 84.429);
+  --chart-5: oklch(0.769 0.188 70.08);
+  --sidebar: oklch(0.985 0 0);
+  --sidebar-foreground: oklch(0.145 0 0);
+  --sidebar-primary: var(--brand);
+  --sidebar-primary-foreground: var(--brand-foreground);
+  --sidebar-accent: oklch(0.97 0 0);
+  --sidebar-accent-foreground: oklch(0.205 0 0);
+  --sidebar-border: oklch(0.922 0 0);
+  --sidebar-ring: var(--brand);
+
+  /* Same brand hue as dark, lifted darker/more saturated so it still holds contrast
+     on a white background. */
+  --brand: oklch(0.48 0.15 262);
+  --brand-foreground: oklch(0.985 0 0);
+  --brand-tint-foreground: oklch(0.32 0.12 262);
+  --surface: #f8fafc;
+  --success: #16a34a;
+
+  --log-error: #dc2626;
+  --log-warn: #b45309;
+  --log-info: #2563eb;
+
+  --canvas-trace: #64748b;
 }
 
 /* Maps the theme tokens above to Tailwind utilities (bg-background, border-border,
@@ -91,6 +164,23 @@
   --radius-xl: calc(var(--radius) + 4px);
 }
 
+/* Canvas chrome shared by EmgViewer's signal plot and StreamMonitor's rate graph:
+   background, gridlines, and text that aren't per-class (those come from
+   palette.ts via theme.color()). Derived from --foreground/--background with
+   color-mix so both themes fall out of the same rule instead of needing their own
+   literal — add a theme, and these adapt for free. */
+:root {
+  --canvas-bg: var(--surface);
+  --canvas-grid: color-mix(in oklab, var(--foreground) 8%, transparent);
+  --canvas-grid-faint: color-mix(in oklab, var(--foreground) 6%, transparent);
+  --canvas-label: color-mix(in oklab, var(--foreground) 47%, transparent);
+  --canvas-label-faint: color-mix(in oklab, var(--foreground) 40%, transparent);
+  --canvas-label-strong: color-mix(in oklab, var(--foreground) 60%, transparent);
+  --canvas-text-strong: var(--foreground);
+  --canvas-tau-line: color-mix(in oklab, var(--foreground) 33%, transparent);
+  --canvas-dim-overlay: color-mix(in oklab, var(--canvas-bg) 40%, transparent);
+}
+
 * { box-sizing: border-box; }
 
 /* Layout chrome. Components come from shadcn-svelte; these are the app shell, the
@@ -104,7 +194,7 @@
 .nav { display: flex; flex-direction: column; gap: 4px; }
 .nav-item { display: flex; align-items: center; gap: 8px; padding: 8px; border: none; background: none; text-align: left; cursor: pointer; border-radius: var(--radius); font: inherit; color: inherit; width: 100%; }
 .nav-item:hover { background: var(--muted); }
-.nav-item[data-state="active"] { background: color-mix(in oklab, var(--brand) 22%, transparent); color: oklch(0.92 0.04 262); }
+.nav-item[data-state="active"] { background: color-mix(in oklab, var(--brand) 22%, transparent); color: var(--brand-tint-foreground); }
 .sidebar .statusbar { margin-top: auto; display: flex; flex-direction: column; }
 .sidebar .status { padding: 8px; font-size: 12px; color: var(--muted-foreground); display: flex; align-items: center; gap: 6px; }
 .sidebar .status.on { color: var(--success); }
@@ -127,6 +217,28 @@ td, th { padding: 6px 10px; text-align: left; }
 
 /* The pose panel's floating reset control (a Tooltip trigger button). */
 .home-btn { position: absolute; top: 12px; right: 12px; z-index: 1; }
+
+/* The theme toggle (App.svelte), a three-position segmented control in the sidebar
+   footer. */
+.theme-toggle { display: flex; gap: 2px; padding: 8px 8px 0; }
+.theme-toggle button {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 6px 0;
+  border: 1px solid var(--border);
+  background: none;
+  color: var(--muted-foreground);
+  cursor: pointer;
+  border-radius: var(--radius);
+}
+.theme-toggle button:hover { background: var(--muted); }
+.theme-toggle button[aria-pressed="true"] {
+  background: color-mix(in oklab, var(--brand) 18%, transparent);
+  color: var(--brand-tint-foreground);
+  border-color: color-mix(in oklab, var(--brand) 40%, transparent);
+}
 
 @layer base {
 	* {

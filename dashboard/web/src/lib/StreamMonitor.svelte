@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { on, live } from './socket.svelte';
+  import { theme } from './theme.svelte';
 
   // A scrolling frame-rate monitor of the device→backend→browser pipe. EMG arrivals are
   // bucketed into fixed time slots; the canvas plots the received rate (fill) against the
@@ -15,9 +16,21 @@
   let head = 0; // index of the bucket currently filling
   let target = $state(0); // frames/sec needed to keep up with real time
 
-  let fill = 'rgba(120,160,255,0.35)';
-  let stroke = 'rgba(120,160,255,0.9)';
-  let line = 'rgba(160,160,170,0.7)';
+  // Read from the same --brand / --muted-foreground tokens app.css themes, so this
+  // graph never needs its own light/dark colours. Recomputed whenever the theme
+  // flips (not every frame — canvas can't read CSS variables directly, so this is
+  // the one place that resolves them to literal colours).
+  const strokeColors = $derived.by(() => {
+    theme.effective; // reactive dependency
+    const css = getComputedStyle(document.documentElement);
+    const brand = css.getPropertyValue('--brand').trim() || 'rgba(120,160,255,0.9)';
+    const muted = css.getPropertyValue('--muted-foreground').trim() || 'rgba(160,160,170,0.7)';
+    return {
+      fill: `color-mix(in oklab, ${brand} 35%, transparent)`,
+      stroke: brand,
+      line: muted,
+    };
+  });
 
   // The selected device's transport, e.g. "Serial" or "Wifi (myhome)", so the pipe
   // this panel monitors is named. Null while no device is selected.
@@ -31,15 +44,6 @@
   });
 
   onMount(() => {
-    const css = getComputedStyle(document.documentElement);
-    const brand = css.getPropertyValue('--brand').trim();
-    if (brand) {
-      fill = `color-mix(in oklab, ${brand} 35%, transparent)`;
-      stroke = brand;
-    }
-    const muted = css.getPropertyValue('--muted-foreground').trim();
-    if (muted) line = muted;
-
     const off = on('emg', (emg) => {
       counts[head] = (counts[head] ?? 0) + 1;
       if (emg.time > 0) target = emg.sampleRate / emg.time;
@@ -88,15 +92,15 @@
     }
     ctx.lineTo(w, h);
     ctx.closePath();
-    ctx.fillStyle = fill;
+    ctx.fillStyle = strokeColors.fill;
     ctx.fill();
-    ctx.strokeStyle = stroke;
+    ctx.strokeStyle = strokeColors.stroke;
     ctx.lineWidth = 1;
     ctx.stroke();
 
     // Real-time target: everything below this line is signal the browser isn't getting.
     if (target > 0) {
-      ctx.strokeStyle = line;
+      ctx.strokeStyle = strokeColors.line;
       ctx.setLineDash([3, 3]);
       ctx.beginPath();
       ctx.moveTo(0, y(target));

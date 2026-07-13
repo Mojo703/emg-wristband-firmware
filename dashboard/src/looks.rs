@@ -1,17 +1,25 @@
 //! The backend's cosmetic layer — the only thing it owns that the device does not.
 //! It projects a device's functional [`DeviceConfig`] into per-class and per-state
-//! render hints (colours/labels) for the browser. It invents no functional values
+//! render hints (names/labels) for the browser. It invents no functional values
 //! and assumes no fixed gesture count: the palette is indexed modulo its length, so
 //! any number of classes renders.
+//!
+//! Colours are sent as named palette keys ("blue", "green", …), not CSS values: the
+//! frontend's `lib/palette.ts` owns the name → light/dark colour mapping (see
+//! `dashboard/web/src/lib/theme.svelte.ts`'s `color()`), so a theme can change
+//! independently of this file and an unrecognised name degrades to grey instead of
+//! breaking. To add a colour, add it to both this array and `palette.ts`.
 
 use protocol::{ClassInfo, DeviceConfig, MediaKey, StateInfo};
 
-/// Per-class line/legend/band colours. Indexed `class % len`, so it never runs out.
-const CLASS_PALETTE: [&str; 8] =
-    ["#3b82f6", "#22c55e", "#f59e0b", "#a855f7", "#ec4899", "#14b8a6", "#f97316", "#60a5fa"];
+/// Per-class line/legend/band colour names. Indexed `class % len`, so it never runs
+/// out. Must match a key in the frontend's `PALETTE` (`lib/palette.ts`).
+const CLASS_PALETTE: [&str; 8] = [
+    "blue", "green", "amber", "purple", "pink", "teal", "orange", "sky",
+];
 
-/// The palette colour for a class index — the single source for line, legend, band,
-/// and commit-marker colour.
+/// The palette colour name for a class index — the single source for line, legend,
+/// band, and commit-marker colour.
 pub fn class_color(gesture: u8) -> &'static str {
     CLASS_PALETTE[gesture as usize % CLASS_PALETTE.len()]
 }
@@ -43,7 +51,11 @@ pub fn classes_for(config: &DeviceConfig) -> Vec<ClassInfo> {
                 Some(name) => format!("C{gesture} · {name}"),
                 None => format!("C{gesture}"),
             };
-            ClassInfo { label, color: class_color(gesture).to_string(), command: true }
+            ClassInfo {
+                label,
+                color: class_color(gesture).to_string(),
+                command: true,
+            }
         })
         .collect()
 }
@@ -53,8 +65,23 @@ pub fn classes_for(config: &DeviceConfig) -> Vec<ClassInfo> {
 /// by hue. The names match `protocol::WakeState`'s snake_case.
 pub fn states() -> Vec<StateInfo> {
     vec![
-        StateInfo { name: "idle".into(), label: "idle".into(), color: "#6b7280".into(), intensity: 0.12 },
-        StateInfo { name: "arming".into(), label: "arming".into(), color: "#f59e0b".into(), intensity: 0.45 },
-        StateInfo { name: "active".into(), label: "active".into(), color: "#22c55e".into(), intensity: 0.9 },
+        StateInfo {
+            name: "idle".into(),
+            label: "idle".into(),
+            color: "gray".into(),
+            intensity: 0.12,
+        },
+        StateInfo {
+            name: "arming".into(),
+            label: "arming".into(),
+            color: "amber".into(),
+            intensity: 0.45,
+        },
+        StateInfo {
+            name: "active".into(),
+            label: "active".into(),
+            color: "green".into(),
+            intensity: 0.9,
+        },
     ]
 }

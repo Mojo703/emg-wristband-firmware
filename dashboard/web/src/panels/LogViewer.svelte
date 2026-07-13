@@ -101,9 +101,9 @@
   .level {
     font-weight: 600;
   }
-  .level-error .level { color: #f87171; }
-  .level-warn .level { color: #fbbf24; }
-  .level-info .level { color: #60a5fa; }
+  .level-error .level { color: var(--log-error); }
+  .level-warn .level { color: var(--log-warn); }
+  .level-info .level { color: var(--log-info); }
   .level-debug .level { color: var(--muted-foreground); }
   .empty {
     padding: 12px 4px;

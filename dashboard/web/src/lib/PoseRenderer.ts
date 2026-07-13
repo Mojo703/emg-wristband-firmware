@@ -31,17 +31,27 @@ const CONNECTIONS: Record<string, readonly [number, number][]> = {
   ],
 };
 
+/** Theme-dependent colours for the 3-D scene — the canvas draws these directly
+ * (WebGL materials, not CSS), so the caller resolves them from app.css's tokens /
+ * palette.ts and passes them in; see `PoseViewer.svelte`. */
+export interface PoseColors {
+  readonly background: string;
+  readonly joint: string;
+  readonly bone: string;
+}
+
 export interface PoseRenderer {
   readonly format: string;
   updatePose(format: string, joints: readonly (readonly [number, number, number])[], confidence: number): void;
+  setColors(colors: PoseColors): void;
   resize(): void;
   resetView(): void;
   dispose(): void;
 }
 
-export function createPoseRenderer(canvas: HTMLCanvasElement): PoseRenderer {
+export function createPoseRenderer(canvas: HTMLCanvasElement, colors: PoseColors): PoseRenderer {
   const scene = new THREE.Scene();
-  scene.background = new THREE.Color('#0b0e14');
+  scene.background = new THREE.Color(colors.background);
 
   const camera = new THREE.PerspectiveCamera(45, canvas.clientWidth / canvas.clientHeight, 0.01, 100);
   const initialCameraPosition = new THREE.Vector3(0, 0.15, 0.25);
@@ -77,8 +87,15 @@ export function createPoseRenderer(canvas: HTMLCanvasElement): PoseRenderer {
   let pageVisible = !document.hidden;
 
   const jointGeometry = new THREE.SphereGeometry(0.004, 16, 16);
-  const jointMaterial = new THREE.MeshStandardMaterial({ color: '#22c55e' });
-  const boneMaterial = new THREE.LineBasicMaterial({ color: '#e5e7eb', linewidth: 2 });
+  const jointMaterial = new THREE.MeshStandardMaterial({ color: colors.joint });
+  const boneMaterial = new THREE.LineBasicMaterial({ color: colors.bone, linewidth: 2 });
+
+  function setColors(next: PoseColors): void {
+    scene.background = new THREE.Color(next.background);
+    jointMaterial.color.set(next.joint);
+    boneMaterial.color.set(next.bone);
+    scheduleRender();
+  }
 
   function clearMeshes() {
     for (const child of [...handGroup.children]) {
@@ -215,6 +232,7 @@ export function createPoseRenderer(canvas: HTMLCanvasElement): PoseRenderer {
       return currentFormat;
     },
     updatePose,
+    setColors,
     resize,
     resetView,
     dispose,

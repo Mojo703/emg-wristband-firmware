@@ -57,6 +57,7 @@ export type FrameType = (typeof FrameType)[keyof typeof FrameType];
 
 export interface ClassInfo {
   readonly label: string;
+  /** A named palette colour (see `lib/palette.ts`), resolved per theme with `theme.color()`. */
   readonly color: string;
   readonly command: boolean;
 }
@@ -64,6 +65,7 @@ export interface ClassInfo {
 export interface StateInfo {
   readonly name: string;
   readonly label: string;
+  /** A named palette colour (see `lib/palette.ts`), resolved per theme with `theme.color()`. */
   readonly color: string;
   readonly intensity: number;
 }
@@ -154,6 +156,7 @@ export interface EventFrame {
   readonly t_us: number;
   readonly kind: string;
   readonly label: string | null;
+  /** A named palette colour (see `lib/palette.ts`), resolved per theme with `theme.color()`. */
   readonly color: string | null;
 }
 
