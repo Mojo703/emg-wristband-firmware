@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { Tabs } from 'bits-ui';
+  import { Tabs, ToggleGroup } from 'bits-ui';
   import * as Tooltip from '$lib/components/ui/tooltip/index.js';
   import { panels } from './lib/panels';
   import { connect, live, api } from './lib/socket.svelte';
@@ -17,6 +17,15 @@
     { value: 'light', icon: 'sun', title: 'Light theme' },
     { value: 'dark', icon: 'moon', title: 'Dark theme' },
   ];
+  const THEME_INDEX: Record<ThemeChoice, number> = { system: 0, light: 1, dark: 2 };
+  const themeIndex = $derived(THEME_INDEX[theme.choice]);
+
+  // bits-ui's single-select ToggleGroup deselects (emits "") when the pressed item
+  // is clicked again — fine for a toolbar, wrong for a theme picker, which must
+  // always have exactly one of the three selected. Ignore the empty emission.
+  function onThemeChange(value: string): void {
+    if (value === 'system' || value === 'light' || value === 'dark') theme.set(value);
+  }
 
   // Which device the dashboard is viewing. The list and selection are owned by the
   // backend (it tracks every connected device); selecting one routes its stream and
@@ -63,18 +72,20 @@
           {live.connected ? 'backend online' : 'backend offline'}
         </div>
         <StreamMonitor />
-        <div class="theme-toggle" role="group" aria-label="Colour theme">
+        <ToggleGroup.Root
+          type="single"
+          value={theme.choice}
+          onValueChange={onThemeChange}
+          class="theme-toggle"
+          aria-label="Colour theme"
+        >
+          <span class="theme-toggle-thumb" style:--index={themeIndex}></span>
           {#each THEME_CHOICES as { value, icon, title } (value)}
-            <button
-              type="button"
-              title={title}
-              aria-pressed={theme.choice === value}
-              onclick={() => theme.set(value)}
-            >
+            <ToggleGroup.Item {value} title={title} class="theme-toggle-item">
               <Icon name={icon} size={14} />
-            </button>
+            </ToggleGroup.Item>
           {/each}
-        </div>
+        </ToggleGroup.Root>
       </div>
     </div>
 
