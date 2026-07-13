@@ -6,7 +6,15 @@
 // independently of the backend and an unrecognised name degrades to `gray` instead
 // of breaking.
 //
-// To add a colour: add one entry below. No other file needs to change.
+// Values are step 11 ("low-contrast text") from Radix Colors (radix-ui/colors,
+// MIT), pulled from its light.ts/dark.ts — the step Radix tunes specifically for
+// coloured text/lines against that theme's page background, which is how these are
+// used (confidence lines, legend swatches, log levels). Not hand-picked, so a light
+// and dark value are never off-hand mixes of different shade levels.
+//
+// To add a colour: look up the hue's `<name>11` (light.ts) and `<name>Dark11`
+// (dark.ts) at https://github.com/radix-ui/colors and add one entry below. No
+// other file needs to change.
 export type ThemeMode = 'light' | 'dark';
 
 interface ColorPair {
@@ -15,15 +23,15 @@ interface ColorPair {
 }
 
 const PALETTE: Record<string, ColorPair> = {
-  blue: { dark: '#3b82f6', light: '#2563eb' },
-  green: { dark: '#22c55e', light: '#16a34a' },
-  amber: { dark: '#f59e0b', light: '#b45309' },
-  purple: { dark: '#a855f7', light: '#9333ea' },
-  pink: { dark: '#ec4899', light: '#db2777' },
-  teal: { dark: '#14b8a6', light: '#0f766e' },
-  orange: { dark: '#f97316', light: '#c2410c' },
-  sky: { dark: '#60a5fa', light: '#2563eb' },
-  gray: { dark: '#6b7280', light: '#57606a' },
+  blue: { light: '#0d74ce', dark: '#70b8ff' },
+  green: { light: '#218358', dark: '#3dd68c' },
+  amber: { light: '#ab6400', dark: '#ffca16' },
+  purple: { light: '#8145b5', dark: '#d19dff' },
+  pink: { light: '#c2298a', dark: '#ff8dcc' },
+  teal: { light: '#008573', dark: '#0bd8b6' },
+  orange: { light: '#cc4e00', dark: '#ffa057' },
+  sky: { light: '#00749e', dark: '#75c7f0' },
+  gray: { light: '#646464', dark: '#b4b4b4' },
 };
 
 const FALLBACK_NAME = 'gray';

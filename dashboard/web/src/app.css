@@ -62,16 +62,19 @@
      the page background. */
   --brand-tint-foreground: oklch(0.92 0.04 262);
   --surface: #0b0e14;
-  --success: #22c55e;
+  /* Radix Colors greenDark11 — see palette.ts for why (this is the same "coloured
+     text on this theme's background" step, just for the connection-status dot). */
+  --success: #3dd68c;
 
-  /* Log-level text (LogViewer.svelte). */
-  --log-error: #f87171;
-  --log-warn: #fbbf24;
-  --log-info: #60a5fa;
+  /* Log-level text (LogViewer.svelte). Radix Colors step 11 per hue, dark.ts. */
+  --log-error: #ff9592;
+  --log-warn: #ffca16;
+  --log-info: #70b8ff;
 
   /* EMG line accent (EmgViewer/StreamMonitor canvas trace) — cosmetic, not
-     class-related, so it lives here rather than in palette.ts. */
-  --canvas-trace: #8593a8;
+     class-related, so it lives here rather than in palette.ts. Radix Colors
+     slateDark11. */
+  --canvas-trace: #b0b4ba;
 }
 
 :root[data-theme="light"] {
@@ -114,13 +117,16 @@
   --brand-foreground: oklch(0.985 0 0);
   --brand-tint-foreground: oklch(0.32 0.12 262);
   --surface: #f8fafc;
-  --success: #16a34a;
+  /* Radix Colors green11 (light.ts) — matches --success in the dark block. */
+  --success: #218358;
 
-  --log-error: #dc2626;
-  --log-warn: #b45309;
-  --log-info: #2563eb;
+  /* Log-level text (LogViewer.svelte). Radix Colors step 11 per hue, light.ts. */
+  --log-error: #ce2c31;
+  --log-warn: #ab6400;
+  --log-info: #0d74ce;
 
-  --canvas-trace: #64748b;
+  /* EMG line accent — cosmetic, not class-related. Radix Colors slate11. */
+  --canvas-trace: #60646c;
 }
 
 /* Maps the theme tokens above to Tailwind utilities (bg-background, border-border,
