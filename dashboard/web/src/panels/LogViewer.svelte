@@ -89,17 +89,28 @@
     font-size: 12px;
     line-height: 1.5;
   }
+  /* Grid, not flex: a flex row lets a long message's shrink squeeze the timestamp
+     and level columns too, and word-break then force-breaks them mid-word (no
+     space to break at). max-content (not a fixed ch width) sizes each column to
+     its own row's text, so a timestamp that outgrows the usual padded width still
+     gets a whole column instead of wrapping. Only .message is allowed to wrap. */
   .line {
-    display: flex;
+    display: grid;
+    grid-template-columns: max-content max-content 1fr;
     gap: 10px;
-    white-space: pre-wrap;
-    word-break: break-word;
   }
   .t {
     color: var(--muted-foreground);
+    white-space: nowrap;
   }
   .level {
     font-weight: 600;
+    white-space: nowrap;
+  }
+  .message {
+    min-width: 0;
+    white-space: pre-wrap;
+    word-break: break-word;
   }
   .level-error .level { color: var(--log-error); }
   .level-warn .level { color: var(--log-warn); }
