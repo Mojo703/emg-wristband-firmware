@@ -26,6 +26,7 @@ log = "0.4"
 esp-idf-svc = "0.52"
 anyhow = "1"
 toml-cfg = "0.2"
+sampling-utils = { path = "../sampling-utils" }
 
 [build-dependencies]
 embuild = "0.33"

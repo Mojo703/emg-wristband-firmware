@@ -1,0 +1,9 @@
+# Empty workspace table makes this a workspace root so cargo doesn't attach it
+# to an unrelated Cargo.toml higher up the directory tree.
+[workspace]
+
+[package]
+name = "sampling-utils"
+version = "0.1.0"
+edition = "2021"
+description = "Pure decode/LOFF/voltage-conversion utilities for ADS1298 sEMG sampling, no hardware dependencies so it host-builds and host-tests"

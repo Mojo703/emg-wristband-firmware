@@ -1139,6 +1139,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "sampling-utils"
+version = "0.1.0"
+
+[[package]]
 name = "semg-daq"
 version = "0.1.0"
 dependencies = [
@@ -1146,6 +1150,7 @@ dependencies = [
  "embuild",
  "esp-idf-svc",
  "log",
+ "sampling-utils",
  "toml-cfg",
 ]
 

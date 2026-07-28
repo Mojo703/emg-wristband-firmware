@@ -7,44 +7,47 @@ use esp_idf_svc::hal::delay::FreeRtos;
 use esp_idf_svc::hal::gpio::{Input, Output, PinDriver};
 use esp_idf_svc::hal::spi::{Operation, SpiDeviceDriver, SpiDriver};
 
+use sampling_utils::decode::parse_sample;
+pub use sampling_utils::decode::{Sample, Frame, CHANNELS_PER_DEVICE, FRAME_BYTES};
+
 use crate::registers::Register;
 use crate::spi_commands;
 
-pub const CHANNELS_PER_DEVICE: usize = 8;
-pub const DEVICE_COUNT: usize = 2;
-const STATUS_BYTES: usize = 3;
-const BYTES_PER_CHANNEL: usize = 3;
-pub const FRAME_BYTES: usize = STATUS_BYTES + CHANNELS_PER_DEVICE * BYTES_PER_CHANNEL; // 27
-
-/// Decoded status word + 8 sign-extended 24-bit channel codes for one device
-#[derive(Debug, Clone, Copy)]
-pub struct Sample {
-    pub status: u32,
-    pub channels: [i32; CHANNELS_PER_DEVICE],
-}
-
-/// One frame is a sample from each of the two cascaded devices
-#[derive(Debug, Clone, Copy)]
-pub struct Frame {
-    pub devices: [Sample; DEVICE_COUNT],
+/// Which cascaded device this is — determines which registers differ
+/// (CONFIG1.CLK_EN, CONFIG3.PD_RLD, RLD_SENSP/N). See CLAUDE_HANDOFF.md.
+#[derive(Clone, Copy, Debug)]
+pub enum ChipRole {
+    /// Clock master: drives CLK out to the other device (CONFIG1.CLK_EN=1)
+    A,
+    /// Clock slave: receives CLK from the master (CONFIG1.CLK_EN=0)
+    B,
 }
 
 /// One ADS1298 addressed via its own dedicated CS on the shared SPI bus
-/// Each ADC also has its own DRDY pin, however START is tied together
+/// Each ADC also has its own DRDY and RESET pin, however START is tied together
 /// so they DRDY pins should pull at same time 
 pub struct Ads1298Device<'d> {
     spi: SpiDeviceDriver<'d, &'d SpiDriver<'d>>,
     drdy: PinDriver<'d, Input>,
+    reset_n: PinDriver<'d, Output>,
+    pwdn: PinDriver<'d, Output>,
 }
 
 impl<'d> Ads1298Device<'d> {
-    pub fn new(spi: SpiDeviceDriver<'d, &'d SpiDriver<'d>>, drdy: PinDriver<'d, Input>) -> Self {
-        Self { spi, drdy }
+    pub fn new(spi: SpiDeviceDriver<'d, &'d SpiDriver<'d>>, drdy: PinDriver<'d, Input>, reset_n: PinDriver<'d, Output>, pwdn: PinDriver<'d, Output>) -> Self {
+        Self { spi, drdy, reset_n, pwdn }
     }
 
     /// DRDY is active-low. It falls when a new frame is ready to be sampled.
     pub fn data_ready(&self) -> Result<bool> {
         Ok(self.drdy.is_low())
+    }
+
+    pub fn reset_pulse(&mut self) -> Result<()> {
+        self.reset_n.set_low()?;
+        FreeRtos::delay_ms(1);
+        self.reset_n.set_high()?;
+        Ok(())
     }
 
     /// Helper for sending SPI commands
@@ -107,6 +110,123 @@ impl<'d> Ads1298Device<'d> {
     pub fn verify_id(&mut self, expected: u8) -> Result<bool> {
         Ok(self.read_register(Register::Id)? == expected)
     }
+
+    // Writes this device's full register set. Must be called after
+    // `stop_read_data_continuous()` (SDATAC), since registers can't be written while streaming.
+    pub fn configure(&mut self, role: ChipRole) -> Result<()> {
+        // --- Role-specific registers ---
+        let config1 = match role {
+            ChipRole::A => 0xE4, 
+            ChipRole::B => 0xC4, 
+        };
+        self.write_register(Register::Config1, config1)?;
+
+        let config3 = match role {
+            ChipRole::A => 0xC6,
+            ChipRole::B => 0xC0, 
+        };
+        self.write_register(Register::Config3, config3)?;
+
+        let rld_sens_p = match role {
+            ChipRole::A => 0xFF, 
+            ChipRole::B => 0x00, 
+        };
+        self.write_register(Register::RldSensP, rld_sens_p)?;
+
+        let rld_sens_n = match role {
+            ChipRole::A => 0xFF, 
+            ChipRole::B => 0x00, 
+        };
+        self.write_register(Register::RldSensN, rld_sens_n)?;
+
+        // Shared registers (identical on both chips)
+        self.write_register(Register::Config2, 0x00)?; 
+        self.write_register(Register::Loff, 0x13)?; 
+
+        for reg in [
+            Register::Ch1Set,
+            Register::Ch2Set,
+            Register::Ch3Set,
+            Register::Ch4Set,
+            Register::Ch5Set,
+            Register::Ch6Set,
+            Register::Ch7Set,
+            Register::Ch8Set,
+        ] {
+            self.write_register(reg, 0x00)?;
+        }
+
+        self.write_register(Register::LoffSensP, 0xFF)?; 
+        self.write_register(Register::LoffSensN, 0xFF)?;
+        self.write_register(Register::LoffFlip, 0x00)?; 
+        self.write_register(Register::Gpio, 0x00)?; 
+        self.write_register(Register::Pace, 0x00)?; 
+        self.write_register(Register::Resp, 0x20)?; 
+        self.write_register(Register::Config4, 0x02)?; 
+        self.write_register(Register::Wct1, 0x00)?; 
+        self.write_register(Register::Wct2, 0x00)?; 
+
+        Ok(())
+    }
+
+    // Power-up sequencing for each individual device
+     pub fn power_up(&mut self, role: ChipRole) -> Result<()> {
+        self.pwdn.set_low()?;
+        self.reset_n.set_low()?;
+
+        FreeRtos::delay_ms(5);
+
+        self.pwdn.set_high()?;
+        self.reset_n.set_high()?;
+
+        FreeRtos::delay_ms(2000);
+
+        self.reset_pulse()?;
+
+        self.stop_read_data_continuous()?;
+
+        FreeRtos::delay_ms(1);
+
+        if !self.verify_id(0x92)? {
+            anyhow::bail!("ADS1298 ({role:?}) ID mismatch");
+        }
+
+        self.configure(role)?;
+
+        FreeRtos::delay_ms(200);
+
+        Ok(())
+    }
+
+    pub fn enable_test_signal(&mut self, channel: usize) -> Result<()> {
+        debug_assert!(channel < CHANNELS_PER_DEVICE, "channel must be 0..=7, got {channel}");
+
+        self.write_register(Register::Config2, 0x10)?;
+
+        let channels = [
+            Register::Ch1Set,
+            Register::Ch2Set,
+            Register::Ch3Set,
+            Register::Ch4Set,
+            Register::Ch5Set,
+            Register::Ch6Set,
+            Register::Ch7Set,
+            Register::Ch8Set,
+        ];
+        for (i, reg) in channels.into_iter().enumerate() {
+            let value = if i == channel {
+                0x05 
+            } else {
+                0x01 
+            };
+            self.write_register(reg, value)?;
+        }
+
+        self.write_register(Register::LoffSensP, 0x00)?; 
+        self.write_register(Register::LoffSensN, 0x00)?;
+
+        Ok(())
+    }
 }
 
 /// Owns both ADS1298 devices sharing one Cascaded SPI bus and two
@@ -115,7 +235,6 @@ impl<'d> Ads1298Device<'d> {
 pub struct Ads1298Pair<'d> {
     pub adc1: Ads1298Device<'d>,
     pub adc2: Ads1298Device<'d>,
-    reset_n: PinDriver<'d, Output>,
     start: PinDriver<'d, Output>,
 }
 
@@ -123,26 +242,13 @@ impl<'d> Ads1298Pair<'d> {
     pub fn new(
         adc1: Ads1298Device<'d>,
         adc2: Ads1298Device<'d>,
-        reset_n: PinDriver<'d, Output>,
-        start: PinDriver<'d, Output>,
+        start: PinDriver<'d, Output>
     ) -> Self {
         Self {
             adc1,
             adc2,
-            reset_n,
             start,
         }
-    }
-
-    /// Pulse RESET_N low then high. Datasheet mentions >= 2 tCLK low and a
-    /// >= 18 tCLK wait before the first command can be sent. Both delays here are 
-    /// temporarily 1ms since the actual CLK frequency isn't decided yet.
-    pub fn hardware_reset(&mut self) -> Result<()> {
-        self.reset_n.set_low()?;
-        FreeRtos::delay_ms(1);
-        self.reset_n.set_high()?;
-        FreeRtos::delay_ms(1);
-        Ok(())
     }
 
     /// Pulls the shared START pin high 
@@ -171,25 +277,4 @@ impl<'d> Ads1298Pair<'d> {
         let s2 = self.adc2.read_frame()?;
         Ok(Frame { devices: [s1, s2] })
     }
-}
-
-/// Sign-extends a 24-bit two's-complement sample into a full i32
-fn decode_i24(b: [u8; 3]) -> i32 {
-    let u = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | (b[2] as u32);
-    if u & 0x00800000 != 0 {
-        (u | 0xFF000000) as i32
-    } else {
-        u as i32
-    }
-}
-
-/// Decodes one device's raw frame bytes (status word + 8 channels) into a `Sample`
-fn parse_sample(raw: &[u8; FRAME_BYTES]) -> Sample {
-    let status = ((raw[0] as u32) << 16) | ((raw[1] as u32) << 8) | (raw[2] as u32);
-    let mut channels = [0i32; CHANNELS_PER_DEVICE];
-    for (i, channel) in channels.iter_mut().enumerate() {
-        let off = STATUS_BYTES + i * BYTES_PER_CHANNEL;
-        *channel = decode_i24([raw[off], raw[off + 1], raw[off + 2]]);
-    }
-    Sample { status, channels }
 }

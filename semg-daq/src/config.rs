@@ -4,6 +4,6 @@
 pub struct Config {
     /// Target output sampling rate in Hz, pacing the acquisition loop. 
     // Must be equal to whatever CONFIG1.DR ends being in `ads1298.rs`.
-    #[default(500)]
+    #[default(2000)]
     pub sample_rate_hz: u32,
 }
