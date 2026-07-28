@@ -3,7 +3,6 @@
 //! For this skeleton the "hand off" is just a log line. Once the pipeline has been
 //! tested and has somewhere to send samples, I'll replace `log_frame` with that call.
 
-use anyhow::Result;
 use log::{info, warn};
 use sampling_utils::convert::code_to_voltage;
 use sampling_utils::loff::loff_flagged;
@@ -16,7 +15,7 @@ const VREF: f32 = 2.4;
 const GAIN: f32 = 6.0;
 
 /// Runs forever for now, reading one frame per DRDY pulse
-pub fn run(chain: &mut Ads1298Pair<'_>) -> ! {
+pub(crate) fn run(chain: &mut Ads1298Pair<'_>) -> ! {
     loop {
         match chain.data_ready() {
             Ok(true) => match chain.read_frame() {

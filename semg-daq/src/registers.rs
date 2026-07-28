@@ -4,10 +4,9 @@
 //! The rest is kept as a reference for when lead-off detection, gain, 
 //! and reference config get implemented.
 
-#[allow(dead_code)]
 #[repr(u8)]
 #[derive(Clone, Copy, Debug)]
-pub enum Register {
+pub(crate) enum Register {
     Id = 0x00,
     Config1 = 0x01,
     Config2 = 0x02,
@@ -37,7 +36,7 @@ pub enum Register {
 }
 
 impl Register {
-    pub const fn addr(self) -> u8 {
+    pub(crate) const fn addr(self) -> u8 {
         self as u8
     }
 }

@@ -2,7 +2,7 @@
 //!
 
 pub const CHANNELS_PER_DEVICE: usize = 8;
-pub const DEVICE_COUNT: usize = 2;
+const DEVICE_COUNT: usize = 2;
 const STATUS_BYTES: usize = 3;
 const BYTES_PER_CHANNEL: usize = 3;
 pub const FRAME_BYTES: usize = STATUS_BYTES + CHANNELS_PER_DEVICE * BYTES_PER_CHANNEL; // 27
@@ -21,7 +21,7 @@ pub struct Frame {
 }
 
 // Sign-extends a 24-bit two's-complement sample into a full i32
-pub fn decode_i24(b: [u8; 3]) -> i32 {
+fn decode_i24(b: [u8; 3]) -> i32 {
     let u = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | (b[2] as u32);
     if u & 0x00800000 != 0 {
         (u | 0xFF000000) as i32

@@ -8,7 +8,8 @@ use esp_idf_svc::hal::gpio::{Input, Output, PinDriver};
 use esp_idf_svc::hal::spi::{Operation, SpiDeviceDriver, SpiDriver};
 
 use sampling_utils::decode::parse_sample;
-pub use sampling_utils::decode::{Sample, Frame, CHANNELS_PER_DEVICE, FRAME_BYTES};
+use sampling_utils::decode::{Sample, FRAME_BYTES};
+pub(crate) use sampling_utils::decode::{Frame, CHANNELS_PER_DEVICE};
 
 use crate::registers::Register;
 use crate::spi_commands;
@@ -16,7 +17,7 @@ use crate::spi_commands;
 /// Which cascaded device this is — determines which registers differ
 /// (CONFIG1.CLK_EN, CONFIG3.PD_RLD, RLD_SENSP/N). See CLAUDE_HANDOFF.md.
 #[derive(Clone, Copy, Debug)]
-pub enum ChipRole {
+pub(crate) enum ChipRole {
     /// Clock master: drives CLK out to the other device (CONFIG1.CLK_EN=1)
     A,
     /// Clock slave: receives CLK from the master (CONFIG1.CLK_EN=0)
@@ -26,7 +27,7 @@ pub enum ChipRole {
 /// One ADS1298 addressed via its own dedicated CS on the shared SPI bus
 /// Each ADC also has its own DRDY and RESET pin, however START is tied together
 /// so they DRDY pins should pull at same time 
-pub struct Ads1298Device<'d> {
+pub(crate) struct Ads1298Device<'d> {
     spi: SpiDeviceDriver<'d, &'d SpiDriver<'d>>,
     drdy: PinDriver<'d, Input>,
     reset_n: PinDriver<'d, Output>,
@@ -34,16 +35,16 @@ pub struct Ads1298Device<'d> {
 }
 
 impl<'d> Ads1298Device<'d> {
-    pub fn new(spi: SpiDeviceDriver<'d, &'d SpiDriver<'d>>, drdy: PinDriver<'d, Input>, reset_n: PinDriver<'d, Output>, pwdn: PinDriver<'d, Output>) -> Self {
+    pub(crate) fn new(spi: SpiDeviceDriver<'d, &'d SpiDriver<'d>>, drdy: PinDriver<'d, Input>, reset_n: PinDriver<'d, Output>, pwdn: PinDriver<'d, Output>) -> Self {
         Self { spi, drdy, reset_n, pwdn }
     }
 
     /// DRDY is active-low. It falls when a new frame is ready to be sampled.
-    pub fn data_ready(&self) -> Result<bool> {
+    fn data_ready(&self) -> Result<bool> {
         Ok(self.drdy.is_low())
     }
 
-    pub fn reset_pulse(&mut self) -> Result<()> {
+    fn reset_pulse(&mut self) -> Result<()> {
         self.reset_n.set_low()?;
         FreeRtos::delay_ms(1);
         self.reset_n.set_high()?;
@@ -69,25 +70,25 @@ impl<'d> Ads1298Device<'d> {
     }
 
     /// Disables read data continuous mode so that registers can be configured
-    pub fn stop_read_data_continuous(&mut self) -> Result<()> {
+    fn stop_read_data_continuous(&mut self) -> Result<()> {
         self.send_command(spi_commands::SDATAC)
     }
 
     /// Enables read data continuous mode. Once started, each DRDY
     /// falling edge means a frame is ready to clock out
-    pub fn read_data_continuous(&mut self) -> Result<()> {
+    pub(crate) fn read_data_continuous(&mut self) -> Result<()> {
         self.send_command(spi_commands::RDATAC)
     }
 
     // Writes to a single register on the ADS1298
-    pub fn write_register(&mut self, reg: Register, value: u8) -> Result<()> {
+    fn write_register(&mut self, reg: Register, value: u8) -> Result<()> {
         // Second byte is "number of registers - 1" (0x00 = one register).
         self.spi.write(&[spi_commands::WREG_BASE | reg.addr(), 0x00, value])?;
         Ok(())
     }
 
     // Reads from a single register on the ADS1298
-    pub fn read_register(&mut self, reg: Register) -> Result<u8> {
+    fn read_register(&mut self, reg: Register) -> Result<u8> {
         let mut rx = [0u8; 1];
         self.spi.transaction(&mut [
             Operation::Write(&[spi_commands::RREG_BASE | reg.addr(), 0x00]),
@@ -96,9 +97,9 @@ impl<'d> Ads1298Device<'d> {
         Ok(rx[0])
     }
 
-    /// Clocks out one frame. Only valid while in RDATAC mode 
+    /// Clocks out one frame. Only valid while in RDATAC mode
     // and after `data_ready()` reports true
-    pub fn read_frame(&mut self) -> Result<Sample> {
+    fn read_frame(&mut self) -> Result<Sample> {
         let mut raw = [0u8; FRAME_BYTES];
         self.spi.read(&mut raw)?;
         Ok(parse_sample(&raw))
@@ -107,13 +108,13 @@ impl<'d> Ads1298Device<'d> {
     /// First hardware bring-up check to confirm that SPI works. 
     //  Reads the Id register and compares against the
     //  datasheet's documented value for this device (0x92). 
-    pub fn verify_id(&mut self, expected: u8) -> Result<bool> {
+    fn verify_id(&mut self, expected: u8) -> Result<bool> {
         Ok(self.read_register(Register::Id)? == expected)
     }
 
     // Writes this device's full register set. Must be called after
     // `stop_read_data_continuous()` (SDATAC), since registers can't be written while streaming.
-    pub fn configure(&mut self, role: ChipRole) -> Result<()> {
+    fn configure(&mut self, role: ChipRole) -> Result<()> {
         // --- Role-specific registers ---
         let config1 = match role {
             ChipRole::A => 0xE4, 
@@ -170,7 +171,7 @@ impl<'d> Ads1298Device<'d> {
     }
 
     // Power-up sequencing for each individual device
-     pub fn power_up(&mut self, role: ChipRole) -> Result<()> {
+     pub(crate) fn power_up(&mut self, role: ChipRole) -> Result<()> {
         self.pwdn.set_low()?;
         self.reset_n.set_low()?;
 
@@ -232,14 +233,14 @@ impl<'d> Ads1298Device<'d> {
 /// Owns both ADS1298 devices sharing one Cascaded SPI bus and two
 /// control lines. Specifically in this format so that RLD registers 
 // for each ADS1298 can be configured differently on startup.
-pub struct Ads1298Pair<'d> {
-    pub adc1: Ads1298Device<'d>,
-    pub adc2: Ads1298Device<'d>,
+pub(crate) struct Ads1298Pair<'d> {
+    pub(crate) adc1: Ads1298Device<'d>,
+    pub(crate) adc2: Ads1298Device<'d>,
     start: PinDriver<'d, Output>,
 }
 
 impl<'d> Ads1298Pair<'d> {
-    pub fn new(
+    pub(crate) fn new(
         adc1: Ads1298Device<'d>,
         adc2: Ads1298Device<'d>,
         start: PinDriver<'d, Output>
@@ -251,8 +252,8 @@ impl<'d> Ads1298Pair<'d> {
         }
     }
 
-    /// Pulls the shared START pin high 
-    pub fn start_conversion(&mut self) -> Result<()> {
+    /// Pulls the shared START pin high
+    pub(crate) fn start_conversion(&mut self) -> Result<()> {
         self.start.set_high()?;
         Ok(())
     }
@@ -266,13 +267,13 @@ impl<'d> Ads1298Pair<'d> {
     /// True only once both devices report their own DRDY low. Since each
     /// device has its own dedicated DRDY pin, this checks both independently
     /// rather than trusting just one
-    pub fn data_ready(&self) -> Result<bool> {
+    pub(crate) fn data_ready(&self) -> Result<bool> {
         Ok(self.adc1.data_ready()? && self.adc2.data_ready()?)
     }
 
     /// Clocks out one frame from each device simultaneously. Only valid while
     /// both are in RDATAC mode and after `data_ready()` reports true
-    pub fn read_frame(&mut self) -> Result<Frame> {
+    pub(crate) fn read_frame(&mut self) -> Result<Frame> {
         let s1 = self.adc1.read_frame()?;
         let s2 = self.adc2.read_frame()?;
         Ok(Frame { devices: [s1, s2] })
