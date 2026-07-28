@@ -5,7 +5,7 @@
 
 // Returns true if either the positive or negative lead-off comparator is
 // flagged for a zero-indexed channel within one device's status word.
-pub fn loff_flagged(status: u32, channel: usize) -> bool {
+pub(super) fn loff_flagged(status: u32, channel: usize) -> bool {
     debug_assert!(channel < 8, "channel must be 0..=7, got {channel}");
     let stat_p = (status >> 12) & 0xFF;
     let stat_n = (status >> 4) & 0xFF;

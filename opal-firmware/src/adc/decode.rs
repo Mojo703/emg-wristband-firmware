@@ -1,29 +1,29 @@
 //! Raw ADS1298 frame decoding: status word + per-channel 24-bit codes.
 //!
 
-pub const CHANNELS_PER_DEVICE: usize = 8;
-pub const DEVICE_COUNT: usize = 2;
+pub(crate) const CHANNELS_PER_DEVICE: usize = 8;
+pub(super) const DEVICE_COUNT: usize = 2;
 const STATUS_BYTES: usize = 3;
 const BYTES_PER_CHANNEL: usize = 3;
-pub const FRAME_BYTES: usize = STATUS_BYTES + CHANNELS_PER_DEVICE * BYTES_PER_CHANNEL; // 27
+pub(super) const FRAME_BYTES: usize = STATUS_BYTES + CHANNELS_PER_DEVICE * BYTES_PER_CHANNEL; // 27
 
 // Decoded status word + 8 sign-extended 24-bit channel codes for one device
 #[derive(Debug, Clone, Copy)]
-pub struct Sample {
-    pub status: u32,
-    pub channels: [i32; CHANNELS_PER_DEVICE],
+pub(super) struct Sample {
+    pub(super) status: u32,
+    pub(super) channels: [i32; CHANNELS_PER_DEVICE],
 }
 
 /// One frame is a sample from each of the two cascaded devices. Named `AdcFrame`
 /// rather than `Frame` because `protocol::Frame` (the wire frame) is already in
 /// scope across this crate and the two are unrelated.
 #[derive(Debug, Clone, Copy)]
-pub struct AdcFrame {
-    pub devices: [Sample; DEVICE_COUNT],
+pub(super) struct AdcFrame {
+    pub(super) devices: [Sample; DEVICE_COUNT],
 }
 
 // Sign-extends a 24-bit two's-complement sample into a full i32
-pub fn decode_i24(b: [u8; 3]) -> i32 {
+fn decode_i24(b: [u8; 3]) -> i32 {
     let u = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | (b[2] as u32);
     if u & 0x00800000 != 0 {
         (u | 0xFF000000) as i32
@@ -33,7 +33,7 @@ pub fn decode_i24(b: [u8; 3]) -> i32 {
 }
 
 // Decodes one device's raw frame bytes (status word + 8 channels) into a `Sample`
-pub fn parse_sample(raw: &[u8; FRAME_BYTES]) -> Sample {
+pub(super) fn parse_sample(raw: &[u8; FRAME_BYTES]) -> Sample {
     let status = ((raw[0] as u32) << 16) | ((raw[1] as u32) << 8) | (raw[2] as u32);
     let mut channels = [0i32; CHANNELS_PER_DEVICE];
     for (i, channel) in channels.iter_mut().enumerate() {

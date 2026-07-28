@@ -3,9 +3,9 @@
 //! # This module encodes an unverified assumption
 //!
 //! The model was trained on `.npy` windows produced upstream by `emg-gesture-class
-//! export`, which is not in this repository. Whatever that exporter did to the raw
-//! Hyser signal — unit choice, filtering, per-channel normalisation — has to be
-//! reproduced here, because the model only ever saw data shaped that way.
+//! export`, which is not in this repository. This module has to reproduce whatever
+//! that exporter did to the raw Hyser signal (unit choice, filtering, per-channel
+//! normalisation), because the model only ever saw data shaped that way.
 //!
 //! Until someone reads that exporter, this module assumes the simplest possible chain:
 //! sign-extended code, to microvolts, to int8 at the model's own `input_scale`. No
@@ -18,9 +18,9 @@
 //! trained on.
 //!
 //! This will not crash. It will quietly produce bad predictions, which is the most
-//! expensive kind of wrong. So the whole chain is deliberately confined to one small
-//! function here rather than spread through the acquisition path: when the exporter is
-//! read, [`sample_to_int8`] is the only thing that should need to change.
+//! expensive kind of wrong. So this file deliberately confines the whole chain to one
+//! small function, rather than spreading it through the acquisition path: once someone
+//! reads the exporter, [`sample_to_int8`] is the only thing that should need to change.
 
 use super::convert::code_to_voltage;
 use super::loff::loff_flagged;
@@ -29,11 +29,11 @@ use emg_runtime::model::INPUT_CH;
 
 /// Internal reference voltage. CONFIG3 is `0xC6`, whose `VREF_4V` bit (bit 5) is clear,
 /// selecting the 2.4 V reference.
-pub const REFERENCE_VOLTS: f32 = 2.4;
+const REFERENCE_VOLTS: f32 = 2.4;
 
-/// PGA gain. Every CHnSET register is written `0x00`, whose `GAIN` field (bits 6:4) of
-/// `0b000` is gain 6.
-pub const GAIN: f32 = 6.0;
+/// PGA gain. `configure` writes `0x00` to every CHnSET register; its `GAIN` field
+/// (bits 6:4), value `0b000`, selects gain 6.
+const GAIN: f32 = 6.0;
 
 const MICROVOLTS_PER_VOLT: f32 = 1_000_000.0;
 
@@ -43,11 +43,11 @@ const MICROVOLTS_PER_VOLT: f32 = 1_000_000.0;
 /// `input_scale` is the model's own µV-per-count, read from the model blob, so the
 /// quantisation here matches what training produced.
 ///
-/// Channels flagged by the lead-off comparators are zeroed rather than passed through.
-/// A disconnected electrode rails the input, and a railed channel would otherwise
-/// dominate the window. Zero is what the model reads as "no signal", which is the
-/// honest answer for an electrode that is not attached.
-pub fn sample_to_int8(frame: &AdcFrame, input_scale: f32) -> [i8; INPUT_CH] {
+/// This zeros channels the lead-off comparators flag, rather than passing them
+/// through. A disconnected electrode rails the input, and a railed channel would
+/// otherwise dominate the window. Zero is what the model reads as "no signal": the
+/// honest answer for a disconnected electrode.
+pub(super) fn sample_to_int8(frame: &AdcFrame, input_scale: f32) -> [i8; INPUT_CH] {
     let mut out = [0i8; INPUT_CH];
     for (device_index, sample) in frame.devices.iter().enumerate() {
         for channel in 0..CHANNELS_PER_DEVICE {
@@ -125,7 +125,7 @@ mod tests {
 
     #[test]
     fn chip_b_lands_in_the_upper_eight_channels() {
-        // Full scale is 2.4/6 V, i.e. 400_000 µV, so a 1000 µV/count scale saturates.
+        // Full scale is 2.4/6 V (400_000 µV), so a 1000 µV/count scale saturates.
         let frame = frame_with([0; 8], [8_388_607; 8], 0);
         let out = sample_to_int8(&frame, 1000.0);
         assert_eq!(out[0..8], [0i8; 8]);
@@ -134,8 +134,8 @@ mod tests {
 
     #[test]
     fn full_scale_code_is_the_expected_microvolts() {
-        // Guards the VREF/gain constants: 2.4 V over gain 6 is 400 mV, so one count of
-        // 400_000 µV puts positive full scale at exactly 1.
+        // This test guards the VREF/gain constants: 2.4 V over gain 6 is 400 mV, so
+        // one count of 400_000 µV puts positive full scale at exactly 1.
         let frame = frame_with([8_388_607; 8], [0; 8], 0);
         let out = sample_to_int8(&frame, 400_000.0);
         assert_eq!(out[0], 1);

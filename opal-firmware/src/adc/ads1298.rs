@@ -9,7 +9,7 @@ use esp_idf_svc::hal::spi::{Operation, SpiDeviceDriver, SpiDriver};
 use std::sync::Arc;
 
 use super::decode::parse_sample;
-pub use super::decode::{AdcFrame, Sample, CHANNELS_PER_DEVICE, FRAME_BYTES};
+use super::decode::{AdcFrame, Sample, CHANNELS_PER_DEVICE, FRAME_BYTES};
 
 use super::registers::Register;
 use super::spi_commands;
@@ -27,15 +27,15 @@ type SpiDevice = SpiDeviceDriver<'static, Arc<SpiDriver<'static>>>;
 /// `DR = 0b100` (bits 2:0). In high-resolution mode fMOD is fCLK/4 = 512 kHz, and
 /// `DR = 0b100` selects fMOD/256, so 512000/256 = 2000 SPS.
 ///
-/// Note this is 2000 Hz, not the 2048 Hz the model was trained on — a 2.3% time-base
-/// difference that has not yet been measured for its effect on accuracy. See
+/// This is 2000 Hz. The model trained at 2048 Hz, a 2.3% difference in the time base
+/// that nobody has yet measured for its effect on accuracy. See
 /// [`crate::adc::preprocess`].
-pub const SAMPLE_RATE_HZ: u32 = 2000;
+pub(crate) const SAMPLE_RATE_HZ: u32 = 2000;
 
 /// Which cascaded device this is — determines which registers differ
 /// (CONFIG1.CLK_EN, CONFIG3.PD_RLD, RLD_SENSP/N).
 #[derive(Clone, Copy, Debug)]
-pub enum ChipRole {
+pub(super) enum ChipRole {
     /// Clock master: drives CLK out to the other device (CONFIG1.CLK_EN=1)
     A,
     /// Clock slave: receives CLK from the master (CONFIG1.CLK_EN=0)
@@ -45,7 +45,7 @@ pub enum ChipRole {
 /// One ADS1298 addressed via its own dedicated CS on the shared SPI bus
 /// Each ADC also has its own DRDY and RESET pin, however START is tied together
 /// so they DRDY pins should pull at same time
-pub struct Ads1298Device {
+pub(super) struct Ads1298Device {
     spi: SpiDevice,
     drdy: PinDriver<'static, Input>,
     reset_n: PinDriver<'static, Output>,
@@ -53,7 +53,7 @@ pub struct Ads1298Device {
 }
 
 impl Ads1298Device {
-    pub fn new(
+    pub(super) fn new(
         spi: SpiDevice,
         drdy: PinDriver<'static, Input>,
         reset_n: PinDriver<'static, Output>,
@@ -68,7 +68,7 @@ impl Ads1298Device {
     }
 
     /// DRDY is active-low. It falls when a new frame is ready to be sampled.
-    pub fn data_ready(&self) -> Result<bool> {
+    pub(super) fn data_ready(&self) -> Result<bool> {
         Ok(self.drdy.is_low())
     }
 
@@ -78,7 +78,7 @@ impl Ads1298Device {
     ///
     /// `callback` runs in an interrupt. It must not call into std, libc or most of
     /// FreeRTOS. Notifying a task is one of the few things it may do.
-    pub unsafe fn subscribe_data_ready(
+    pub(super) unsafe fn subscribe_data_ready(
         &mut self,
         callback: impl FnMut() + Send + 'static,
     ) -> Result<()> {
@@ -90,12 +90,12 @@ impl Ads1298Device {
     /// Arms the DRDY interrupt. esp-idf-hal disables it inside its own ISR to avoid
     /// re-entering, so this has to be called again after every notification, from
     /// outside interrupt context.
-    pub fn arm_data_ready_interrupt(&mut self) -> Result<()> {
+    pub(super) fn arm_data_ready_interrupt(&mut self) -> Result<()> {
         self.drdy.enable_interrupt()?;
         Ok(())
     }
 
-    pub fn reset_pulse(&mut self) -> Result<()> {
+    pub(super) fn reset_pulse(&mut self) -> Result<()> {
         self.reset_n.set_low()?;
         FreeRtos::delay_ms(1);
         self.reset_n.set_high()?;
@@ -109,33 +109,33 @@ impl Ads1298Device {
     }
 
     #[allow(dead_code)] // Datasheet command set, kept whole for bring-up.
-    pub fn software_reset(&mut self) -> Result<()> {
+    pub(super) fn software_reset(&mut self) -> Result<()> {
         self.send_command(spi_commands::RESET)
     }
 
     #[allow(dead_code)] // Datasheet command set, kept whole for bring-up.
-    pub fn wakeup(&mut self) -> Result<()> {
+    pub(super) fn wakeup(&mut self) -> Result<()> {
         self.send_command(spi_commands::WAKEUP)
     }
 
     #[allow(dead_code)] // Datasheet command set, kept whole for bring-up.
-    pub fn standby(&mut self) -> Result<()> {
+    pub(super) fn standby(&mut self) -> Result<()> {
         self.send_command(spi_commands::STANDBY)
     }
 
     /// Disables read data continuous mode so that registers can be configured
-    pub fn stop_read_data_continuous(&mut self) -> Result<()> {
+    pub(super) fn stop_read_data_continuous(&mut self) -> Result<()> {
         self.send_command(spi_commands::SDATAC)
     }
 
     /// Enables read data continuous mode. Once started, each DRDY
     /// falling edge means a frame is ready to clock out
-    pub fn read_data_continuous(&mut self) -> Result<()> {
+    pub(super) fn read_data_continuous(&mut self) -> Result<()> {
         self.send_command(spi_commands::RDATAC)
     }
 
     // Writes to a single register on the ADS1298
-    pub fn write_register(&mut self, reg: Register, value: u8) -> Result<()> {
+    pub(super) fn write_register(&mut self, reg: Register, value: u8) -> Result<()> {
         // Second byte is "number of registers - 1" (0x00 = one register).
         self.spi
             .write(&[spi_commands::WREG_BASE | reg.addr(), 0x00, value])?;
@@ -143,7 +143,7 @@ impl Ads1298Device {
     }
 
     // Reads from a single register on the ADS1298
-    pub fn read_register(&mut self, reg: Register) -> Result<u8> {
+    pub(super) fn read_register(&mut self, reg: Register) -> Result<u8> {
         let mut rx = [0u8; 1];
         self.spi.transaction(&mut [
             Operation::Write(&[spi_commands::RREG_BASE | reg.addr(), 0x00]),
@@ -154,7 +154,7 @@ impl Ads1298Device {
 
     /// Clocks out one frame. Only valid while in RDATAC mode
     // and after `data_ready()` reports true
-    pub fn read_frame(&mut self) -> Result<Sample> {
+    pub(super) fn read_frame(&mut self) -> Result<Sample> {
         let mut raw = [0u8; FRAME_BYTES];
         self.spi.read(&mut raw)?;
         Ok(parse_sample(&raw))
@@ -162,7 +162,7 @@ impl Ads1298Device {
 
     // Writes this device's full register set. Must be called after
     // `stop_read_data_continuous()` (SDATAC), since registers can't be written while streaming.
-    pub fn configure(&mut self, role: ChipRole) -> Result<()> {
+    pub(super) fn configure(&mut self, role: ChipRole) -> Result<()> {
         // --- Role-specific registers ---
         let config1 = match role {
             ChipRole::A => 0xE4,
@@ -219,7 +219,7 @@ impl Ads1298Device {
     }
 
     // Power-up sequencing for each individual device
-    pub fn power_up(&mut self, role: ChipRole, expected_device_id: u8) -> Result<()> {
+    pub(super) fn power_up(&mut self, role: ChipRole, expected_device_id: u8) -> Result<()> {
         self.pwdn.set_low()?;
         self.reset_n.set_low()?;
 
@@ -257,7 +257,7 @@ impl Ads1298Device {
         Ok(())
     }
 
-    pub fn enable_test_signal(&mut self, channel: usize) -> Result<()> {
+    pub(super) fn enable_test_signal(&mut self, channel: usize) -> Result<()> {
         debug_assert!(
             channel < CHANNELS_PER_DEVICE,
             "channel must be 0..=7, got {channel}"
@@ -290,14 +290,14 @@ impl Ads1298Device {
 /// Owns both ADS1298 devices sharing one Cascaded SPI bus and two
 /// control lines. Specifically in this format so that RLD registers
 // for each ADS1298 can be configured differently on startup.
-pub struct Ads1298Pair {
-    pub adc1: Ads1298Device,
-    pub adc2: Ads1298Device,
+pub(crate) struct Ads1298Pair {
+    pub(super) adc1: Ads1298Device,
+    pub(super) adc2: Ads1298Device,
     start: PinDriver<'static, Output>,
 }
 
 impl Ads1298Pair {
-    pub fn new(
+    pub(super) fn new(
         adc1: Ads1298Device,
         adc2: Ads1298Device,
         start: PinDriver<'static, Output>,
@@ -306,14 +306,16 @@ impl Ads1298Pair {
     }
 
     /// Pulls the shared START pin high
-    pub fn start_conversion(&mut self) -> Result<()> {
+    pub(super) fn start_conversion(&mut self) -> Result<()> {
         self.start.set_high()?;
         Ok(())
     }
 
-    /// Pulls the shared START pin low
-    #[allow(dead_code)] // Datasheet command set, kept whole for bring-up.
-    pub fn stop_conversion(&mut self) -> Result<()> {
+    /// Pulls the shared START pin low. Nothing stops the chips today, since the
+    /// firmware streams until it reboots, but halting conversion is the other half of
+    /// `start_conversion` and bring-up will want it.
+    #[allow(dead_code)]
+    pub(super) fn stop_conversion(&mut self) -> Result<()> {
         self.start.set_low()?;
         Ok(())
     }
@@ -326,13 +328,13 @@ impl Ads1298Pair {
     /// checks chip B on its own. Kept because polling both is the obvious thing to
     /// reach for during bring-up.
     #[allow(dead_code)]
-    pub fn data_ready(&self) -> Result<bool> {
+    pub(super) fn data_ready(&self) -> Result<bool> {
         Ok(self.adc1.data_ready()? && self.adc2.data_ready()?)
     }
 
     /// Clocks out one frame from each device simultaneously. Only valid while
     /// both are in RDATAC mode and after `data_ready()` reports true
-    pub fn read_frame(&mut self) -> Result<AdcFrame> {
+    pub(super) fn read_frame(&mut self) -> Result<AdcFrame> {
         let s1 = self.adc1.read_frame()?;
         let s2 = self.adc2.read_frame()?;
         Ok(AdcFrame { devices: [s1, s2] })

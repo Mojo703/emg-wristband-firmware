@@ -9,7 +9,6 @@ pub const WAKEUP: u8 = 0x02;
 #[allow(dead_code)]
 pub const STANDBY: u8 = 0x04;
 
-#[allow(dead_code)]
 pub const RESET: u8 = 0x06;
 
 #[allow(dead_code)]

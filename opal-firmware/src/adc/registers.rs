@@ -4,7 +4,6 @@
 //! The rest is kept as a reference for when lead-off detection, gain,
 //! and reference config get implemented.
 
-#[allow(dead_code)]
 #[repr(u8)]
 #[derive(Clone, Copy, Debug)]
 pub enum Register {
@@ -26,7 +25,11 @@ pub enum Register {
     LoffSensP = 0x0F,
     LoffSensN = 0x10,
     LoffFlip = 0x11,
+    // The lead-off status arrives in every frame's status word, which `loff` decodes,
+    // so nothing reads these two registers directly. They stay for the complete map.
+    #[allow(dead_code)]
     LoffStatP = 0x12,
+    #[allow(dead_code)]
     LoffStatN = 0x13,
     Gpio = 0x14,
     Pace = 0x15,

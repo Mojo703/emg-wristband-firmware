@@ -28,11 +28,12 @@ use config::{Sensitivity, Settings, Store};
 use emg_runtime::model::{Model, NUM_CLASSES};
 use emg_runtime::{softmax, ForwardResult, RejectPipeline};
 use esp_idf_svc::eventloop::EspSystemEventLoop;
+use esp_idf_svc::hal::delay::FreeRtos;
 use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::hal::usb_serial::{UsbSerialConfig, UsbSerialDriver};
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use links::Links;
-use log::info;
+use log::{info, warn};
 use protocol::{Frame, WakeState};
 use std::time::Instant;
 use transport::{Control, SerialTransport};
@@ -55,16 +56,23 @@ const ADC_TEST_SIGNAL_CHANNEL: Option<usize> = None;
 // session, so refuse it at compile time rather than at boot.
 const _: () = assert!(
     match ADC_TEST_SIGNAL_CHANNEL {
-        Some(channel) => channel < adc::decode::CHANNELS_PER_DEVICE,
+        Some(channel) => channel < adc::CHANNELS_PER_DEVICE,
         None => true,
     },
     "ADC_TEST_SIGNAL_CHANNEL must be within 0..CHANNELS_PER_DEVICE"
 );
 
-/// How long to wait for a window before giving up and running the loop again.
-/// Comfortably longer than one window period (~250 ms), comfortably shorter than the
-/// 5 s task watchdog, so a silent front end logs a stall instead of rebooting.
-const WINDOW_TIMEOUT_MS: u32 = 1000;
+/// How long the loop sleeps when no window is waiting.
+///
+/// The loop has two jobs: run inference, and service the links. Windows arrive every
+/// ~250 ms, so blocking on one would hold control frames and heartbeats behind it. A
+/// short sleep instead polls the links at 200 Hz and costs at most 5 ms of the 250 ms
+/// pipeline.
+const IDLE_POLL_MS: u32 = 5;
+
+/// How long the front end may stay silent before the loop says so. Long enough that
+/// normal jitter never trips it, short enough to notice a stalled ADC quickly.
+const STALL_WARNING_MS: u128 = 1000;
 
 /// Windows between periodic performance log lines (~31 s at the 244 ms window
 /// period). Long enough that the log stays single events, not spam.
@@ -119,7 +127,7 @@ impl PerfStats {
 
 /// The int8 model blob exported by `emg-tds export-int8`. Embedded and handed to
 /// `emg-runtime`. Shared with `ml-bench`.
-pub const MODEL_BIN: &[u8] = include_bytes!("../../ml-bench/data/model_int8.bin");
+const MODEL_BIN: &[u8] = include_bytes!("../../ml-bench/data/model_int8.bin");
 
 fn main() -> anyhow::Result<()> {
     esp_idf_svc::sys::link_patches();
@@ -163,8 +171,8 @@ fn main() -> anyhow::Result<()> {
     // test-signal channel are constants at the top of this file.
     //
     // SCLK/DIN/DOUT are shared by both chips. CS, DRDY, RESET and PWDN are per-chip.
-    // START is tied to both so they convert on the same edge. GPIO 19 and 20 are
-    // taken by USB-Serial-JTAG above and are not available here.
+    // START is tied to both so they convert on the same edge. USB-Serial-JTAG above
+    // claims GPIO 19 and 20, so they are not available here.
     // ---------------------------------------------------------------------------
     let adc_pins = adc::AdcPins {
         clock: peripherals.pins.gpio12.into(),
@@ -185,9 +193,9 @@ fn main() -> anyhow::Result<()> {
     // path produces int8 on the same footing training used.
     let input_scale = emg_runtime::VerifyBatch::new(MODEL_BIN).input_scale;
 
-    // Bring-up blocks ~4.4 s on the ADS1298's mandated settling delays, so it has to
-    // happen before the task watchdog is registered below. A failure here is fatal:
-    // this firmware has no other source of EMG, so there is nothing useful left to do.
+    // Bring-up blocks ~4.4 s on the ADS1298's mandated settling delays, so it must run
+    // before the code below registers the task watchdog. A failure here is fatal: this
+    // firmware has no other source of EMG, so there is nothing useful left to do.
     let pair = adc::bring_up(
         peripherals.spi2,
         adc_pins,
@@ -208,6 +216,8 @@ fn main() -> anyhow::Result<()> {
     let mut seq: u32 = 0;
     let mut prev_wake = WakeState::Idle;
     let mut perf = PerfStats::default();
+    let mut last_window_at = Instant::now();
+    let mut stall_reported = false;
 
     loop {
         unsafe {
@@ -226,11 +236,25 @@ fn main() -> anyhow::Result<()> {
         // the ADC thread. `perf.record` below closes it out after the frames are on
         // the wire.
         //
-        // A missing window is not fatal: keep looping so the watchdog stays fed and
-        // the link stays serviced. `next_window` has already logged why.
-        let Some(input) = source.next_window(WINDOW_TIMEOUT_MS) else {
+        // No window yet is the common case, not an error: the ADCs produce one every
+        // ~250 ms and this loop runs every 5 ms. Sleep and come back, so the loop keeps
+        // servicing the links and feeding the watchdog.
+        let Some(input) = source.try_next_window() else {
+            if !stall_reported && last_window_at.elapsed().as_millis() > STALL_WARNING_MS {
+                warn!(
+                    "no ADC window for {} ms (dropped {}, read errors {}, desyncs {})",
+                    last_window_at.elapsed().as_millis(),
+                    source.dropped_windows(),
+                    source.read_errors(),
+                    source.desyncs()
+                );
+                stall_reported = true;
+            }
+            FreeRtos::delay_ms(IDLE_POLL_MS);
             continue;
         };
+        last_window_at = Instant::now();
+        stall_reported = false;
         let infer_start = Instant::now();
         let ForwardResult::Logits(raw_logits) = model.forward(&input);
         let infer_us = infer_start.elapsed().as_micros() as u64;

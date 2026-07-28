@@ -3,7 +3,7 @@
 const FULL_SCALE_CODE: f32 = 8_388_608.0; // 2^23
 
 // Converts a signed 24-bit ADC code to volts: `V = code * (VREF / gain) / 2^23`.
-pub fn code_to_voltage(code: i32, vref: f32, gain: f32) -> f32 {
+pub(super) fn code_to_voltage(code: i32, vref: f32, gain: f32) -> f32 {
     code as f32 * (vref / gain) / FULL_SCALE_CODE
 }
 

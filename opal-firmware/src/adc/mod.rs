@@ -8,18 +8,20 @@
 //!
 //! Threading. Sampling cannot live on the main loop: at 2 kSPS a frame arrives every
 //! 500 µs, while the main loop runs one 244 ms inference window per iteration and
-//! feeds the task watchdog. So [`acquisition::start`] moves the driver onto its own
-//! thread, which is why everything here owns its peripherals at `'static` rather than
-//! borrowing them.
+//! feeds the task watchdog. [`acquisition::start`] moves the driver onto its own
+//! thread, so everything here owns its peripherals at `'static` instead of borrowing
+//! them.
 
-pub mod acquisition;
-pub mod ads1298;
-pub mod convert;
-pub mod decode;
-pub mod loff;
-pub mod preprocess;
+pub(crate) mod acquisition;
+pub(crate) mod ads1298;
+mod convert;
+mod decode;
+mod loff;
+mod preprocess;
 mod registers;
 mod spi_commands;
+
+pub(crate) use decode::CHANNELS_PER_DEVICE;
 
 use anyhow::{Context, Result};
 use esp_idf_svc::hal::gpio::{AnyInputPin, AnyOutputPin, PinDriver, Pull};
@@ -31,27 +33,27 @@ use std::sync::Arc;
 
 use ads1298::{Ads1298Device, Ads1298Pair, ChipRole};
 
-/// The ADS1298 reports this in its ID register. Checked during bring-up so a dead bus
-/// fails loudly at boot instead of producing plausible-looking zeroes forever.
+/// The ADS1298 reports this in its ID register. Bring-up checks it so a dead bus fails
+/// loudly at boot instead of producing plausible-looking zeroes forever.
 const EXPECTED_DEVICE_ID: u8 = 0x92;
 
 /// Every pin the front end needs, type-erased so the wiring lives in one place.
 ///
-/// SCLK, DIN and DOUT are shared by both chips; CS, DRDY, RESET and PWDN are per-chip;
-/// START is tied together so both chips convert on the same edge.
-pub struct AdcPins {
-    pub clock: AnyOutputPin<'static>,
-    pub data_in: AnyOutputPin<'static>,
-    pub data_out: AnyInputPin<'static>,
-    pub chip_select_a: AnyOutputPin<'static>,
-    pub chip_select_b: AnyOutputPin<'static>,
-    pub data_ready_a: AnyInputPin<'static>,
-    pub data_ready_b: AnyInputPin<'static>,
-    pub reset_a: AnyOutputPin<'static>,
-    pub reset_b: AnyOutputPin<'static>,
-    pub power_down_a: AnyOutputPin<'static>,
-    pub power_down_b: AnyOutputPin<'static>,
-    pub start: AnyOutputPin<'static>,
+/// SCLK, DIN and DOUT are shared by both chips. CS, DRDY, RESET and PWDN are per-chip.
+/// START is tied together, so both chips convert on the same edge.
+pub(crate) struct AdcPins {
+    pub(crate) clock: AnyOutputPin<'static>,
+    pub(crate) data_in: AnyOutputPin<'static>,
+    pub(crate) data_out: AnyInputPin<'static>,
+    pub(crate) chip_select_a: AnyOutputPin<'static>,
+    pub(crate) chip_select_b: AnyOutputPin<'static>,
+    pub(crate) data_ready_a: AnyInputPin<'static>,
+    pub(crate) data_ready_b: AnyInputPin<'static>,
+    pub(crate) reset_a: AnyOutputPin<'static>,
+    pub(crate) reset_b: AnyOutputPin<'static>,
+    pub(crate) power_down_a: AnyOutputPin<'static>,
+    pub(crate) power_down_b: AnyOutputPin<'static>,
+    pub(crate) start: AnyOutputPin<'static>,
 }
 
 /// Brings both chips up and leaves them streaming in RDATAC mode.
@@ -63,7 +65,7 @@ pub struct AdcPins {
 /// `test_signal_channel` is `Some(0..=7)` to drive the ADS1298's internal square wave
 /// into that channel on both chips instead of the electrodes. See
 /// [`ads1298::Ads1298Device::enable_test_signal`].
-pub fn bring_up<SPI: SpiAnyPins + 'static>(
+pub(crate) fn bring_up<SPI: SpiAnyPins + 'static>(
     spi: SPI,
     pins: AdcPins,
     baud_rate_hz: u32,
