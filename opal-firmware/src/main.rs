@@ -1,8 +1,8 @@
 //! Opal EMG wristband firmware (ESP32-S3).
 //!
-//! Does the work of the final device: a fake provider replays embedded Hyser windows
-//! (no ADC yet), the int8 model classifies each window, the reject pipeline smooths
-//! it into a wake-gate decision, and the result streams to the dashboard as EMG +
+//! Does the work of the final device: two ADS1298 ADCs sample 16 EMG channels on their
+//! own thread, the int8 model classifies each window, the reject pipeline smooths it
+//! into a wake-gate decision, and the result streams to the dashboard as EMG +
 //! prediction + event + log frames. The device owns its functional config
 //! (sensitivity, keymap, wifi) and honors browser control frames, persisting them to
 //! NVS.
@@ -15,12 +15,12 @@
 //! (heartbeats keep the claim alive; silence or unplug releases it), and TCP carries
 //! the stream otherwise.
 
+mod adc;
 mod config;
 mod frames;
 mod link_policy;
 mod links;
 mod logger;
-mod provider;
 mod transport;
 mod wifi;
 
@@ -28,19 +28,43 @@ use config::{Sensitivity, Settings, Store};
 use emg_runtime::model::{Model, NUM_CLASSES};
 use emg_runtime::{softmax, ForwardResult, RejectPipeline};
 use esp_idf_svc::eventloop::EspSystemEventLoop;
-use esp_idf_svc::hal::delay::FreeRtos;
 use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::hal::usb_serial::{UsbSerialConfig, UsbSerialDriver};
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use links::Links;
 use log::info;
 use protocol::{Frame, WakeState};
-use provider::Provider;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use transport::{Control, SerialTransport};
 
-/// Hyser acquisition rate; the window duration paces the stream.
-const SAMPLE_RATE: u32 = 2048;
+/// SPI clock for the ADS1298 bus. Two 27-byte frames have to clear inside one sample
+/// period (500 µs at 2 kSPS), which 1 MHz only just manages. Raise this if the
+/// dropped-window counter in the periodic log is ever non-zero.
+const ADC_SPI_BAUD_RATE_HZ: u32 = 1_000_000;
+
+/// Drive the ADS1298's internal square wave into this channel instead of the
+/// electrodes, shorting every other channel's input.
+///
+/// This is the bring-up check that separates a broken read path from a broken analog
+/// front end: the named channel must show a clean square wave at a known amplitude
+/// while the others sit near zero. If the test signal is right and the electrodes are
+/// wrong, the fault is in front of the ADC. `None` reads the electrodes.
+const ADC_TEST_SIGNAL_CHANNEL: Option<usize> = None;
+
+// An out-of-range channel would silently sample the wrong input and cost a bench
+// session, so refuse it at compile time rather than at boot.
+const _: () = assert!(
+    match ADC_TEST_SIGNAL_CHANNEL {
+        Some(channel) => channel < adc::decode::CHANNELS_PER_DEVICE,
+        None => true,
+    },
+    "ADC_TEST_SIGNAL_CHANNEL must be within 0..CHANNELS_PER_DEVICE"
+);
+
+/// How long to wait for a window before giving up and running the loop again.
+/// Comfortably longer than one window period (~250 ms), comfortably shorter than the
+/// 5 s task watchdog, so a silent front end logs a stall instead of rebooting.
+const WINDOW_TIMEOUT_MS: u32 = 1000;
 
 /// Windows between periodic performance log lines (~31 s at the 244 ms window
 /// period). Long enough that the log stays single events, not spam.
@@ -49,8 +73,8 @@ const PERF_LOG_INTERVAL: u32 = 128;
 /// Running inference-latency, total-processing-latency, and loop-throughput stats
 /// between periodic log lines. "Total" is inference plus the reject-pipeline
 /// decision, CBOR frame build, and transport write -- everything the device itself
-/// contributes to onset-to-output latency, short of the acquisition front end (no
-/// ADC yet) and BLE dispatch (not wired into this firmware yet).
+/// contributes to onset-to-output latency, short of acquisition (which runs on its own
+/// thread) and BLE dispatch (not wired into this firmware yet).
 #[derive(Default)]
 struct PerfStats {
     interval_start: Option<Instant>,
@@ -59,14 +83,20 @@ struct PerfStats {
     infer_max_us: u64,
     total_sum_us: u64,
     total_max_us: u64,
+    /// Cumulative dropped-window count at the start of the interval, so the log can
+    /// report drops per interval rather than an ever-growing total.
+    dropped_at_interval_start: u32,
 }
 
 impl PerfStats {
     /// Record one window's inference time and total processing time (inference
     /// through frame send, excluding the intentional real-time pacing sleep);
     /// logs and resets every [`PERF_LOG_INTERVAL`] windows.
-    fn record(&mut self, infer_us: u64, total_us: u64) {
+    fn record(&mut self, infer_us: u64, total_us: u64, dropped_total: u32) {
         let start = *self.interval_start.get_or_insert_with(Instant::now);
+        if self.count == 0 {
+            self.dropped_at_interval_start = dropped_total;
+        }
         self.count += 1;
         self.infer_sum_us += infer_us;
         self.infer_max_us = self.infer_max_us.max(infer_us);
@@ -77,8 +107,9 @@ impl PerfStats {
             let infer_mean_us = self.infer_sum_us / self.count as u64;
             let total_mean_us = self.total_sum_us / self.count as u64;
             let throughput_hz = self.count as f64 / start.elapsed().as_secs_f64();
+            let dropped = dropped_total.saturating_sub(self.dropped_at_interval_start);
             info!(
-                "inference: mean {infer_mean_us} us | max {} us || total processing: mean {total_mean_us} us | max {} us || throughput {throughput_hz:.1} windows/sec (over {} windows)",
+                "inference: mean {infer_mean_us} us | max {} us || total processing: mean {total_mean_us} us | max {} us || throughput {throughput_hz:.1} windows/sec (over {} windows) || dropped {dropped}",
                 self.infer_max_us, self.total_max_us, self.count
             );
             *self = PerfStats::default();
@@ -87,8 +118,7 @@ impl PerfStats {
 }
 
 /// The int8 model blob exported by `emg-tds export-int8`. Embedded and handed to
-/// `emg-runtime`, which also reads its embedded verify windows as the fake provider's
-/// data. Shared with `ml-bench`.
+/// `emg-runtime`. Shared with `ml-bench`.
 pub const MODEL_BIN: &[u8] = include_bytes!("../../ml-bench/data/model_int8.bin");
 
 fn main() -> anyhow::Result<()> {
@@ -106,7 +136,6 @@ fn main() -> anyhow::Result<()> {
     info!("device id: {device_id}");
 
     let model = Model::load(MODEL_BIN);
-    let mut provider = Provider::new();
     let mut pipeline = RejectPipeline::new(NUM_CLASSES, settings.sensitivity.tau());
 
     // Heap headroom is the constraint when sizing wifi/lwIP buffers (see
@@ -128,6 +157,45 @@ fn main() -> anyhow::Result<()> {
 
     let mut links = Links::new(serial, peripherals.modem, sysloop, nvs_partition, &settings)?;
 
+    // ---------------------------------------------------------------------------
+    // ADS1298 wiring. This block is the pin map: if the board disagrees with the
+    // firmware, this is the only place that needs editing. The SPI clock and the
+    // test-signal channel are constants at the top of this file.
+    //
+    // SCLK/DIN/DOUT are shared by both chips. CS, DRDY, RESET and PWDN are per-chip.
+    // START is tied to both so they convert on the same edge. GPIO 19 and 20 are
+    // taken by USB-Serial-JTAG above and are not available here.
+    // ---------------------------------------------------------------------------
+    let adc_pins = adc::AdcPins {
+        clock: peripherals.pins.gpio12.into(),
+        data_in: peripherals.pins.gpio11.into(),
+        data_out: peripherals.pins.gpio13.into(),
+        chip_select_a: peripherals.pins.gpio10.into(),
+        chip_select_b: peripherals.pins.gpio6.into(),
+        data_ready_a: peripherals.pins.gpio9.into(),
+        data_ready_b: peripherals.pins.gpio5.into(),
+        reset_a: peripherals.pins.gpio8.into(),
+        reset_b: peripherals.pins.gpio1.into(),
+        power_down_a: peripherals.pins.gpio14.into(),
+        power_down_b: peripherals.pins.gpio4.into(),
+        start: peripherals.pins.gpio7.into(),
+    };
+
+    // The model's own quantisation scale, read straight off the blob header so the ADC
+    // path produces int8 on the same footing training used.
+    let input_scale = emg_runtime::VerifyBatch::new(MODEL_BIN).input_scale;
+
+    // Bring-up blocks ~4.4 s on the ADS1298's mandated settling delays, so it has to
+    // happen before the task watchdog is registered below. A failure here is fatal:
+    // this firmware has no other source of EMG, so there is nothing useful left to do.
+    let pair = adc::bring_up(
+        peripherals.spi2,
+        adc_pins,
+        ADC_SPI_BAUD_RATE_HZ,
+        ADC_TEST_SIGNAL_CHANNEL,
+    )?;
+    let source = adc::acquisition::start(pair, model.input_len, input_scale)?;
+
     // The main loop paces at one window (~244 ms); if it ever stops feeding the task
     // watchdog (default 5 s), something below hung on I/O and the chip must reboot
     // rather than sit dead until unplugged. The boot log names the reset reason.
@@ -135,13 +203,13 @@ fn main() -> anyhow::Result<()> {
         esp_idf_svc::sys::esp_task_wdt_add(std::ptr::null_mut());
     }
 
-    let window_us = model.input_len as u64 * 1_000_000 / SAMPLE_RATE as u64;
+    let sample_rate = adc::ads1298::SAMPLE_RATE_HZ;
+    let window_us = model.input_len as u64 * 1_000_000 / sample_rate as u64;
     let mut seq: u32 = 0;
     let mut prev_wake = WakeState::Idle;
     let mut perf = PerfStats::default();
 
     loop {
-        let iter_start = Instant::now();
         unsafe {
             esp_idf_svc::sys::esp_task_wdt_reset();
         }
@@ -153,13 +221,18 @@ fn main() -> anyhow::Result<()> {
             config_changed |= apply_control(control, &mut settings, &mut pipeline, &store);
         }
 
-        // One window of work. `infer_start` marks where the device's own
-        // contribution to onset-to-output latency begins (acquisition happens
-        // upstream of this, on hardware that doesn't exist yet); `perf.record`
-        // below closes it out after the frames are on the wire.
-        let window = provider.next_window();
+        // One window of work. `infer_start` marks where the device's own contribution
+        // to onset-to-output latency begins; acquisition happens upstream of it, on
+        // the ADC thread. `perf.record` below closes it out after the frames are on
+        // the wire.
+        //
+        // A missing window is not fatal: keep looping so the watchdog stays fed and
+        // the link stays serviced. `next_window` has already logged why.
+        let Some(input) = source.next_window(WINDOW_TIMEOUT_MS) else {
+            continue;
+        };
         let infer_start = Instant::now();
-        let ForwardResult::Logits(raw_logits) = model.forward(&window.input);
+        let ForwardResult::Logits(raw_logits) = model.forward(&input);
         let infer_us = infer_start.elapsed().as_micros() as u64;
         let logits: [f32; NUM_CLASSES] =
             std::array::from_fn(|class| raw_logits[class] as f32 * model.logit_scale);
@@ -170,10 +243,10 @@ fn main() -> anyhow::Result<()> {
         let mut window_frames = vec![
             frames::emg(
                 seq,
-                &window.input,
-                provider.input_scale(),
+                &input,
+                source.input_scale(),
                 model.input_len,
-                SAMPLE_RATE,
+                sample_rate,
             ),
             frames::prediction(seq, logits, softmax, &decision, pipeline.tau),
         ];
@@ -184,17 +257,14 @@ fn main() -> anyhow::Result<()> {
             config: settings.to_wire(),
         });
         links.send_window(hello.as_ref(), &window_frames);
-        perf.record(infer_us, infer_start.elapsed().as_micros() as u64);
+        perf.record(
+            infer_us,
+            infer_start.elapsed().as_micros() as u64,
+            source.dropped_windows(),
+        );
 
         prev_wake = decision.wake_state;
         seq = seq.wrapping_add(1);
-
-        // Pace to real time: sleep only what's left of the window after this
-        // iteration's compute and send. If the work already overran, don't sleep.
-        let window = Duration::from_micros(window_us);
-        if let Some(remaining) = window.checked_sub(iter_start.elapsed()) {
-            FreeRtos::delay_ms(remaining.as_millis() as u32);
-        }
     }
 }
 

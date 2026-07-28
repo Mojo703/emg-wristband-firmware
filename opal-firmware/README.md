@@ -1,9 +1,12 @@
 # opal-firmware
 
-Firmware for the Opal EMG wristband (ESP32-S3): a fake provider replays embedded
-Hyser windows, the int8 model classifies each window, the reject pipeline smooths
-it into a wake-gate decision, and the frames stream to the dashboard over wifi or
-USB serial. `src/main.rs` has the module-level docs.
+Firmware for the Opal EMG wristband (ESP32-S3): two ADS1298 ADCs sample 16 EMG
+channels, the int8 model classifies each window, the reject pipeline smooths it
+into a wake-gate decision, and the frames stream to the dashboard over wifi or USB
+serial. `src/main.rs` has the module-level docs.
+
+The ADCs are the only source of EMG: if they do not come up, boot fails and says why.
+`BRINGUP.md` is the bench procedure for new hardware.
 
 ## Building and flashing
 
@@ -21,8 +24,8 @@ override it.
 
 ## On-device tests
 
-The unit tests (currently the `link_policy` module) run on the device, because the
-crate only builds for Xtensa:
+The unit tests (`link_policy`, and the ADC decode, lead-off, conversion and
+preprocessing modules) run on the device, because the crate only builds for Xtensa:
 
 ```sh
 cargo test-device
