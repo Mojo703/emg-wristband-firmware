@@ -17,6 +17,7 @@
 //! (optional pose inference service WebSocket the backend proxies EMG frames to).
 
 mod browser;
+mod collect;
 mod device;
 mod frame;
 mod looks;
@@ -55,8 +56,7 @@ async fn main() -> anyhow::Result<()> {
     let pose_url = std::env::var("EMG_POSE_URL").ok();
 
     // Devices dialing in over wifi land on this TCP port.
-    let device_addr =
-        std::env::var("EMG_DEVICE_ADDR").unwrap_or_else(|_| "0.0.0.0:9000".into());
+    let device_addr = std::env::var("EMG_DEVICE_ADDR").unwrap_or_else(|_| "0.0.0.0:9000".into());
     // The port a device dials over wifi — the bind's own port, regardless of the
     // (usually wildcard) bind host. Suggestions pair it with each of our IPs.
     let device_port = device_addr
@@ -73,7 +73,11 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(device::run_serial_discovery(registry.clone()));
     }
 
-    let state = AppState { registry, pose_url, device_port };
+    let state = AppState {
+        registry,
+        pose_url,
+        device_port,
+    };
 
     let web_dir = std::env::var("DASHBOARD_WEB").unwrap_or_else(|_| "web/dist".into());
     let static_files =

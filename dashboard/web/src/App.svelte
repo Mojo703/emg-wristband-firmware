@@ -33,7 +33,7 @@
   const deviceOptions = $derived(
     (live.hello?.devices ?? []).map((device) => ({ value: device.id, label: device.label })),
   );
-  const selectedDevice = $derived(live.hello?.selected_device ?? '');
+  const selectedDevice = $derived(live.hello?.selection?.device_id ?? '');
 
   onMount(connect);
 </script>

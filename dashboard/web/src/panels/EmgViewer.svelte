@@ -231,8 +231,8 @@
   // Cosmetics (labels, colours, the command/reject split, state vocabulary) come
   // from the backend; functional values (τ, the streak goal) from the device config.
   const config = $derived(live.hello);
-  const deviceConfig = $derived(live.hello?.config ?? null);
-  const classInfo = $derived<readonly ClassInfo[]>(config?.classes ?? []);
+  const deviceConfig = $derived(live.hello?.selection?.config ?? null);
+  const classInfo = $derived<readonly ClassInfo[]>(config?.selection?.classes ?? []);
   const stateByName = $derived<Record<string, StateInfo>>(
     config === null ? {} : Object.fromEntries(
       config.states.map((state) => [state.name, state]),

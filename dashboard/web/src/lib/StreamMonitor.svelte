@@ -36,10 +36,10 @@
   // this panel monitors is named. Null while no device is selected.
   const transport = $derived.by(() => {
     const hello = live.hello;
-    const device = hello?.devices.find((entry) => entry.id === hello.selected_device);
+    const device = hello?.devices.find((entry) => entry.id === hello.selection?.device_id);
     if (device === undefined) return null;
     if (device.transport === 'serial') return 'Serial';
-    const ssid = hello?.config?.wifi_ssid;
+    const ssid = hello?.selection?.config.wifi_ssid;
     return ssid ? `Wifi (${ssid})` : 'Wifi';
   });
 

@@ -231,6 +231,8 @@ dependencies = [
  "futures-util",
  "if-addrs",
  "protocol",
+ "serde",
+ "serde_json",
  "tokio",
  "tokio-serial",
  "tokio-tungstenite",

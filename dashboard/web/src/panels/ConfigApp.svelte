@@ -18,7 +18,7 @@
   // The discrete settings reflect the selected device's live config directly — no
   // local draft. Each change applies immediately; the device re-announces and the
   // backend echoes a fresh Hello, so what's shown is always what's active.
-  const config = $derived(live.hello?.config ?? null);
+  const config = $derived(live.hello?.selection?.config ?? null);
   const gestures = $derived(config?.gestures ?? 0);
   const keymap = $derived(config?.keymap ?? []);
   const levels = $derived(config?.sensitivity_levels ?? []);

@@ -24,6 +24,7 @@
 
 extern crate alloc;
 
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
@@ -33,22 +34,16 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Frame {
     /// Backend → browser: the complete view state. Re-sent whenever the device set,
-    /// the selection, or the selected device's config changes. `config` is the
-    /// selected device's own functional truth; `classes`/`states` are the backend's
-    /// cosmetic projection (colours/labels) layered on top.
+    /// the selection, or the selected device's config changes. Everything that
+    /// only exists when a device is selected travels together inside
+    /// `selection`, so "a selected id without its config" cannot be encoded.
     Hello {
         /// Every device currently connected to the backend — the picker list.
         devices: Vec<DeviceInfo>,
-        /// Which device the config/classes below describe, if one is selected.
-        selected_device: Option<String>,
-        /// The selected device's functional config; `None` when nothing is selected.
-        config: Option<DeviceConfig>,
-        /// Render hints per softmax class for the selected device (label/colour/role)
-        /// so the frontend needs no built-in palette or command/reject knowledge.
-        /// Empty when no device is selected.
-        classes: Vec<ClassInfo>,
+        /// The selected device and its projection; `None` when nothing is selected.
+        selection: Option<Selection>,
         /// Render hints per wake-gate state (colour/label/intensity) so the frontend
-        /// hardcodes none of the state vocabulary.
+        /// hardcodes none of the state vocabulary. Selection-independent.
         states: Vec<StateInfo>,
         /// Candidate dashboard addresses (this host's own reachable IPv4s paired with
         /// the device-listener port), best-guess first, so the config UI can pre-fill
@@ -167,6 +162,465 @@ pub enum Frame {
     /// the device falls back to wifi. The reply direction needs no heartbeat: the
     /// data stream itself is the liveness signal.
     Heartbeat {},
+
+    // ------------------------------------------------------------------
+    // Training-data collection (the rhythm game). These frames travel only
+    // between browser and backend; the device never sees them — collection
+    // records the same `Emg` stream the device already sends. Instants ride
+    // as [`UnixMilliseconds`] on the one clock browser and backend share
+    // (same machine); positions inside a track are [`TrackMilliseconds`].
+    // ------------------------------------------------------------------
+    /// Backend → browser: everything the session-setup form offers — the subject
+    /// roster, the playable tracks, the gesture classes being collected (with
+    /// their lane colours), the activity/sweat vocabularies, and the per-class
+    /// rep goal. Sent on connect and whenever the backend's collection config
+    /// changes. The gesture classes are the *collection* target set; they are
+    /// unrelated to the device's trained model classes in [`DeviceConfig`].
+    CollectionCatalog {
+        subjects: Vec<SubjectId>,
+        tracks: Vec<TrackInfo>,
+        collection_classes: Vec<CollectionClass>,
+        activities: Vec<ActivityCondition>,
+        sweat_levels: Vec<SweatLevel>,
+        goal_per_class: u16,
+    },
+
+    /// Browser → backend: begin a collection session on the selected device. The
+    /// backend creates the session directory, starts the EMG recorder and the
+    /// webcam capture, generates the beatmap, and answers with [`Frame::Beatmap`]
+    /// plus a [`Frame::CollectionState`] in the `armed` phase.
+    StartCollection {
+        metadata: SessionMetadata,
+        track_id: TrackId,
+    },
+
+    /// Browser → backend: audio playback actually began (the browser owns the
+    /// audio element, so only it knows the true start moment). Anchors every
+    /// note's track position to the shared clock; the backend logs cue events
+    /// from it.
+    TrackStarted { at_unix_ms: UnixMilliseconds },
+
+    /// Browser → backend: end or resolve the session. While armed/playing it
+    /// aborts early (recording is finalized first); in the reviewing phase it
+    /// resolves the decision the summary screen offers. Either way
+    /// `save: false` deletes the session directory and `save: true` keeps it;
+    /// the backend then returns to idle.
+    StopCollection { save: bool },
+
+    /// Browser → backend: capture a webcam still of the donned band. Allowed
+    /// before `StartCollection`; the backend holds the most recent photo and
+    /// writes it into the next session's directory.
+    CapturePlacementPhoto {},
+
+    /// Backend → browser: the authoritative collection state. Sent on every
+    /// phase change and periodically while recording, so the browser's rec
+    /// tripwire reflects bytes actually reaching disk rather than local hope.
+    CollectionState {
+        /// Everything phase-specific lives *inside* the phase: an armed/playing
+        /// session always has recording health, a finished one always has its
+        /// summary, and idle carries nothing.
+        phase: CollectionPhase,
+        /// When the pending placement photo was captured, if one is held.
+        placement_photo: Option<UnixMilliseconds>,
+    },
+
+    /// Backend → browser: the complete note schedule for the armed session. The
+    /// browser renders it against audio time and never invents notes; the backend
+    /// logs the same schedule as cue events, so labels never depend on the
+    /// browser. `session_id` ties it to the session it was generated for, so a
+    /// stale schedule cannot be silently attributed to a new session.
+    Beatmap {
+        session_id: SessionId,
+        track: TrackInfo,
+        notes: Beatmap,
+        /// Silence the browser inserts before audio t = 0 so the first notes
+        /// have fall time.
+        lead_in: DurationMilliseconds,
+    },
+
+    /// Backend → browser: verdict for one cued note from the activity detector
+    /// (did muscle activity spike inside the note's timing window?). Drives the
+    /// streak colouring; carries no claim about *which* gesture was made.
+    NoteResult {
+        session_id: SessionId,
+        index: NoteIndex,
+        hit: bool,
+    },
+}
+
+// ------------------------------------------------------------------
+// Collection units and identifiers. All are `#[serde(transparent)]`:
+// on the wire they are the bare value, in Rust they are distinct types,
+// so a track position cannot be handed to something expecting a wall-clock
+// instant and a class id cannot be swapped with a subject id.
+// ------------------------------------------------------------------
+
+/// An instant on the wall clock browser and backend share (unix epoch
+/// milliseconds; both run on the same laptop, so `Date.now()` and the backend
+/// clock agree). The value is private so all arithmetic goes through the named
+/// operations below — adding two instants, say, does not exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct UnixMilliseconds(u64);
+
+impl UnixMilliseconds {
+    pub const fn new(unix_epoch_milliseconds: u64) -> Self {
+        Self(unix_epoch_milliseconds)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    /// The wall-clock moment a track position occurs, given the instant audio
+    /// t = 0 happened — the anchoring every cue label rests on.
+    pub const fn at_track_position(self, position: TrackMilliseconds) -> UnixMilliseconds {
+        UnixMilliseconds(self.0 + position.get() as u64)
+    }
+
+    /// Signed distance from `earlier` to `self`.
+    pub const fn since(self, earlier: UnixMilliseconds) -> OffsetMilliseconds {
+        OffsetMilliseconds(self.0 as i64 - earlier.0 as i64)
+    }
+}
+
+/// A position on a track's audio timeline (milliseconds after audio t = 0).
+/// Positions add with durations, never with each other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TrackMilliseconds(u32);
+
+impl TrackMilliseconds {
+    pub const fn new(milliseconds_after_audio_start: u32) -> Self {
+        Self(milliseconds_after_audio_start)
+    }
+
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+
+    pub const fn plus(self, duration: DurationMilliseconds) -> TrackMilliseconds {
+        TrackMilliseconds(self.0 + duration.get())
+    }
+
+    /// Is this position inside a track of the given length?
+    pub const fn is_within(self, length: DurationMilliseconds) -> bool {
+        self.0 < length.get()
+    }
+}
+
+/// A length of time, unattached to any timeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct DurationMilliseconds(u32);
+
+impl DurationMilliseconds {
+    pub const fn new(milliseconds: u32) -> Self {
+        Self(milliseconds)
+    }
+
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+/// A signed distance between two instants (e.g. how late video capture started).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct OffsetMilliseconds(i64);
+
+impl OffsetMilliseconds {
+    pub const fn new(milliseconds: i64) -> Self {
+        Self(milliseconds)
+    }
+
+    pub const fn get(self) -> i64 {
+        self.0
+    }
+}
+
+/// Position of a note in its [`Beatmap`] — the index [`Beatmap::get`] resolves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct NoteIndex(pub u32);
+
+macro_rules! string_id {
+    ($(#[$doc:meta])* $name:ident) => {
+        $(#[$doc])*
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+        #[serde(transparent)]
+        pub struct $name(pub String);
+
+        impl core::fmt::Display for $name {
+            fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                formatter.write_str(&self.0)
+            }
+        }
+    };
+}
+
+string_id! {
+    /// A subject from the catalog roster.
+    SubjectId
+}
+string_id! {
+    /// A playable track in the catalog.
+    TrackId
+}
+string_id! {
+    /// A gesture class being collected, e.g. "index_pinch". The stable label
+    /// written into cue events.
+    ClassId
+}
+string_id! {
+    /// An activity condition from the catalog, e.g. "seated", "post_workout".
+    ActivityId
+}
+string_id! {
+    /// A sweat level from the catalog, e.g. "dry", "sweaty".
+    SweatId
+}
+string_id! {
+    /// A collection session — its directory name.
+    SessionId
+}
+
+/// Band distance below the elbow crease.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Millimeters(pub u16);
+
+/// Band rotation from the agreed reference orientation, signed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Degrees(pub i16);
+
+/// A track's tempo. `NonZero` so `beat_period` cannot divide by zero: a track
+/// claiming 0 bpm is rejected at deserialization, not discovered mid-session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct BeatsPerMinute(pub core::num::NonZeroU16);
+
+impl BeatsPerMinute {
+    /// The time between consecutive beats.
+    pub const fn beat_period(self) -> DurationMilliseconds {
+        DurationMilliseconds(60_000 / self.0.get() as u32)
+    }
+}
+
+/// Which arm wears the band.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Arm {
+    Left,
+    Right,
+}
+
+/// The session-setup form's answers, browser → backend in [`Frame::StartCollection`]
+/// and stored verbatim in the session's `session.json`. Every id refers into the
+/// [`Frame::CollectionCatalog`] vocabularies.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionMetadata {
+    pub subject: SubjectId,
+    pub arm: Arm,
+    pub gloves: bool,
+    pub skin_prep: bool,
+    pub band_offset: Millimeters,
+    pub band_rotation: Degrees,
+    /// When the band was last donned (auto-stamped; "re-donned now" re-stamps).
+    pub donned: UnixMilliseconds,
+    pub activity: ActivityId,
+    pub sweat: SweatId,
+    /// The one optional free-text field.
+    pub note: Option<String>,
+}
+
+/// One activity condition the setup form offers (what the body is doing).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ActivityCondition {
+    pub id: ActivityId,
+    pub label: String,
+}
+
+/// One sweat level the setup form offers.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SweatLevel {
+    pub id: SweatId,
+    pub label: String,
+}
+
+/// One playable track in the catalog. The browser fetches the audio itself over
+/// HTTP (`/collection/audio/{id}`); only the identity and beat grid ride the socket.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TrackInfo {
+    pub id: TrackId,
+    pub title: String,
+    pub beats_per_minute: BeatsPerMinute,
+    /// Where the first beat of the grid falls on the audio timeline.
+    pub first_beat: TrackMilliseconds,
+    pub duration: DurationMilliseconds,
+}
+
+/// One gesture class being collected — a lane in the game. `color` is a named
+/// palette colour, backend-owned like every other cosmetic.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CollectionClass {
+    pub id: ClassId,
+    pub label: String,
+    pub color: String,
+}
+
+/// One cue in the beatmap. Carries its class *identity*, not an index into a
+/// list that travels in a different frame; its position in the schedule is its
+/// [`NoteIndex`], held by the [`Beatmap`] rather than duplicated here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Note {
+    pub class_id: ClassId,
+    pub at: TrackMilliseconds,
+}
+
+/// A note schedule whose ordering invariant is checked once, at construction
+/// (and at deserialization, via `try_from`): positions strictly increase, so
+/// every [`NoteIndex`] resolves to the note at that position and rendering
+/// order equals schedule order. Serializes as the bare note array.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "Vec<Note>", into = "Vec<Note>")]
+pub struct Beatmap {
+    notes: Vec<Note>,
+}
+
+/// Why a note list is not a valid [`Beatmap`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NotesOutOfOrder;
+
+impl core::fmt::Display for NotesOutOfOrder {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("beatmap notes must strictly increase in track position")
+    }
+}
+
+impl TryFrom<Vec<Note>> for Beatmap {
+    type Error = NotesOutOfOrder;
+
+    fn try_from(notes: Vec<Note>) -> Result<Self, Self::Error> {
+        let ordered = notes.windows(2).all(|pair| pair[0].at < pair[1].at);
+        if ordered {
+            Ok(Self { notes })
+        } else {
+            Err(NotesOutOfOrder)
+        }
+    }
+}
+
+impl From<Beatmap> for Vec<Note> {
+    fn from(beatmap: Beatmap) -> Vec<Note> {
+        beatmap.notes
+    }
+}
+
+impl Beatmap {
+    /// The note at a given schedule position.
+    pub fn get(&self, index: NoteIndex) -> Option<&Note> {
+        self.notes.get(index.0 as usize)
+    }
+
+    /// Every note with its position, schedule order.
+    pub fn iter(&self) -> impl Iterator<Item = (NoteIndex, &Note)> {
+        self.notes
+            .iter()
+            .enumerate()
+            .map(|(position, note)| (NoteIndex(position as u32), note))
+    }
+
+    pub fn len(&self) -> usize {
+        self.notes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.notes.is_empty()
+    }
+}
+
+/// Where a collection session stands. Each phase carries exactly the data that
+/// exists in it, so "finished without a summary" or "idle with recording
+/// health" cannot be constructed. Serializes internally tagged on `name`
+/// (`{"name": "playing", ...}`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "name", rename_all = "snake_case")]
+pub enum CollectionPhase {
+    /// No session; the setup form is live.
+    Idle,
+    /// Session started, recorder and camera rolling, waiting for `TrackStarted`.
+    Armed {
+        session_id: SessionId,
+        recording: RecordingHealth,
+    },
+    /// Audio playing, notes falling.
+    Playing {
+        session_id: SessionId,
+        recording: RecordingHealth,
+    },
+    /// The track ended (or the session was stopped): recording is finalized,
+    /// the files are on disk, and the summary screen is asking the user to
+    /// keep or discard. `StopCollection` resolves it and returns to idle.
+    Reviewing {
+        session_id: SessionId,
+        summary: CollectionSummary,
+    },
+}
+
+/// Disk-level progress of one recording stream. `advancing` means the bytes
+/// grew since the previous health check — the tripwire signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamProgress {
+    pub bytes_on_disk: u64,
+    pub advancing: bool,
+}
+
+/// Liveness of the session's recording streams, measured at the disk, not the
+/// intent. `video` is `None` when no camera is running — a session without
+/// video is legitimate, a session without EMG is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordingHealth {
+    pub emg: StreamProgress,
+    pub video: Option<StreamProgress>,
+}
+
+/// One file the session wrote, for the summary screen's files card.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FileReport {
+    pub name: String,
+    pub bytes: u64,
+    /// Human line beside the name, e.g. "2000 sps · 16 ch" or "30 fps".
+    pub detail: String,
+}
+
+/// What the summary screen shows when a session finishes. The total cue count
+/// is deliberately absent: it is the sum of `cues_per_class`, and carrying it
+/// separately would be an invariant to violate.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CollectionSummary {
+    pub duration: DurationMilliseconds,
+    /// Cues delivered per class, keyed by identity — no positional coupling to
+    /// a class list that travelled in an earlier frame.
+    pub cues_per_class: BTreeMap<ClassId, u16>,
+    /// Cues whose timing window contained detected muscle activity.
+    pub activity_hits: u32,
+    pub files: Vec<FileReport>,
+    /// Windows missing from the EMG stream, by `seq` discontinuities.
+    pub emg_gap_count: u32,
+    /// Video start relative to session start on the shared clock, if video ran.
+    pub video_start_offset: Option<OffsetMilliseconds>,
+}
+
+impl CollectionSummary {
+    /// Total cues delivered across all classes.
+    pub fn cues_total(&self) -> u32 {
+        self.cues_per_class
+            .values()
+            .map(|&count| count as u32)
+            .sum()
+    }
 }
 
 /// Severity of a [`Frame::Log`] record. Mirrors the `log` crate's levels the
@@ -178,6 +632,21 @@ pub enum LogLevel {
     Warn,
     Info,
     Debug,
+}
+
+/// The selected device in a [`Frame::Hello`]: its identity, its own functional
+/// config, and the backend's cosmetic projection of that config. One `Option`
+/// around this whole product replaces three fields that had to be null/empty
+/// in lockstep.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Selection {
+    /// Stable, MAC-derived id, e.g. "opal-1a2b3c".
+    pub device_id: String,
+    /// The device's functional config, verbatim.
+    pub config: DeviceConfig,
+    /// Render hints per softmax class (label/colour/role) so the frontend needs
+    /// no built-in palette or command/reject knowledge.
+    pub classes: Vec<ClassInfo>,
 }
 
 /// A connected device, as shown in the browser's device picker.
@@ -616,6 +1085,258 @@ mod tests {
             } => {
                 assert_eq!(device_id, "opal-1a2b3c");
                 assert_eq!(out, config);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    fn sample_metadata() -> SessionMetadata {
+        SessionMetadata {
+            subject: SubjectId("matthew".into()),
+            arm: Arm::Right,
+            gloves: false,
+            skin_prep: true,
+            band_offset: Millimeters(40),
+            band_rotation: Degrees(-15),
+            donned: UnixMilliseconds(1_784_000_000_000),
+            activity: ActivityId("seated".into()),
+            sweat: SweatId("dry".into()),
+            note: None,
+        }
+    }
+
+    #[test]
+    fn start_collection_roundtrips() {
+        let frame = Frame::StartCollection {
+            metadata: sample_metadata(),
+            track_id: TrackId("steady-run".into()),
+        };
+        match roundtrip(&frame) {
+            Frame::StartCollection { metadata, track_id } => {
+                assert_eq!(metadata, sample_metadata());
+                assert_eq!(track_id, TrackId("steady-run".into()));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transparent_newtypes_encode_as_bare_values() {
+        // The whole point of `#[serde(transparent)]`: the wire sees the value,
+        // not a wrapper. A timestamp newtype must encode byte-identically to
+        // its inner integer, and a string id to its inner string.
+        let mut as_newtype = Vec::new();
+        ciborium::into_writer(&UnixMilliseconds(1_784_000_000_000), &mut as_newtype).unwrap();
+        let mut as_bare = Vec::new();
+        ciborium::into_writer(&1_784_000_000_000u64, &mut as_bare).unwrap();
+        assert_eq!(as_newtype, as_bare);
+
+        let mut id_newtype = Vec::new();
+        ciborium::into_writer(&ClassId("index_pinch".into()), &mut id_newtype).unwrap();
+        let mut id_bare = Vec::new();
+        ciborium::into_writer(&"index_pinch", &mut id_bare).unwrap();
+        assert_eq!(id_newtype, id_bare);
+    }
+
+    #[test]
+    fn cue_anchoring_arithmetic() {
+        let track_started = UnixMilliseconds(1_784_000_000_000);
+        let note_position = TrackMilliseconds(4_240);
+        assert_eq!(
+            track_started.at_track_position(note_position),
+            UnixMilliseconds(1_784_000_004_240)
+        );
+        assert_eq!(
+            UnixMilliseconds(1_500).since(UnixMilliseconds(2_000)),
+            OffsetMilliseconds(-500)
+        );
+        let tempo = BeatsPerMinute(core::num::NonZeroU16::new(120).unwrap());
+        assert_eq!(tempo.beat_period(), DurationMilliseconds(500));
+        assert!(TrackMilliseconds(999).is_within(DurationMilliseconds(1_000)));
+        assert!(!TrackMilliseconds(1_000).is_within(DurationMilliseconds(1_000)));
+    }
+
+    #[test]
+    fn collection_state_roundtrips_through_phases() {
+        let playing = Frame::CollectionState {
+            phase: CollectionPhase::Playing {
+                session_id: SessionId("2026-07-30T16-40_matthew".into()),
+                recording: RecordingHealth {
+                    emg: StreamProgress {
+                        bytes_on_disk: 15_700_000,
+                        advancing: true,
+                    },
+                    video: Some(StreamProgress {
+                        bytes_on_disk: 81_000_000,
+                        advancing: false,
+                    }),
+                },
+            },
+            placement_photo: Some(UnixMilliseconds(1_784_000_000_000)),
+        };
+        match roundtrip(&playing) {
+            Frame::CollectionState {
+                phase: CollectionPhase::Playing { recording, .. },
+                placement_photo,
+            } => {
+                assert!(recording.emg.advancing);
+                assert!(!recording.video.unwrap().advancing);
+                assert_eq!(placement_photo, Some(UnixMilliseconds(1_784_000_000_000)));
+            }
+            other => panic!("wrong shape: {other:?}"),
+        }
+
+        let cues_per_class: BTreeMap<ClassId, u16> = [
+            (ClassId("index_pinch".into()), 48),
+            (ClassId("middle_pinch".into()), 47),
+            (ClassId("pinky_pinch".into()), 48),
+            (ClassId("key_pinch".into()), 46),
+        ]
+        .into_iter()
+        .collect();
+        let summary = CollectionSummary {
+            duration: DurationMilliseconds(245_000),
+            cues_per_class: cues_per_class.clone(),
+            activity_hits: 183,
+            files: vec![FileReport {
+                name: "emg.i16".into(),
+                bytes: 15_700_000,
+                detail: "2000 sps · 16 ch".into(),
+            }],
+            emg_gap_count: 0,
+            video_start_offset: Some(OffsetMilliseconds(420)),
+        };
+        assert_eq!(summary.cues_total(), 189);
+        let finished = Frame::CollectionState {
+            phase: CollectionPhase::Reviewing {
+                session_id: SessionId("2026-07-30T16-40_matthew".into()),
+                summary,
+            },
+            placement_photo: None,
+        };
+        match roundtrip(&finished) {
+            Frame::CollectionState {
+                phase: CollectionPhase::Reviewing { summary, .. },
+                ..
+            } => assert_eq!(summary.cues_per_class, cues_per_class),
+            other => panic!("wrong shape: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn beatmap_roundtrips() {
+        let track = TrackInfo {
+            id: TrackId("steady-run".into()),
+            title: "Steady Run".into(),
+            beats_per_minute: BeatsPerMinute(core::num::NonZeroU16::new(120).unwrap()),
+            first_beat: TrackMilliseconds(240),
+            duration: DurationMilliseconds(245_000),
+        };
+        let notes = Beatmap::try_from(vec![
+            Note {
+                class_id: ClassId("pinky_pinch".into()),
+                at: TrackMilliseconds(2_240),
+            },
+            Note {
+                class_id: ClassId("index_pinch".into()),
+                at: TrackMilliseconds(4_240),
+            },
+        ])
+        .unwrap();
+        let frame = Frame::Beatmap {
+            session_id: SessionId("2026-07-30T16-40_matthew".into()),
+            track: track.clone(),
+            notes,
+            lead_in: DurationMilliseconds(3_000),
+        };
+        match roundtrip(&frame) {
+            Frame::Beatmap {
+                track: out_track,
+                notes,
+                lead_in,
+                ..
+            } => {
+                assert_eq!(out_track, track);
+                assert_eq!(
+                    notes.get(NoteIndex(1)),
+                    Some(&Note {
+                        class_id: ClassId("index_pinch".into()),
+                        at: TrackMilliseconds(4_240),
+                    })
+                );
+                assert_eq!(lead_in, DurationMilliseconds(3_000));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn beatmap_rejects_out_of_order_notes() {
+        let out_of_order = vec![
+            Note {
+                class_id: ClassId("index_pinch".into()),
+                at: TrackMilliseconds(4_240),
+            },
+            Note {
+                class_id: ClassId("pinky_pinch".into()),
+                at: TrackMilliseconds(2_240),
+            },
+        ];
+        assert_eq!(Beatmap::try_from(out_of_order), Err(NotesOutOfOrder));
+
+        // The same invariant holds at the deserialization boundary: a decoded
+        // frame carrying an unordered schedule is a decode error, not a value.
+        let mut encoded = Vec::new();
+        ciborium::into_writer(
+            &alloc::vec![
+                Note {
+                    class_id: ClassId("a".into()),
+                    at: TrackMilliseconds(2),
+                },
+                Note {
+                    class_id: ClassId("b".into()),
+                    at: TrackMilliseconds(1),
+                },
+            ],
+            &mut encoded,
+        )
+        .unwrap();
+        let decoded: Result<Beatmap, _> = ciborium::from_reader(encoded.as_slice());
+        assert!(decoded.is_err());
+    }
+
+    #[test]
+    fn collection_catalog_roundtrips() {
+        let frame = Frame::CollectionCatalog {
+            subjects: vec![SubjectId("matthew".into()), SubjectId("alex".into())],
+            tracks: vec![],
+            collection_classes: vec![CollectionClass {
+                id: ClassId("index_pinch".into()),
+                label: "Index pinch".into(),
+                color: "emerald".into(),
+            }],
+            activities: vec![ActivityCondition {
+                id: ActivityId("seated".into()),
+                label: "Seated".into(),
+            }],
+            sweat_levels: vec![SweatLevel {
+                id: SweatId("dry".into()),
+                label: "Dry".into(),
+            }],
+            goal_per_class: 50,
+        };
+        match roundtrip(&frame) {
+            Frame::CollectionCatalog {
+                subjects,
+                collection_classes,
+                activities,
+                goal_per_class,
+                ..
+            } => {
+                assert_eq!(subjects[0], SubjectId("matthew".into()));
+                assert_eq!(collection_classes[0].id, ClassId("index_pinch".into()));
+                assert_eq!(activities[0].id, ActivityId("seated".into()));
+                assert_eq!(goal_per_class, 50);
             }
             other => panic!("wrong variant: {other:?}"),
         }

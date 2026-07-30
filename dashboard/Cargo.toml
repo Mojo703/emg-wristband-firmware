@@ -25,3 +25,7 @@ futures-util = "0.3"
 ciborium = "0.2"
 anyhow = "1"
 if-addrs = "0.15.0"
+
+# Collection sessions: session.json manifest and the events.jsonl label log.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

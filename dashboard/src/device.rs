@@ -224,7 +224,9 @@ fn auto_discover_ports() -> Vec<String> {
 /// whenever it names a path that exists; otherwise auto-select by USB identity. The
 /// baud rate is nominal — a CDC channel ignores it.
 pub async fn run_serial_discovery(registry: Arc<Registry>) {
-    let override_port = std::env::var(SERIAL_PORT_ENV).ok().filter(|s| !s.is_empty());
+    let override_port = std::env::var(SERIAL_PORT_ENV)
+        .ok()
+        .filter(|s| !s.is_empty());
     match &override_port {
         Some(path) => tracing::info!("serial discovery forced onto {path} (from {SERIAL_PORT_ENV})"),
         None => tracing::info!(
@@ -279,7 +281,11 @@ pub async fn run_serial_discovery(registry: Arc<Registry>) {
 /// bursty traffic, and a stalled reader backs the device's CDC buffer up until its
 /// writes time out. Blocking reads with a timeout are immune, and the threads bridge
 /// into [`device_session`] through the same channels the TCP path uses.
-async fn serial_session(path: &str, registry: Arc<Registry>, warned_ports: &Mutex<HashSet<String>>) {
+async fn serial_session(
+    path: &str,
+    registry: Arc<Registry>,
+    warned_ports: &Mutex<HashSet<String>>,
+) {
     let mut reader_port = match tokio_serial::new(path, 921_600)
         .timeout(Duration::from_millis(100))
         .open()
@@ -290,7 +296,10 @@ async fn serial_session(path: &str, registry: Arc<Registry>, warned_ports: &Mute
         // explain each path's failure once.
         Err(e) => {
             if warned_ports.lock().unwrap().insert(path.to_string()) {
-                if matches!(e.kind(), SerialErrorKind::Io(std::io::ErrorKind::PermissionDenied)) {
+                if matches!(
+                    e.kind(),
+                    SerialErrorKind::Io(std::io::ErrorKind::PermissionDenied)
+                ) {
                     tracing::warn!(
                         "serial {path}: permission denied. Add your user to the port's group \
                          (`sudo usermod -aG uucp $USER` on Arch, `dialout` on Debian/Ubuntu) and \

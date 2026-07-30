@@ -13,7 +13,7 @@
 
   // Live classifier state.
   let prediction = $state<PredictionFrame | null>(null);
-  let classes = $derived<readonly ClassInfo[]>(live.hello?.classes ?? []);
+  let classes = $derived<readonly ClassInfo[]>(live.hello?.selection?.classes ?? []);
 
   // Event log, capped to keep the panel compact.
   let events = $state<EventFrame[]>([]);

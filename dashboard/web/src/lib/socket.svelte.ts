@@ -196,7 +196,15 @@ export function connect(): void {
     if (frame.type === 'hello') {
       live.setHello(frame);
     } else if (frame.type === 'emg') {
-      const emg = decodeEmg(frame);
+      let emg: DecodedEmg;
+      try {
+        emg = decodeEmg(frame);
+      } catch (error) {
+        // A malformed blob (length not divisible by the channel count) is
+        // dropped loudly rather than rendered channel-shifted.
+        console.error('dropping malformed EMG frame', error);
+        return;
+      }
       live.setEmg(emg);
       for (const cb of listeners.emg) cb(emg);
     } else if (frame.type === 'prediction') {

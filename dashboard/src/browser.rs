@@ -31,12 +31,39 @@ const OUTBOUND_CAP: usize = 256;
 /// discard the EMG half of the stream.
 #[derive(Clone, Copy)]
 enum LiveKind {
-    Emg = 0,
-    Prediction = 1,
-    Pose = 2,
-    Other = 3,
+    Emg,
+    Prediction,
+    Pose,
+    Other,
 }
-const LIVE_KINDS: usize = 4;
+
+/// The latest live message of each kind, held while the browser catches up.
+/// One named slot per [`LiveKind`] and an exhaustive match in `set`, so adding
+/// a kind without a slot is a compile error rather than silently dropped traffic.
+#[derive(Default)]
+struct LatestLive {
+    emg: Option<Message>,
+    prediction: Option<Message>,
+    pose: Option<Message>,
+    other: Option<Message>,
+}
+
+impl LatestLive {
+    fn set(&mut self, kind: LiveKind, message: Message) {
+        match kind {
+            LiveKind::Emg => self.emg = Some(message),
+            LiveKind::Prediction => self.prediction = Some(message),
+            LiveKind::Pose => self.pose = Some(message),
+            LiveKind::Other => self.other = Some(message),
+        }
+    }
+
+    fn drain(self) -> impl Iterator<Item = Message> {
+        [self.emg, self.prediction, self.pose, self.other]
+            .into_iter()
+            .flatten()
+    }
+}
 
 /// A message headed for the browser socket. `Reliable` frames (device list/config,
 /// discrete `Event`s) are delivered in order; `Live` frames (EMG, predictions, poses) are
@@ -46,26 +73,35 @@ enum Out {
     Live(LiveKind, Message),
 }
 
-/// Both return `false` only when the socket has closed (so the caller can stop); a full
-/// channel drops the frame — rare for reliable, the intended backpressure for live.
-fn send_reliable(tx: &mpsc::Sender<Out>, msg: Message) -> bool {
-    !matches!(tx.try_send(Out::Reliable(msg)), Err(TrySendError::Closed(_)))
+/// The browser's socket has closed; the session loop should end. This is the
+/// *only* failure `send` reports — a full channel intentionally drops the frame
+/// (rare for reliable, the intended backpressure for live) and is not an error.
+struct BrowserGone;
+
+fn send(tx: &mpsc::Sender<Out>, out: Out) -> Result<(), BrowserGone> {
+    match tx.try_send(out) {
+        Ok(()) | Err(TrySendError::Full(_)) => Ok(()),
+        Err(TrySendError::Closed(_)) => Err(BrowserGone),
+    }
 }
 
-fn send_live(tx: &mpsc::Sender<Out>, kind: LiveKind, msg: Message) -> bool {
-    !matches!(tx.try_send(Out::Live(kind, msg)), Err(TrySendError::Closed(_)))
-}
-
-/// The complete browser view: device list, the selection, the selected device's
-/// functional config, and the cosmetic projection of it.
-fn view(registry: &Registry, selected: &Option<String>, device_port: u16) -> Frame {
-    let config = selected.as_ref().and_then(|id| registry.config_of(id));
-    let classes = config.as_ref().map(looks::classes_for).unwrap_or_default();
+/// The complete browser view: device list plus, when a device is selected, one
+/// `Selection` carrying its config and cosmetic projection together — the wire
+/// type makes a selection-without-config unrepresentable, so this function no
+/// longer needs to keep three fields consistent by hand.
+fn view(registry: &Registry, selected: Option<&str>, device_port: u16) -> Frame {
+    let selection = selected.and_then(|device_id| {
+        let config = registry.config_of(device_id)?;
+        let classes = looks::classes_for(&config);
+        Some(protocol::Selection {
+            device_id: device_id.to_string(),
+            config,
+            classes,
+        })
+    });
     Frame::Hello {
         devices: registry.list(),
-        selected_device: config.as_ref().and(selected.clone()),
-        config,
-        classes,
+        selection,
         states: looks::states(),
         server_suggestions: server_suggestions(device_port),
     }
@@ -85,8 +121,8 @@ const VIRTUAL_INTERFACE_PREFIXES: [&str; 6] = ["docker", "br-", "veth", "zt", "t
 fn server_suggestions(port: u16) -> Vec<String> {
     fn rank(ip: Ipv4Addr) -> u8 {
         match ip.octets() {
-            [10, 42, ..] => 0,                            // NM shared / hotspot subnet
-            [192, 168, ..] | [10, ..] => 1,               // other private ranges
+            [10, 42, ..] => 0,              // NM shared / hotspot subnet
+            [192, 168, ..] | [10, ..] => 1, // other private ranges
             [172, b, ..] if (16..=31).contains(&b) => 1,
             _ => 2,
         }
@@ -117,37 +153,84 @@ fn server_suggestions(port: u16) -> Vec<String> {
 
 /// Send a device's retained logs to a browser that just started (or switched to)
 /// viewing it, so the log panel has scrollback instead of starting empty.
-fn replay_logs(registry: &Registry, selected: &Option<String>, tx: &mpsc::Sender<Out>) {
+fn replay_logs(registry: &Registry, selected: Option<&str>, tx: &mpsc::Sender<Out>) {
     if let Some(id) = selected {
         for frame in registry.logs_of(id) {
-            if !send_reliable(tx, Message::Binary(frame::encode(&frame))) {
+            let msg = Message::Binary(frame::encode(&frame));
+            if send(tx, Out::Reliable(msg)).is_err() {
                 return;
             }
         }
     }
 }
 
-/// Keep `selected` pointing at a live device: prefer the current choice, else the
-/// first available, else nothing.
-fn reconcile(registry: &Registry, selected: &mut Option<String>) {
-    let live = registry.list();
-    let still_there = selected.as_ref().is_some_and(|id| live.iter().any(|d| d.id == *id));
-    if !still_there {
-        *selected = live.first().map(|device| device.id.clone());
+/// What device this browser session is viewing. Three states, not two parallel
+/// `Option`s: the impossible fourth combination (a live stream with no chosen
+/// device) has no representation. `Selected` without a stream is the deliberate
+/// in-between — the user's preference survives a device dropping off, so a
+/// reconnect under the same id is re-picked instead of falling to first-available.
+enum DeviceSelection {
+    /// No devices exist.
+    None,
+    /// A device is chosen but its stream is not live (device gone or not yet
+    /// subscribed).
+    Selected { device_id: String },
+    /// A device is chosen and its broadcast is being consumed.
+    Streaming {
+        device_id: String,
+        frames: broadcast::Receiver<Frame>,
+    },
+}
+
+impl DeviceSelection {
+    fn device_id(&self) -> Option<&str> {
+        match self {
+            DeviceSelection::None => None,
+            DeviceSelection::Selected { device_id }
+            | DeviceSelection::Streaming { device_id, .. } => Some(device_id),
+        }
     }
 }
 
-/// Next data frame from the selected device, or pend forever when nothing is
-/// selected/connected (a `changed` notification drives reselection instead).
-async fn next_frame(sub: &mut Option<broadcast::Receiver<Frame>>) -> Frame {
+/// Keep the selection pointing at a live device — prefer the current choice,
+/// else the first available, else none — and (re)subscribe to its broadcast.
+/// Resubscribing unconditionally matters: a reconnect keeps its id but gets a
+/// fresh broadcast channel, so a held receiver would go silent otherwise.
+fn reconcile(registry: &Registry, selection: &mut DeviceSelection) {
+    let live = registry.list();
+    let preferred = selection
+        .device_id()
+        .filter(|id| live.iter().any(|device| device.id == *id))
+        .map(str::to_string)
+        .or_else(|| live.first().map(|device| device.id.clone()));
+    *selection = match preferred {
+        None => DeviceSelection::None,
+        Some(device_id) => match registry.subscribe(&device_id) {
+            Some(frames) => DeviceSelection::Streaming { device_id, frames },
+            None => DeviceSelection::Selected { device_id },
+        },
+    };
+}
+
+/// Next data frame from the selected device, or pend forever when no stream is
+/// live (a `changed` notification drives reselection instead). A closed
+/// broadcast downgrades `Streaming` to `Selected` — the preference outlives
+/// the stream.
+async fn next_frame(selection: &mut DeviceSelection) -> Frame {
     loop {
-        match sub {
-            Some(rx) => match rx.recv().await {
+        match selection {
+            DeviceSelection::Streaming { device_id, frames } => match frames.recv().await {
                 Ok(frame) => return frame,
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => *sub = None,
+                Err(broadcast::error::RecvError::Closed) => {
+                    *selection = DeviceSelection::Selected {
+                        device_id: std::mem::take(device_id),
+                    };
+                }
             },
-            None => std::future::pending::<()>().await,
+            DeviceSelection::None | DeviceSelection::Selected { .. } => {
+                std::future::pending::<()>().await
+            }
         }
     }
 }
@@ -170,7 +253,7 @@ pub async fn handle_browser(
             // Drain what's queued now: reliable frames in order, live frames coalesced to
             // the most recent of each kind, so a browser that fell behind jumps to
             // current data without losing one stream to another.
-            let mut latest_live: [Option<Message>; LIVE_KINDS] = Default::default();
+            let mut latest_live = LatestLive::default();
             let mut item = Some(first);
             loop {
                 match item.take().expect("item present") {
@@ -179,14 +262,14 @@ pub async fn handle_browser(
                             return;
                         }
                     }
-                    Out::Live(kind, msg) => latest_live[kind as usize] = Some(msg),
+                    Out::Live(kind, msg) => latest_live.set(kind, msg),
                 }
                 match browser_rx.try_recv() {
                     Ok(next) => item = Some(next),
                     Err(_) => break,
                 }
             }
-            for msg in latest_live.into_iter().flatten() {
+            for msg in latest_live.drain() {
                 if sink.send(msg).await.is_err() {
                     return;
                 }
@@ -197,19 +280,27 @@ pub async fn handle_browser(
     let pose = pose_url.map(|url| {
         let queue: PoseQueue = Arc::new(tokio::sync::Mutex::new(VecDeque::new()));
         let notify: PoseNotify = Arc::new(tokio::sync::Notify::new());
-        let handle =
-            tokio::spawn(run_pose_proxy(url, queue.clone(), notify.clone(), browser_tx.clone()));
+        let handle = tokio::spawn(run_pose_proxy(
+            url,
+            queue.clone(),
+            notify.clone(),
+            browser_tx.clone(),
+        ));
         (queue, notify, handle)
     });
 
-    let mut selected: Option<String> = None;
-    reconcile(&registry, &mut selected);
-    let mut sub = selected.as_ref().and_then(|id| registry.subscribe(id));
+    let mut selection = DeviceSelection::None;
+    reconcile(&registry, &mut selection);
     let mut changed = registry.watch();
-    if !send_reliable(&browser_tx, Message::Binary(frame::encode(&view(&registry, &selected, device_port)))) {
+    let hello = Message::Binary(frame::encode(&view(
+        &registry,
+        selection.device_id(),
+        device_port,
+    )));
+    if send(&browser_tx, Out::Reliable(hello)).is_err() {
         return;
     }
-    replay_logs(&registry, &selected, &browser_tx);
+    replay_logs(&registry, selection.device_id(), &browser_tx);
 
     loop {
         tokio::select! {
@@ -218,20 +309,20 @@ pub async fn handle_browser(
                     let Ok(frame) = frame::decode(&bytes) else { continue };
                     match frame {
                         Frame::SelectDevice { device_id } => {
-                            selected = Some(device_id);
-                            reconcile(&registry, &mut selected);
-                            sub = selected.as_ref().and_then(|id| registry.subscribe(id));
-                            if !send_reliable(&browser_tx, Message::Binary(frame::encode(&view(&registry, &selected, device_port)))) {
+                            selection = DeviceSelection::Selected { device_id };
+                            reconcile(&registry, &mut selection);
+                            let hello = Message::Binary(frame::encode(&view(&registry, selection.device_id(), device_port)));
+                            if send(&browser_tx, Out::Reliable(hello)).is_err() {
                                 break;
                             }
-                            replay_logs(&registry, &selected, &browser_tx);
+                            replay_logs(&registry, selection.device_id(), &browser_tx);
                         }
                         // Forward control frames to the selected device.
                         control @ (Frame::SetSensitivity { .. }
                         | Frame::SetKeymap { .. }
                         | Frame::SetWifi { .. }
                         | Frame::SetServer { .. }) => {
-                            if let Some(id) = &selected {
+                            if let Some(id) = selection.device_id() {
                                 registry.send_control(id, control);
                             }
                         }
@@ -242,7 +333,7 @@ pub async fn handle_browser(
                 Some(Err(_)) => break,
                 _ => {}
             },
-            frame = next_frame(&mut sub) => {
+            frame = next_frame(&mut selection) => {
                 // Mirror EMG frames into the pose queue before forwarding.
                 if let (Frame::Emg { .. }, Some((queue, notify, _))) = (&frame, &pose) {
                     let mut q = queue.lock().await;
@@ -255,28 +346,27 @@ pub async fn handle_browser(
                 }
                 // Discrete events must not be coalesced away; the timeseries may be.
                 let msg = Message::Binary(frame::encode(&frame));
-                let ok = match &frame {
+                let out = match &frame {
                     // Discrete records must arrive complete and ordered.
-                    Frame::Event { .. } | Frame::Log { .. } => send_reliable(&browser_tx, msg),
-                    Frame::Emg { .. } => send_live(&browser_tx, LiveKind::Emg, msg),
-                    Frame::Prediction { .. } => send_live(&browser_tx, LiveKind::Prediction, msg),
-                    _ => send_live(&browser_tx, LiveKind::Other, msg),
+                    Frame::Event { .. } | Frame::Log { .. } => Out::Reliable(msg),
+                    Frame::Emg { .. } => Out::Live(LiveKind::Emg, msg),
+                    Frame::Prediction { .. } => Out::Live(LiveKind::Prediction, msg),
+                    _ => Out::Live(LiveKind::Other, msg),
                 };
-                if !ok {
+                if send(&browser_tx, out).is_err() {
                     break;
                 }
             }
             _ = changed.recv() => {
-                // A device came or went: keep a valid selection and refresh the picker.
-                reconcile(&registry, &mut selected);
-                // Re-subscribe unconditionally: a reconnect keeps its id but gets a fresh
-                // broadcast channel, so the old receiver would go silent otherwise.
-                sub = selected.as_ref().and_then(|id| registry.subscribe(id));
-                if !send_reliable(&browser_tx, Message::Binary(frame::encode(&view(&registry, &selected, device_port)))) {
+                // A device came or went: keep a valid selection (and a fresh
+                // subscription — reconcile resubscribes) and refresh the picker.
+                reconcile(&registry, &mut selection);
+                let hello = Message::Binary(frame::encode(&view(&registry, selection.device_id(), device_port)));
+                if send(&browser_tx, Out::Reliable(hello)).is_err() {
                     break;
                 }
                 // The browser clears its log panel on every hello; refill it.
-                replay_logs(&registry, &selected, &browser_tx);
+                replay_logs(&registry, selection.device_id(), &browser_tx);
             }
         }
     }
@@ -316,7 +406,11 @@ async fn run_pose_proxy(
                             q.pop_front()
                         };
                         if let Some(frame) = frame {
-                            if sink.send(WsMessage::Binary(frame::encode(&frame))).await.is_err() {
+                            if sink
+                                .send(WsMessage::Binary(frame::encode(&frame)))
+                                .await
+                                .is_err()
+                            {
                                 break;
                             }
                         } else {
@@ -328,14 +422,19 @@ async fn run_pose_proxy(
                 while let Some(Ok(msg)) = stream.next().await {
                     if let WsMessage::Binary(bytes) = msg {
                         if let Ok(Frame::Pose { .. }) = frame::decode(&bytes) {
-                            let _ = send_live(&browser_tx, LiveKind::Pose, Message::Binary(bytes));
+                            let _ = send(
+                                &browser_tx,
+                                Out::Live(LiveKind::Pose, Message::Binary(bytes)),
+                            );
                         }
                     }
                 }
                 to_service.abort();
                 tracing::warn!("pose service connection closed; reconnecting in {backoff:?}");
             }
-            Err(e) => tracing::warn!("pose service connection failed ({e}); retrying in {backoff:?}"),
+            Err(e) => {
+                tracing::warn!("pose service connection failed ({e}); retrying in {backoff:?}")
+            }
         }
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_secs(30));
