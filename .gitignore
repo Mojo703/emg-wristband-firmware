@@ -8,5 +8,6 @@ target/
 node_modules/
 dist/
 /tmp
+documentation/
 # JetBrains project files (RustRover).
 .idea/
