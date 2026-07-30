@@ -4,6 +4,7 @@
 
 use anyhow::Result;
 use esp_idf_svc::hal::delay::FreeRtos;
+use log::info;
 use esp_idf_svc::hal::gpio::{Input, Output, PinDriver};
 use esp_idf_svc::hal::spi::{Operation, SpiDeviceDriver, SpiDriver};
 
@@ -117,7 +118,7 @@ impl<'d> Ads1298Device<'d> {
     fn configure(&mut self, role: ChipRole) -> Result<()> {
         // --- Role-specific registers ---
         let config1 = match role {
-            ChipRole::A => 0xE4, 
+            ChipRole::A => 0xC4, 
             ChipRole::B => 0xC4, 
         };
         self.write_register(Register::Config1, config1)?;
@@ -174,9 +175,8 @@ impl<'d> Ads1298Device<'d> {
      pub(crate) fn power_up(&mut self, role: ChipRole) -> Result<()> {
         self.pwdn.set_low()?;
         self.reset_n.set_low()?;
-
         FreeRtos::delay_ms(5);
-
+        
         self.pwdn.set_high()?;
         self.reset_n.set_high()?;
 
@@ -191,6 +191,8 @@ impl<'d> Ads1298Device<'d> {
         if !self.verify_id(0x92)? {
             anyhow::bail!("ADS1298 ({role:?}) ID mismatch");
         }
+        info!("ID Verified");
+        
 
         self.configure(role)?;
 
