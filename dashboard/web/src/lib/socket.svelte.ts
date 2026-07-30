@@ -15,17 +15,33 @@ import {
   asIncomingFrame,
   assertOutgoingFrame,
   decodeEmg,
+  type BeatmapFrame,
   type Binding,
+  type CollectionCatalogFrame,
+  type CollectionStateFrame,
   type DecodedEmg,
   type EventFrame,
   type HelloFrame,
   type LogFrame,
+  type NoteResultFrame,
   type OutgoingFrame,
   type PoseFrame,
   type PredictionFrame,
+  type SessionMetadata,
+  type UnixMilliseconds,
 } from './protocol';
 
-const cbor = new Encoder({ useRecords: false, mapsAsObjects: true, tagUint8Array: false });
+// `int64AsNumber` matters: ciborium encodes any integer above 2^32 (epoch-scale
+// timestamps, a long-uptime device's `t0_us`) as an 8-byte CBOR integer, which
+// cbor-x otherwise decodes as BigInt — failing every `isNumber` guard and
+// silently dropping the frame. The option is honoured by cbor-x's decoder at
+// runtime but missing from its published Options type, hence the assertion.
+const cbor = new Encoder({
+  useRecords: false,
+  mapsAsObjects: true,
+  tagUint8Array: false,
+  int64AsNumber: true,
+} as ConstructorParameters<typeof Encoder>[0]);
 
 class LiveStateManager {
   status = $state<'offline' | 'handshake' | 'online'>('offline');
@@ -43,9 +59,29 @@ class LiveStateManager {
   // active panel is mounted; cleared on every hello, which the backend follows
   // with a replay of the selected device's retained logs.
   logs = $state<readonly LogFrame[]>([]);
+  // Collection (the falling-notes capture game). The catalog is a descriptor the
+  // backend sends once per connection, like hello; the state frame is the
+  // backend's authoritative session phase, and the beatmap arrives once per
+  // session when it arms. All three are gated on `online` so a panel never paints
+  // a session that belongs to a dropped connection.
+  #catalog = $state<CollectionCatalogFrame | null>(null);
+  #collectionState = $state<CollectionStateFrame | null>(null);
+  #beatmap = $state<BeatmapFrame | null>(null);
 
   get hello(): HelloFrame | null {
     return this.status === 'online' ? this.#hello : null;
+  }
+
+  get catalog(): CollectionCatalogFrame | null {
+    return this.status === 'online' ? this.#catalog : null;
+  }
+
+  get collectionState(): CollectionStateFrame | null {
+    return this.status === 'online' ? this.#collectionState : null;
+  }
+
+  get beatmap(): BeatmapFrame | null {
+    return this.status === 'online' ? this.#beatmap : null;
   }
 
   get emg(): DecodedEmg | null {
@@ -99,12 +135,34 @@ class LiveStateManager {
     this.#pose = value;
   }
 
+  setCatalog(value: CollectionCatalogFrame): void {
+    this.#catalog = value;
+  }
+
+  setCollectionState(value: CollectionStateFrame): void {
+    this.#collectionState = value;
+    // A beatmap belongs to exactly one session; drop it as soon as the backend
+    // leaves the phases that use it, so a stale schedule can't outlive its
+    // session.
+    const phase = value.phase.name;
+    if (phase === 'idle' || phase === 'reviewing') {
+      this.#beatmap = null;
+    }
+  }
+
+  setBeatmap(value: BeatmapFrame): void {
+    this.#beatmap = value;
+  }
+
   setHandshake(): void {
     this.status = 'handshake';
     this.#hello = null;
     this.#emg = null;
     this.#prediction = null;
     this.#pose = null;
+    this.#catalog = null;
+    this.#collectionState = null;
+    this.#beatmap = null;
     this.logs = [];
     this.fps = 0;
     this.#emgSinceTick = 0;
@@ -116,6 +174,9 @@ class LiveStateManager {
     this.#emg = null;
     this.#prediction = null;
     this.#pose = null;
+    this.#catalog = null;
+    this.#collectionState = null;
+    this.#beatmap = null;
     this.logs = [];
     this.fps = 0;
     this.#emgSinceTick = 0;
@@ -133,6 +194,9 @@ type PredictionHandler = (prediction: PredictionFrame) => void;
 type EventHandler = (event: EventFrame) => void;
 type PoseHandler = (pose: PoseFrame) => void;
 type LogHandler = (log: LogFrame) => void;
+// Note results are per-cue verdicts, not state: the game view folds each one into
+// a streak as it lands, so they fan out imperatively instead of being retained.
+type NoteResultHandler = (result: NoteResultFrame) => void;
 
 interface ListenerMap {
   emg: Set<EmgHandler>;
@@ -140,6 +204,7 @@ interface ListenerMap {
   event: Set<EventHandler>;
   pose: Set<PoseHandler>;
   log: Set<LogHandler>;
+  noteResult: Set<NoteResultHandler>;
 }
 
 const listeners: ListenerMap = {
@@ -148,6 +213,7 @@ const listeners: ListenerMap = {
   event: new Set<EventHandler>(),
   pose: new Set<PoseHandler>(),
   log: new Set<LogHandler>(),
+  noteResult: new Set<NoteResultHandler>(),
 };
 
 type HandlerFor<T extends keyof ListenerMap> = T extends 'emg'
@@ -158,7 +224,9 @@ type HandlerFor<T extends keyof ListenerMap> = T extends 'emg'
       ? PoseHandler
       : T extends 'log'
         ? LogHandler
-        : EventHandler;
+        : T extends 'noteResult'
+          ? NoteResultHandler
+          : EventHandler;
 
 export function on<T extends keyof ListenerMap>(
   type: T,
@@ -218,6 +286,14 @@ export function connect(): void {
     } else if (frame.type === 'log') {
       live.appendLog(frame);
       for (const cb of listeners.log) cb(frame);
+    } else if (frame.type === 'collection_catalog') {
+      live.setCatalog(frame);
+    } else if (frame.type === 'collection_state') {
+      live.setCollectionState(frame);
+    } else if (frame.type === 'beatmap') {
+      live.setBeatmap(frame);
+    } else if (frame.type === 'note_result') {
+      for (const cb of listeners.noteResult) cb(frame);
     }
   };
 }
@@ -242,7 +318,24 @@ export const api = {
     send({ type: 'set_wifi', ssid, psk }),
   server: (addr: string) =>
     send({ type: 'set_server', addr }),
+  startCollection: (metadata: SessionMetadata, trackId: string) =>
+    send({ type: 'start_collection', metadata, track_id: trackId }),
+  // The moment the audio element actually began playing, which is the only
+  // timestamp that can align the recorded streams with the beat grid.
+  trackStarted: (atUnixMilliseconds: UnixMilliseconds) =>
+    send({ type: 'track_started', at_unix_ms: atUnixMilliseconds }),
+  stopCollection: (save: boolean) =>
+    send({ type: 'stop_collection', save }),
+  capturePlacementPhoto: () =>
+    send({ type: 'capture_placement_photo' }),
 } as const;
 
 // Re-export protocol types so panels can import everything from the socket module.
 export type { Binding, DecodedEmg, EventFrame, HelloFrame, LogFrame, PoseFrame, PredictionFrame } from './protocol';
+export type {
+  BeatmapFrame,
+  CollectionCatalogFrame,
+  CollectionStateFrame,
+  NoteResultFrame,
+  SessionMetadata,
+} from './protocol';

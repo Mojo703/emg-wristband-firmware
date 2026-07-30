@@ -240,6 +240,7 @@ pub async fn handle_browser(
     registry: Arc<Registry>,
     pose_url: Option<String>,
     device_port: u16,
+    collection: Arc<crate::collect::manager::CollectionManager>,
 ) {
     tracing::info!("browser connected");
     let (browser_sink, mut browser_stream) = socket.split();
@@ -302,11 +303,33 @@ pub async fn handle_browser(
     }
     replay_logs(&registry, selection.device_id(), &browser_tx);
 
+    // Collection: catch this browser up on the current session reality, then
+    // stream every later collection frame it broadcasts.
+    let mut collection_rx = collection.subscribe();
+    for frame in collection.connect_frames() {
+        if send(
+            &browser_tx,
+            Out::Reliable(Message::Binary(frame::encode(&frame))),
+        )
+        .is_err()
+        {
+            return;
+        }
+    }
+
     loop {
         tokio::select! {
             incoming = browser_stream.next() => match incoming {
                 Some(Ok(Message::Binary(bytes))) => {
-                    let Ok(frame) = frame::decode(&bytes) else { continue };
+                    let frame = match frame::decode(&bytes) {
+                        Ok(frame) => frame,
+                        Err(error) => {
+                            // A browser frame that doesn't decode is a bug on one
+                            // side of the mirror; dropping it silently hides that.
+                            tracing::warn!("undecodable browser frame: {error:#}");
+                            continue;
+                        }
+                    };
                     match frame {
                         Frame::SelectDevice { device_id } => {
                             selection = DeviceSelection::Selected { device_id };
@@ -326,6 +349,17 @@ pub async fn handle_browser(
                                 registry.send_control(id, control);
                             }
                         }
+                        // Collection control frames go to the session manager.
+                        Frame::StartCollection { metadata, track_id } => {
+                            collection.start_collection(
+                                metadata,
+                                track_id,
+                                selection.device_id().map(str::to_string),
+                            );
+                        }
+                        Frame::TrackStarted { at_unix_ms } => collection.track_started(at_unix_ms),
+                        Frame::StopCollection { save } => collection.stop_collection(save),
+                        Frame::CapturePlacementPhoto {} => collection.capture_placement_photo(),
                         _ => {} // device/backend-origin frames are ignored if echoed
                     }
                 }
@@ -357,6 +391,18 @@ pub async fn handle_browser(
                     break;
                 }
             }
+            collection_frame = collection_rx.recv() => match collection_frame {
+                // Collection frames are all discrete state (phase changes, the
+                // beatmap, per-note verdicts): reliable, never coalesced.
+                Ok(frame) => {
+                    let msg = Message::Binary(frame::encode(&frame));
+                    if send(&browser_tx, Out::Reliable(msg)).is_err() {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => {} // manager lives as long as the process
+            },
             _ = changed.recv() => {
                 // A device came or went: keep a valid selection (and a fresh
                 // subscription — reconcile resubscribes) and refresh the picker.

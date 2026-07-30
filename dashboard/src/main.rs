@@ -41,6 +41,8 @@ struct AppState {
     /// The port devices dial over wifi (from `EMG_DEVICE_ADDR`), used to build the
     /// server-address suggestions offered to the config UI.
     device_port: u16,
+    /// The training-data collection session manager (the rhythm game's backend).
+    collection: Arc<collect::manager::CollectionManager>,
 }
 
 #[tokio::main]
@@ -73,10 +75,31 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(device::run_serial_discovery(registry.clone()));
     }
 
+    // The collection game's backend: catalog from EMG_COLLECTION_CONFIG (default
+    // config/collection.json), sessions under EMG_SESSIONS_DIR (default sessions/),
+    // webcam at EMG_CAMERA_DEVICE (default /dev/video0).
+    let collection_config =
+        std::env::var("EMG_COLLECTION_CONFIG").unwrap_or_else(|_| "config/collection.json".into());
+    let sessions_root = std::path::PathBuf::from(
+        std::env::var("EMG_SESSIONS_DIR").unwrap_or_else(|_| "sessions".into()),
+    );
+    std::fs::create_dir_all(&sessions_root)?;
+    let camera_device = std::path::PathBuf::from(
+        std::env::var("EMG_CAMERA_DEVICE").unwrap_or_else(|_| "/dev/video0".into()),
+    );
+    let catalog = collect::beatmap::TrackCatalog::load(std::path::Path::new(&collection_config))?;
+    let collection = collect::manager::CollectionManager::new(
+        catalog,
+        camera_device,
+        registry.clone(),
+        sessions_root,
+    );
+
     let state = AppState {
         registry,
         pose_url,
         device_port,
+        collection,
     };
 
     let web_dir = std::env::var("DASHBOARD_WEB").unwrap_or_else(|_| "web/dist".into());
@@ -85,6 +108,7 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/ws", get(browser_ws))
+        .route("/collection/audio/:track_id", get(collection_audio))
         .fallback_service(static_files)
         .with_state(state)
         .layer(TraceLayer::new_for_http());
@@ -101,6 +125,35 @@ async fn main() -> anyhow::Result<()> {
 
 async fn browser_ws(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
     ws.on_upgrade(move |socket| {
-        browser::handle_browser(socket, state.registry, state.pose_url, state.device_port)
+        browser::handle_browser(
+            socket,
+            state.registry,
+            state.pose_url,
+            state.device_port,
+            state.collection,
+        )
     })
+}
+
+/// Serve a catalog track's audio to the game's `<audio>` element.
+async fn collection_audio(
+    axum::extract::Path(track_id): axum::extract::Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    use axum::http::{header, StatusCode};
+    use axum::response::IntoResponse;
+    let Some(path) = state.collection.audio_path(&protocol::TrackId(track_id)) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let content_type = match path.extension().and_then(|extension| extension.to_str()) {
+        Some("ogg") => "audio/ogg",
+        Some("mp3") => "audio/mpeg",
+        Some("flac") => "audio/flac",
+        Some("wav") => "audio/wav",
+        _ => "application/octet-stream",
+    };
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => ([(header::CONTENT_TYPE, content_type)], bytes).into_response(),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
 }

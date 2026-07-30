@@ -13,8 +13,8 @@
 //! - `beatmap`   — track catalog and note-schedule generation
 //! - `manager`   — session state machine tying the above together (integration)
 
-// Interfaces land before their implementations; drop this once the manager wires
-// everything into the browser session loop.
-#![allow(dead_code)]
-
+pub mod beatmap;
 pub mod interfaces;
+pub mod manager;
+pub mod recorder;
+pub mod video;

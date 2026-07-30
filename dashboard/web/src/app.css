@@ -212,6 +212,38 @@ h2 { margin-top: 0; }
 .spacer { flex: 1; }
 .btn { padding: 6px 12px; border: 1px solid var(--border); background: none; border-radius: var(--radius); cursor: pointer; font: inherit; color: inherit; display: inline-flex; align-items: center; gap: 6px; }
 .btn:hover { background: var(--muted); }
+
+/* A selectable chip (single- or multi-select button rows, e.g. the Collect
+   panel's tag form and track picker). Base recipe is .btn's; the pressed state
+   is the same brand tint as the active nav item and theme-toggle item. State
+   rides aria-pressed so the markup's semantics and the styling cannot disagree. */
+.chip { padding: 6px 12px; border: 1px solid var(--border); background: none; border-radius: var(--radius); cursor: pointer; font: inherit; font-size: 13px; color: inherit; }
+.chip:hover:not(:disabled) { background: var(--muted); }
+.chip[aria-pressed="true"] { background: color-mix(in oklab, var(--brand) 22%, transparent); color: var(--brand-tint-foreground); border-color: color-mix(in oklab, var(--brand) 40%, transparent); }
+.chip:disabled { opacity: 0.5; cursor: default; }
+
+/* An optional text entry in chip clothes (the "+ other" / "+ note" pattern):
+   its label is the placeholder while empty and unfocused, focusing turns it into
+   a text entry, and a filled one keeps the pressed tint so it reads as chosen. */
+input.chip { width: 6.5em; }
+input.chip:focus { width: 16em; cursor: text; }
+input.chip[data-filled="true"] { width: 16em; background: color-mix(in oklab, var(--brand) 22%, transparent); color: var(--brand-tint-foreground); border-color: color-mix(in oklab, var(--brand) 40%, transparent); }
+
+/* Small uppercase section label above a form group or card body. */
+.field-label { font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted-foreground); }
+
+/* A bordered content card. */
+.card { border: 1px solid var(--border); border-radius: var(--radius); padding: 12px; }
+
+/* Numbers that must line up (clocks, counters, table columns). */
+.numeric { font-variant-numeric: tabular-nums; }
+
+/* A live/stalled stream indicator dot (the Collect panel's rec tripwire). */
+.status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--success); }
+.status-dot[data-state="stalled"] { background: var(--destructive); }
+
+/* Inline warning text, same hue as the log panel's warn level. */
+.warn { color: var(--log-warn); }
 input { padding: 6px 10px; border: 1px solid var(--input); border-radius: var(--radius); background: none; color: inherit; font: inherit; }
 label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; }
 

@@ -259,9 +259,54 @@ pub enum Frame {
 /// milliseconds; both run on the same laptop, so `Date.now()` and the backend
 /// clock agree). The value is private so all arithmetic goes through the named
 /// operations below — adding two instants, say, does not exist.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+///
+/// Deserialization accepts an integral float as well as an integer: epoch
+/// milliseconds exceed 32 bits, and cbor-x encodes JavaScript integers that
+/// large as CBOR float64, so a browser-sent timestamp arrives as `1.7e12`-as-
+/// float. A float with a fractional part is still rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(transparent)]
 pub struct UnixMilliseconds(u64);
+
+impl<'de> Deserialize<'de> for UnixMilliseconds {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct MillisecondsVisitor;
+
+        impl serde::de::Visitor<'_> for MillisecondsVisitor {
+            type Value = UnixMilliseconds;
+
+            fn expecting(&self, formatter: &mut core::fmt::Formatter) -> core::fmt::Result {
+                formatter.write_str("unix epoch milliseconds as an integer or integral float")
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
+                Ok(UnixMilliseconds(value))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Self::Value, E> {
+                u64::try_from(value)
+                    .map(UnixMilliseconds)
+                    .map_err(|_| E::custom("negative timestamp"))
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Self::Value, E> {
+                let truncated = value as u64;
+                if value >= 0.0 && truncated as f64 == value {
+                    Ok(UnixMilliseconds(truncated))
+                } else {
+                    Err(E::custom(
+                        "timestamp is not an integral number of milliseconds",
+                    ))
+                }
+            }
+        }
+
+        deserializer.deserialize_any(MillisecondsVisitor)
+    }
+}
 
 impl UnixMilliseconds {
     pub const fn new(unix_epoch_milliseconds: u64) -> Self {
@@ -385,7 +430,9 @@ string_id! {
     SessionId
 }
 
-/// Band distance below the elbow crease.
+/// Band distance up the forearm from the ulnar styloid — the bony bump on the
+/// wrist's pinky side. The band wears like a wristwatch, so that bump is the
+/// palpable landmark every re-don can be measured against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Millimeters(pub u16);
@@ -470,19 +517,32 @@ pub struct CollectionClass {
     pub color: String,
 }
 
-/// One cue in the beatmap. Carries its class *identity*, not an index into a
-/// list that travels in a different frame; its position in the schedule is its
-/// [`NoteIndex`], held by the [`Beatmap`] rather than duplicated here.
+/// One cue in the beatmap: a *hold block*. The gesture begins when `at`
+/// reaches the hit line, is held for `hold`, and releases at
+/// `at.plus(hold)` — both transitions are labeled moments in the recording.
+/// Carries its class *identity*, not an index into a list that travels in a
+/// different frame; its position in the schedule is its [`NoteIndex`], held by
+/// the [`Beatmap`] rather than duplicated here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Note {
     pub class_id: ClassId,
     pub at: TrackMilliseconds,
+    pub hold: DurationMilliseconds,
 }
 
-/// A note schedule whose ordering invariant is checked once, at construction
-/// (and at deserialization, via `try_from`): positions strictly increase, so
-/// every [`NoteIndex`] resolves to the note at that position and rendering
-/// order equals schedule order. Serializes as the bare note array.
+impl Note {
+    /// The moment the hold ends on the track timeline.
+    pub const fn release(&self) -> TrackMilliseconds {
+        self.at.plus(self.hold)
+    }
+}
+
+/// A note schedule whose invariants are checked once, at construction (and at
+/// deserialization, via `try_from`): onsets strictly increase and holds never
+/// overlap — one hand performs one gesture at a time, so a note may only begin
+/// after the previous one released. Every [`NoteIndex`] therefore resolves to
+/// the note at that position and rendering order equals schedule order.
+/// Serializes as the bare note array.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "Vec<Note>", into = "Vec<Note>")]
 pub struct Beatmap {
@@ -491,23 +551,24 @@ pub struct Beatmap {
 
 /// Why a note list is not a valid [`Beatmap`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NotesOutOfOrder;
+pub struct NotesOverlapOrRegress;
 
-impl core::fmt::Display for NotesOutOfOrder {
+impl core::fmt::Display for NotesOverlapOrRegress {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        formatter.write_str("beatmap notes must strictly increase in track position")
+        formatter
+            .write_str("beatmap notes must strictly increase and never overlap a previous hold")
     }
 }
 
 impl TryFrom<Vec<Note>> for Beatmap {
-    type Error = NotesOutOfOrder;
+    type Error = NotesOverlapOrRegress;
 
     fn try_from(notes: Vec<Note>) -> Result<Self, Self::Error> {
-        let ordered = notes.windows(2).all(|pair| pair[0].at < pair[1].at);
-        if ordered {
+        let valid = notes.windows(2).all(|pair| pair[0].release() < pair[1].at);
+        if valid {
             Ok(Self { notes })
         } else {
-            Err(NotesOutOfOrder)
+            Err(NotesOverlapOrRegress)
         }
     }
 }
@@ -1139,6 +1200,22 @@ mod tests {
     }
 
     #[test]
+    fn unix_milliseconds_accepts_integral_floats() {
+        // cbor-x encodes JavaScript integers above 32 bits as float64, so a
+        // browser's Date.now() arrives as a float. It must decode; a fractional
+        // value must not.
+        let mut as_float = Vec::new();
+        ciborium::into_writer(&1_784_000_000_000.0f64, &mut as_float).unwrap();
+        let decoded: UnixMilliseconds = ciborium::from_reader(as_float.as_slice()).unwrap();
+        assert_eq!(decoded, UnixMilliseconds::new(1_784_000_000_000));
+
+        let mut fractional = Vec::new();
+        ciborium::into_writer(&1_784_000_000_000.5f64, &mut fractional).unwrap();
+        let rejected: Result<UnixMilliseconds, _> = ciborium::from_reader(fractional.as_slice());
+        assert!(rejected.is_err());
+    }
+
+    #[test]
     fn cue_anchoring_arithmetic() {
         let track_started = UnixMilliseconds(1_784_000_000_000);
         let note_position = TrackMilliseconds(4_240);
@@ -1236,10 +1313,12 @@ mod tests {
             Note {
                 class_id: ClassId("pinky_pinch".into()),
                 at: TrackMilliseconds(2_240),
+                hold: DurationMilliseconds(1_000),
             },
             Note {
                 class_id: ClassId("index_pinch".into()),
                 at: TrackMilliseconds(4_240),
+                hold: DurationMilliseconds(500),
             },
         ])
         .unwrap();
@@ -1262,6 +1341,7 @@ mod tests {
                     Some(&Note {
                         class_id: ClassId("index_pinch".into()),
                         at: TrackMilliseconds(4_240),
+                        hold: DurationMilliseconds(500),
                     })
                 );
                 assert_eq!(lead_in, DurationMilliseconds(3_000));
@@ -1271,31 +1351,51 @@ mod tests {
     }
 
     #[test]
-    fn beatmap_rejects_out_of_order_notes() {
+    fn beatmap_rejects_regressing_or_overlapping_notes() {
         let out_of_order = vec![
             Note {
                 class_id: ClassId("index_pinch".into()),
                 at: TrackMilliseconds(4_240),
+                hold: DurationMilliseconds(500),
             },
             Note {
                 class_id: ClassId("pinky_pinch".into()),
                 at: TrackMilliseconds(2_240),
+                hold: DurationMilliseconds(500),
             },
         ];
-        assert_eq!(Beatmap::try_from(out_of_order), Err(NotesOutOfOrder));
+        assert_eq!(Beatmap::try_from(out_of_order), Err(NotesOverlapOrRegress));
+
+        // Ordered onsets are not enough: a hold reaching into the next onset is
+        // two gestures at once, which one hand cannot perform.
+        let overlapping = vec![
+            Note {
+                class_id: ClassId("index_pinch".into()),
+                at: TrackMilliseconds(1_000),
+                hold: DurationMilliseconds(2_000),
+            },
+            Note {
+                class_id: ClassId("pinky_pinch".into()),
+                at: TrackMilliseconds(2_500),
+                hold: DurationMilliseconds(500),
+            },
+        ];
+        assert_eq!(Beatmap::try_from(overlapping), Err(NotesOverlapOrRegress));
 
         // The same invariant holds at the deserialization boundary: a decoded
-        // frame carrying an unordered schedule is a decode error, not a value.
+        // frame carrying an invalid schedule is a decode error, not a value.
         let mut encoded = Vec::new();
         ciborium::into_writer(
             &alloc::vec![
                 Note {
                     class_id: ClassId("a".into()),
                     at: TrackMilliseconds(2),
+                    hold: DurationMilliseconds(1),
                 },
                 Note {
                     class_id: ClassId("b".into()),
                     at: TrackMilliseconds(1),
+                    hold: DurationMilliseconds(1),
                 },
             ],
             &mut encoded,

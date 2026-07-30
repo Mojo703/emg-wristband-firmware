@@ -84,13 +84,15 @@ pub enum SessionEvent {
     },
     /// Audio playback began in the browser (anchor for the beat grid).
     TrackStarted { at: UnixMilliseconds },
-    /// One cue crossed the hit line: the note in the beatmap, its class id
-    /// (self-contained for the windowing tool), and the moment on the shared
-    /// clock. Logged by the backend from the anchored schedule, not the browser.
+    /// One cue's hold block: the note in the beatmap, its class id
+    /// (self-contained for the windowing tool), and both transitions on the
+    /// shared clock — the gesture begins at `at` and releases at `release`.
+    /// Logged by the backend from the anchored schedule, not the browser.
     Cue {
         note_index: NoteIndex,
         class_id: ClassId,
         at: UnixMilliseconds,
+        release: UnixMilliseconds,
     },
     /// The activity detector saw muscle activity inside a cue's timing window.
     ActivityHit {
@@ -167,9 +169,16 @@ pub struct RecordingHandle(pub(crate) ());
 /// Unit 2: the webcam, via a host-side ffmpeg child process.
 ///
 /// One instance owns the camera for the whole dashboard lifetime (v4l2 devices
-/// don't share), so photos can be taken between sessions. Implementations must
-/// detect a stalled ffmpeg (output file not growing) and report it via
-/// `health()`, not by blocking.
+/// don't share), so photos can be taken between sessions — and *only* between
+/// sessions: a v4l2 device cannot be opened twice, so `capture_photo` while a
+/// recording is live is an error by design. Implementations must detect a
+/// stalled ffmpeg (output file not growing) and report it via `health()`, not
+/// by blocking.
+///
+/// Call-site contract: `stop_recording` and `capture_photo` may block their
+/// calling thread for several seconds (child-process shutdown). From async
+/// code they must be invoked via `tokio::task::spawn_blocking`, never directly
+/// on a runtime worker.
 pub trait VideoCapture: Send {
     /// Begin recording to `output`. `requested_start` is the session start on
     /// the shared clock; the implementation measures its own actual start
@@ -180,7 +189,8 @@ pub trait VideoCapture: Send {
         requested_start: UnixMilliseconds,
     ) -> anyhow::Result<RecordingHandle>;
 
-    /// Capture one still to `output`. Callable while recording or idle.
+    /// Capture one still to `output`. Idle only: errors while a recording is
+    /// live (the camera cannot be opened twice).
     fn capture_photo(&mut self, output: &Path) -> anyhow::Result<()>;
 
     /// Bytes of the recording on disk, and whether they grew since last call.

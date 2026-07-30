@@ -1,0 +1,95 @@
+{
+  "subjects": [
+    "Matthew",
+    "Zachary",
+    "Cole",
+    "Julian",
+    "Hoomehr"
+  ],
+  "collection_classes": [
+    {
+      "id": "key_pinch",
+      "label": "Key pinch",
+      "color": "purple"
+    },
+    {
+      "id": "index_pinch",
+      "label": "Index pinch",
+      "color": "blue"
+    },
+    {
+      "id": "middle_pinch",
+      "label": "Middle pinch",
+      "color": "green"
+    },
+    {
+      "id": "pinky_pinch",
+      "label": "Pinky pinch",
+      "color": "amber"
+    }
+  ],
+  "activities": [
+    {
+      "id": "seated",
+      "label": "Seated"
+    },
+    {
+      "id": "standing",
+      "label": "Standing"
+    },
+    {
+      "id": "post_workout",
+      "label": "Post workout"
+    },
+    {
+      "id": "arm_swing",
+      "label": "Arm swinging"
+    }
+  ],
+  "sweat_levels": [
+    {
+      "id": "dry",
+      "label": "Dry"
+    },
+    {
+      "id": "damp",
+      "label": "Damp"
+    },
+    {
+      "id": "sweaty",
+      "label": "Sweaty"
+    }
+  ],
+  "goal_per_class": 48,
+  "tracks": [
+    {
+      "id": "steady_run",
+      "title": "Steady Run",
+      "file": "steady-run.ogg",
+      "beats_per_minute": 120,
+      "first_beat_ms": 240,
+      "duration_ms": 240000
+    },
+    {
+      "id": "powder_day",
+      "title": "Powder Day",
+      "file": "powder-day.ogg",
+      "beats_per_minute": 96,
+      "first_beat_ms": 240,
+      "duration_ms": 180000
+    },
+    {
+      "id": "traverse",
+      "title": "Traverse",
+      "file": "traverse.ogg",
+      "beats_per_minute": 132,
+      "first_beat_ms": 240,
+      "duration_ms": 300000
+    }
+  ],
+  "hold_lengths_beats": [
+    1,
+    2,
+    4
+  ]
+}

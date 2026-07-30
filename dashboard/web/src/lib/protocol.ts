@@ -171,7 +171,8 @@ export interface SessionMetadata {
   readonly arm: Arm;
   readonly gloves: boolean;
   readonly skin_prep: boolean;
-  /** Band distance below the elbow crease, integer millimetres. */
+  /** Band distance up the forearm from the ulnar styloid (the wrist's ulna
+   * bump), integer millimetres. */
   readonly band_offset: number;
   /** Band rotation from the reference orientation, signed integer degrees. */
   readonly band_rotation: number;
@@ -209,11 +210,13 @@ export interface CollectionClass {
   readonly color: string;
 }
 
-/** One cue. Carries its class identity directly; its position in the schedule
- * is its index in the beatmap array. */
+/** One cue: a hold block. The gesture begins when `at` reaches the hit line,
+ * is held for `hold`, and releases at `at + hold`. Carries its class identity
+ * directly; its position in the schedule is its index in the beatmap array. */
 export interface Note {
   readonly class_id: string;
   readonly at: TrackMilliseconds;
+  readonly hold: DurationMilliseconds;
 }
 
 /** Disk-level progress of one recording stream — the tripwire signal. */
@@ -732,7 +735,10 @@ function isCollectionClass(value: unknown): value is CollectionClass {
 
 function isNote(value: unknown): value is Note {
   return (
-    isObject(value) && isString(value['class_id']) && isNumber(value['at'])
+    isObject(value) &&
+    isString(value['class_id']) &&
+    isNumber(value['at']) &&
+    isNumber(value['hold'])
   );
 }
 
@@ -844,12 +850,13 @@ export function isBeatmapFrame(value: unknown): value is BeatmapFrame {
     return false;
   }
   // Mirror the backend's Beatmap construction invariant at this boundary too:
-  // an unordered schedule is a rejected frame, not a rendering surprise.
+  // an unordered or hold-overlapping schedule is a rejected frame, not a
+  // rendering surprise.
   const notes = value['notes'] as readonly Note[];
-  let previous = -Infinity;
+  let previousRelease = -Infinity;
   for (const note of notes) {
-    if (note.at <= previous) return false;
-    previous = note.at;
+    if (note.at <= previousRelease) return false;
+    previousRelease = note.at + note.hold;
   }
   return true;
 }
@@ -901,6 +908,11 @@ export function asIncomingFrame(value: unknown): IncomingFrame | null {
   if (isCollectionStateFrame(value)) return value;
   if (isBeatmapFrame(value)) return value;
   if (isNoteResultFrame(value)) return value;
+  // A tagged frame that fails its own guard is a bug on one side of the wire
+  // mirror; dropping it silently is how such bugs stay hidden for hours.
+  if (isObject(value) && isString(value['type'])) {
+    console.warn('incoming frame failed validation and was dropped', value);
+  }
   return null;
 }
 

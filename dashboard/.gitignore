@@ -1,4 +1,11 @@
 /target
-/config
+# Runtime state (app.cbor) lives in /config; the collection catalog and its
+# placeholder tracks are shipped content, so /config's *contents* are ignored
+# rather than the directory, which is what lets the negations work.
+/config/*
+!/config/collection.json
+!/config/*.ogg
+# Recorded collection sessions land here at runtime.
+/sessions
 /web/node_modules
 /web/dist
