@@ -1,17 +1,34 @@
 //! Raw ADS1298 frame decoding: status word + per-channel 24-bit codes.
 //!
 
-pub(crate) const CHANNELS_PER_DEVICE: usize = 8;
+use super::channel::CHANNELS_PER_DEVICE;
+use super::status::StatusWord;
+
 pub(super) const DEVICE_COUNT: usize = 2;
 const STATUS_BYTES: usize = 3;
 const BYTES_PER_CHANNEL: usize = 3;
 pub(super) const FRAME_BYTES: usize = STATUS_BYTES + CHANNELS_PER_DEVICE * BYTES_PER_CHANNEL; // 27
 
-// Decoded status word + 8 sign-extended 24-bit channel codes for one device
+// Raw status word + 8 sign-extended 24-bit channel codes for one device
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Sample {
+    /// The status word exactly as it came off the wire.
+    ///
+    /// Kept raw rather than parsed at construction because a frame whose marker is
+    /// broken has no [`StatusWord`], and the raw bits are then the only diagnostic
+    /// there is: where the `1100` marker landed says whether the read is misaligned or
+    /// the chip returned nothing at all.
     pub(super) status: u32,
     pub(super) channels: [i32; CHANNELS_PER_DEVICE],
+}
+
+impl Sample {
+    /// The decoded status word, or `None` when the frame's fixed marker is missing --
+    /// which means the read is not trustworthy, not that the electrodes are fine. See
+    /// [`super::status`].
+    pub(super) const fn status_word(&self) -> Option<StatusWord> {
+        StatusWord::from_word(self.status)
+    }
 }
 
 /// One frame is a sample from each of the two cascaded devices. Named `AdcFrame`

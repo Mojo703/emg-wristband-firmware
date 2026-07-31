@@ -26,6 +26,7 @@ use std::sync::Arc;
 
 use super::ads1298::Ads1298Pair;
 use super::preprocess::sample_to_int8;
+use super::status::describe_status_word;
 
 /// Windows the channel will hold. One in flight plus one being handed over is all the
 /// slack the timing budget calls for.
@@ -54,8 +55,90 @@ const DATA_READY_TIMEOUT_TICKS: u32 = DATA_READY_TIMEOUT_MS; // CONFIG_FREERTOS_
 /// fault. The counters carry the true total, so staying quiet loses nothing.
 const READ_ERROR_LOG_INTERVAL: u32 = 2000;
 
+/// DRDY edges between timing summaries. Matches the edge-counter interval so the two
+/// numbers in the line always describe the same stretch.
+const TIMING_LOG_INTERVAL: u32 = 500;
+
 /// One window of model input, time-major `[t, c]` to match [`emg_runtime::tensor`].
 type Window = Vec<i8>;
+
+/// Microseconds since boot.
+fn now_us() -> u64 {
+    unsafe { esp_idf_svc::sys::esp_timer_get_time() as u64 }
+}
+
+/// Where the time between DRDY edges actually goes.
+///
+/// The observed edge rate falls from 1000 Hz to 250 Hz partway through a session, which
+/// is either the loop taking 4 ms to come back around or the front end producing an edge
+/// only every 4 ms. Those need opposite fixes, and the difference is visible in one
+/// number: how long the SPI read takes as a fraction of the wake-to-wake period. A read
+/// of ~450 µs inside a 4000 µs period means the thread spent 3.5 ms waiting, so the
+/// edges are not there to catch.
+#[derive(Default)]
+struct EdgeTiming {
+    count: u32,
+    last_woke_us: Option<u64>,
+    period_min_us: u64,
+    period_sum_us: u64,
+    period_max_us: u64,
+    read_min_us: u64,
+    read_sum_us: u64,
+    read_max_us: u64,
+}
+
+impl EdgeTiming {
+    /// Called on every wake, before any work. Returns nothing; the summary comes out of
+    /// [`Self::summary`] once the interval fills.
+    fn record_wake(&mut self, woke_us: u64) {
+        if let Some(last) = self.last_woke_us {
+            let period = woke_us.saturating_sub(last);
+            self.period_min_us = if self.count == 0 {
+                period
+            } else {
+                self.period_min_us.min(period)
+            };
+            self.period_max_us = self.period_max_us.max(period);
+            self.period_sum_us += period;
+            self.count += 1;
+        }
+        self.last_woke_us = Some(woke_us);
+    }
+
+    fn record_read(&mut self, elapsed_us: u64) {
+        self.read_min_us = if self.read_sum_us == 0 {
+            elapsed_us
+        } else {
+            self.read_min_us.min(elapsed_us)
+        };
+        self.read_max_us = self.read_max_us.max(elapsed_us);
+        self.read_sum_us += elapsed_us;
+    }
+
+    /// A one-line summary, and a reset, once `TIMING_LOG_INTERVAL` edges have gone by.
+    fn summary(&mut self) -> Option<String> {
+        if self.count < TIMING_LOG_INTERVAL {
+            return None;
+        }
+        let period_mean = self.period_sum_us / self.count as u64;
+        let read_mean = self.read_sum_us / self.count as u64;
+        let line = format!(
+            "wake period min/mean/max {}/{}/{} us || SPI read min/mean/max {}/{}/{} us",
+            self.period_min_us,
+            period_mean,
+            self.period_max_us,
+            self.read_min_us,
+            read_mean,
+            self.read_max_us
+        );
+        let last_woke_us = self.last_woke_us;
+        *self = Self {
+            last_woke_us,
+            ..Self::default()
+        };
+        Some(line)
+    }
+}
 
 /// What the consumer needs to know about the producer's health. These outlive any
 /// single window, so they sit beside the channel rather than in it.
@@ -67,6 +150,8 @@ struct Counters {
     read_errors: AtomicU32,
     /// Times chip B was not ready when chip A signalled.
     desyncs: AtomicU32,
+    /// Frames whose status word lost its fixed marker bits.
+    bad_status: AtomicU32,
 }
 
 /// The consumer side of the acquisition thread.
@@ -99,6 +184,13 @@ impl AdcSource {
     /// Anything above zero means the 16 channels are not one instant in time.
     pub(crate) fn desyncs(&self) -> u32 {
         self.counters.desyncs.load(Ordering::Relaxed)
+    }
+
+    /// Frames whose status marker came back wrong, cumulative since boot. Unlike
+    /// `read_errors`, these are transactions the SPI driver reported as successful --
+    /// the bus is running but the data is not trustworthy.
+    pub(crate) fn bad_status(&self) -> u32 {
+        self.counters.bad_status.load(Ordering::Relaxed)
     }
 
     /// The newest window, or `None` if none is waiting. Never blocks.
@@ -152,6 +244,9 @@ pub(crate) fn start(
             let samples_per_window = window_length * INPUT_CH;
             let mut building: Window = Vec::with_capacity(samples_per_window);
             let mut warned_about_desync = false;
+            let mut drdy_edges: u32 = 0;
+            let mut timing = EdgeTiming::default();
+            let mut last_status = [0u32; 2];
 
             // Wake on chip A's DRDY falling edge rather than polling it. The thread
             // has to block between frames: it runs above the idle task, the idle-task
@@ -180,11 +275,43 @@ pub(crate) fn start(
                     warn!("no DRDY edge in {DATA_READY_TIMEOUT_MS} ms; is START asserted?");
                     continue;
                 }
+                drdy_edges += 1;
+                timing.record_wake(now_us());
+                // TEMP bring-up diagnostic: confirms the interrupt is firing at all,
+                // and where the time between edges goes, without spamming a log per
+                // edge at ~2 kHz.
+                if drdy_edges == 1 {
+                    info!("DRDY edge #{drdy_edges}");
+                }
+                if let Some(line) = timing.summary() {
+                    // The status words ride along because the lead-off bits in them
+                    // track LOFF_SENSP/N, which `configure` sets to every channel and
+                    // reset clears to none. So a chip that quietly reverts to its
+                    // power-on defaults announces itself here, mid-stream, without
+                    // anything having to stop and read a register -- and it says so in
+                    // named channels rather than a hex word to be decoded by hand.
+                    info!(
+                        "DRDY edge #{drdy_edges} || {line} || status A ({}) B ({}) || desyncs {} bad status {}",
+                        describe_status_word(last_status[0]),
+                        describe_status_word(last_status[1]),
+                        producer.desyncs.load(Ordering::Relaxed),
+                        producer.bad_status.load(Ordering::Relaxed)
+                    );
+                }
 
                 // Chip A's DRDY fell. Both chips share START and a clock, so B should
                 // be ready in the same breath. If it is not, they have drifted apart
                 // and the 16 channels no longer belong to one instant in time, which
                 // corrupts every window silently. Say so once, then count it.
+                //
+                // This check must stay here, before `read_frame` touches the bus. The
+                // ADS1298 clears DRDY on the first SCLK falling edge *regardless of the
+                // state of CS* (SBAS459K §9.4.1.2, which for this reason tells you to
+                // gate SCLK per chip when several share a bus -- this board does not).
+                // So clocking chip A's frame out also drives chip B's DRDY high, and
+                // any reading of B's DRDY taken after that is an artefact of the shared
+                // SCLK rather than a real desync. The window between the interrupt and
+                // the first read is the only place this measurement means anything.
                 if !chain.adc2.data_ready().unwrap_or(true) {
                     if !warned_about_desync {
                         warn!("chip B not ready when chip A fired; frames may not align");
@@ -193,7 +320,10 @@ pub(crate) fn start(
                     producer.desyncs.fetch_add(1, Ordering::Relaxed);
                 }
 
-                let frame = match chain.read_frame() {
+                let read_started_us = now_us();
+                let read = chain.read_frame();
+                timing.record_read(now_us().saturating_sub(read_started_us));
+                let frame = match read {
                     Ok(frame) => frame,
                     Err(error) => {
                         let total = producer.read_errors.fetch_add(1, Ordering::Relaxed) + 1;
@@ -203,6 +333,35 @@ pub(crate) fn start(
                         continue;
                     }
                 };
+
+                last_status = [frame.devices[0].status, frame.devices[1].status];
+
+                // The transaction succeeded, but that only means the SPI driver got
+                // 27 bytes back -- not that they were the right 27 bytes. The status
+                // word's fixed marker bits catch a bit-misaligned or corrupted read
+                // that read_errors can't, since nothing about it fails as a transfer.
+                if frame
+                    .devices
+                    .iter()
+                    .any(|sample| sample.status_word().is_none())
+                {
+                    let total = producer.bad_status.fetch_add(1, Ordering::Relaxed) + 1;
+                    if total % READ_ERROR_LOG_INTERVAL == 1 {
+                        // The status words themselves, not just the count. A valid one
+                        // is 0xCxxxxx; all-zero means the chip returned nothing, and a
+                        // marker sitting at the wrong bit offset means the read is
+                        // misaligned rather than the chip being silent. Naming the chip
+                        // separates a chip B fault from a shared-bus one.
+                        warn!(
+                            "frame status marker invalid ({total} so far): chip A {:#08x} {}, chip B {:#08x} {}",
+                            frame.devices[0].status,
+                            if frame.devices[0].status_word().is_some() { "ok" } else { "BAD" },
+                            frame.devices[1].status,
+                            if frame.devices[1].status_word().is_some() { "ok" } else { "BAD" },
+                        );
+                    }
+                    continue;
+                }
 
                 building.extend_from_slice(&sample_to_int8(&frame, input_scale));
 
