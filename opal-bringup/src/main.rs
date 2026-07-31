@@ -1,38 +1,37 @@
 //! ADS1298 bench harness: one chip, one thread, one text console.
 //!
-//! This exists because `opal-firmware` cannot answer a hardware question. That binary
-//! brings up two chips on a shared bus, in two different register configurations, one
-//! clocking the other, behind wifi, a model, an interrupt-driven sampling thread and a
-//! CBOR link that has to come up before any log line is readable. Every one of those is
-//! a variable in a fault that is currently unexplained.
+//! This exists because `opal-firmware` cannot answer a hardware question. The fault
+//! under investigation: with two or more channel amplifiers powered and converting,
+//! conversions stop 9 ms to 1.7 s after START — stochastically, on both AFE boards,
+//! under every register configuration, input condition, and clock source tested. The
+//! full campaign is written up in `documentation/ads1298-bringup-2026-07-31/`
+//! (TEST-LOG.md for the summary, RESULTS-single-chip.md for the narrative).
 //!
-//! So: one board wired on its own and self-clocked, the eleven registers needed to
-//! convert and nothing else, DRDY polled on the main task, frames clocked out with
-//! RDATA so registers stay readable mid-stream, and logs straight out the USB cable.
+//! The harness has three modes, chosen by the knobs below:
 //!
-//! What it is looking for is a chip that reverts to its power-on defaults shortly after
-//! conversions start. A run moves through three stages, each holding the chip in a
-//! different amount of activity, and watches CONFIG1-3 throughout:
+//! - **Staged stream** (`RUN_SURVEY = false`): configure, START, stream and audit
+//!   CONFIG1-3 between frames, recovering and reporting on every revert.
+//! - **Operating-point survey** (`RUN_SURVEY = true`): walk configuration cells,
+//!   each from a fresh hardware reset, and print a survival matrix.
+//! - **Fast-recovery acquisition** (`VALIDATE_RECOVERY_ONLY = true`): the working
+//!   partial operating mode — stream 8 channels, detect a death in 10 ms, warm-reset
+//!   and rewrite in ~3 ms, and report the verified yield. Measured 97% at
+//!   2000 SPS x 8 channels (run 29).
 //!
-//! 1. **idle, START low** — registers written, nothing converting. A revert here means
-//!    conversion activity is not the trigger.
-//! 2. **converting, channels powered down** — START high with every channel amplifier
-//!    off, so the digital core and reference carry the only load.
-//! 3. **converting, channels normal** — the full front end, until the cable is pulled.
-//!
-//! On every revert the harness logs the elapsed time and the interval since the last
-//! one, rewrites the configuration, and keeps going — so one capture shows whether the
-//! fault is one-shot or periodic, and which stage wakes it.
+//! Frames are clocked out with RDATA rather than RDATAC so registers stay readable
+//! mid-stream; DRDY is edge-waited so a floating wire cannot fake data; and logs go
+//! straight out the USB cable.
 
 mod ads1298;
 
 use ads1298::{
     Ads1298, Frame, CHANNELS, REGISTER_NAMES, REG_CH1SET, REG_CONFIG1, REG_CONFIG2, REG_CONFIG3,
-    REG_COUNT, REG_ID,
+    REG_COUNT, REG_GPIO, REG_ID,
 };
 use anyhow::Result;
 use esp_idf_svc::hal::delay::{Ets, FreeRtos};
 use esp_idf_svc::hal::gpio::{AnyInputPin, AnyOutputPin, PinDriver, Pull};
+use esp_idf_svc::hal::ledc::{config::TimerConfig, LedcDriver, LedcTimerDriver, Resolution};
 use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::hal::spi::config::{Config as SpiConfig, MODE_1};
 use esp_idf_svc::hal::spi::{SpiDeviceDriver, SpiDriver, SpiDriverConfig};
@@ -49,7 +48,7 @@ use std::sync::Arc;
 const BOARD: &str = "A";
 
 /// SPI clock for the streaming loop, picked from what the sweep below reports.
-const SPI_BAUD_RATE_HZ: u32 = 1_000_000;
+const SPI_BAUD_RATE_HZ: u32 = 2_000_000;
 
 /// Clocks the boot-time sweep measures an ID-read error rate at. All five read clean
 /// once multi-byte commands were burst-framed; kept as a per-boot health check.
@@ -66,7 +65,7 @@ const TEST_SIGNAL_CHANNEL: Option<usize> = None;
 /// CONFIG1.DR. With HR set, `0b110` converts at 500 SPS — slow enough that a polled
 /// loop never has to hurry, and exactly twice the 250 SPS a reset chip converts at, so
 /// a revert doubles the measured period rather than nudging it.
-const DATA_RATE_BITS: u8 = 0b110;
+const DATA_RATE_BITS: u8 = 0b100; // 2000 SPS in HR mode -- the ML target rate
 
 /// CONFIG1: HR=1, DAISY_EN=1 (per-chip readback), CLK_EN=0, DR as above.
 ///
@@ -74,7 +73,7 @@ const DATA_RATE_BITS: u8 = 0b110;
 /// CLK pins is gone and this board's CLKSEL is tied high, so nothing is listening. Set
 /// it to 1 only to give a scope a trigger — the CLK output stopping is the cleanest
 /// edge the reversion produces.
-const CONFIG1: u8 = 0b1110_0000 | DATA_RATE_BITS; // CLK_EN=1: oscillator out the CLK pin as a scope probe
+const CONFIG1: u8 = 0b1100_0000 | DATA_RATE_BITS; // CLK_EN=0: the CLK pin is an input now -- the ESP32 drives it
 
 /// CONFIG2: internal test-signal generator off, or bit 4 set to switch it on.
 const CONFIG2: u8 = if TEST_SIGNAL_CHANNEL.is_some() {
@@ -93,9 +92,14 @@ const CHANNEL_NORMAL: u8 = 0x00;
 const CHANNEL_TEST_SIGNAL: u8 = 0x05;
 /// CHnSET with the inputs shorted, so the channel reads its own noise floor.
 const CHANNEL_SHORTED: u8 = 0x01;
-/// CHnSET with the channel amplifier powered down and the inputs shorted, for the
-/// stage that converts with no analog channel load at all.
+/// CHnSET with the channel amplifier powered down and the inputs shorted, so a cell
+/// or stage can convert with no analog channel load at all.
 const CHANNEL_POWERED_DOWN: u8 = 0x81;
+
+/// The chip's four GPIO pins driven as outputs, low. The GPIO register resets to
+/// 0x0F — four floating CMOS inputs on a bench that ties none of them — and floating
+/// inputs are a classic source of on-die noise and excess current.
+const GPIO_OUTPUTS_LOW: u8 = 0x00;
 
 /// Wait after CONFIG3 powers the internal reference buffer before START. The datasheet
 /// specifies a 150 ms reference start-up time and its initialization flow settles it
@@ -145,6 +149,21 @@ const AUDIT_INTERVAL: u32 = 50;
 /// Frames printed in full at the start of each stage, before the summaries take over.
 const RAW_FRAMES_LOGGED: u32 = 3;
 
+/// Skip the discriminator cells and run only the fast-recovery data-quality pass,
+/// with the channels on their electrode inputs (MUX=000) so whatever is wired to the
+/// analog connector is actually in circuit.
+const VALIDATE_RECOVERY_ONLY: bool = true;
+
+/// Run the operating-point survey instead of the staged stream: walk channel counts
+/// and windowed-conversion patterns, with a full hardware reset between cells, and
+/// report a survival matrix. This is the map of what the board can actually sustain,
+/// for choosing a partial operating point for the product.
+const RUN_SURVEY: bool = true;
+
+/// How long a survey cell must stream to be called a survivor. Every collapse so far
+/// has arrived inside a second; ten covers it an order of magnitude over.
+const CELL_DURATION_MS: u64 = 10_000;
+
 // ---------------------------------------------------------------------------
 
 fn main() -> Result<()> {
@@ -157,6 +176,23 @@ fn main() -> Result<()> {
 
     let peripherals = Peripherals::take()?;
     let pins = peripherals.pins;
+
+    // The external master clock: 2.048 MHz from the LEDC peripheral into the chip's
+    // CLK pin, with CLKSEL strapped to GND so the chip uses it instead of its
+    // internal RC oscillator. The oscillator is the one shared conversion-domain
+    // block never yet exonerated: DRDY dying while SPI (clocked by SCLK) stays alive
+    // is exactly what a stopping master clock looks like. The clock must run before
+    // the chip comes out of reset, so this precedes power-up. The driver stays bound
+    // for the whole session; dropping it would silence the clock.
+    let clock_timer = LedcTimerDriver::new(
+        peripherals.ledc.timer0,
+        &TimerConfig::new()
+            .frequency(2_048_000.Hz())
+            .resolution(Resolution::Bits4),
+    )?;
+    let mut master_clock = LedcDriver::new(peripherals.ledc.channel0, &clock_timer, pins.gpio10)?;
+    master_clock.set_duty(master_clock.get_max_duty() / 2)?;
+    info!("external master clock: 2.048 MHz on GPIO10, CLKSEL expected at GND");
 
     // The pin map, rewired 2026-07-31 so the jumpers run in header order on the
     // breakout: SCLK 2, CS 3, START 4, RST 5, MOSI 6, MISO 7, PWDN 8, DRDY 9.
@@ -212,6 +248,14 @@ fn main() -> Result<()> {
 
     sweep_spi_clock(&mut chip, &bus)?;
     chip.set_spi(spi_device(&bus, SPI_BAUD_RATE_HZ)?);
+
+    if RUN_SURVEY {
+        survey(&mut chip)?;
+        info!("survey complete; idling");
+        loop {
+            FreeRtos::delay_ms(10_000);
+        }
+    }
 
     log_registers(&mut chip, "after reset")?;
 
@@ -311,6 +355,229 @@ fn sweep_spi_clock(chip: &mut Ads1298, bus: &Arc<SpiDriver<'static>>) -> Result<
             warn!("SPI {baud_rate_hz:>8} Hz: {failures}/{SWEEP_ATTEMPTS} ID reads WRONG");
         }
     }
+    Ok(())
+}
+
+/// One row of the survival matrix. `config_held` distinguishes a genuine survivor
+/// from a chip that silently reverted to power-on defaults and kept converting at
+/// 250 SPS — which the frame count alone confused for survival in the first surveys.
+struct CellReport {
+    label: String,
+    frames: u32,
+    died_at_ms: Option<u64>,
+    config_held: bool,
+}
+
+/// Walks the operating-point cells, each from a fresh hardware reset, and prints the
+/// survival matrix at the end. Inputs are internally shorted (MUX=001) throughout, so
+/// the cells measure the board, not the electrodes.
+fn survey(chip: &mut Ads1298) -> Result<()> {
+    if VALIDATE_RECOVERY_ONLY {
+        // The data-quality pass: recovery mode with MUX=electrode, so the external
+        // input path (connector, ESD network, series resistors, PGA) is in circuit.
+        // With the pairs externally shorted the per-channel spread should be the
+        // noise floor; rail-scale spread means the input path is not delivering.
+        return run_recovery_cell(chip, 60_000, CHANNEL_NORMAL);
+    }
+    let mut reports = Vec::new();
+
+    // The reference buffer is refuted (buffer-off cells died identically). The
+    // remaining differences between our dying configuration and the power-on default
+    // a reverted chip demonstrably converts under: HR vs LP mode and data rate
+    // (default is LP 250 SPS), DAISY_EN, CLK_EN, and the four chip GPIO pins left as
+    // floating inputs (GPIO register defaults to 0x0F; the bench ties none of them).
+    // GPIO_OUTPUTS_LOW drives all four low so nothing on the die floats.
+    for &(config1, gpio, tag) in &[
+        (CONFIG1, None, "control (HR500, CLK out, GPIO floating)"),
+        (0xC6u8, None, "CLK_EN off"),
+        (CONFIG1, Some(GPIO_OUTPUTS_LOW), "GPIO driven low"),
+        (0xC6, Some(GPIO_OUTPUTS_LOW), "CLK_EN off + GPIO low"),
+        (0x06, None, "full default CONFIG1 (LP250, no daisy, no clk)"),
+        (0x06, Some(GPIO_OUTPUTS_LOW), "default CONFIG1 + GPIO low"),
+        (0x46, Some(GPIO_OUTPUTS_LOW), "LP250 + DAISY_EN + GPIO low"),
+        (
+            0xC6,
+            Some(GPIO_OUTPUTS_LOW),
+            "repeat: CLK_EN off + GPIO low",
+        ),
+    ] {
+        reports.push(run_continuous_cell(
+            chip, CHANNELS, config1, CONFIG3, gpio, tag,
+        )?);
+    }
+    run_recovery_cell(chip, 60_000, CHANNEL_SHORTED)?;
+
+    info!("=== survival matrix ===");
+    for report in &reports {
+        let config = if report.config_held {
+            "config HELD"
+        } else {
+            "config LOST"
+        };
+        match report.died_at_ms {
+            None => info!(
+                "SURVIVED  {}: {} frames, {config}",
+                report.label, report.frames
+            ),
+            Some(at) => info!(
+                "DIED      {}: at {} ms, {} frames, {config}",
+                report.label, at, report.frames
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// Resets the chip and configures `powered_channels` amplifiers on (inputs shorted),
+/// the rest powered down.
+fn reset_and_configure(
+    chip: &mut Ads1298,
+    powered_channels: usize,
+    config1: u8,
+    config3: u8,
+    gpio: Option<u8>,
+) -> Result<Vec<(u8, u8)>> {
+    chip.stop_conversion()?;
+    chip.power_up()?;
+    let mut writes = planned_writes(|channel| {
+        if channel < powered_channels {
+            CHANNEL_SHORTED
+        } else {
+            CHANNEL_POWERED_DOWN
+        }
+    });
+    for entry in writes.iter_mut() {
+        if entry.0 == REG_CONFIG1 {
+            entry.1 = config1;
+        }
+        if entry.0 == REG_CONFIG3 {
+            entry.1 = config3;
+        }
+    }
+    if let Some(value) = gpio {
+        writes.push((REG_GPIO, value));
+    }
+    apply(chip, &writes)?;
+    FreeRtos::delay_ms(REFERENCE_SETTLE_MS);
+    Ok(writes)
+}
+
+/// Streams continuously for [`CELL_DURATION_MS`] or until DRDY dies.
+fn run_continuous_cell(
+    chip: &mut Ads1298,
+    powered_channels: usize,
+    config1: u8,
+    config3: u8,
+    gpio: Option<u8>,
+    tag: &str,
+) -> Result<CellReport> {
+    let label = format!("{powered_channels} channels continuous, {tag}");
+    info!("cell '{label}'");
+    reset_and_configure(chip, powered_channels, config1, config3, gpio)?;
+    chip.start_conversion()?;
+    let started_us = now_us();
+    let mut frames = 0u32;
+    let mut died_at_ms = None;
+    loop {
+        let elapsed_ms = (now_us() - started_us) / 1000;
+        if elapsed_ms >= CELL_DURATION_MS {
+            break;
+        }
+        match wait_data_ready_falling_edge(chip) {
+            Ok(()) => {
+                if chip.read_frame().is_ok() {
+                    frames += 1;
+                }
+            }
+            Err(_) => {
+                died_at_ms = Some(elapsed_ms);
+                break;
+            }
+        }
+    }
+    let config_held = chip
+        .read_register(REG_CONFIG1)
+        .map(|v| v == CONFIG1)
+        .unwrap_or(false);
+    chip.stop_conversion()?;
+    Ok(CellReport {
+        label,
+        frames,
+        died_at_ms,
+        config_held,
+    })
+}
+
+/// The partial operating mode candidate: accept that a conversion run dies, and
+/// measure how much coverage fast recovery buys. On each death: a bare RESET pulse,
+/// SDATAC, rewrite, START — no cold-start settling — and back to streaming. The
+/// yield number (frames achieved / frames possible) is what the ML side needs to know
+/// to decide whether gap-aware training on this hardware is viable.
+fn run_recovery_cell(chip: &mut Ads1298, duration_ms: u64, channel_value: u8) -> Result<()> {
+    info!("cell 'fast-recovery acquisition, 8 channels, CHnSET {channel_value:#04x}, {duration_ms} ms'");
+    let mut writes = reset_and_configure(chip, CHANNELS, CONFIG1, CONFIG3, Some(GPIO_OUTPUTS_LOW))?;
+    for entry in writes.iter_mut() {
+        if entry.0 >= REG_CH1SET && entry.0 < REG_CH1SET + CHANNELS as u8 {
+            entry.1 = channel_value;
+        }
+    }
+    apply(chip, &writes)?;
+    chip.start_conversion()?;
+    let started_us = now_us();
+    let mut frames = 0u32;
+    let mut deaths = 0u32;
+    let mut recovery_time_us = 0u64;
+    let mut frames_since_audit = 0u32;
+    let mut channel_minimum = [i32::MAX; CHANNELS];
+    let mut channel_maximum = [i32::MIN; CHANNELS];
+    while (now_us() - started_us) / 1000 < duration_ms {
+        // A frame only counts when its marker is intact, and every 64 frames the
+        // configuration is re-read — a silent revert produces DRDY and markers at the
+        // wrong rate, so without this gate the yield number counts garbage.
+        let mut dead = false;
+        match wait_data_ready_falling_edge_within(chip, 10_000) {
+            Ok(()) => match chip.read_frame() {
+                Ok(frame) if frame.marker_ok() => {
+                    frames += 1;
+                    for (index, &code) in frame.channels.iter().enumerate() {
+                        channel_minimum[index] = channel_minimum[index].min(code);
+                        channel_maximum[index] = channel_maximum[index].max(code);
+                    }
+                    frames_since_audit += 1;
+                    if frames_since_audit >= 64 {
+                        frames_since_audit = 0;
+                        if chip.read_register(REG_CONFIG1).ok() != Some(CONFIG1) {
+                            frames = frames.saturating_sub(64);
+                            dead = true;
+                        }
+                    }
+                }
+                _ => {}
+            },
+            Err(_) => dead = true,
+        }
+        if dead {
+            deaths += 1;
+            let recovery_started_us = now_us();
+            chip.stop_conversion()?;
+            chip.reset_pulse()?;
+            apply(chip, &writes)?;
+            chip.start_conversion()?;
+            recovery_time_us += now_us() - recovery_started_us;
+            frames_since_audit = 0;
+        }
+    }
+    chip.stop_conversion()?;
+    let possible = duration_ms * u64::from(samples_per_second()) / 1000;
+    info!(
+        "RECOVERY  8 channels {duration_ms} ms: {frames} frames of {possible} possible ({}%), {deaths} deaths, {} ms recovering",
+        frames as u64 * 100 / possible.max(1),
+        recovery_time_us / 1000,
+    );
+    let spreads: Vec<i64> = (0..CHANNELS)
+        .map(|index| i64::from(channel_maximum[index]) - i64::from(channel_minimum[index]))
+        .collect();
+    info!("RECOVERY  per-channel peak-to-peak codes: {spreads:?}");
     Ok(())
 }
 
@@ -648,7 +915,16 @@ fn configuration_bits(address: u8, value: u8) -> u8 {
 /// a notification and a second thread are three things that can be wrong about a
 /// measurement whose whole purpose is to be trusted.
 fn wait_data_ready_falling_edge(chip: &Ads1298) -> Result<(), &'static str> {
-    let deadline_us = now_us() + FRAME_TIMEOUT_US;
+    wait_data_ready_falling_edge_within(chip, FRAME_TIMEOUT_US)
+}
+
+/// As above with an explicit timeout, for the recovery loop where detection latency
+/// is lost signal: DRDY arrives every 2 ms when healthy, so 10 ms is already sure.
+fn wait_data_ready_falling_edge_within(
+    chip: &Ads1298,
+    timeout_us: u64,
+) -> Result<(), &'static str> {
+    let deadline_us = now_us() + timeout_us;
     while chip.data_ready() {
         if now_us() > deadline_us {
             return Err("low");

@@ -42,6 +42,7 @@ pub const REG_CONFIG1: u8 = 0x01;
 pub const REG_CONFIG2: u8 = 0x02;
 pub const REG_CONFIG3: u8 = 0x03;
 pub const REG_CH1SET: u8 = 0x05;
+pub const REG_GPIO: u8 = 0x14;
 pub const REG_COUNT: u8 = 0x1A;
 
 /// Register names in address order, so a dump reads as names rather than offsets.
@@ -162,8 +163,24 @@ impl Ads1298 {
         Ok(())
     }
 
+    /// A bare warm reset: RESET pulse, the post-reset lockout, SDATAC. For recovery
+    /// mid-session, where the cold-start supply settling has long since happened.
+    pub fn reset_pulse(&mut self) -> Result<()> {
+        self.reset_n.set_low()?;
+        FreeRtos::delay_ms(1);
+        self.reset_n.set_high()?;
+        FreeRtos::delay_ms(1);
+        self.command(SDATAC)?;
+        Ok(())
+    }
+
     pub fn start_conversion(&mut self) -> Result<()> {
         self.start.set_high()?;
+        Ok(())
+    }
+
+    pub fn stop_conversion(&mut self) -> Result<()> {
+        self.start.set_low()?;
         Ok(())
     }
 
