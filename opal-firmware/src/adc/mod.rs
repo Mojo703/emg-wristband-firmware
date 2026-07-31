@@ -97,13 +97,15 @@ pub(crate) fn bring_up<SPI: SpiAnyPins + 'static>(
         PinDriver::input(pins.data_ready_a, Pull::Floating)?,
         PinDriver::output(pins.reset_a)?,
         PinDriver::output(pins.power_down_a)?,
-    );
+    )
+    .context("chip A pin init")?;
     let device_b = Ads1298Device::new(
         SpiDeviceDriver::new(bus, Some(pins.chip_select_b), &spi_config).context("SPI device B")?,
         PinDriver::input(pins.data_ready_b, Pull::Floating)?,
         PinDriver::output(pins.reset_b)?,
         PinDriver::output(pins.power_down_b)?,
-    );
+    )
+    .context("chip B pin init")?;
 
     let mut pair = Ads1298Pair::new(device_a, device_b, PinDriver::output(pins.start)?);
 

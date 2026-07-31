@@ -175,18 +175,18 @@ fn main() -> anyhow::Result<()> {
     // claims GPIO 19 and 20, so they are not available here.
     // ---------------------------------------------------------------------------
     let adc_pins = adc::AdcPins {
-        clock: peripherals.pins.gpio12.into(),
-        data_in: peripherals.pins.gpio11.into(),
-        data_out: peripherals.pins.gpio13.into(),
-        chip_select_a: peripherals.pins.gpio10.into(),
-        chip_select_b: peripherals.pins.gpio6.into(),
-        data_ready_a: peripherals.pins.gpio9.into(),
-        data_ready_b: peripherals.pins.gpio5.into(),
+        clock: peripherals.pins.gpio12.into(), //SCLK (Shared) 
+        data_in: peripherals.pins.gpio9.into(), //MOSI (Shared)
+        data_out: peripherals.pins.gpio10.into(), //MISO (Shared)
+        chip_select_a: peripherals.pins.gpio1.into(), 
+        chip_select_b: peripherals.pins.gpio5.into(), 
+        data_ready_a: peripherals.pins.gpio11.into(), 
+        data_ready_b: peripherals.pins.gpio4.into(), 
         reset_a: peripherals.pins.gpio8.into(),
-        reset_b: peripherals.pins.gpio1.into(),
-        power_down_a: peripherals.pins.gpio14.into(),
-        power_down_b: peripherals.pins.gpio4.into(),
-        start: peripherals.pins.gpio7.into(),
+        reset_b: peripherals.pins.gpio6.into(), 
+        power_down_a: peripherals.pins.gpio13.into(), 
+        power_down_b: peripherals.pins.gpio7.into(),
+        start: peripherals.pins.gpio2.into(), //Shared
     };
 
     // The model's own quantisation scale, read straight off the blob header so the ADC
@@ -250,6 +250,10 @@ fn main() -> anyhow::Result<()> {
                 );
                 stall_reported = true;
             }
+            // No window to send, but logger::drain() only runs inside send_window,
+            // so this is also what flushes buffered logs (e.g. ADS1298 bring-up
+            // checkpoints) to the dashboard while the ADC is silent.
+            links.send_window(None, &[]);
             FreeRtos::delay_ms(IDLE_POLL_MS);
             continue;
         };

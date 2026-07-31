@@ -56,15 +56,21 @@ impl Ads1298Device {
     pub(super) fn new(
         spi: SpiDevice,
         drdy: PinDriver<'static, Input>,
-        reset_n: PinDriver<'static, Output>,
-        pwdn: PinDriver<'static, Output>,
-    ) -> Self {
-        Self {
+        mut reset_n: PinDriver<'static, Output>,
+        mut pwdn: PinDriver<'static, Output>,
+    ) -> Result<Self> {
+        // Held low from construction, before either chip's `power_up()`/`configure()`
+        // runs: both chips share DIN/DOUT/SCLK, so an un-reset chip could drive the
+        // bus while its sibling is still being brought up.
+        pwdn.set_low()?;
+        reset_n.set_low()?;
+
+        Ok(Self {
             spi,
             drdy,
             reset_n,
             pwdn,
-        }
+        })
     }
 
     /// DRDY is active-low. It falls when a new frame is ready to be sampled.
@@ -220,9 +226,8 @@ impl Ads1298Device {
 
     // Power-up sequencing for each individual device
     pub(super) fn power_up(&mut self, role: ChipRole, expected_device_id: u8) -> Result<()> {
-        self.pwdn.set_low()?;
-        self.reset_n.set_low()?;
-
+        // Held low since construction (see `new`); wait out the minimum power-down
+        // assertion before bringing the chip up.
         FreeRtos::delay_ms(5);
 
         self.pwdn.set_high()?;
@@ -252,7 +257,8 @@ impl Ads1298Device {
 
         self.configure(role)?;
 
-        FreeRtos::delay_ms(200);
+        // TEMP bring-up experiment: bumped from 200, same reason as above.
+        FreeRtos::delay_ms(1000);
 
         Ok(())
     }
@@ -282,6 +288,15 @@ impl Ads1298Device {
 
         self.write_register(Register::LoffSensP, 0x00)?;
         self.write_register(Register::LoffSensN, 0x00)?;
+
+        // `configure()` includes every channel in the RLD derivation (RLD_SENSP/N =
+        // 0xFF on chip A) for real electrode use. With the test signal active, that
+        // sums the driven channel's square wave into the shared RLD reference and
+        // bleeds an attenuated copy of it back onto every other channel, including
+        // ones shorted above. There's no patient loop to cancel common-mode noise on
+        // during a test-signal check, so drop every channel out of RLD entirely.
+        self.write_register(Register::RldSensP, 0x00)?;
+        self.write_register(Register::RldSensN, 0x00)?;
 
         Ok(())
     }

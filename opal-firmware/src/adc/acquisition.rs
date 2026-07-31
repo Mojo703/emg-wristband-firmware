@@ -152,6 +152,7 @@ pub(crate) fn start(
             let samples_per_window = window_length * INPUT_CH;
             let mut building: Window = Vec::with_capacity(samples_per_window);
             let mut warned_about_desync = false;
+            let mut drdy_edges: u32 = 0;
 
             // Wake on chip A's DRDY falling edge rather than polling it. The thread
             // has to block between frames: it runs above the idle task, the idle-task
@@ -179,6 +180,13 @@ pub(crate) fn start(
                 if notification.wait(DATA_READY_TIMEOUT_TICKS).is_none() {
                     warn!("no DRDY edge in {DATA_READY_TIMEOUT_MS} ms; is START asserted?");
                     continue;
+                }
+                drdy_edges += 1;
+                // TEMP bring-up diagnostic: confirms the interrupt is firing at all,
+                // and roughly how long it kept firing before going quiet, without
+                // spamming a log per edge at ~2 kHz.
+                if drdy_edges == 1 || drdy_edges % 500 == 0 {
+                    info!("DRDY edge #{drdy_edges}");
                 }
 
                 // Chip A's DRDY fell. Both chips share START and a clock, so B should
