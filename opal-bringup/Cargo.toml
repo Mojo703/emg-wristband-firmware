@@ -1,0 +1,31 @@
+# Empty workspace table makes this a workspace root so cargo doesn't attach it
+# to an unrelated Cargo.toml higher up the directory tree.
+[workspace]
+
+[package]
+name = "opal-bringup"
+version = "0.1.0"
+edition = "2021"
+resolver = "2"
+rust-version = "1.77"
+description = "ESP32-S3 bench harness for one ADS1298: configure, stream over a text console, and catch the chip reverting"
+
+[[bin]]
+name = "opal-bringup"
+
+[profile.release]
+opt-level = 3
+
+[profile.dev]
+opt-level = 1
+debug = true
+
+# Deliberately no protocol, emg-runtime, serde or ciborium. This crate shares no code
+# with opal-firmware: the point is a binary with nothing in it but the ADC.
+[dependencies]
+esp-idf-svc = "0.52"
+log = "0.4"
+anyhow = "1"
+
+[build-dependencies]
+embuild = "0.33"

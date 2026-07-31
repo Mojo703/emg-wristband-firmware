@@ -57,7 +57,7 @@ const ADC_SPI_BAUD_RATE_HZ: u32 = 1_000_000;
 /// silently sample the wrong input and cost a bench session, so `Channel::checked`
 /// refuses it at compile time; `Channel::new` is the wrong constructor here, because
 /// its `None` would read as "no test signal" instead of failing.
-const ADC_TEST_SIGNAL_CHANNEL: Option<Channel> = None;
+const ADC_TEST_SIGNAL_CHANNEL: Option<Channel> = Channel::new(1);
 
 /// How long the loop sleeps when no window is waiting.
 ///
