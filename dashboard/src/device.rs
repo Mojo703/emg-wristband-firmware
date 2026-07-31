@@ -14,7 +14,7 @@
 
 use crate::frame;
 use crate::registry::{DeviceHandle, Registry};
-use protocol::{DeviceTransport, Frame, FrameScanner};
+use protocol::{DeviceTransport, Frame, FrameScanner, LogLevel};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -69,7 +69,24 @@ async fn device_session(
             // browser is subscribed, which is fine — drop it. Logs are additionally
             // retained so a browser opened later still sees them.
             other => {
-                if matches!(other, Frame::Log { .. }) {
+                if let Frame::Log {
+                    t_us,
+                    level,
+                    message,
+                } = &other
+                {
+                    // Onto the backend's own log as well as the browser's. Bring-up
+                    // happens at a bench with no browser open, and the device has no
+                    // text console of its own (`CONFIG_ESP_CONSOLE_NONE`), so without
+                    // this a device that fails before anyone opens a tab says nothing
+                    // anywhere that can be captured, piped, or diffed between runs.
+                    let seconds = *t_us as f64 / 1_000_000.0;
+                    match level {
+                        LogLevel::Error => tracing::error!("{device_id} {seconds:.3} {message}"),
+                        LogLevel::Warn => tracing::warn!("{device_id} {seconds:.3} {message}"),
+                        LogLevel::Info => tracing::info!("{device_id} {seconds:.3} {message}"),
+                        LogLevel::Debug => tracing::debug!("{device_id} {seconds:.3} {message}"),
+                    }
                     registry.push_log(&device_id, other.clone());
                 }
                 let _ = frames.send(other);
@@ -224,7 +241,9 @@ fn auto_discover_ports() -> Vec<String> {
 /// whenever it names a path that exists; otherwise auto-select by USB identity. The
 /// baud rate is nominal — a CDC channel ignores it.
 pub async fn run_serial_discovery(registry: Arc<Registry>) {
-    let override_port = std::env::var(SERIAL_PORT_ENV).ok().filter(|s| !s.is_empty());
+    let override_port = std::env::var(SERIAL_PORT_ENV)
+        .ok()
+        .filter(|s| !s.is_empty());
     match &override_port {
         Some(path) => tracing::info!("serial discovery forced onto {path} (from {SERIAL_PORT_ENV})"),
         None => tracing::info!(
@@ -279,7 +298,11 @@ pub async fn run_serial_discovery(registry: Arc<Registry>) {
 /// bursty traffic, and a stalled reader backs the device's CDC buffer up until its
 /// writes time out. Blocking reads with a timeout are immune, and the threads bridge
 /// into [`device_session`] through the same channels the TCP path uses.
-async fn serial_session(path: &str, registry: Arc<Registry>, warned_ports: &Mutex<HashSet<String>>) {
+async fn serial_session(
+    path: &str,
+    registry: Arc<Registry>,
+    warned_ports: &Mutex<HashSet<String>>,
+) {
     let mut reader_port = match tokio_serial::new(path, 921_600)
         .timeout(Duration::from_millis(100))
         .open()
@@ -290,7 +313,10 @@ async fn serial_session(path: &str, registry: Arc<Registry>, warned_ports: &Mute
         // explain each path's failure once.
         Err(e) => {
             if warned_ports.lock().unwrap().insert(path.to_string()) {
-                if matches!(e.kind(), SerialErrorKind::Io(std::io::ErrorKind::PermissionDenied)) {
+                if matches!(
+                    e.kind(),
+                    SerialErrorKind::Io(std::io::ErrorKind::PermissionDenied)
+                ) {
                     tracing::warn!(
                         "serial {path}: permission denied. Add your user to the port's group \
                          (`sudo usermod -aG uucp $USER` on Arch, `dialout` on Debian/Ubuntu) and \
@@ -388,10 +414,17 @@ async fn serial_session(path: &str, registry: Arc<Registry>, warned_ports: &Mute
         let mut port = writer_port;
         let mut out_rx = out_rx;
         // Opening the port can bounce the device's reset line, so the first writes may
-        // land while it reboots and its CDC accepts nothing. Ride out a few seconds of
-        // failures before declaring the link dead; a torn frame from a partial write
-        // is fine, the device's scanner resyncs on the next magic.
-        const WRITE_ATTEMPTS: u32 = 8;
+        // land while it reboots and its CDC accepts nothing. Ride out the reboot before
+        // declaring the link dead; a torn frame from a partial write is fine, the
+        // device's scanner resyncs on the next magic.
+        //
+        // The budget has to cover the device's slowest path to its serve loop, since
+        // nothing reads the port until then. ADS1298 bring-up alone blocks ~4.4 s on
+        // mandated settling delays, and a failed bring-up spends another ~2 s powering
+        // the second chip for diagnostics. At ~600 ms per attempt (a 100 ms port
+        // timeout plus the sleep), 8 attempts gave under 5 s and declared a device dead
+        // exactly when it had the most to say. 30 gives ~18 s.
+        const WRITE_ATTEMPTS: u32 = 30;
         'session: while let Some(frame) = out_rx.blocking_recv() {
             let bytes = protocol::frame_bytes(&frame::encode(&frame));
             for attempt in 1.. {

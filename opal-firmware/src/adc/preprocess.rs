@@ -22,17 +22,17 @@
 //! small function, rather than spreading it through the acquisition path: once someone
 //! reads the exporter, [`sample_to_int8`] is the only thing that should need to change.
 
+use super::channel::{Channel, CHANNELS_PER_DEVICE};
 use super::convert::code_to_voltage;
-use super::loff::loff_flagged;
-use crate::adc::decode::{AdcFrame, CHANNELS_PER_DEVICE};
+use crate::adc::decode::AdcFrame;
 use emg_runtime::model::INPUT_CH;
 
-/// Internal reference voltage. CONFIG3 is `0xC6`, whose `VREF_4V` bit (bit 5) is clear,
-/// selecting the 2.4 V reference.
+/// Internal reference voltage. `config3_for` sets `four_volt_reference: false`, which
+/// selects the 2.4 V reference.
 const REFERENCE_VOLTS: f32 = 2.4;
 
-/// PGA gain. `configure` writes `0x00` to every CHnSET register; its `GAIN` field
-/// (bits 6:4), value `0b000`, selects gain 6.
+/// Programmable gain amplifier setting. `configure` writes `Gain::Six` to every CHnSET
+/// register.
 const GAIN: f32 = 6.0;
 
 const MICROVOLTS_PER_VOLT: f32 = 1_000_000.0;
@@ -50,17 +50,23 @@ const MICROVOLTS_PER_VOLT: f32 = 1_000_000.0;
 pub(super) fn sample_to_int8(frame: &AdcFrame, input_scale: f32) -> [i8; INPUT_CH] {
     let mut out = [0i8; INPUT_CH];
     for (device_index, sample) in frame.devices.iter().enumerate() {
-        for channel in 0..CHANNELS_PER_DEVICE {
-            let slot = device_index * CHANNELS_PER_DEVICE + channel;
+        // Decoded once per device rather than once per channel. `None` means the
+        // frame's status marker was missing, which acquisition rejects before this
+        // runs; if one ever gets here, the lead-off bits of an untrustworthy word are
+        // not evidence of anything, so no channel is zeroed on their say-so.
+        let status = sample.status_word();
+        for channel in Channel::ALL {
+            let slot = device_index * CHANNELS_PER_DEVICE + channel.index();
             if slot >= INPUT_CH {
                 break;
             }
-            if loff_flagged(sample.status, channel) {
+            if status.is_some_and(|status| status.lead_off(channel)) {
                 out[slot] = 0;
                 continue;
             }
-            let microvolts = code_to_voltage(sample.channels[channel], REFERENCE_VOLTS, GAIN)
-                * MICROVOLTS_PER_VOLT;
+            let microvolts =
+                code_to_voltage(sample.channels[channel.index()], REFERENCE_VOLTS, GAIN)
+                    * MICROVOLTS_PER_VOLT;
             out[slot] = quantize(microvolts, input_scale);
         }
     }
@@ -89,6 +95,11 @@ fn quantize(microvolts: f32, scale: f32) -> i8 {
 mod tests {
     use super::*;
     use crate::adc::decode::Sample;
+
+    /// The fixed marker every real status word carries. A word without it does not
+    /// decode at all, so any test that means to say something about the lead-off bits
+    /// has to build on top of this.
+    const STATUS_MARKER: u32 = 0xC0_0000;
 
     fn frame_with(channels_a: [i32; 8], channels_b: [i32; 8], status: u32) -> AdcFrame {
         AdcFrame {
@@ -144,7 +155,7 @@ mod tests {
     #[test]
     fn lead_off_channels_are_zeroed() {
         // Full-scale on every channel of chip A, but STATP flags channel 0 (bit 12).
-        let frame = frame_with([8_388_607; 8], [0; 8], 1 << 12);
+        let frame = frame_with([8_388_607; 8], [0; 8], STATUS_MARKER | (1 << 12));
         let out = sample_to_int8(&frame, 1.0);
         assert_eq!(out[0], 0, "flagged channel should be zeroed");
         assert_eq!(out[1], 127, "unflagged channel should still saturate");

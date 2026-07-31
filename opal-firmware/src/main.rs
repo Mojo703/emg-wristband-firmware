@@ -24,6 +24,7 @@ mod logger;
 mod transport;
 mod wifi;
 
+use adc::Channel;
 use config::{Sensitivity, Settings, Store};
 use emg_runtime::model::{Model, NUM_CLASSES};
 use emg_runtime::{softmax, ForwardResult, RejectPipeline};
@@ -33,14 +34,15 @@ use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::hal::usb_serial::{UsbSerialConfig, UsbSerialDriver};
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use links::Links;
-use log::{info, warn};
+use log::{error, info, warn};
 use protocol::{Frame, WakeState};
 use std::time::Instant;
 use transport::{Control, SerialTransport};
 
 /// SPI clock for the ADS1298 bus. Two 27-byte frames have to clear inside one sample
-/// period (500 µs at 2 kSPS), which 1 MHz only just manages. Raise this if the
-/// dropped-window counter in the periodic log is ever non-zero.
+/// period (500 µs at 2 kSPS), which 1 MHz only just manages. 2 MHz and 4 MHz both read
+/// the ID register back as 0x00 on this board, so raising it needs the wiring looked at
+/// first.
 const ADC_SPI_BAUD_RATE_HZ: u32 = 1_000_000;
 
 /// Drive the ADS1298's internal square wave into this channel instead of the
@@ -50,17 +52,12 @@ const ADC_SPI_BAUD_RATE_HZ: u32 = 1_000_000;
 /// front end: the named channel must show a clean square wave at a known amplitude
 /// while the others sit near zero. If the test signal is right and the electrodes are
 /// wrong, the fault is in front of the ADC. `None` reads the electrodes.
-const ADC_TEST_SIGNAL_CHANNEL: Option<usize> = None;
-
-// An out-of-range channel would silently sample the wrong input and cost a bench
-// session, so refuse it at compile time rather than at boot.
-const _: () = assert!(
-    match ADC_TEST_SIGNAL_CHANNEL {
-        Some(channel) => channel < adc::CHANNELS_PER_DEVICE,
-        None => true,
-    },
-    "ADC_TEST_SIGNAL_CHANNEL must be within 0..CHANNELS_PER_DEVICE"
-);
+///
+/// Switch it on with `Some(Channel::checked(3))`. An out-of-range channel would
+/// silently sample the wrong input and cost a bench session, so `Channel::checked`
+/// refuses it at compile time; `Channel::new` is the wrong constructor here, because
+/// its `None` would read as "no test signal" instead of failing.
+const ADC_TEST_SIGNAL_CHANNEL: Option<Channel> = None;
 
 /// How long the loop sleeps when no window is waiting.
 ///
@@ -175,18 +172,18 @@ fn main() -> anyhow::Result<()> {
     // claims GPIO 19 and 20, so they are not available here.
     // ---------------------------------------------------------------------------
     let adc_pins = adc::AdcPins {
-        clock: peripherals.pins.gpio12.into(), //SCLK (Shared) 
-        data_in: peripherals.pins.gpio9.into(), //MOSI (Shared)
-        data_out: peripherals.pins.gpio10.into(), //MISO (Shared)
-        chip_select_a: peripherals.pins.gpio1.into(), 
-        chip_select_b: peripherals.pins.gpio5.into(), 
-        data_ready_a: peripherals.pins.gpio11.into(), 
-        data_ready_b: peripherals.pins.gpio4.into(), 
-        reset_a: peripherals.pins.gpio8.into(),
-        reset_b: peripherals.pins.gpio6.into(), 
-        power_down_a: peripherals.pins.gpio13.into(), 
-        power_down_b: peripherals.pins.gpio7.into(),
-        start: peripherals.pins.gpio2.into(), //Shared
+        clock: peripherals.pins.gpio2.into(),    //SCLK (Shared)
+        data_in: peripherals.pins.gpio4.into(),  //MOSI (Shared)
+        data_out: peripherals.pins.gpio1.into(), //MISO (Shared)
+        chip_select_a: peripherals.pins.gpio11.into(),
+        chip_select_b: peripherals.pins.gpio8.into(),
+        data_ready_a: peripherals.pins.gpio12.into(),
+        data_ready_b: peripherals.pins.gpio9.into(),
+        reset_a: peripherals.pins.gpio10.into(),
+        reset_b: peripherals.pins.gpio7.into(),
+        power_down_a: peripherals.pins.gpio5.into(),
+        power_down_b: peripherals.pins.gpio6.into(),
+        start: peripherals.pins.gpio3.into(), //Shared
     };
 
     // The model's own quantisation scale, read straight off the blob header so the ADC
@@ -194,15 +191,32 @@ fn main() -> anyhow::Result<()> {
     let input_scale = emg_runtime::VerifyBatch::new(MODEL_BIN).input_scale;
 
     // Bring-up blocks ~4.4 s on the ADS1298's mandated settling delays, so it must run
-    // before the code below registers the task watchdog. A failure here is fatal: this
-    // firmware has no other source of EMG, so there is nothing useful left to do.
-    let pair = adc::bring_up(
+    // before the code below registers the task watchdog.
+    //
+    // A failure here must not propagate out of `main`. The serve loop below is the only
+    // thing that drains the log buffer onto a link, so returning `Err` here exits the
+    // process, reboots the chip, and takes the explanation with it -- there is no text
+    // console to fall back on (`CONFIG_ESP_CONSOLE_NONE`), and the reboot loop leaves
+    // the dashboard writing into a CDC endpoint that keeps re-enumerating. Degrade
+    // instead: no EMG, but the link still comes up, so the error reaches the dashboard
+    // and provisioning still works. `{error:#}` prints the whole context chain, which
+    // is where the useful part lives (an ID-register mismatch names wiring, power, or
+    // chip select as the suspects).
+    let source = match adc::bring_up(
         peripherals.spi2,
         adc_pins,
         ADC_SPI_BAUD_RATE_HZ,
         ADC_TEST_SIGNAL_CHANNEL,
-    )?;
-    let source = adc::acquisition::start(pair, model.input_len, input_scale)?;
+    )
+    .and_then(|pair| adc::acquisition::start(pair, model.input_len, input_scale))
+    {
+        Ok(source) => Some(source),
+        Err(error) => {
+            error!("ADC bring-up failed: {error:#}");
+            error!("serving links without EMG; fix the front end and reflash");
+            None
+        }
+    };
 
     // The main loop paces at one window (~244 ms); if it ever stops feeding the task
     // watchdog (default 5 s), something below hung on I/O and the chip must reboot
@@ -239,17 +253,27 @@ fn main() -> anyhow::Result<()> {
         // No window yet is the common case, not an error: the ADCs produce one every
         // ~250 ms and this loop runs every 5 ms. Sleep and come back, so the loop keeps
         // servicing the links and feeding the watchdog.
-        let Some(input) = source.try_next_window() else {
-            if !stall_reported && last_window_at.elapsed().as_millis() > STALL_WARNING_MS {
-                warn!(
-                    "no ADC window for {} ms (dropped {}, read errors {}, desyncs {}, bad status {})",
-                    last_window_at.elapsed().as_millis(),
-                    source.dropped_windows(),
-                    source.read_errors(),
-                    source.desyncs(),
-                    source.bad_status()
-                );
-                stall_reported = true;
+        // `source` is `None` when bring-up failed, and the loop then serves links only.
+        // The window carries the source along so the code below can read its counters
+        // without unwrapping.
+        let next_window = source
+            .as_ref()
+            .and_then(|source| Some((source, source.try_next_window()?)));
+        let Some((source, input)) = next_window else {
+            // Nothing to warn about when there is no front end at all: the stall
+            // warning is for one that came up and then went quiet.
+            if let Some(source) = source.as_ref() {
+                if !stall_reported && last_window_at.elapsed().as_millis() > STALL_WARNING_MS {
+                    warn!(
+                        "no ADC window for {} ms (dropped {}, read errors {}, desyncs {}, bad status {})",
+                        last_window_at.elapsed().as_millis(),
+                        source.dropped_windows(),
+                        source.read_errors(),
+                        source.desyncs(),
+                        source.bad_status()
+                    );
+                    stall_reported = true;
+                }
             }
             // No window to send, but logger::drain() only runs inside send_window,
             // so this is also what flushes buffered logs (e.g. ADS1298 bring-up

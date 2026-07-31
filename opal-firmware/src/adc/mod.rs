@@ -1,10 +1,11 @@
 //! The EMG acquisition front end: two TI ADS1298 8-channel ADCs on a shared SPI bus,
 //! giving the 16 channels the model expects.
 //!
-//! Layout. [`ads1298`] is the register-level driver, [`decode`]/[`loff`]/[`convert`]
-//! are the hardware-free frame maths, [`preprocess`] turns ADC codes into the model's
-//! int8 input, and [`acquisition`] runs the sampling thread. [`bring_up`] does the
-//! wiring and hands back a configured, streaming pair.
+//! Layout. [`registers`] is the typed register map and [`ads1298`] the register-level
+//! driver; [`decode`]/[`status`]/[`convert`] are the hardware-free frame maths,
+//! [`preprocess`] turns ADC codes into the model's int8 input, and [`acquisition`] runs
+//! the sampling thread. [`bring_up`] does the wiring and hands back a configured,
+//! streaming pair.
 //!
 //! Threading. Sampling cannot live on the main loop: at 2 kSPS a frame arrives every
 //! 500 µs, while the main loop runs one 244 ms inference window per iteration and
@@ -14,14 +15,15 @@
 
 pub(crate) mod acquisition;
 pub(crate) mod ads1298;
+mod channel;
 mod convert;
 mod decode;
-mod loff;
 mod preprocess;
 mod registers;
 mod spi_commands;
+mod status;
 
-pub(crate) use decode::CHANNELS_PER_DEVICE;
+pub(crate) use channel::Channel;
 
 use anyhow::{Context, Result};
 use esp_idf_svc::hal::gpio::{AnyInputPin, AnyOutputPin, PinDriver, Pull};
@@ -62,14 +64,14 @@ pub(crate) struct AdcPins {
 /// clear inside one sample period: at 2 kSPS that period is 500 µs, and 54 bytes is
 /// 432 bits, so 1 MHz leaves under 70 µs for CS toggling and driver overhead. Raise it
 /// until the drop counter in [`acquisition`] stays at zero.
-/// `test_signal_channel` is `Some(0..=7)` to drive the ADS1298's internal square wave
+/// `test_signal_channel` is `Some(channel)` to drive the ADS1298's internal square wave
 /// into that channel on both chips instead of the electrodes. See
 /// [`ads1298::Ads1298Device::enable_test_signal`].
 pub(crate) fn bring_up<SPI: SpiAnyPins + 'static>(
     spi: SPI,
     pins: AdcPins,
     baud_rate_hz: u32,
-    test_signal_channel: Option<usize>,
+    test_signal_channel: Option<Channel>,
 ) -> Result<Ads1298Pair> {
     // One bus driver shared by both chips through an Arc, so the devices are 'static
     // and can move onto the acquisition thread.
@@ -119,6 +121,11 @@ pub(crate) fn bring_up<SPI: SpiAnyPins + 'static>(
     pair.adc2
         .power_up(ChipRole::B, EXPECTED_DEVICE_ID)
         .context("chip B power-up")?;
+
+    // Still in SDATAC, so registers are readable. Once RDATAC starts below there is no
+    // way to check them again without tearing the stream down.
+    pair.adc1.log_configuration_readback(ChipRole::A);
+    pair.adc2.log_configuration_readback(ChipRole::B);
 
     if let Some(channel) = test_signal_channel {
         // Registers can only be written outside RDATAC, which power_up leaves us in.
