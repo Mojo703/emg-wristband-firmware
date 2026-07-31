@@ -59,6 +59,25 @@ const READ_ERROR_LOG_INTERVAL: u32 = 2000;
 /// numbers in the line always describe the same stretch.
 const TIMING_LOG_INTERVAL: u32 = 500;
 
+/// Consecutive bad-status frames before the pair is warm-recovered. One corrupt frame
+/// is a glitch; a run of them is the front end gone, and the bring-up campaign showed
+/// it never comes back on its own.
+const BAD_STATUS_RECOVERY_THRESHOLD: u32 = 8;
+
+/// Consecutive slow DRDY periods before the pair is warm-recovered. A chip that
+/// silently reverts to its power-on defaults keeps converting — at 250 SPS instead of
+/// 2000, so the wake period physically quadruples. This is a rate measurement, not an
+/// inference: sixteen straight periods at better than double the nominal 500 µs
+/// cannot be produced by a correctly configured front end.
+const SLOW_PERIOD_RECOVERY_THRESHOLD: u32 = 16;
+
+/// A wake period above this is counted toward [`SLOW_PERIOD_RECOVERY_THRESHOLD`].
+const SLOW_PERIOD_US: u64 = 1_500;
+
+/// Log the first recovery and then every this-many, so a bench-grade failure rate
+/// (~2 per second was measured) describes itself without flooding the link.
+const RECOVERY_LOG_INTERVAL: u32 = 32;
+
 /// One window of model input, time-major `[t, c]` to match [`emg_runtime::tensor`].
 type Window = Vec<i8>;
 
@@ -152,6 +171,11 @@ struct Counters {
     desyncs: AtomicU32,
     /// Frames whose status word lost its fixed marker bits.
     bad_status: AtomicU32,
+    /// Times the pair was warm-recovered after its conversions died. The bring-up
+    /// campaign (documentation/ads1298-bringup-2026-07-31/TEST-LOG.md) established
+    /// the front end dies stochastically under multi-channel conversion; recovery
+    /// restores it in a few milliseconds at the cost of a gap in the stream.
+    recoveries: AtomicU32,
 }
 
 /// The consumer side of the acquisition thread.
@@ -191,6 +215,12 @@ impl AdcSource {
     /// the bus is running but the data is not trustworthy.
     pub(crate) fn bad_status(&self) -> u32 {
         self.counters.bad_status.load(Ordering::Relaxed)
+    }
+
+    /// Times the front end died and was warm-recovered, cumulative since boot. Each
+    /// one is a ~15 ms gap in the sample stream and a discarded partial window.
+    pub(crate) fn recoveries(&self) -> u32 {
+        self.counters.recoveries.load(Ordering::Relaxed)
     }
 
     /// The newest window, or `None` if none is waiting. Never blocks.
@@ -247,6 +277,28 @@ pub(crate) fn start(
             let mut drdy_edges: u32 = 0;
             let mut timing = EdgeTiming::default();
             let mut last_status = [0u32; 2];
+            let mut consecutive_bad_status: u32 = 0;
+            let mut consecutive_slow_periods: u32 = 0;
+            let mut last_wake_us: Option<u64> = None;
+
+            // Warm-recovers the pair and accounts for it. The partial window is
+            // discarded rather than stitched across the gap: a window that silently
+            // spans a discontinuity would feed the model 250 ms that never happened.
+            macro_rules! recover {
+                ($building:expr, $reason:expr) => {{
+                    let total = producer.recoveries.fetch_add(1, Ordering::Relaxed) + 1;
+                    if total == 1 || total % RECOVERY_LOG_INTERVAL == 0 {
+                        warn!("front end died ({}); warm recovery #{total}", $reason);
+                    }
+                    if let Err(error) = chain.warm_recover() {
+                        warn!("warm recovery failed: {error}");
+                    }
+                    $building.clear();
+                    consecutive_bad_status = 0;
+                    consecutive_slow_periods = 0;
+                    last_wake_us = None;
+                }};
+            }
 
             // Wake on chip A's DRDY falling edge rather than polling it. The thread
             // has to block between frames: it runs above the idle task, the idle-task
@@ -272,11 +324,27 @@ pub(crate) fn start(
                     return;
                 }
                 if notification.wait(DATA_READY_TIMEOUT_TICKS).is_none() {
-                    warn!("no DRDY edge in {DATA_READY_TIMEOUT_MS} ms; is START asserted?");
+                    recover!(building, "no DRDY edge");
                     continue;
                 }
                 drdy_edges += 1;
-                timing.record_wake(now_us());
+                let woke_us = now_us();
+                timing.record_wake(woke_us);
+                // The silent-revert detector: a chip back at power-on defaults still
+                // converts, but four times slower. Sustained slow periods mean the
+                // configuration is gone even though frames keep arriving.
+                if let Some(last) = last_wake_us {
+                    if woke_us.saturating_sub(last) > SLOW_PERIOD_US {
+                        consecutive_slow_periods += 1;
+                        if consecutive_slow_periods >= SLOW_PERIOD_RECOVERY_THRESHOLD {
+                            recover!(building, "sustained slow DRDY period");
+                            continue;
+                        }
+                    } else {
+                        consecutive_slow_periods = 0;
+                    }
+                }
+                last_wake_us = Some(woke_us);
                 // TEMP bring-up diagnostic: confirms the interrupt is firing at all,
                 // and where the time between edges goes, without spamming a log per
                 // edge at ~2 kHz.
@@ -360,8 +428,13 @@ pub(crate) fn start(
                             if frame.devices[1].status_word().is_some() { "ok" } else { "BAD" },
                         );
                     }
+                    consecutive_bad_status += 1;
+                    if consecutive_bad_status >= BAD_STATUS_RECOVERY_THRESHOLD {
+                        recover!(building, "sustained bad status markers");
+                    }
                     continue;
                 }
+                consecutive_bad_status = 0;
 
                 building.extend_from_slice(&sample_to_int8(&frame, input_scale));
 

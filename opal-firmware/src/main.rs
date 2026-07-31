@@ -265,12 +265,13 @@ fn main() -> anyhow::Result<()> {
             if let Some(source) = source.as_ref() {
                 if !stall_reported && last_window_at.elapsed().as_millis() > STALL_WARNING_MS {
                     warn!(
-                        "no ADC window for {} ms (dropped {}, read errors {}, desyncs {}, bad status {})",
+                        "no ADC window for {} ms (dropped {}, read errors {}, desyncs {}, bad status {}, recoveries {})",
                         last_window_at.elapsed().as_millis(),
                         source.dropped_windows(),
                         source.read_errors(),
                         source.desyncs(),
-                        source.bad_status()
+                        source.bad_status(),
+                        source.recoveries()
                     );
                     stall_reported = true;
                 }
