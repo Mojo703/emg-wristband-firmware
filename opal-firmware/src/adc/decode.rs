@@ -14,6 +14,20 @@ pub(super) struct Sample {
     pub(super) channels: [i32; CHANNELS_PER_DEVICE],
 }
 
+/// Bits 23:20 of the status word are a fixed `1100` marker on every ADS1298 frame
+/// independent of LOFF/GPIO state. A frame that got past the SPI driver
+/// without an error but lost bit alignment -- a stuck bus, noise, a desync between
+/// the two chips -- will usually corrupt this marker even when the transaction
+/// itself "succeeded", so checking it catches garbage the read-error counter can't.
+const STATUS_MARKER_MASK: u32 = 0xF00000;
+const STATUS_MARKER_EXPECTED: u32 = 0xC00000;
+
+impl Sample {
+    pub(super) fn has_valid_status_marker(&self) -> bool {
+        self.status & STATUS_MARKER_MASK == STATUS_MARKER_EXPECTED
+    }
+}
+
 /// One frame is a sample from each of the two cascaded devices. Named `AdcFrame`
 /// rather than `Frame` because `protocol::Frame` (the wire frame) is already in
 /// scope across this crate and the two are unrelated.

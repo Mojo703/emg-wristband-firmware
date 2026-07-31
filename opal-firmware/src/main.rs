@@ -242,11 +242,12 @@ fn main() -> anyhow::Result<()> {
         let Some(input) = source.try_next_window() else {
             if !stall_reported && last_window_at.elapsed().as_millis() > STALL_WARNING_MS {
                 warn!(
-                    "no ADC window for {} ms (dropped {}, read errors {}, desyncs {})",
+                    "no ADC window for {} ms (dropped {}, read errors {}, desyncs {}, bad status {})",
                     last_window_at.elapsed().as_millis(),
                     source.dropped_windows(),
                     source.read_errors(),
-                    source.desyncs()
+                    source.desyncs(),
+                    source.bad_status()
                 );
                 stall_reported = true;
             }

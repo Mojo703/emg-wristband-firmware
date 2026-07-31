@@ -92,17 +92,21 @@ a scope or the analyser on SCLK and DRDY and confirm the read finishes well befo
 next DRDY falls, rather than trusting the counter alone: a read that only just fits will
 pass on a quiet bench and fail once wifi is busy.
 
-Three other counters appear if the front end goes quiet for a second:
+Four other counters appear if the front end goes quiet for a second:
 
 ```
-no ADC window for 1013 ms (dropped N, read errors N, desyncs N)
+no ADC window for 1013 ms (dropped N, read errors N, desyncs N, bad status N)
 ```
 
 `read errors` counts frames the SPI read refused. `desyncs` counts times chip B was not
 ready when chip A signalled, which means the two chips have drifted apart and the 16
-channels no longer describe one instant. Either one above zero is a hardware or timing
-fault, not a software one. Read errors are logged one in two thousand: a stuck bus fails
-every frame, and logging each would drown the link.
+channels no longer describe one instant. `bad status` counts frames the SPI read
+accepted as a successful transfer but whose status word lost its fixed marker bits
+(bits 23:20, always `1100` per the datasheet) -- a bit-misaligned or corrupted read
+that a clean transaction can't catch on its own. Any of the three above zero is a
+hardware or timing fault, not a software one. Read errors and bad status are each
+logged one in two thousand: a stuck bus fails every frame, and logging each would
+drown the link.
 
 ## 4. Do the electrodes work?
 

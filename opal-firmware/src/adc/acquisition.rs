@@ -67,6 +67,8 @@ struct Counters {
     read_errors: AtomicU32,
     /// Times chip B was not ready when chip A signalled.
     desyncs: AtomicU32,
+    /// Frames whose status word lost its fixed marker bits.
+    bad_status: AtomicU32,
 }
 
 /// The consumer side of the acquisition thread.
@@ -99,6 +101,13 @@ impl AdcSource {
     /// Anything above zero means the 16 channels are not one instant in time.
     pub(crate) fn desyncs(&self) -> u32 {
         self.counters.desyncs.load(Ordering::Relaxed)
+    }
+
+    /// Frames whose status marker came back wrong, cumulative since boot. Unlike
+    /// `read_errors`, these are transactions the SPI driver reported as successful --
+    /// the bus is running but the data is not trustworthy.
+    pub(crate) fn bad_status(&self) -> u32 {
+        self.counters.bad_status.load(Ordering::Relaxed)
     }
 
     /// The newest window, or `None` if none is waiting. Never blocks.
@@ -211,6 +220,18 @@ pub(crate) fn start(
                         continue;
                     }
                 };
+
+                // The transaction succeeded, but that only means the SPI driver got
+                // 27 bytes back -- not that they were the right 27 bytes. The status
+                // word's fixed marker bits catch a bit-misaligned or corrupted read
+                // that read_errors can't, since nothing about it fails as a transfer.
+                if frame.devices.iter().any(|sample| !sample.has_valid_status_marker()) {
+                    let total = producer.bad_status.fetch_add(1, Ordering::Relaxed) + 1;
+                    if total % READ_ERROR_LOG_INTERVAL == 1 {
+                        warn!("frame status marker invalid ({total} so far); bus may be desynced");
+                    }
+                    continue;
+                }
 
                 building.extend_from_slice(&sample_to_int8(&frame, input_scale));
 
