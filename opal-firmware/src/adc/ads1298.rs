@@ -3,9 +3,9 @@
 //! Datasheet: <https://www.ti.com/lit/ds/symlink/ads1298.pdf>
 
 use anyhow::Result;
-use esp_idf_svc::hal::delay::FreeRtos;
+use esp_idf_svc::hal::delay::{Ets, FreeRtos};
 use esp_idf_svc::hal::gpio::{Input, InterruptType, Output, PinDriver};
-use esp_idf_svc::hal::spi::{Operation, SpiDeviceDriver, SpiDriver};
+use esp_idf_svc::hal::spi::{SpiDeviceDriver, SpiDriver};
 use log::{info, warn};
 use std::sync::Arc;
 
@@ -28,6 +28,15 @@ use super::spi_commands;
 /// acquisition thread. `SpiDriver` and `SpiDeviceDriver` are both `Send`, and the
 /// bus is serialised internally by esp-idf's own device lock.
 type SpiDevice = SpiDeviceDriver<'static, Arc<SpiDriver<'static>>>;
+
+/// Gap between the bytes of a multi-byte register command. The ADS1298's command
+/// decoder needs tSDECODE = 4 tCLK (~2 µs at 2.048 MHz) per byte, and clocking a
+/// multi-byte command as one continuous stream is only legal when the SCLK is slow
+/// enough to provide that inside the byte itself (SBAS459K §9.5.1.2.1). The bench
+/// proved this the hard way: without burst framing, 2 MHz and 4 MHz SPI read the ID
+/// register as 0x00. 5 µs rather than 2 for margin; register traffic never sits on
+/// the frame-read hot path.
+const COMMAND_DECODE_GAP_US: u32 = 5;
 
 /// The output data rate the register set in [`Ads1298Device::configure`] selects.
 ///
@@ -282,6 +291,18 @@ impl Ads1298Device {
         Ok(())
     }
 
+    /// Warm recovery for a chip whose conversions have died mid-session: RESET pulse,
+    /// the post-reset lockout, SDATAC, full reconfigure. The bench measured the whole
+    /// pair recovering in ~3 ms; the cold-start supply settling in `power_up` is not
+    /// repeated because the rails have long since settled.
+    pub(super) fn warm_reset(&mut self, role: ChipRole) -> Result<()> {
+        self.reset_pulse()?;
+        // 18 tCLK after RESET rises before any command (SBAS459K §9.3.2.3).
+        FreeRtos::delay_ms(1);
+        self.stop_read_data_continuous()?;
+        self.configure(role)
+    }
+
     /// Helper for sending SPI commands
     fn send_command(&mut self, command: u8) -> Result<()> {
         self.spi.write(&[command])?;
@@ -335,20 +356,27 @@ impl Ads1298Device {
     // The one place a register address and a byte meet. Private, so every caller comes
     // through a typed path above.
     fn write_register_byte(&mut self, reg: Register, value: u8) -> Result<()> {
-        // Second byte is "number of registers - 1" (0x00 = one register).
-        self.spi
-            .write(&[spi_commands::WREG_BASE | reg.addr(), 0x00, value])?;
-        Ok(())
+        // Second byte is "number of registers - 1" (0x00 = one register). Burst-framed:
+        // one byte per transfer with a decode gap between, per SBAS459K §9.5.1.2.1.
+        self.write_bytes_burst_framed(&[spi_commands::WREG_BASE | reg.addr(), 0x00, value])
     }
 
     // Reads from a single register on the ADS1298
     pub(super) fn read_register(&mut self, reg: Register) -> Result<u8> {
+        self.write_bytes_burst_framed(&[spi_commands::RREG_BASE | reg.addr(), 0x00])?;
         let mut rx = [0u8; 1];
-        self.spi.transaction(&mut [
-            Operation::Write(&[spi_commands::RREG_BASE | reg.addr(), 0x00]),
-            Operation::Read(&mut rx),
-        ])?;
+        self.spi.read(&mut rx)?;
         Ok(rx[0])
+    }
+
+    /// Clocks bytes out one at a time with [`COMMAND_DECODE_GAP_US`] between them —
+    /// the datasheet's burst method for multi-byte commands.
+    fn write_bytes_burst_framed(&mut self, bytes: &[u8]) -> Result<()> {
+        for &byte in bytes {
+            self.spi.write(&[byte])?;
+            Ets::delay_us(COMMAND_DECODE_GAP_US);
+        }
+        Ok(())
     }
 
     /// Clocks out one frame. Only valid while in RDATAC mode
@@ -518,10 +546,7 @@ impl Ads1298Pair {
         Ok(())
     }
 
-    /// Pulls the shared START pin low. Nothing stops the chips today, since the
-    /// firmware streams until it reboots, but halting conversion is the other half of
-    /// `start_conversion` and bring-up will want it.
-    #[allow(dead_code)]
+    /// Pulls the shared START pin low. Used by [`Self::warm_recover`].
     pub(super) fn stop_conversion(&mut self) -> Result<()> {
         self.start.set_low()?;
         Ok(())
@@ -543,6 +568,22 @@ impl Ads1298Pair {
     #[allow(dead_code)]
     pub(super) fn data_ready(&self) -> Result<bool> {
         Ok(self.adc1.data_ready()? && self.adc2.data_ready()?)
+    }
+
+    /// Warm-recovers both chips after a mid-session death: conversions stopped, then
+    /// per-chip RESET/SDATAC/reconfigure, RDATAC, and START again. The bring-up
+    /// campaign (documentation/ads1298-bringup-2026-07-31/) established that the front
+    /// end dies stochastically under multi-channel conversion and that this recovery
+    /// restores it within a few milliseconds, yielding 97% verified frames at
+    /// 2 kSPS × 8 channels on the bench.
+    pub(super) fn warm_recover(&mut self) -> Result<()> {
+        self.stop_conversion()?;
+        self.adc1.warm_reset(ChipRole::A)?;
+        self.adc2.warm_reset(ChipRole::B)?;
+        self.adc1.read_data_continuous()?;
+        self.adc2.read_data_continuous()?;
+        self.start_conversion()?;
+        Ok(())
     }
 
     /// Clocks out one frame from each device simultaneously. Only valid while
