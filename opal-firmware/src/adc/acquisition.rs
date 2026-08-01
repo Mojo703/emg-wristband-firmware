@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, TrySendError};
 use std::sync::Arc;
 
-use super::ads1298::Ads1298Pair;
+use super::ads1298::Ads1298FrontEnd;
 use super::preprocess::sample_to_int8;
 use super::status::describe_status_word;
 
@@ -45,9 +45,12 @@ const THREAD_PRIORITY: u8 = 10;
 /// Notification payload. The value carries no meaning; only the wakeup matters.
 const DATA_READY_BIT: NonZeroU32 = NonZeroU32::new(1).unwrap();
 
-/// How long to wait for a DRDY edge before complaining. Long enough that it never
-/// fires in normal operation at 2 kSPS, short enough to notice a stalled front end.
-const DATA_READY_TIMEOUT_MS: u32 = 500;
+/// How long to wait for a DRDY edge before declaring the front end dead. DRDY comes
+/// every 500 µs at 2 kSPS, so 10 ms is already twenty missed periods. Detection
+/// latency is lost signal: the front end dies stochastically (see the bring-up
+/// campaign) and every death costs this timeout plus ~3 ms of warm recovery. The
+/// bench measured 97% verified yield with this value.
+const DATA_READY_TIMEOUT_MS: u32 = 10;
 const DATA_READY_TIMEOUT_TICKS: u32 = DATA_READY_TIMEOUT_MS; // CONFIG_FREERTOS_HZ=1000
 
 /// Log one read failure in this many. A stuck bus fails every frame, 2000 times a
@@ -167,8 +170,6 @@ struct Counters {
     dropped: AtomicU32,
     /// Frames the driver failed to read.
     read_errors: AtomicU32,
-    /// Times chip B was not ready when chip A signalled.
-    desyncs: AtomicU32,
     /// Frames whose status word lost its fixed marker bits.
     bad_status: AtomicU32,
     /// Times the pair was warm-recovered after its conversions died. The bring-up
@@ -202,12 +203,6 @@ impl AdcSource {
     /// Frames the driver failed to clock out, cumulative since boot.
     pub(crate) fn read_errors(&self) -> u32 {
         self.counters.read_errors.load(Ordering::Relaxed)
-    }
-
-    /// Times the two chips disagreed about having data ready, cumulative since boot.
-    /// Anything above zero means the 16 channels are not one instant in time.
-    pub(crate) fn desyncs(&self) -> u32 {
-        self.counters.desyncs.load(Ordering::Relaxed)
     }
 
     /// Frames whose status marker came back wrong, cumulative since boot. Unlike
@@ -257,7 +252,7 @@ impl AdcSource {
 ///
 /// `window_length` is the model's `input_len`; `input_scale` is its µV per count.
 pub(crate) fn start(
-    mut chain: Ads1298Pair,
+    mut chain: Ads1298FrontEnd,
     window_length: usize,
     input_scale: f32,
 ) -> Result<AdcSource> {
@@ -273,10 +268,9 @@ pub(crate) fn start(
             info!("ADC acquisition thread running");
             let samples_per_window = window_length * INPUT_CH;
             let mut building: Window = Vec::with_capacity(samples_per_window);
-            let mut warned_about_desync = false;
             let mut drdy_edges: u32 = 0;
             let mut timing = EdgeTiming::default();
-            let mut last_status = [0u32; 2];
+            let mut last_status = 0u32;
             let mut consecutive_bad_status: u32 = 0;
             let mut consecutive_slow_periods: u32 = 0;
             let mut last_wake_us: Option<u64> = None;
@@ -310,7 +304,7 @@ pub(crate) fn start(
             let notification = Notification::new();
             let notifier = notification.notifier();
             if let Err(error) = unsafe {
-                chain.adc1.subscribe_data_ready(move || {
+                chain.device.subscribe_data_ready(move || {
                     notifier.notify_and_yield(DATA_READY_BIT);
                 })
             } {
@@ -319,7 +313,7 @@ pub(crate) fn start(
             }
 
             loop {
-                if let Err(error) = chain.adc1.arm_data_ready_interrupt() {
+                if let Err(error) = chain.device.arm_data_ready_interrupt() {
                     warn!("could not arm DRDY interrupt: {error}");
                     return;
                 }
@@ -359,33 +353,11 @@ pub(crate) fn start(
                     // anything having to stop and read a register -- and it says so in
                     // named channels rather than a hex word to be decoded by hand.
                     info!(
-                        "DRDY edge #{drdy_edges} || {line} || status A ({}) B ({}) || desyncs {} bad status {}",
-                        describe_status_word(last_status[0]),
-                        describe_status_word(last_status[1]),
-                        producer.desyncs.load(Ordering::Relaxed),
-                        producer.bad_status.load(Ordering::Relaxed)
+                        "DRDY edge #{drdy_edges} || {line} || status ({}) || bad status {} recoveries {}",
+                        describe_status_word(last_status),
+                        producer.bad_status.load(Ordering::Relaxed),
+                        producer.recoveries.load(Ordering::Relaxed)
                     );
-                }
-
-                // Chip A's DRDY fell. Both chips share START and a clock, so B should
-                // be ready in the same breath. If it is not, they have drifted apart
-                // and the 16 channels no longer belong to one instant in time, which
-                // corrupts every window silently. Say so once, then count it.
-                //
-                // This check must stay here, before `read_frame` touches the bus. The
-                // ADS1298 clears DRDY on the first SCLK falling edge *regardless of the
-                // state of CS* (SBAS459K §9.4.1.2, which for this reason tells you to
-                // gate SCLK per chip when several share a bus -- this board does not).
-                // So clocking chip A's frame out also drives chip B's DRDY high, and
-                // any reading of B's DRDY taken after that is an artefact of the shared
-                // SCLK rather than a real desync. The window between the interrupt and
-                // the first read is the only place this measurement means anything.
-                if !chain.adc2.data_ready().unwrap_or(true) {
-                    if !warned_about_desync {
-                        warn!("chip B not ready when chip A fired; frames may not align");
-                        warned_about_desync = true;
-                    }
-                    producer.desyncs.fetch_add(1, Ordering::Relaxed);
                 }
 
                 let read_started_us = now_us();
@@ -402,30 +374,22 @@ pub(crate) fn start(
                     }
                 };
 
-                last_status = [frame.devices[0].status, frame.devices[1].status];
+                last_status = frame.status;
 
                 // The transaction succeeded, but that only means the SPI driver got
                 // 27 bytes back -- not that they were the right 27 bytes. The status
                 // word's fixed marker bits catch a bit-misaligned or corrupted read
                 // that read_errors can't, since nothing about it fails as a transfer.
-                if frame
-                    .devices
-                    .iter()
-                    .any(|sample| sample.status_word().is_none())
-                {
+                if frame.status_word().is_none() {
                     let total = producer.bad_status.fetch_add(1, Ordering::Relaxed) + 1;
                     if total % READ_ERROR_LOG_INTERVAL == 1 {
-                        // The status words themselves, not just the count. A valid one
-                        // is 0xCxxxxx; all-zero means the chip returned nothing, and a
+                        // The status word itself, not just the count. A valid one is
+                        // 0xCxxxxx; all-zero means the chip returned nothing, and a
                         // marker sitting at the wrong bit offset means the read is
-                        // misaligned rather than the chip being silent. Naming the chip
-                        // separates a chip B fault from a shared-bus one.
+                        // misaligned rather than the chip being silent.
                         warn!(
-                            "frame status marker invalid ({total} so far): chip A {:#08x} {}, chip B {:#08x} {}",
-                            frame.devices[0].status,
-                            if frame.devices[0].status_word().is_some() { "ok" } else { "BAD" },
-                            frame.devices[1].status,
-                            if frame.devices[1].status_word().is_some() { "ok" } else { "BAD" },
+                            "frame status marker invalid ({total} so far): {:#08x}",
+                            frame.status,
                         );
                     }
                     consecutive_bad_status += 1;

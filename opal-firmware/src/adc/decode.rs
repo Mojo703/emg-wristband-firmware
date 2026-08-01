@@ -4,7 +4,6 @@
 use super::channel::CHANNELS_PER_DEVICE;
 use super::status::StatusWord;
 
-pub(super) const DEVICE_COUNT: usize = 2;
 const STATUS_BYTES: usize = 3;
 const BYTES_PER_CHANNEL: usize = 3;
 pub(super) const FRAME_BYTES: usize = STATUS_BYTES + CHANNELS_PER_DEVICE * BYTES_PER_CHANNEL; // 27
@@ -29,14 +28,6 @@ impl Sample {
     pub(super) const fn status_word(&self) -> Option<StatusWord> {
         StatusWord::from_word(self.status)
     }
-}
-
-/// One frame is a sample from each of the two cascaded devices. Named `AdcFrame`
-/// rather than `Frame` because `protocol::Frame` (the wire frame) is already in
-/// scope across this crate and the two are unrelated.
-#[derive(Debug, Clone, Copy)]
-pub(super) struct AdcFrame {
-    pub(super) devices: [Sample; DEVICE_COUNT],
 }
 
 // Sign-extends a 24-bit two's-complement sample into a full i32

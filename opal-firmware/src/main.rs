@@ -39,11 +39,12 @@ use protocol::{Frame, WakeState};
 use std::time::Instant;
 use transport::{Control, SerialTransport};
 
-/// SPI clock for the ADS1298 bus. Two 27-byte frames have to clear inside one sample
-/// period (500 µs at 2 kSPS), which 1 MHz only just manages. 2 MHz and 4 MHz both read
-/// the ID register back as 0x00 on this board, so raising it needs the wiring looked at
-/// first.
-const ADC_SPI_BAUD_RATE_HZ: u32 = 1_000_000;
+/// SPI clock for the ADS1298 bus. One 27-byte frame has to clear well inside the
+/// 500 µs sample period at 2 kSPS. The old 2/4 MHz ID-read failures were the driver
+/// violating tSDECODE on multi-byte commands, not signal integrity — with burst
+/// framing in the driver, the bring-up bench read the ID 200/200 at every rate up to
+/// 4 MHz, and streamed at 2 MHz through the whole campaign.
+const ADC_SPI_BAUD_RATE_HZ: u32 = 2_000_000;
 
 /// Drive the ADS1298's internal square wave into this channel instead of the
 /// electrodes, shorting every other channel's input.
@@ -57,7 +58,7 @@ const ADC_SPI_BAUD_RATE_HZ: u32 = 1_000_000;
 /// silently sample the wrong input and cost a bench session, so `Channel::checked`
 /// refuses it at compile time; `Channel::new` is the wrong constructor here, because
 /// its `None` would read as "no test signal" instead of failing.
-const ADC_TEST_SIGNAL_CHANNEL: Option<Channel> = Channel::new(1);
+const ADC_TEST_SIGNAL_CHANNEL: Option<Channel> = None;
 
 /// How long the loop sleeps when no window is waiting.
 ///
@@ -171,19 +172,18 @@ fn main() -> anyhow::Result<()> {
     // START is tied to both so they convert on the same edge. USB-Serial-JTAG above
     // claims GPIO 19 and 20, so they are not available here.
     // ---------------------------------------------------------------------------
+    // The single-board pin map, in header order on the AFE breakout. The board is
+    // self-clocked: CLKSEL strapped to 3.3 V, nothing on the CLK pin, and the chip's
+    // own GPIO pins tied to GND (SBAS459K forbids floating them).
     let adc_pins = adc::AdcPins {
-        clock: peripherals.pins.gpio2.into(),    //SCLK (Shared)
-        data_in: peripherals.pins.gpio4.into(),  //MOSI (Shared)
-        data_out: peripherals.pins.gpio1.into(), //MISO (Shared)
-        chip_select_a: peripherals.pins.gpio11.into(),
-        chip_select_b: peripherals.pins.gpio8.into(),
-        data_ready_a: peripherals.pins.gpio12.into(),
-        data_ready_b: peripherals.pins.gpio9.into(),
-        reset_a: peripherals.pins.gpio10.into(),
-        reset_b: peripherals.pins.gpio7.into(),
-        power_down_a: peripherals.pins.gpio5.into(),
-        power_down_b: peripherals.pins.gpio6.into(),
-        start: peripherals.pins.gpio3.into(), //Shared
+        clock: peripherals.pins.gpio2.into(), // SCLK
+        chip_select: peripherals.pins.gpio3.into(),
+        start: peripherals.pins.gpio4.into(),
+        reset: peripherals.pins.gpio5.into(),
+        data_in: peripherals.pins.gpio6.into(),  // MOSI
+        data_out: peripherals.pins.gpio7.into(), // MISO
+        power_down: peripherals.pins.gpio8.into(),
+        data_ready: peripherals.pins.gpio9.into(),
     };
 
     // The model's own quantisation scale, read straight off the blob header so the ADC
@@ -265,11 +265,10 @@ fn main() -> anyhow::Result<()> {
             if let Some(source) = source.as_ref() {
                 if !stall_reported && last_window_at.elapsed().as_millis() > STALL_WARNING_MS {
                     warn!(
-                        "no ADC window for {} ms (dropped {}, read errors {}, desyncs {}, bad status {}, recoveries {})",
+                        "no ADC window for {} ms (dropped {}, read errors {}, bad status {}, recoveries {})",
                         last_window_at.elapsed().as_millis(),
                         source.dropped_windows(),
                         source.read_errors(),
-                        source.desyncs(),
                         source.bad_status(),
                         source.recoveries()
                     );

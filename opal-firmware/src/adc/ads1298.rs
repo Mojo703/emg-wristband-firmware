@@ -1,17 +1,23 @@
-//! Driver for two TI ADS1298 8-channel ADCs in "Cascade Configuration"
+//! Driver for the single TI ADS1298 8-channel ADC front end.
 //!
-//! Datasheet: <https://www.ti.com/lit/ds/symlink/ads1298.pdf>
+//! Datasheet: <https://www.ti.com/lit/ds/symlink/ads1298.pdf> (SBAS459K).
+//!
+//! One chip, self-clocked (CLKSEL strapped high), eight channels. The two-chip
+//! cascade this driver grew up around is gone: the bring-up campaign
+//! (documentation/ads1298-bringup-2026-07-31/) ran on one board, the product bench
+//! has one board, and the second slot of the model's 16 input channels is
+//! zero-padded until the model is retrained at 8.
 
 use anyhow::Result;
 use esp_idf_svc::hal::delay::{Ets, FreeRtos};
 use esp_idf_svc::hal::gpio::{Input, InterruptType, Output, PinDriver};
-use esp_idf_svc::hal::spi::{SpiDeviceDriver, SpiDriver};
+use esp_idf_svc::hal::spi::{Operation, SpiDeviceDriver, SpiDriver};
 use log::{info, warn};
 use std::sync::Arc;
 
 use super::channel::Channel;
 use super::decode::parse_sample;
-use super::decode::{AdcFrame, Sample, FRAME_BYTES};
+use super::decode::{Sample, FRAME_BYTES};
 
 use super::registers::{
     ChannelInput, ChannelMask, ChannelSettings, Config1, Config2, Config3, Config4, DataRate, Gain,
@@ -36,104 +42,95 @@ type SpiDevice = SpiDeviceDriver<'static, Arc<SpiDriver<'static>>>;
 /// proved this the hard way: without burst framing, 2 MHz and 4 MHz SPI read the ID
 /// register as 0x00. 5 µs rather than 2 for margin; register traffic never sits on
 /// the frame-read hot path.
-const COMMAND_DECODE_GAP_US: u32 = 5;
+///
+/// The gaps must sit INSIDE one `transaction()`, which holds hardware CS asserted
+/// across its operations. Splitting the bytes into separate `write()` calls raises CS
+/// between them — and a CS rising edge resets the chip's command decoder (§9.5.1.1),
+/// which kills every multi-byte command at its first byte boundary. That exact bug
+/// shipped once and read every register as 0x00.
+const COMMAND_DECODE_GAP_NANOSECONDS: u32 = 5_000;
+
+/// Gap before CS rises after a transaction, and the minimum CS-high dwell after it.
+const CHIP_SELECT_GAP_MICROSECONDS: u32 = 5;
 
 /// The output data rate the register set in [`Ads1298Device::configure`] selects.
 ///
-/// Derived from chip A's actual CONFIG1 rather than written down beside it, so it
-/// cannot drift out of agreement with the register the driver writes: change
-/// `data_rate` or `high_resolution` below and this number follows.
+/// Derived from the actual CONFIG1 rather than written down beside it, so it cannot
+/// drift out of agreement with the register the driver writes: change `data_rate` or
+/// `high_resolution` below and this number follows.
 ///
 /// It comes out at 2000 Hz. The model trained at 2048 Hz, a 2.3% difference in the time
 /// base that nobody has yet measured for its effect on accuracy. See
 /// [`crate::adc::preprocess`].
 pub(crate) const SAMPLE_RATE_HZ: u32 = {
-    let config1 = config1_for(ChipRole::A);
+    let config1 = device_config1();
     config1
         .data_rate
         .samples_per_second(config1.high_resolution)
 };
 
-/// CONFIG1 for a role. Chip A drives the clock out, chip B receives it. Both run in
-/// high resolution at fMOD/256, which is where [`SAMPLE_RATE_HZ`] comes from. The reset
-/// default is `0x06` — low power at fMOD/1024 — which converts at 250 SPS, so a chip
-/// that has reverted is visible both in a readback and in the edge rate.
-const fn config1_for(role: ChipRole) -> Config1 {
+/// CONFIG1: high resolution at fMOD/256, which is where [`SAMPLE_RATE_HZ`] comes from.
+/// The clock output stays off — nothing listens to the CLK pin with one self-clocked
+/// chip. The reset default is `0x06` — low power at fMOD/1024 — which converts at
+/// 250 SPS, so a chip that has silently reverted is visible both in a readback and in
+/// the DRDY edge rate; acquisition's slow-period recovery trigger keys on exactly that.
+const fn device_config1() -> Config1 {
     Config1 {
         high_resolution: true,
-        // Each chip has its own chip select, so they are read back individually rather
-        // than daisy-chained through a single DOUT.
         multiple_readback: true,
-        output_clock_enabled: match role {
-            ChipRole::A => true,
-            ChipRole::B => false,
-        },
+        output_clock_enabled: false,
         data_rate: DataRate::ModulatorClockOver256,
     }
 }
 
-/// How chip A drives the subject reference. A TEMP bring-up experiment: chip A resets
-/// itself to power-on defaults a variable 0.2-8 s after conversions start, and the
-/// right-leg drive is the largest analog load that distinguishes chip A from chip B,
-/// which never resets.
+/// How the chip drives the subject bias reference.
 ///
-/// Each board makes its own +-2.5 V analog rails locally (TLV70025 and a TPS72325 fed
-/// by a TPS60400 charge pump), so an analog supply that sags under load explains one
-/// chip failing while the other does not. This is the knob that changes that load.
+/// TODO(bias drive): the subject bias / right-leg drive is OFF. On-skin sessions run
+/// without common-mode rejection, so expect visibly more 50/60 Hz mains pickup in
+/// collected data. Before enabling it: (1) fix the board — the compensation network
+/// (1 MΩ ∥ 1 nF) must move from RLDIN to RLDINV per SBAS459K figure 94; (2) validate
+/// the powered loop on the bench with the survival harness, since RLD load was never
+/// exonerated in the conversion-death campaign; (3) pick Internal vs External
+/// reference against the schematic (RLDREF is grounded, which only suits internal).
 ///
-/// Sweep all three against a scope on AVSS. One run proves nothing here — the failure
-/// time varies by more than an order of magnitude between boots, and an earlier
-/// single-run comparison of `Disabled` against `ExternalReference` looked worse but was
-/// well inside that noise.
+/// `Disabled` is the only bench-validated setting: the entire bring-up campaign ran
+/// with the amplifier off, and the PCB review found the drive's compensation network
+/// on the wrong pin (RLDIN, the monitor mux, instead of RLDINV, the feedback node —
+/// SBAS459K figure 94), so the loop's stability when powered is unverified. Enabling
+/// it is its own future experiment; expect worse mains rejection until then.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum RightLegDriveMode {
-    /// Amplifier powered, reference taken from the RLDREF pin (`0xC6`). What the bench
-    /// has been running. Suspect: a datasheet audit flagged that nothing is known to
-    /// drive RLDREF, which would leave the amplifier's reference input floating and its
-    /// output railed.
+    /// Amplifier powered, reference taken from the RLDREF pin (`0xC6`). RLDREF is
+    /// grounded on this board, which is only correct with the internal reference
+    /// selected — do not use this mode without re-reading the schematic.
+    #[allow(dead_code)]
     ExternalReference,
-    /// Amplifier powered, reference generated internally at mid-supply (`0xCE`). What
-    /// the configuration probably should have been all along if the board has no
-    /// RLDREF divider.
+    /// Amplifier powered, reference generated internally at mid-supply (`0xCE`).
+    #[allow(dead_code)]
     InternalReference,
-    /// Amplifier powered down entirely (`0xC0`), the same as chip B. Removes the load
-    /// rather than fixing it — a diagnostic, not a destination, since the right-leg
-    /// drive is what rejects common-mode noise once a subject is attached.
+    /// Amplifier powered down entirely (`0xC0`). The validated configuration.
     Disabled,
 }
 
-/// The mode chip A is running right now. Chip B never powers the block whatever this
-/// says.
-const RIGHT_LEG_DRIVE_MODE: RightLegDriveMode = RightLegDriveMode::ExternalReference;
+/// The mode the chip is running right now.
+const RIGHT_LEG_DRIVE_MODE: RightLegDriveMode = RightLegDriveMode::Disabled;
 
-/// CONFIG3 for a role. Both chips run their internal reference buffer off the 2.4 V
-/// reference; the difference is the right-leg drive, which chip A powers and chip B
-/// does not.
-///
-/// One amplifier drives the subject's reference for the whole board, so exactly one
-/// chip may own it. Chip A does, alongside the channels it sums into that drive
-/// (`right_leg_drive_channels`) and the lead-off sense that rides on the same
-/// amplifier. Chip B leaves the block powered down.
-const fn config3_for(role: ChipRole) -> Config3 {
-    config3_for_mode(role, RIGHT_LEG_DRIVE_MODE)
+/// CONFIG3: the internal reference buffer on the 2.4 V reference, and the right-leg
+/// drive wherever [`RIGHT_LEG_DRIVE_MODE`] puts it.
+const fn device_config3() -> Config3 {
+    config3_for_mode(RIGHT_LEG_DRIVE_MODE)
 }
 
-/// [`config3_for`] with the experiment's setting passed in, so the tests can pin every
-/// mode's byte rather than only whichever one the bench happens to be running.
-const fn config3_for_mode(role: ChipRole, mode: RightLegDriveMode) -> Config3 {
-    let drive_enabled = match role {
-        ChipRole::A => !matches!(mode, RightLegDriveMode::Disabled),
-        ChipRole::B => false,
-    };
+/// [`device_config3`] with the setting passed in, so the tests can pin every mode's
+/// byte rather than only whichever one the bench happens to be running.
+const fn config3_for_mode(mode: RightLegDriveMode) -> Config3 {
+    let drive_enabled = !matches!(mode, RightLegDriveMode::Disabled);
     Config3 {
         internal_reference_enabled: true,
         // The 2.4 V reference, which is what `preprocess` converts codes against.
         four_volt_reference: false,
         right_leg_drive_measurement: false,
-        right_leg_drive_reference_internal: match role {
-            ChipRole::A => matches!(mode, RightLegDriveMode::InternalReference),
-            ChipRole::B => false,
-        },
+        right_leg_drive_reference_internal: matches!(mode, RightLegDriveMode::InternalReference),
         right_leg_drive_enabled: drive_enabled,
         // The lead-off sense rides on the same amplifier, so it goes wherever the
         // drive goes.
@@ -141,12 +138,12 @@ const fn config3_for_mode(role: ChipRole, mode: RightLegDriveMode) -> Config3 {
     }
 }
 
-/// RLD_SENSP/N for a role: chip A sums every channel into the right-leg drive, chip B
-/// none of them, so exactly one amplifier defines the reference for the whole board.
-const fn right_leg_drive_channels(role: ChipRole) -> ChannelMask {
-    match role {
-        ChipRole::A => ChannelMask::ALL,
-        ChipRole::B => ChannelMask::NONE,
+/// RLD_SENSP/N: which channels sum into the right-leg drive. Nothing while the drive
+/// is off; every channel once a powered mode is validated.
+const fn right_leg_drive_channels() -> ChannelMask {
+    match RIGHT_LEG_DRIVE_MODE {
+        RightLegDriveMode::Disabled => ChannelMask::NONE,
+        _ => ChannelMask::ALL,
     }
 }
 
@@ -174,15 +171,30 @@ const NORMAL_CHANNEL_SETTINGS: ChannelSettings = ChannelSettings {
     input: ChannelInput::Electrode,
 };
 
-/// CONFIG4: continuous conversion, and the lead-off comparators powered up — without
-/// them the status word's lead-off bits never set however LOFF_SENSP/N are configured,
-/// and `preprocess` would pass a disconnected electrode's railed signal to the model.
+/// TODO(lead-off): detection is OFF. The bring-up campaign validated every stable
+/// operating point with the lead-off block unpowered, and the first firmware run with
+/// it on died ~35 times per second versus ~2 on the bench. Disconnected electrodes
+/// therefore rail their channels instead of being zeroed by `preprocess` — re-enable
+/// as its own bench experiment (flip LEAD_OFF_ENABLED) once the front end is stable
+/// enough to isolate its effect.
+const LEAD_OFF_ENABLED: bool = false;
+
+/// CONFIG4: continuous conversion; lead-off comparators per [`LEAD_OFF_ENABLED`].
 const CONFIG4: Config4 = Config4 {
     respiration_frequency: RespirationFrequency::SixtyFourKilohertz,
     single_shot: false,
     wilson_center_terminal_to_right_leg_drive: false,
-    lead_off_comparators_enabled: true,
+    lead_off_comparators_enabled: LEAD_OFF_ENABLED,
 };
+
+/// LOFF_SENSP/N: which input halves the comparators watch.
+const fn lead_off_channels() -> ChannelMask {
+    if LEAD_OFF_ENABLED {
+        ChannelMask::ALL
+    } else {
+        ChannelMask::NONE
+    }
+}
 
 /// RESP: the respiration block off. The byte is not zero only because bit 5 is reserved
 /// and must be written 1.
@@ -215,21 +227,16 @@ const fn test_signal_channel_settings(driven: bool) -> ChannelSettings {
     }
 }
 
-/// Which cascaded device this is — determines which registers differ
-/// (CONFIG1.CLK_EN, CONFIG3.PD_RLD, RLD_SENSP/N).
-#[derive(Clone, Copy, Debug)]
-pub(super) enum ChipRole {
-    /// Clock master: drives CLK out to the other device (CONFIG1.CLK_EN=1)
-    A,
-    /// Clock slave: receives CLK from the master (CONFIG1.CLK_EN=0)
-    B,
-}
-
-/// One ADS1298 addressed via its own dedicated CS on the shared SPI bus
-/// Each ADC also has its own DRDY and RESET pin, however START is tied together
-/// so they DRDY pins should pull at same time
+/// The one ADS1298, addressed via its dedicated CS.
+///
+/// CS is a GPIO the driver toggles itself, not the SPI peripheral's hardware CS.
+/// This is the mechanism the bring-up harness validated end to end: held low across
+/// a whole multi-byte command (whose bytes need tSDECODE gaps between them), raised
+/// between transactions so the chip's command decoder gets its reset edge
+/// (SBAS459K §9.5.1.1).
 pub(super) struct Ads1298Device {
     spi: SpiDevice,
+    chip_select: PinDriver<'static, Output>,
     drdy: PinDriver<'static, Input>,
     reset_n: PinDriver<'static, Output>,
     pwdn: PinDriver<'static, Output>,
@@ -238,25 +245,40 @@ pub(super) struct Ads1298Device {
 impl Ads1298Device {
     pub(super) fn new(
         spi: SpiDevice,
+        mut chip_select: PinDriver<'static, Output>,
         drdy: PinDriver<'static, Input>,
         mut reset_n: PinDriver<'static, Output>,
         mut pwdn: PinDriver<'static, Output>,
     ) -> Result<Self> {
-        // Held low from construction, before either chip's `power_up()`/`configure()`
-        // runs: both chips share DIN/DOUT/SCLK, so an un-reset chip could drive the
-        // bus while its sibling is still being brought up.
+        // Held in reset from construction until `power_up()` runs the sequence.
         pwdn.set_low()?;
         reset_n.set_low()?;
+        chip_select.set_high()?;
 
         Ok(Self {
             spi,
+            chip_select,
             drdy,
             reset_n,
             pwdn,
         })
     }
 
+    /// Runs one transaction with CS low, raising CS afterwards even on failure so the
+    /// decoder-reset edge is never skipped. The trailing gap covers tSCCS (4 tCLK
+    /// after the last SCLK before CS may rise) and the minimum CS-high pulse.
+    fn with_selection<T>(&mut self, transaction: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        self.chip_select.set_low()?;
+        let result = transaction(self);
+        Ets::delay_us(CHIP_SELECT_GAP_MICROSECONDS);
+        self.chip_select.set_high()?;
+        Ets::delay_us(CHIP_SELECT_GAP_MICROSECONDS);
+        result
+    }
+
     /// DRDY is active-low. It falls when a new frame is ready to be sampled.
+    /// Acquisition waits on the interrupt instead; kept for bring-up polling.
+    #[allow(dead_code)]
     pub(super) fn data_ready(&self) -> Result<bool> {
         Ok(self.drdy.is_low())
     }
@@ -295,18 +317,20 @@ impl Ads1298Device {
     /// the post-reset lockout, SDATAC, full reconfigure. The bench measured the whole
     /// pair recovering in ~3 ms; the cold-start supply settling in `power_up` is not
     /// repeated because the rails have long since settled.
-    pub(super) fn warm_reset(&mut self, role: ChipRole) -> Result<()> {
+    pub(super) fn warm_reset(&mut self) -> Result<()> {
         self.reset_pulse()?;
         // 18 tCLK after RESET rises before any command (SBAS459K §9.3.2.3).
         FreeRtos::delay_ms(1);
         self.stop_read_data_continuous()?;
-        self.configure(role)
+        self.configure()
     }
 
     /// Helper for sending SPI commands
     fn send_command(&mut self, command: u8) -> Result<()> {
-        self.spi.write(&[command])?;
-        Ok(())
+        self.with_selection(|device| {
+            device.spi.write(&[command])?;
+            Ok(())
+        })
     }
 
     #[allow(dead_code)] // Datasheet command set, kept whole for bring-up.
@@ -356,35 +380,43 @@ impl Ads1298Device {
     // The one place a register address and a byte meet. Private, so every caller comes
     // through a typed path above.
     fn write_register_byte(&mut self, reg: Register, value: u8) -> Result<()> {
-        // Second byte is "number of registers - 1" (0x00 = one register). Burst-framed:
-        // one byte per transfer with a decode gap between, per SBAS459K §9.5.1.2.1.
-        self.write_bytes_burst_framed(&[spi_commands::WREG_BASE | reg.addr(), 0x00, value])
+        // Second byte is "number of registers - 1" (0x00 = one register). CS held for
+        // the whole command, decode gaps between the bytes.
+        self.with_selection(|device| {
+            device.spi.transaction(&mut [
+                Operation::Write(&[spi_commands::WREG_BASE | reg.addr()]),
+                Operation::DelayNs(COMMAND_DECODE_GAP_NANOSECONDS),
+                Operation::Write(&[0x00]),
+                Operation::DelayNs(COMMAND_DECODE_GAP_NANOSECONDS),
+                Operation::Write(&[value]),
+            ])?;
+            Ok(())
+        })
     }
 
     // Reads from a single register on the ADS1298
     pub(super) fn read_register(&mut self, reg: Register) -> Result<u8> {
-        self.write_bytes_burst_framed(&[spi_commands::RREG_BASE | reg.addr(), 0x00])?;
-        let mut rx = [0u8; 1];
-        self.spi.read(&mut rx)?;
-        Ok(rx[0])
-    }
-
-    /// Clocks bytes out one at a time with [`COMMAND_DECODE_GAP_US`] between them —
-    /// the datasheet's burst method for multi-byte commands.
-    fn write_bytes_burst_framed(&mut self, bytes: &[u8]) -> Result<()> {
-        for &byte in bytes {
-            self.spi.write(&[byte])?;
-            Ets::delay_us(COMMAND_DECODE_GAP_US);
-        }
-        Ok(())
+        self.with_selection(|device| {
+            let mut rx = [0u8; 1];
+            device.spi.transaction(&mut [
+                Operation::Write(&[spi_commands::RREG_BASE | reg.addr()]),
+                Operation::DelayNs(COMMAND_DECODE_GAP_NANOSECONDS),
+                Operation::Write(&[0x00]),
+                Operation::DelayNs(COMMAND_DECODE_GAP_NANOSECONDS),
+                Operation::Read(&mut rx),
+            ])?;
+            Ok(rx[0])
+        })
     }
 
     /// Clocks out one frame. Only valid while in RDATAC mode
     // and after `data_ready()` reports true
     pub(super) fn read_frame(&mut self) -> Result<Sample> {
-        let mut raw = [0u8; FRAME_BYTES];
-        self.spi.read(&mut raw)?;
-        Ok(parse_sample(&raw))
+        self.with_selection(|device| {
+            let mut raw = [0u8; FRAME_BYTES];
+            device.spi.read(&mut raw)?;
+            Ok(parse_sample(&raw))
+        })
     }
 
     /// Reads back the registers the sample rate and the status word depend on, and logs
@@ -394,41 +426,39 @@ impl Ads1298Device {
     /// fails is invisible until it shows up as a wrong conversion rate, which is a long
     /// way downstream of the cause. Must be called in SDATAC, before RDATAC starts the
     /// stream — registers cannot be read while streaming.
-    pub(super) fn log_configuration_readback(&mut self, role: ChipRole) {
+    pub(super) fn log_configuration_readback(&mut self) {
         let expected = [
-            (Register::Config1, config1_for(role).to_byte()),
+            (Register::Config1, device_config1().to_byte()),
             (Register::Config2, NORMAL_CONFIG2.to_byte()),
-            (Register::Config3, config3_for(role).to_byte()),
+            (Register::Config3, device_config3().to_byte()),
             (
                 Register::LoffSensP,
-                LeadOffSensePositive(ChannelMask::ALL).to_byte(),
+                LeadOffSensePositive(lead_off_channels()).to_byte(),
             ),
         ];
         for (register, written) in expected {
             match self.read_register(register) {
                 Ok(read) if read == written => {
-                    info!("chip {role:?}: {register:?} = {read:#04x} as written")
+                    info!("{register:?} = {read:#04x} as written")
                 }
                 Ok(read) => warn!(
-                    "chip {role:?}: {register:?} wrote {written:#04x}, reads {read:#04x} -- the write did not take"
+                    "{register:?} wrote {written:#04x}, reads {read:#04x} -- the write did not take"
                 ),
-                Err(error) => warn!("chip {role:?}: {register:?} readback failed: {error}"),
+                Err(error) => warn!("{register:?} readback failed: {error}"),
             }
         }
     }
 
     // Writes this device's full register set. Must be called after
     // `stop_read_data_continuous()` (SDATAC), since registers can't be written while streaming.
-    pub(super) fn configure(&mut self, role: ChipRole) -> Result<()> {
-        // --- Role-specific registers ---
-        self.write_register(config1_for(role))?;
+    pub(super) fn configure(&mut self) -> Result<()> {
+        self.write_register(device_config1())?;
 
-        self.write_register(config3_for(role))?;
+        self.write_register(device_config3())?;
 
-        self.write_register(RightLegDriveSensePositive(right_leg_drive_channels(role)))?;
-        self.write_register(RightLegDriveSenseNegative(right_leg_drive_channels(role)))?;
+        self.write_register(RightLegDriveSensePositive(right_leg_drive_channels()))?;
+        self.write_register(RightLegDriveSenseNegative(right_leg_drive_channels()))?;
 
-        // Shared registers (identical on both chips)
         self.write_register(NORMAL_CONFIG2)?;
         self.write_register(LEAD_OFF_CONTROL)?;
 
@@ -436,10 +466,10 @@ impl Ads1298Device {
             self.write_channel_settings(channel, NORMAL_CHANNEL_SETTINGS)?;
         }
 
-        // Watch both ends of every differential pair for lead-off, with no channel's
-        // excitation direction flipped.
-        self.write_register(LeadOffSensePositive(ChannelMask::ALL))?;
-        self.write_register(LeadOffSenseNegative(ChannelMask::ALL))?;
+        // Both ends of every differential pair when lead-off is enabled, nothing
+        // while it is off (see LEAD_OFF_ENABLED).
+        self.write_register(LeadOffSensePositive(lead_off_channels()))?;
+        self.write_register(LeadOffSenseNegative(lead_off_channels()))?;
         self.write_register(LeadOffFlip(ChannelMask::NONE))?;
         self.write_register(GeneralPurposeInputOutputOff)?;
         self.write_register(PaceDetectOff)?;
@@ -452,7 +482,7 @@ impl Ads1298Device {
     }
 
     // Power-up sequencing for each individual device
-    pub(super) fn power_up(&mut self, role: ChipRole, expected_device_id: u8) -> Result<()> {
+    pub(super) fn power_up(&mut self, expected_device_id: u8) -> Result<()> {
         // Held low since construction (see `new`); wait out the minimum power-down
         // assertion before bringing the chip up.
         FreeRtos::delay_ms(5);
@@ -477,7 +507,7 @@ impl Ads1298Device {
         let device_id = self.read_register(Register::Id)?;
         if device_id != expected_device_id {
             anyhow::bail!(
-                "ADS1298 ({role:?}) ID mismatch: read {device_id:#04x}, expected \
+                "ADS1298 ID mismatch: read {device_id:#04x}, expected \
                  {expected_device_id:#04x}. {}",
                 match device_id {
                     0x00 | 0xFF =>
@@ -488,10 +518,11 @@ impl Ads1298Device {
             );
         }
 
-        self.configure(role)?;
+        self.configure()?;
 
-        // TEMP bring-up experiment: bumped from 200, same reason as above.
-        FreeRtos::delay_ms(1000);
+        // Internal reference settling: the datasheet's 150 ms start-up time with
+        // margin, after CONFIG3 powers the reference buffer and before START.
+        FreeRtos::delay_ms(300);
 
         Ok(())
     }
@@ -522,22 +553,15 @@ impl Ads1298Device {
     }
 }
 
-/// Owns both ADS1298 devices sharing one Cascaded SPI bus and two
-/// control lines. Specifically in this format so that RLD registers
-// for each ADS1298 can be configured differently on startup.
-pub(crate) struct Ads1298Pair {
-    pub(super) adc1: Ads1298Device,
-    pub(super) adc2: Ads1298Device,
+/// The front end: the one ADS1298 and the START line that gates its conversions.
+pub(crate) struct Ads1298FrontEnd {
+    pub(super) device: Ads1298Device,
     start: PinDriver<'static, Output>,
 }
 
-impl Ads1298Pair {
-    pub(super) fn new(
-        adc1: Ads1298Device,
-        adc2: Ads1298Device,
-        start: PinDriver<'static, Output>,
-    ) -> Self {
-        Self { adc1, adc2, start }
+impl Ads1298FrontEnd {
+    pub(super) fn new(device: Ads1298Device, start: PinDriver<'static, Output>) -> Self {
+        Self { device, start }
     }
 
     /// Pulls the shared START pin high
@@ -552,46 +576,23 @@ impl Ads1298Pair {
         Ok(())
     }
 
-    /// True only once both devices report their own DRDY low. Since each
-    /// device has its own dedicated DRDY pin, this checks both independently
-    /// rather than trusting just one.
-    ///
-    /// Acquisition does not use this: it waits on chip A's DRDY interrupt and then
-    /// checks chip B on its own. Kept because polling both is the obvious thing to
-    /// reach for during bring-up.
-    ///
-    /// Careful where you call it. Both chips share SCLK, and the ADS1298 clears DRDY on
-    /// the first SCLK falling edge whether or not that chip is selected (SBAS459K
-    /// §9.4.1.2). So once either chip has been read this conversion cycle, both DRDY
-    /// lines read high and this returns false for reasons that have nothing to do with
-    /// the data.
-    #[allow(dead_code)]
-    pub(super) fn data_ready(&self) -> Result<bool> {
-        Ok(self.adc1.data_ready()? && self.adc2.data_ready()?)
-    }
-
-    /// Warm-recovers both chips after a mid-session death: conversions stopped, then
-    /// per-chip RESET/SDATAC/reconfigure, RDATAC, and START again. The bring-up
-    /// campaign (documentation/ads1298-bringup-2026-07-31/) established that the front
-    /// end dies stochastically under multi-channel conversion and that this recovery
-    /// restores it within a few milliseconds, yielding 97% verified frames at
-    /// 2 kSPS × 8 channels on the bench.
+    /// Warm-recovers the front end after a mid-session death: conversions stopped,
+    /// RESET/SDATAC/reconfigure, RDATAC, START again. The bring-up campaign
+    /// (documentation/ads1298-bringup-2026-07-31/) established that the front end dies
+    /// stochastically under multi-channel conversion and that this recovery restores
+    /// it within a few milliseconds, yielding 97% verified frames at 2 kSPS ×
+    /// 8 channels on the bench.
     pub(super) fn warm_recover(&mut self) -> Result<()> {
         self.stop_conversion()?;
-        self.adc1.warm_reset(ChipRole::A)?;
-        self.adc2.warm_reset(ChipRole::B)?;
-        self.adc1.read_data_continuous()?;
-        self.adc2.read_data_continuous()?;
+        self.device.warm_reset()?;
+        self.device.read_data_continuous()?;
         self.start_conversion()?;
         Ok(())
     }
 
-    /// Clocks out one frame from each device simultaneously. Only valid while
-    /// both are in RDATAC mode and after `data_ready()` reports true
-    pub(super) fn read_frame(&mut self) -> Result<AdcFrame> {
-        let s1 = self.adc1.read_frame()?;
-        let s2 = self.adc2.read_frame()?;
-        Ok(AdcFrame { devices: [s1, s2] })
+    /// Clocks out one frame. Only valid in RDATAC mode after DRDY falls.
+    pub(super) fn read_frame(&mut self) -> Result<Sample> {
+        self.device.read_frame()
     }
 }
 
@@ -599,54 +600,30 @@ impl Ads1298Pair {
 mod tests {
     use super::*;
 
-    /// Every byte `configure` puts on the wire, asserted against the values the bench
-    /// is running today.
-    ///
-    /// This test is the point of the typed register layer. The chips are mid-bring-up
-    /// and the register set is an experiment in progress: a byte that shifts because
-    /// someone renamed a field or forgot a reserved bit would corrupt the investigation
-    /// rather than break the build, and it would do it silently, days before anyone
-    /// noticed the data looked wrong. So the wire format is pinned here, by number,
-    /// with the field names beside it -- change a field on purpose and this test tells
-    /// you exactly which byte moved.
+    /// Every byte `configure` puts on the wire, pinned by number with the field names
+    /// beside it — change a field on purpose and this test names the byte that moved.
     #[test]
-    fn configure_writes_the_bytes_the_bench_is_running() {
-        // CONFIG1: high resolution, multiple readback, fMOD/256. Chip A also drives
-        // the clock out to chip B, which is the only difference between the two.
-        assert_eq!(config1_for(ChipRole::A).to_byte(), 0xE4);
-        assert_eq!(config1_for(ChipRole::B).to_byte(), 0xC4);
+    fn configure_writes_the_bytes_the_bench_validated() {
+        // CONFIG1: high resolution, per-chip readback, fMOD/256 (2000 SPS), clock
+        // output off — one self-clocked chip, nothing listening to CLK.
+        assert_eq!(device_config1().to_byte(), 0xC4);
 
         // CONFIG2: the internal test signal generator off.
         assert_eq!(NORMAL_CONFIG2.to_byte(), 0x00);
 
-        // CONFIG3: chip A powers the right-leg drive and the lead-off sense that rides
-        // on it, chip B does not. The two bytes differ only in those two bits.
-        assert_eq!(config3_for(ChipRole::A).to_byte(), 0xC6);
-        assert_eq!(config3_for(ChipRole::B).to_byte(), 0xC0);
-    }
+        // CONFIG3: internal reference on, bias drive off — the only bench-validated
+        // drive mode (see the TODO on RightLegDriveMode).
+        assert_eq!(device_config3().to_byte(), 0xC0);
 
-    /// Every setting of the right-leg-drive experiment, pinned by number. Whichever one
-    /// the bench is running, the other two still have to emit the byte the datasheet
-    /// says they do — otherwise switching modes mid-investigation silently changes
-    /// something else as well.
-    #[test]
-    fn each_right_leg_drive_mode_emits_its_datasheet_byte() {
-        use RightLegDriveMode::{Disabled, ExternalReference, InternalReference};
-
+        // RLD_SENSP/N: no channels sum into a drive that is powered down.
         assert_eq!(
-            config3_for_mode(ChipRole::A, ExternalReference).to_byte(),
-            0xC6
+            RightLegDriveSensePositive(right_leg_drive_channels()).to_byte(),
+            0x00
         );
         assert_eq!(
-            config3_for_mode(ChipRole::A, InternalReference).to_byte(),
-            0xCE
+            RightLegDriveSenseNegative(right_leg_drive_channels()).to_byte(),
+            0x00
         );
-        assert_eq!(config3_for_mode(ChipRole::A, Disabled).to_byte(), 0xC0);
-
-        // Chip B never powers the block, whatever the experiment is set to.
-        for mode in [ExternalReference, InternalReference, Disabled] {
-            assert_eq!(config3_for_mode(ChipRole::B, mode).to_byte(), 0xC0);
-        }
 
         // LOFF: DC lead-off detection in resistor mode.
         assert_eq!(LEAD_OFF_CONTROL.to_byte(), 0x13);
@@ -654,27 +631,9 @@ mod tests {
         // CH1SET..CH8SET: powered up, gain 6, on the electrode.
         assert_eq!(NORMAL_CHANNEL_SETTINGS.to_byte(), 0x00);
 
-        // RLD_SENSP/N: every channel on chip A, none on chip B.
-        assert_eq!(
-            RightLegDriveSensePositive(right_leg_drive_channels(ChipRole::A)).to_byte(),
-            0xFF
-        );
-        assert_eq!(
-            RightLegDriveSenseNegative(right_leg_drive_channels(ChipRole::A)).to_byte(),
-            0xFF
-        );
-        assert_eq!(
-            RightLegDriveSensePositive(right_leg_drive_channels(ChipRole::B)).to_byte(),
-            0x00
-        );
-        assert_eq!(
-            RightLegDriveSenseNegative(right_leg_drive_channels(ChipRole::B)).to_byte(),
-            0x00
-        );
-
-        // LOFF_SENSP/N and LOFF_FLIP.
-        assert_eq!(LeadOffSensePositive(ChannelMask::ALL).to_byte(), 0xFF);
-        assert_eq!(LeadOffSenseNegative(ChannelMask::ALL).to_byte(), 0xFF);
+        // LOFF_SENSP/N and LOFF_FLIP: nothing sensed while lead-off is off.
+        assert_eq!(LeadOffSensePositive(lead_off_channels()).to_byte(), 0x00);
+        assert_eq!(LeadOffSenseNegative(lead_off_channels()).to_byte(), 0x00);
         assert_eq!(LeadOffFlip(ChannelMask::NONE).to_byte(), 0x00);
 
         // The blocks this board leaves off.
@@ -686,8 +645,19 @@ mod tests {
         // RESP is 0x20 rather than 0x00 purely because bit 5 is a reserved one.
         assert_eq!(RESPIRATION_OFF.to_byte(), 0x20);
 
-        // CONFIG4: continuous conversion with the lead-off comparators powered.
-        assert_eq!(CONFIG4.to_byte(), 0x02);
+        // CONFIG4: continuous conversion, lead-off comparators off.
+        assert_eq!(CONFIG4.to_byte(), 0x00);
+    }
+
+    /// Every bias-drive mode's byte, pinned so switching the knob later cannot
+    /// silently change anything else.
+    #[test]
+    fn each_right_leg_drive_mode_emits_its_datasheet_byte() {
+        use RightLegDriveMode::{Disabled, ExternalReference, InternalReference};
+
+        assert_eq!(config3_for_mode(ExternalReference).to_byte(), 0xC6);
+        assert_eq!(config3_for_mode(InternalReference).to_byte(), 0xCE);
+        assert_eq!(config3_for_mode(Disabled).to_byte(), 0xC0);
     }
 
     /// The same pinning for the test-signal path in `enable_test_signal`.
@@ -713,12 +683,12 @@ mod tests {
     #[test]
     fn written_bytes_decode_back_to_the_values_that_produced_them() {
         assert_eq!(
-            Config1::from_byte(config1_for(ChipRole::A).to_byte()),
-            Some(config1_for(ChipRole::A))
+            Config1::from_byte(device_config1().to_byte()),
+            Some(device_config1())
         );
         assert_eq!(
-            Config3::from_byte(config3_for(ChipRole::B).to_byte()),
-            Some(config3_for(ChipRole::B))
+            Config3::from_byte(device_config3().to_byte()),
+            Some(device_config3())
         );
         assert_eq!(
             Config2::from_byte(TEST_SIGNAL_CONFIG2.to_byte()),
@@ -739,8 +709,8 @@ mod tests {
         );
     }
 
-    /// `SAMPLE_RATE_HZ` is derived from chip A's CONFIG1 rather than written down, so
-    /// this asserts the derivation lands where the hand arithmetic used to.
+    /// `SAMPLE_RATE_HZ` is derived from CONFIG1 rather than written down, so this
+    /// asserts the derivation lands where the hand arithmetic used to.
     #[test]
     fn sample_rate_is_derived_from_the_configured_data_rate() {
         assert_eq!(SAMPLE_RATE_HZ, 2000);

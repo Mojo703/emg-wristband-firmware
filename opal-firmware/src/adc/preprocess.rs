@@ -22,9 +22,9 @@
 //! small function, rather than spreading it through the acquisition path: once someone
 //! reads the exporter, [`sample_to_int8`] is the only thing that should need to change.
 
-use super::channel::{Channel, CHANNELS_PER_DEVICE};
+use super::channel::Channel;
 use super::convert::code_to_voltage;
-use crate::adc::decode::AdcFrame;
+use crate::adc::decode::Sample;
 use emg_runtime::model::INPUT_CH;
 
 /// Internal reference voltage. `config3_for` sets `four_volt_reference: false`, which
@@ -37,8 +37,13 @@ const GAIN: f32 = 6.0;
 
 const MICROVOLTS_PER_VOLT: f32 = 1_000_000.0;
 
-/// One ADC frame to one time step of the model's input: 16 int8 channels, chip A's
-/// eight followed by chip B's eight.
+/// One ADC frame to one time step of the model's input: the single chip's eight
+/// channels in slots 0..8, and slots 8..16 held at zero.
+///
+/// TODO(single chip): the model was trained on 16 channels from the two-chip cascade;
+/// the front end now has one chip, so the upper eight input channels are permanently
+/// zero. Retrain the model at 8 channels in emg-tds and drop `INPUT_CH` to 8 in
+/// emg-runtime; this padding exists only so the current blob keeps loading meanwhile.
 ///
 /// `input_scale` is the model's own µV-per-count, read from the model blob, so the
 /// quantisation here matches what training produced.
@@ -47,28 +52,25 @@ const MICROVOLTS_PER_VOLT: f32 = 1_000_000.0;
 /// through. A disconnected electrode rails the input, and a railed channel would
 /// otherwise dominate the window. Zero is what the model reads as "no signal": the
 /// honest answer for a disconnected electrode.
-pub(super) fn sample_to_int8(frame: &AdcFrame, input_scale: f32) -> [i8; INPUT_CH] {
+pub(super) fn sample_to_int8(sample: &Sample, input_scale: f32) -> [i8; INPUT_CH] {
     let mut out = [0i8; INPUT_CH];
-    for (device_index, sample) in frame.devices.iter().enumerate() {
-        // Decoded once per device rather than once per channel. `None` means the
-        // frame's status marker was missing, which acquisition rejects before this
-        // runs; if one ever gets here, the lead-off bits of an untrustworthy word are
-        // not evidence of anything, so no channel is zeroed on their say-so.
-        let status = sample.status_word();
-        for channel in Channel::ALL {
-            let slot = device_index * CHANNELS_PER_DEVICE + channel.index();
-            if slot >= INPUT_CH {
-                break;
-            }
-            if status.is_some_and(|status| status.lead_off(channel)) {
-                out[slot] = 0;
-                continue;
-            }
-            let microvolts =
-                code_to_voltage(sample.channels[channel.index()], REFERENCE_VOLTS, GAIN)
-                    * MICROVOLTS_PER_VOLT;
-            out[slot] = quantize(microvolts, input_scale);
+    // Decoded once rather than once per channel. `None` means the frame's status
+    // marker was missing, which acquisition rejects before this runs; if one ever
+    // gets here, the lead-off bits of an untrustworthy word are not evidence of
+    // anything, so no channel is zeroed on their say-so.
+    let status = sample.status_word();
+    for channel in Channel::ALL {
+        let slot = channel.index();
+        if slot >= INPUT_CH {
+            break;
         }
+        if status.is_some_and(|status| status.lead_off(channel)) {
+            out[slot] = 0;
+            continue;
+        }
+        let microvolts = code_to_voltage(sample.channels[channel.index()], REFERENCE_VOLTS, GAIN)
+            * MICROVOLTS_PER_VOLT;
+        out[slot] = quantize(microvolts, input_scale);
     }
     out
 }
@@ -94,26 +96,14 @@ fn quantize(microvolts: f32, scale: f32) -> i8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adc::decode::Sample;
 
     /// The fixed marker every real status word carries. A word without it does not
     /// decode at all, so any test that means to say something about the lead-off bits
     /// has to build on top of this.
     const STATUS_MARKER: u32 = 0xC0_0000;
 
-    fn frame_with(channels_a: [i32; 8], channels_b: [i32; 8], status: u32) -> AdcFrame {
-        AdcFrame {
-            devices: [
-                Sample {
-                    status,
-                    channels: channels_a,
-                },
-                Sample {
-                    status: 0,
-                    channels: channels_b,
-                },
-            ],
-        }
+    fn sample_with(channels: [i32; 8], status: u32) -> Sample {
+        Sample { status, channels }
     }
 
     #[test]
@@ -135,35 +125,36 @@ mod tests {
     }
 
     #[test]
-    fn chip_b_lands_in_the_upper_eight_channels() {
-        // Full scale is 2.4/6 V (400_000 µV), so a 1000 µV/count scale saturates.
-        let frame = frame_with([0; 8], [8_388_607; 8], 0);
-        let out = sample_to_int8(&frame, 1000.0);
-        assert_eq!(out[0..8], [0i8; 8]);
-        assert!(out[8..16].iter().all(|&v| v == 127));
+    fn the_upper_eight_channels_stay_zero_padded() {
+        // Full scale is 2.4/6 V (400_000 µV), so a 1000 µV/count scale saturates the
+        // real channels; the padded slots must stay zero regardless.
+        let sample = sample_with([8_388_607; 8], 0);
+        let out = sample_to_int8(&sample, 1000.0);
+        assert!(out[0..8].iter().all(|&v| v == 127));
+        assert_eq!(out[8..16], [0i8; 8]);
     }
 
     #[test]
     fn full_scale_code_is_the_expected_microvolts() {
         // This test guards the VREF/gain constants: 2.4 V over gain 6 is 400 mV, so
         // one count of 400_000 µV puts positive full scale at exactly 1.
-        let frame = frame_with([8_388_607; 8], [0; 8], 0);
-        let out = sample_to_int8(&frame, 400_000.0);
+        let sample = sample_with([8_388_607; 8], 0);
+        let out = sample_to_int8(&sample, 400_000.0);
         assert_eq!(out[0], 1);
     }
 
     #[test]
     fn lead_off_channels_are_zeroed() {
         // Full-scale on every channel of chip A, but STATP flags channel 0 (bit 12).
-        let frame = frame_with([8_388_607; 8], [0; 8], STATUS_MARKER | (1 << 12));
-        let out = sample_to_int8(&frame, 1.0);
+        let sample = sample_with([8_388_607; 8], STATUS_MARKER | (1 << 12));
+        let out = sample_to_int8(&sample, 1.0);
         assert_eq!(out[0], 0, "flagged channel should be zeroed");
         assert_eq!(out[1], 127, "unflagged channel should still saturate");
     }
 
     #[test]
     fn zero_code_is_zero_output() {
-        let frame = frame_with([0; 8], [0; 8], 0);
-        assert_eq!(sample_to_int8(&frame, 1.0), [0i8; INPUT_CH]);
+        let sample = sample_with([0; 8], 0);
+        assert_eq!(sample_to_int8(&sample, 1.0), [0i8; INPUT_CH]);
     }
 }

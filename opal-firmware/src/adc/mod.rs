@@ -1,5 +1,7 @@
-//! The EMG acquisition front end: two TI ADS1298 8-channel ADCs on a shared SPI bus,
-//! giving the 16 channels the model expects.
+//! The EMG acquisition front end: one TI ADS1298 8-channel ADC.
+//!
+//! The model still expects 16 channels; [`preprocess`] zero-pads the upper eight
+//! until it is retrained (see the TODO there).
 //!
 //! Layout. [`registers`] is the typed register map and [`ads1298`] the register-level
 //! driver; [`decode`]/[`status`]/[`convert`] are the hardware-free frame maths,
@@ -33,46 +35,38 @@ use esp_idf_svc::hal::units::FromValueType;
 use log::info;
 use std::sync::Arc;
 
-use ads1298::{Ads1298Device, Ads1298Pair, ChipRole};
+use ads1298::{Ads1298Device, Ads1298FrontEnd};
 
 /// The ADS1298 reports this in its ID register. Bring-up checks it so a dead bus fails
 /// loudly at boot instead of producing plausible-looking zeroes forever.
 const EXPECTED_DEVICE_ID: u8 = 0x92;
 
 /// Every pin the front end needs, type-erased so the wiring lives in one place.
-///
-/// SCLK, DIN and DOUT are shared by both chips. CS, DRDY, RESET and PWDN are per-chip.
-/// START is tied together, so both chips convert on the same edge.
 pub(crate) struct AdcPins {
     pub(crate) clock: AnyOutputPin<'static>,
     pub(crate) data_in: AnyOutputPin<'static>,
     pub(crate) data_out: AnyInputPin<'static>,
-    pub(crate) chip_select_a: AnyOutputPin<'static>,
-    pub(crate) chip_select_b: AnyOutputPin<'static>,
-    pub(crate) data_ready_a: AnyInputPin<'static>,
-    pub(crate) data_ready_b: AnyInputPin<'static>,
-    pub(crate) reset_a: AnyOutputPin<'static>,
-    pub(crate) reset_b: AnyOutputPin<'static>,
-    pub(crate) power_down_a: AnyOutputPin<'static>,
-    pub(crate) power_down_b: AnyOutputPin<'static>,
+    pub(crate) chip_select: AnyOutputPin<'static>,
+    pub(crate) data_ready: AnyInputPin<'static>,
+    pub(crate) reset: AnyOutputPin<'static>,
+    pub(crate) power_down: AnyOutputPin<'static>,
     pub(crate) start: AnyOutputPin<'static>,
 }
 
-/// Brings both chips up and leaves them streaming in RDATAC mode.
+/// Brings the chip up and leaves it streaming in RDATAC mode.
 ///
-/// `baud_rate_hz` is the SPI clock. It has to be fast enough that two 27-byte frames
-/// clear inside one sample period: at 2 kSPS that period is 500 µs, and 54 bytes is
-/// 432 bits, so 1 MHz leaves under 70 µs for CS toggling and driver overhead. Raise it
-/// until the drop counter in [`acquisition`] stays at zero.
-/// `test_signal_channel` is `Some(channel)` to drive the ADS1298's internal square wave
-/// into that channel on both chips instead of the electrodes. See
+/// `baud_rate_hz` is the SPI clock. One 27-byte frame has to clear well inside the
+/// 500 µs sample period at 2 kSPS; the bench validated 2 MHz (burst framing makes the
+/// register path legal at any rate the sweep passed).
+/// `test_signal_channel` is `Some(channel)` to drive the ADS1298's internal square
+/// wave into that channel instead of the electrodes. See
 /// [`ads1298::Ads1298Device::enable_test_signal`].
 pub(crate) fn bring_up<SPI: SpiAnyPins + 'static>(
     spi: SPI,
     pins: AdcPins,
     baud_rate_hz: u32,
     test_signal_channel: Option<Channel>,
-) -> Result<Ads1298Pair> {
+) -> Result<Ads1298FrontEnd> {
     // One bus driver shared by both chips through an Arc, so the devices are 'static
     // and can move onto the acquisition thread.
     let bus = Arc::new(
@@ -92,55 +86,45 @@ pub(crate) fn bring_up<SPI: SpiAnyPins + 'static>(
         .baudrate(baud_rate_hz.Hz())
         .data_mode(MODE_1);
 
-    let device_a = Ads1298Device::new(
-        SpiDeviceDriver::new(bus.clone(), Some(pins.chip_select_a), &spi_config)
-            .context("SPI device A")?,
+    // No hardware CS: the driver toggles CS as a GPIO, held low across each whole
+    // command — the mechanism the bring-up harness validated.
+    let device = Ads1298Device::new(
+        SpiDeviceDriver::new(bus, Option::<AnyOutputPin>::None, &spi_config)
+            .context("SPI device")?,
+        PinDriver::output(pins.chip_select)?,
         // DRDY is actively driven by the ADS1298, so no internal pull is needed.
-        PinDriver::input(pins.data_ready_a, Pull::Floating)?,
-        PinDriver::output(pins.reset_a)?,
-        PinDriver::output(pins.power_down_a)?,
+        PinDriver::input(pins.data_ready, Pull::Floating)?,
+        PinDriver::output(pins.reset)?,
+        PinDriver::output(pins.power_down)?,
     )
-    .context("chip A pin init")?;
-    let device_b = Ads1298Device::new(
-        SpiDeviceDriver::new(bus, Some(pins.chip_select_b), &spi_config).context("SPI device B")?,
-        PinDriver::input(pins.data_ready_b, Pull::Floating)?,
-        PinDriver::output(pins.reset_b)?,
-        PinDriver::output(pins.power_down_b)?,
-    )
-    .context("chip B pin init")?;
+    .context("ADC pin init")?;
 
-    let mut pair = Ads1298Pair::new(device_a, device_b, PinDriver::output(pins.start)?);
+    let mut front_end = Ads1298FrontEnd::new(device, PinDriver::output(pins.start)?);
 
-    // Roughly 2.2 s of mandated settling per chip, done in sequence, so this blocks for
-    // about 4.4 s. It must stay ahead of the task watchdog registration in `main`.
-    info!("ADS1298: powering up chip A");
-    pair.adc1
-        .power_up(ChipRole::A, EXPECTED_DEVICE_ID)
-        .context("chip A power-up")?;
-    info!("ADS1298: powering up chip B");
-    pair.adc2
-        .power_up(ChipRole::B, EXPECTED_DEVICE_ID)
-        .context("chip B power-up")?;
+    // Roughly 2.5 s of mandated settling. It must stay ahead of the task watchdog
+    // registration in `main`.
+    info!("ADS1298: powering up");
+    front_end
+        .device
+        .power_up(EXPECTED_DEVICE_ID)
+        .context("ADS1298 power-up")?;
 
     // Still in SDATAC, so registers are readable. Once RDATAC starts below there is no
     // way to check them again without tearing the stream down.
-    pair.adc1.log_configuration_readback(ChipRole::A);
-    pair.adc2.log_configuration_readback(ChipRole::B);
+    front_end.device.log_configuration_readback();
 
     if let Some(channel) = test_signal_channel {
         // Registers can only be written outside RDATAC, which power_up leaves us in.
-        pair.adc1.enable_test_signal(channel)?;
-        pair.adc2.enable_test_signal(channel)?;
+        front_end.device.enable_test_signal(channel)?;
         info!(
             "ADS1298: internal test signal on channel {channel}; electrodes are NOT \
              being read"
         );
     }
 
-    pair.adc1.read_data_continuous()?;
-    pair.adc2.read_data_continuous()?;
-    pair.start_conversion()?;
-    info!("ADS1298: both chips streaming at {baud_rate_hz} Hz SPI");
+    front_end.device.read_data_continuous()?;
+    front_end.start_conversion()?;
+    info!("ADS1298: streaming at {baud_rate_hz} Hz SPI");
 
-    Ok(pair)
+    Ok(front_end)
 }
