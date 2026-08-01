@@ -239,14 +239,37 @@ export function on<T extends keyof ListenerMap>(
 
 let socket: WebSocket | null = null;
 
+// If the backend's initial hello never lands (dropped, undecodable), the state
+// machine would sit in 'handshake' forever: the status bar reads "backend online"
+// (connected is merely status !== 'offline') while the device picker shows "No
+// devices", and nothing retries. A fresh connection always gets a fresh hello, so
+// the recovery is to tear the socket down and let onclose reconnect.
+const HANDSHAKE_DEADLINE_MS = 3000;
+let handshakeDeadline: ReturnType<typeof setTimeout> | null = null;
+
+function clearHandshakeDeadline(): void {
+  if (handshakeDeadline !== null) {
+    clearTimeout(handshakeDeadline);
+    handshakeDeadline = null;
+  }
+}
+
 export function connect(): void {
   const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
   socket = new WebSocket(`${scheme}://${location.host}/ws`);
   socket.binaryType = 'arraybuffer';
   socket.onopen = () => {
     live.setHandshake();
+    clearHandshakeDeadline();
+    handshakeDeadline = setTimeout(() => {
+      if (live.status === 'handshake' && socket !== null) {
+        console.error(`no hello within ${HANDSHAKE_DEADLINE_MS} ms; reconnecting`);
+        socket.close();
+      }
+    }, HANDSHAKE_DEADLINE_MS);
   };
   socket.onclose = () => {
+    clearHandshakeDeadline();
     live.setOffline();
     socket = null;
     setTimeout(connect, 1000);
@@ -255,13 +278,20 @@ export function connect(): void {
     let decoded: unknown;
     try {
       decoded = cbor.decode(new Uint8Array(event.data));
-    } catch {
+    } catch (error) {
+      // A frame that fails to decode is a bug on one side of the mirror;
+      // dropping it silently is how "backend online, no devices" stays a mystery.
+      console.error('dropping undecodable frame from backend', error);
       return;
     }
     const frame = asIncomingFrame(decoded);
-    if (frame === null) return;
+    if (frame === null) {
+      console.error('dropping frame with unrecognised shape', decoded);
+      return;
+    }
 
     if (frame.type === 'hello') {
+      clearHandshakeDeadline();
       live.setHello(frame);
     } else if (frame.type === 'emg') {
       let emg: DecodedEmg;
@@ -310,6 +340,8 @@ function send(frame: OutgoingFrame): void {
 export const api = {
   selectDevice: (deviceId: string) =>
     send({ type: 'select_device', device_id: deviceId }),
+  dismissDevice: (deviceId: string) =>
+    send({ type: 'dismiss_device', device_id: deviceId }),
   sensitivity: (level: string) =>
     send({ type: 'set_sensitivity', level }),
   keymap: (bindings: readonly Binding[]) =>

@@ -192,17 +192,26 @@ impl DeviceSelection {
     }
 }
 
-/// Keep the selection pointing at a live device — prefer the current choice,
-/// else the first available, else none — and (re)subscribe to its broadcast.
-/// Resubscribing unconditionally matters: a reconnect keeps its id but gets a
-/// fresh broadcast channel, so a held receiver would go silent otherwise.
+/// Keep the selection pointing at a listed device — prefer the current choice
+/// (which stays valid while disconnected: the whole point of retaining corpses is
+/// reading their logs), else the first *connected* device, else the first listed,
+/// else none — and (re)subscribe to its broadcast. Resubscribing unconditionally
+/// matters: a reconnect keeps its id but gets a fresh broadcast channel, so a held
+/// receiver would go silent otherwise. A disconnected selection gets no
+/// subscription and lands in `Selected`, which streams nothing.
 fn reconcile(registry: &Registry, selection: &mut DeviceSelection) {
-    let live = registry.list();
+    let listed = registry.list();
     let preferred = selection
         .device_id()
-        .filter(|id| live.iter().any(|device| device.id == *id))
+        .filter(|id| listed.iter().any(|device| device.id == *id))
         .map(str::to_string)
-        .or_else(|| live.first().map(|device| device.id.clone()));
+        .or_else(|| {
+            listed
+                .iter()
+                .find(|device| device.connected)
+                .or_else(|| listed.first())
+                .map(|device| device.id.clone())
+        });
     *selection = match preferred {
         None => DeviceSelection::None,
         Some(device_id) => match registry.subscribe(&device_id) {
@@ -339,6 +348,12 @@ pub async fn handle_browser(
                                 break;
                             }
                             replay_logs(&registry, selection.device_id(), &browser_tx);
+                        }
+                        Frame::DismissDevice { device_id } => {
+                            // Removal notifies every browser (this one included), and
+                            // the `changed` branch below re-reconciles and re-hellos,
+                            // so nothing else to do here.
+                            registry.dismiss(&device_id);
                         }
                         // Forward control frames to the selected device.
                         control @ (Frame::SetSensitivity { .. }

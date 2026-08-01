@@ -98,11 +98,13 @@ export interface Binding {
 /// The byte pipe a device's session reached the backend over.
 export type DeviceTransport = 'serial' | 'wifi';
 
-/// A connected device in the picker.
+/// A device in the picker. `connected: false` means the backend is retaining a
+/// dropped device (and its logs) until it is dismissed or reconnects.
 export interface DeviceInfo {
   readonly id: string;
   readonly label: string;
   readonly transport: DeviceTransport;
+  readonly connected: boolean;
 }
 
 /// A device's functional config (its own source of truth). The backend passes this
@@ -354,6 +356,11 @@ export interface SelectDeviceFrame {
   readonly device_id: string;
 }
 
+export interface DismissDeviceFrame {
+  readonly type: 'dismiss_device';
+  readonly device_id: string;
+}
+
 export interface SetSensitivityFrame {
   readonly type: 'set_sensitivity';
   readonly level: string;
@@ -437,6 +444,7 @@ export interface NoteResultFrame {
 
 export type OutgoingFrame =
   | SelectDeviceFrame
+  | DismissDeviceFrame
   | SetSensitivityFrame
   | SetKeymapFrame
   | SetWifiFrame
@@ -568,7 +576,8 @@ function isDeviceInfo(value: unknown): value is DeviceInfo {
     isObject(value) &&
     isString(value['id']) &&
     isString(value['label']) &&
-    (value['transport'] === 'serial' || value['transport'] === 'wifi')
+    (value['transport'] === 'serial' || value['transport'] === 'wifi') &&
+    isBoolean(value['connected'])
   );
 }
 
@@ -875,6 +884,8 @@ export function isOutgoingFrame(value: unknown): value is OutgoingFrame {
   if (!isObject(value)) return false;
   switch (value['type']) {
     case 'select_device':
+      return isString(value['device_id']);
+    case 'dismiss_device':
       return isString(value['device_id']);
     case 'set_sensitivity':
       return isString(value['level']);

@@ -10,7 +10,9 @@
 //!
 //! Env: `DASHBOARD_ADDR` (browser/static bind, default 0.0.0.0:8090),
 //! `EMG_DEVICE_ADDR` (device TCP bind, default 0.0.0.0:9000), `DASHBOARD_WEB` (static
-//! dir, default web/dist), `EMG_NO_SERIAL` (set to disable USB serial discovery, e.g.
+//! dir, default web/dist), `EMG_DEVICE_LOG` (set to echo device log frames onto the
+//! backend's own tty for bench captures; quiet by default), `EMG_NO_SERIAL` (set to
+//! disable USB serial discovery, e.g.
 //! while flashing), `EMG_SERIAL_PORT` (force serial discovery onto one port, e.g.
 //! `/dev/ttyACM0` or a `/dev/serial/by-id/…` symlink, instead of auto-selecting by USB
 //! identity; falls back to auto-discovery if the path is absent), `EMG_POSE_URL`

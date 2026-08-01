@@ -123,6 +123,11 @@ pub enum Frame {
     /// Select which connected device to view (browser → backend).
     SelectDevice { device_id: String },
 
+    /// Drop a disconnected device from the picker (browser → backend). Ignored for a
+    /// device whose session is live; reconnecting is the only thing that revives an
+    /// entry, so dismissal is the browser's way of saying it is done reading the logs.
+    DismissDevice { device_id: String },
+
     /// Select a sensitivity preset by id (browser → backend). The backend forwards it
     /// to the selected device, which owns the preset → threshold mapping.
     SetSensitivity { level: String },
@@ -719,6 +724,10 @@ pub struct DeviceInfo {
     pub label: String,
     /// Which byte pipe this device's session reached the backend over.
     pub transport: DeviceTransport,
+    /// Whether the device's session is currently live. The backend keeps
+    /// disconnected devices listed (with their retained logs) until the browser
+    /// dismisses them, so a dropped device can still be inspected.
+    pub connected: bool,
 }
 
 /// The byte pipe carrying a device session: the USB serial port or a TCP socket

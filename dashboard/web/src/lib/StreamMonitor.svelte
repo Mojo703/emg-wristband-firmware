@@ -32,6 +32,14 @@
     };
   });
 
+  // Whether the selected device's session is gone — the statusbar is where the
+  // disconnect reads outside the device list itself.
+  const deviceOffline = $derived.by(() => {
+    const hello = live.hello;
+    const device = hello?.devices.find((entry) => entry.id === hello.selection?.device_id);
+    return device !== undefined && !device.connected;
+  });
+
   // The selected device's transport, e.g. "Serial" or "Wifi (myhome)", so the pipe
   // this panel monitors is named. Null while no device is selected.
   const transport = $derived.by(() => {
@@ -115,7 +123,7 @@
   <div class="stream-head">
     <span>{transport === null ? 'pipe' : `pipe via ${transport}`}</span>
     <span class="stream-rate" class:on={live.streaming}>
-      {target > 0 ? `${live.fps} / ${Math.round(target)} fps` : 'no stream'}
+      {deviceOffline ? 'device offline' : target > 0 ? `${live.fps} / ${Math.round(target)} fps` : 'no stream'}
     </span>
   </div>
   <canvas bind:this={canvas}></canvas>

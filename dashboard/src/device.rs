@@ -17,12 +17,20 @@ use crate::registry::{DeviceHandle, Registry};
 use protocol::{DeviceTransport, Frame, FrameScanner, LogLevel};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_serial::{ErrorKind as SerialErrorKind, SerialPortType};
+
+/// Whether device log lines are echoed onto the backend's own tty (`tracing`).
+/// Enabled by setting `EMG_DEVICE_LOG` to anything but `0`; quiet by default.
+fn device_log_echo_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("EMG_DEVICE_LOG").is_some_and(|value| value != "0"))
+}
 
 /// Drive one device connection: wait for its `DeviceHello`, register it, fan its data
 /// frames out to viewers, and funnel control frames back. `incoming` yields decoded
@@ -75,17 +83,25 @@ async fn device_session(
                     message,
                 } = &other
                 {
-                    // Onto the backend's own log as well as the browser's. Bring-up
-                    // happens at a bench with no browser open, and the device has no
-                    // text console of its own (`CONFIG_ESP_CONSOLE_NONE`), so without
-                    // this a device that fails before anyone opens a tab says nothing
-                    // anywhere that can be captured, piped, or diffed between runs.
-                    let seconds = *t_us as f64 / 1_000_000.0;
-                    match level {
-                        LogLevel::Error => tracing::error!("{device_id} {seconds:.3} {message}"),
-                        LogLevel::Warn => tracing::warn!("{device_id} {seconds:.3} {message}"),
-                        LogLevel::Info => tracing::info!("{device_id} {seconds:.3} {message}"),
-                        LogLevel::Debug => tracing::debug!("{device_id} {seconds:.3} {message}"),
+                    // Onto the backend's own log as well as the browser's, but only
+                    // when `EMG_DEVICE_LOG` is set. Bring-up happens at a bench with
+                    // no browser open and a device with no text console of its own
+                    // (`CONFIG_ESP_CONSOLE_NONE`), so `EMG_DEVICE_LOG=1` makes a
+                    // failing boot capturable, pipeable, and diffable between runs --
+                    // while ordinary dashboard sessions keep a quiet tty. The browser
+                    // path below is unconditional either way.
+                    if device_log_echo_enabled() {
+                        let seconds = *t_us as f64 / 1_000_000.0;
+                        match level {
+                            LogLevel::Error => {
+                                tracing::error!("{device_id} {seconds:.3} {message}")
+                            }
+                            LogLevel::Warn => tracing::warn!("{device_id} {seconds:.3} {message}"),
+                            LogLevel::Info => tracing::info!("{device_id} {seconds:.3} {message}"),
+                            LogLevel::Debug => {
+                                tracing::debug!("{device_id} {seconds:.3} {message}")
+                            }
+                        }
                     }
                     registry.push_log(&device_id, other.clone());
                 }

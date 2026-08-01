@@ -3,10 +3,10 @@
   import { Tabs, ToggleGroup } from 'bits-ui';
   import * as Tooltip from '$lib/components/ui/tooltip/index.js';
   import { panels } from './lib/panels';
-  import { connect, live, api } from './lib/socket.svelte';
+  import { connect, live } from './lib/socket.svelte';
   import { theme, type ThemeChoice } from './lib/theme.svelte';
   import Icon from './lib/Icon.svelte';
-  import Select from './lib/ui/Select.svelte';
+  import DeviceList from './lib/DeviceList.svelte';
   import StreamMonitor from './lib/StreamMonitor.svelte';
 
   const firstPanel = panels[0]!;
@@ -27,14 +27,6 @@
     if (value === 'system' || value === 'light' || value === 'dark') theme.set(value);
   }
 
-  // Which device the dashboard is viewing. The list and selection are owned by the
-  // backend (it tracks every connected device); selecting one routes its stream and
-  // our control frames to it.
-  const deviceOptions = $derived(
-    (live.hello?.devices ?? []).map((device) => ({ value: device.id, label: device.label })),
-  );
-  const selectedDevice = $derived(live.hello?.selection?.device_id ?? '');
-
   onMount(connect);
 </script>
 
@@ -46,16 +38,7 @@
         <span class="company">Cairn Kinetics</span>
       </div>
       <div class="device">
-        {#if deviceOptions.length > 0}
-          <Select
-            value={selectedDevice}
-            options={deviceOptions}
-            onChange={(id) => api.selectDevice(id)}
-            placeholder="Select device…"
-          />
-        {:else}
-          <span class="muted">No devices</span>
-        {/if}
+        <DeviceList />
       </div>
       <Tabs.List class="nav">
         {#each panels as panel (panel.id)}

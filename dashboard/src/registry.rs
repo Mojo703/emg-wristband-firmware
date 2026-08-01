@@ -1,7 +1,12 @@
-//! The connected-device registry. Each device has a broadcast channel (its data
-//! frames fan out to every browser viewing it) and a control channel (browser
-//! control frames funnel back to the device). A change signal lets browser sessions
-//! refresh their picker when devices come and go.
+//! The device registry. Each device has a broadcast channel (its data frames fan
+//! out to every browser viewing it) and a control channel (browser control frames
+//! funnel back to the device). A change signal lets browser sessions refresh their
+//! picker when devices come and go.
+//!
+//! Disconnection is a state, not a deletion: a dropped device stays listed (with
+//! its retained logs readable) until the browser dismisses it or the device
+//! reconnects. Device ids are not guaranteed stable across power cycles, so a
+//! reconnect under the same id replaces the entry — fresh session, fresh logs.
 
 use protocol::{DeviceConfig, DeviceInfo, DeviceTransport, Frame};
 use std::collections::{HashMap, VecDeque};
@@ -25,6 +30,9 @@ struct DeviceEntry {
     /// Identifies this connection, so a reconnect under the same id can't be evicted by
     /// the old session. See [`Registry::deregister`].
     token: u64,
+    /// False once the session behind this entry has closed. The entry then only
+    /// serves log reading until dismissal or a reconnect replaces it.
+    connected: bool,
 }
 
 /// Retained log lines per device — enough scrollback to cover a boot and a few
@@ -80,10 +88,10 @@ impl Registry {
         let (frames, _) = broadcast::channel(FRAME_BUFFER);
         let (control, control_rx) = mpsc::unbounded_channel();
         let token = self.next_token.fetch_add(1, Ordering::Relaxed);
-        // A reconnect (same id) keeps its retained logs; boot logs from the previous
-        // session are exactly what you want to read after a crash.
+        // A reconnect (same id) replaces the whole entry, logs included: device ids
+        // are not guaranteed stable across units, so the previous session's history
+        // must not be presented as this connection's.
         let mut devices = self.devices.lock().unwrap();
-        let logs = devices.remove(&id).map(|old| old.logs).unwrap_or_default();
         devices.insert(
             id,
             DeviceEntry {
@@ -92,8 +100,9 @@ impl Registry {
                 config,
                 frames: frames.clone(),
                 control,
-                logs,
+                logs: VecDeque::new(),
                 token,
+                connected: true,
             },
         );
         drop(devices);
@@ -113,11 +122,26 @@ impl Registry {
         self.notify();
     }
 
-    /// Remove a device whose connection closed, but only if `token` still matches the
-    /// live entry — so a stale session can't evict a newer reconnection under the same id.
+    /// Mark a device whose connection closed as disconnected — but only if `token`
+    /// still matches the live entry, so a stale session can't demote a newer
+    /// reconnection under the same id. The entry (and its logs) stays listed until
+    /// [`Self::dismiss`] or a reconnect replaces it.
     pub fn deregister(&self, id: &str, token: u64) {
         let mut devices = self.devices.lock().unwrap();
-        if devices.get(id).map(|entry| entry.token) == Some(token) {
+        if let Some(entry) = devices.get_mut(id) {
+            if entry.token == token {
+                entry.connected = false;
+                drop(devices);
+                self.notify();
+            }
+        }
+    }
+
+    /// Remove a disconnected device at the browser's request. A live entry is left
+    /// alone: dismissing is for corpses, and the picker only offers it for those.
+    pub fn dismiss(&self, id: &str) {
+        let mut devices = self.devices.lock().unwrap();
+        if devices.get(id).is_some_and(|entry| !entry.connected) {
             devices.remove(id);
             drop(devices);
             self.notify();
@@ -133,6 +157,7 @@ impl Registry {
                 id: id.clone(),
                 label: entry.label.clone(),
                 transport: entry.transport,
+                connected: entry.connected,
             })
             .collect();
         out.sort_by(|a, b| a.id.cmp(&b.id));
@@ -147,12 +172,15 @@ impl Registry {
             .map(|entry| entry.config.clone())
     }
 
-    /// Subscribe a browser to a device's data-frame stream.
+    /// Subscribe a browser to a device's data-frame stream. `None` for a
+    /// disconnected device: there is nothing to stream, and the caller's selection
+    /// then lands in its explicit selected-without-stream state.
     pub fn subscribe(&self, id: &str) -> Option<broadcast::Receiver<Frame>> {
         self.devices
             .lock()
             .unwrap()
             .get(id)
+            .filter(|entry| entry.connected)
             .map(|entry| entry.frames.subscribe())
     }
 
@@ -178,7 +206,13 @@ impl Registry {
 
     /// Forward a control frame to a device (no-op if it has disconnected).
     pub fn send_control(&self, id: &str, frame: Frame) {
-        if let Some(entry) = self.devices.lock().unwrap().get(id) {
+        if let Some(entry) = self
+            .devices
+            .lock()
+            .unwrap()
+            .get(id)
+            .filter(|entry| entry.connected)
+        {
             let _ = entry.control.send(frame);
         }
     }
