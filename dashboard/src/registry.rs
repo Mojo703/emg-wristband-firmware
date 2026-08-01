@@ -114,10 +114,14 @@ impl Registry {
         }
     }
 
-    /// Update a device's config after a re-announced `DeviceHello`.
-    pub fn update_config(&self, id: &str, config: DeviceConfig) {
+    /// Update a device's config after a re-announced `DeviceHello` — but only if
+    /// `token` still names the live session, so a half-open connection's late frames
+    /// cannot write into a fresh reconnection's entry.
+    pub fn update_config(&self, id: &str, token: u64, config: DeviceConfig) {
         if let Some(entry) = self.devices.lock().unwrap().get_mut(id) {
-            entry.config = config;
+            if entry.token == token {
+                entry.config = config;
+            }
         }
         self.notify();
     }
@@ -184,13 +188,17 @@ impl Registry {
             .map(|entry| entry.frames.subscribe())
     }
 
-    /// Retain a device's log frame for later subscribers.
-    pub fn push_log(&self, id: &str, frame: Frame) {
+    /// Retain a device's log frame for later subscribers — token-gated like
+    /// `update_config`, so a stale session's tail cannot bleed into the fresh log
+    /// history of a fast reconnect under the same id.
+    pub fn push_log(&self, id: &str, token: u64, frame: Frame) {
         if let Some(entry) = self.devices.lock().unwrap().get_mut(id) {
-            if entry.logs.len() >= LOG_RETENTION {
-                entry.logs.pop_front();
+            if entry.token == token {
+                if entry.logs.len() >= LOG_RETENTION {
+                    entry.logs.pop_front();
+                }
+                entry.logs.push_back(frame);
             }
-            entry.logs.push_back(frame);
         }
     }
 

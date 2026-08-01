@@ -497,7 +497,7 @@ fn run_continuous_cell(
     }
     let config_held = chip
         .read_register(REG_CONFIG1)
-        .map(|v| v == CONFIG1)
+        .map(|read| read == config1)
         .unwrap_or(false);
     chip.stop_conversion()?;
     Ok(CellReport {
@@ -919,7 +919,8 @@ fn wait_data_ready_falling_edge(chip: &Ads1298) -> Result<(), &'static str> {
 }
 
 /// As above with an explicit timeout, for the recovery loop where detection latency
-/// is lost signal: DRDY arrives every 2 ms when healthy, so 10 ms is already sure.
+/// is lost signal: DRDY arrives every 500 µs at the 2000 SPS the harness now runs,
+/// so 10 ms is already twenty missed periods.
 fn wait_data_ready_falling_edge_within(
     chip: &Ads1298,
     timeout_us: u64,

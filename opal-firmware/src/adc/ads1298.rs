@@ -314,14 +314,19 @@ impl Ads1298Device {
     }
 
     /// Warm recovery for a chip whose conversions have died mid-session: RESET pulse,
-    /// the post-reset lockout, SDATAC, full reconfigure. The bench measured the whole
-    /// pair recovering in ~3 ms; the cold-start supply settling in `power_up` is not
-    /// repeated because the rails have long since settled.
+    /// the post-reset lockout, SDATAC, full reconfigure. The rails have long since
+    /// settled so the cold-start supply wait is not repeated — but the RESET does
+    /// power-cycle the internal reference buffer, whose 150 ms start-up cannot be
+    /// skipped. Acquisition owns that: it discards the frames of the settling window
+    /// rather than stalling here (see `REFERENCE_SETTLE_AFTER_RECOVERY_US`).
     pub(super) fn warm_reset(&mut self) -> Result<()> {
         self.reset_pulse()?;
         // 18 tCLK after RESET rises before any command (SBAS459K §9.3.2.3).
         FreeRtos::delay_ms(1);
         self.stop_read_data_continuous()?;
+        // Same post-SDATAC breather the proven cold-boot path takes before its first
+        // register access.
+        FreeRtos::delay_ms(1);
         self.configure()
     }
 
@@ -578,10 +583,11 @@ impl Ads1298FrontEnd {
 
     /// Warm-recovers the front end after a mid-session death: conversions stopped,
     /// RESET/SDATAC/reconfigure, RDATAC, START again. The bring-up campaign
-    /// (documentation/ads1298-bringup-2026-07-31/) established that the front end dies
-    /// stochastically under multi-channel conversion and that this recovery restores
-    /// it within a few milliseconds, yielding 97% verified frames at 2 kSPS ×
-    /// 8 channels on the bench.
+    /// (documentation/ads1298-bringup-2026-07-31/) established that the front end
+    /// dies stochastically under multi-channel conversion and that this recovery
+    /// restores it. The register work here takes a few milliseconds; the true cost
+    /// per recovery is the reference-settling discard window acquisition applies
+    /// afterwards.
     pub(super) fn warm_recover(&mut self) -> Result<()> {
         self.stop_conversion()?;
         self.device.warm_reset()?;

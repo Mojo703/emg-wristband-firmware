@@ -72,7 +72,7 @@ async fn device_session(
     while let Some(frame) = incoming.recv().await {
         match frame {
             // Re-announced config (e.g. after honoring a SetSensitivity).
-            Frame::DeviceHello { config, .. } => registry.update_config(&device_id, config),
+            Frame::DeviceHello { config, .. } => registry.update_config(&device_id, token, config),
             // Everything else is a data frame to fan out. `send` errs only when no
             // browser is subscribed, which is fine — drop it. Logs are additionally
             // retained so a browser opened later still sees them.
@@ -103,7 +103,7 @@ async fn device_session(
                             }
                         }
                     }
-                    registry.push_log(&device_id, other.clone());
+                    registry.push_log(&device_id, token, other.clone());
                 }
                 let _ = frames.send(other);
             }

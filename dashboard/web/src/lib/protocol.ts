@@ -43,6 +43,7 @@ export const FrameType = {
   Pose: 'pose',
   Log: 'log',
   SelectDevice: 'select_device',
+  DismissDevice: 'dismiss_device',
   SetSensitivity: 'set_sensitivity',
   SetKeymap: 'set_keymap',
   SetWifi: 'set_wifi',

@@ -24,6 +24,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, TrySendError};
 use std::sync::Arc;
 
+use crate::device_now_us as now_us;
+
 use super::ads1298::Ads1298FrontEnd;
 use super::preprocess::sample_to_int8;
 use super::status::describe_status_word;
@@ -81,6 +83,15 @@ const SLOW_PERIOD_US: u64 = 1_500;
 /// (~2 per second was measured) describes itself without flooding the link.
 const RECOVERY_LOG_INTERVAL: u32 = 32;
 
+/// How long after a warm recovery frames are read but discarded. The RESET pulse in
+/// the recovery powers the internal reference buffer down and `configure` powers it
+/// back up, and the datasheet gives the reference a 150 ms start-up (the cold-boot
+/// path waits 300 ms before START for the same reason). Conversions during that
+/// window carry valid status markers but silently wrong amplitude — the one kind of
+/// bad data nothing downstream can detect. Discarding rather than sleeping keeps
+/// DRDY serviced and the death detectors live through the window.
+const REFERENCE_SETTLE_AFTER_RECOVERY_US: u64 = 300_000;
+
 /// One window of model input, time-major `[t, c]` to match [`emg_runtime::tensor`],
 /// stamped with when its first sample was read off the chip.
 struct Window {
@@ -93,11 +104,6 @@ struct Window {
     /// this timeline to their own clock see data stay put instead of drifting.
     started_us: u64,
     samples: Vec<i8>,
-}
-
-/// Microseconds since boot.
-fn now_us() -> u64 {
-    unsafe { esp_idf_svc::sys::esp_timer_get_time() as u64 }
 }
 
 /// Where the time between DRDY edges actually goes.
@@ -224,7 +230,9 @@ impl AdcSource {
     }
 
     /// Times the front end died and was warm-recovered, cumulative since boot. Each
-    /// one is a ~15 ms gap in the sample stream and a discarded partial window.
+    /// one costs the detection timeout, ~3 ms of reset-and-rewrite, and then the
+    /// [`REFERENCE_SETTLE_AFTER_RECOVERY_US`] discard window — roughly a third of a
+    /// second of stream gap — plus the discarded partial window.
     pub(crate) fn recoveries(&self) -> u32 {
         self.counters.recoveries.load(Ordering::Relaxed)
     }
@@ -288,6 +296,9 @@ pub(crate) fn start(
             let mut consecutive_bad_status: u32 = 0;
             let mut consecutive_slow_periods: u32 = 0;
             let mut last_wake_us: Option<u64> = None;
+            // Frames before this instant are read and dropped: the reference buffer
+            // is still settling after a recovery's reset. Zero means no discard.
+            let mut settling_until_us: u64 = 0;
 
             // Warm-recovers the pair and accounts for it. The partial window is
             // discarded rather than stitched across the gap: a window that silently
@@ -305,6 +316,7 @@ pub(crate) fn start(
                     consecutive_bad_status = 0;
                     consecutive_slow_periods = 0;
                     last_wake_us = None;
+                    settling_until_us = now_us() + REFERENCE_SETTLE_AFTER_RECOVERY_US;
                 }};
             }
 
@@ -414,6 +426,11 @@ pub(crate) fn start(
                 }
                 consecutive_bad_status = 0;
 
+                // Settling frames are consumed (DRDY stays serviced, the detectors
+                // above keep seeing a live stream) but never become model input.
+                if woke_us < settling_until_us {
+                    continue;
+                }
                 if building.is_empty() {
                     building_started_us = woke_us;
                 }
