@@ -81,8 +81,19 @@ const SLOW_PERIOD_US: u64 = 1_500;
 /// (~2 per second was measured) describes itself without flooding the link.
 const RECOVERY_LOG_INTERVAL: u32 = 32;
 
-/// One window of model input, time-major `[t, c]` to match [`emg_runtime::tensor`].
-type Window = Vec<i8>;
+/// One window of model input, time-major `[t, c]` to match [`emg_runtime::tensor`],
+/// stamped with when its first sample was read off the chip.
+struct Window {
+    /// Device-clock microseconds at the first frame of this window. This is the
+    /// window's place on the real timeline — *not* a count of windows times a
+    /// nominal duration. The distinction matters twice over: the chip's internal
+    /// oscillator misses the nominal 2000 Hz by several percent (measured ~1837 Hz
+    /// on this board), and every warm recovery removes real time that a synthetic
+    /// `seq × window_us` timeline would silently paper over. Consumers anchoring
+    /// this timeline to their own clock see data stay put instead of drifting.
+    started_us: u64,
+    samples: Vec<i8>,
+}
 
 /// Microseconds since boot.
 fn now_us() -> u64 {
@@ -218,32 +229,32 @@ impl AdcSource {
         self.counters.recoveries.load(Ordering::Relaxed)
     }
 
-    /// The newest window, or `None` if none is waiting. Never blocks.
+    /// The newest window and the device-clock time of its first sample, or `None`
+    /// if none is waiting. Never blocks.
     ///
     /// If more than one has queued up, this discards the older ones and counts them.
     /// A gesture recogniser wants the most recent 250 ms of muscle activity, not a
     /// backlog it will never catch up on.
-    pub(crate) fn try_next_window(&self) -> Option<I8Activation> {
-        let mut samples = self.windows.try_recv().ok()?;
+    pub(crate) fn try_next_window(&self) -> Option<(I8Activation, u64)> {
+        let mut window = self.windows.try_recv().ok()?;
         while let Ok(newer) = self.windows.try_recv() {
             self.counters.dropped.fetch_add(1, Ordering::Relaxed);
-            samples = newer;
+            window = newer;
         }
 
         // `I8Activation::from_i8_slice` asserts on a length mismatch, and an assert
         // here is a reboot with no console, so check it first.
         let expected = self.window_length * INPUT_CH;
-        if samples.len() != expected {
+        if window.samples.len() != expected {
             warn!(
                 "discarding malformed window: {} samples, expected {expected}",
-                samples.len()
+                window.samples.len()
             );
             return None;
         }
-        Some(I8Activation::from_i8_slice(
-            &samples,
-            self.window_length,
-            INPUT_CH,
+        Some((
+            I8Activation::from_i8_slice(&window.samples, self.window_length, INPUT_CH),
+            window.started_us,
         ))
     }
 }
@@ -267,7 +278,10 @@ pub(crate) fn start(
             set_current_thread_priority(THREAD_PRIORITY);
             info!("ADC acquisition thread running");
             let samples_per_window = window_length * INPUT_CH;
-            let mut building: Window = Vec::with_capacity(samples_per_window);
+            let mut building: Vec<i8> = Vec::with_capacity(samples_per_window);
+            // Device-clock time of the first frame in `building`; stamped when the
+            // first samples land, cleared with the buffer.
+            let mut building_started_us: u64 = 0;
             let mut drdy_edges: u32 = 0;
             let mut timing = EdgeTiming::default();
             let mut last_status = 0u32;
@@ -400,11 +414,19 @@ pub(crate) fn start(
                 }
                 consecutive_bad_status = 0;
 
+                if building.is_empty() {
+                    building_started_us = woke_us;
+                }
                 building.extend_from_slice(&sample_to_int8(&frame, input_scale));
 
                 if building.len() >= samples_per_window {
-                    let full =
-                        std::mem::replace(&mut building, Vec::with_capacity(samples_per_window));
+                    let full = Window {
+                        started_us: building_started_us,
+                        samples: std::mem::replace(
+                            &mut building,
+                            Vec::with_capacity(samples_per_window),
+                        ),
+                    };
                     match sender.try_send(full) {
                         Ok(()) => {}
                         Err(TrySendError::Full(_)) => {

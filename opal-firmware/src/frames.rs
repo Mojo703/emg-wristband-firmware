@@ -15,6 +15,7 @@ use protocol::{Frame, WakeState};
 /// [`protocol::pack_samples`]. `scale_uv` is µV per count.
 pub fn emg(
     seq: u32,
+    t0_us: u64,
     input: &I8Activation,
     scale_uv: f32,
     input_len: usize,
@@ -28,10 +29,9 @@ pub fn emg(
             raw.extend_from_slice(&value.to_le_bytes());
         }
     }
-    let window_us = input_len as u64 * 1_000_000 / sample_rate as u64;
     Frame::Emg {
         seq,
-        t0_us: seq as u64 * window_us,
+        t0_us,
         channels: INPUT_CH as u16,
         sample_rate,
         scale_uv,

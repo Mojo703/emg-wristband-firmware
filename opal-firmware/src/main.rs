@@ -127,6 +127,12 @@ impl PerfStats {
 /// `emg-runtime`. Shared with `ml-bench`.
 const MODEL_BIN: &[u8] = include_bytes!("../../ml-bench/data/model_int8.bin");
 
+/// Microseconds since boot on the device clock — the same clock the acquisition
+/// thread stamps windows with and the logger stamps log lines with.
+fn device_now_us() -> u64 {
+    unsafe { esp_idf_svc::sys::esp_timer_get_time() as u64 }
+}
+
 fn main() -> anyhow::Result<()> {
     esp_idf_svc::sys::link_patches();
     logger::init();
@@ -226,7 +232,6 @@ fn main() -> anyhow::Result<()> {
     }
 
     let sample_rate = adc::ads1298::SAMPLE_RATE_HZ;
-    let window_us = model.input_len as u64 * 1_000_000 / sample_rate as u64;
     let mut seq: u32 = 0;
     let mut prev_wake = WakeState::Idle;
     let mut perf = PerfStats::default();
@@ -259,7 +264,7 @@ fn main() -> anyhow::Result<()> {
         let next_window = source
             .as_ref()
             .and_then(|source| Some((source, source.try_next_window()?)));
-        let Some((source, input)) = next_window else {
+        let Some((source, (input, window_t0_us))) = next_window else {
             // Nothing to warn about when there is no front end at all: the stall
             // warning is for one that came up and then went quiet.
             if let Some(source) = source.as_ref() {
@@ -291,11 +296,17 @@ fn main() -> anyhow::Result<()> {
             std::array::from_fn(|class| raw_logits[class] as f32 * model.logit_scale);
         let softmax = softmax(&logits);
         let decision = pipeline.step(&softmax);
-        let t_us = (seq as u64 + 1) * window_us;
+        // Real device-clock time for the decision the events describe. The EMG
+        // window itself carries its first sample's timestamp; both used to be
+        // synthesized from `seq` at the nominal rate, which the actual oscillator
+        // misses by several percent — the drift consumers saw as data sliding away
+        // from their present line.
+        let t_us = device_now_us();
 
         let mut window_frames = vec![
             frames::emg(
                 seq,
+                window_t0_us,
                 &input,
                 source.input_scale(),
                 model.input_len,
