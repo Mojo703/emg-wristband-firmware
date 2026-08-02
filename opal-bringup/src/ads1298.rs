@@ -33,6 +33,8 @@ pub const FRAME_BYTES: usize = 3 + CHANNELS * 3;
 const COMMAND_DECODE_GAP_US: u32 = 5;
 
 const SDATAC: u8 = 0x11;
+const START_COMMAND: u8 = 0x08;
+const STOP_COMMAND: u8 = 0x0A;
 const RDATA: u8 = 0x12;
 const RREG: u8 = 0x20;
 const WREG: u8 = 0x40;
@@ -42,7 +44,15 @@ pub const REG_CONFIG1: u8 = 0x01;
 pub const REG_CONFIG2: u8 = 0x02;
 pub const REG_CONFIG3: u8 = 0x03;
 pub const REG_CH1SET: u8 = 0x05;
+/// Eight fully writable bits with no effect while the right-leg amplifier is powered
+/// down, which makes it the harmless scratch register for a write/readback bus check.
+/// CHnSET cannot serve: its bit 3 is reserved and reads back zero, so half of any
+/// walking pattern would look like a bus failure.
+pub const REG_RLD_SENSP: u8 = 0x0D;
 pub const REG_GPIO: u8 = 0x14;
+/// Bit 3 is SINGLE_SHOT. Nothing else in this harness writes CONFIG4, so it holds its
+/// reset value of 0x00 except in the single-shot cells.
+pub const REG_CONFIG4: u8 = 0x17;
 pub const REG_COUNT: u8 = 0x1A;
 
 /// Register names in address order, so a dump reads as names rather than offsets.
@@ -87,6 +97,16 @@ impl Frame {
     pub fn marker_ok(&self) -> bool {
         self.status >> 20 == 0b1100
     }
+}
+
+fn decode_frame(raw: &[u8; FRAME_BYTES]) -> Frame {
+    let status = ((raw[0] as u32) << 16) | ((raw[1] as u32) << 8) | raw[2] as u32;
+    let mut channels = [0i32; CHANNELS];
+    for (index, channel) in channels.iter_mut().enumerate() {
+        let offset = 3 + index * 3;
+        *channel = decode_i24(&raw[offset..offset + 3]);
+    }
+    Frame { status, channels }
 }
 
 fn decode_i24(bytes: &[u8]) -> i32 {
@@ -184,6 +204,17 @@ impl Ads1298 {
         Ok(())
     }
 
+    /// Begins conversions with the START opcode instead of the pin (SBAS459K
+    /// §9.4.1.1 offers both). The pin stays wherever it is; a cell using this leaves
+    /// it low, so the wire is out of the experiment entirely.
+    pub fn start_conversion_by_command(&mut self) -> Result<()> {
+        self.command(START_COMMAND)
+    }
+
+    pub fn stop_conversion_by_command(&mut self) -> Result<()> {
+        self.command(STOP_COMMAND)
+    }
+
     /// DRDY is active low.
     pub fn data_ready(&self) -> bool {
         self.data_ready.is_low()
@@ -253,14 +284,52 @@ impl Ads1298 {
                 .transaction(&mut [Operation::Write(&[RDATA]), Operation::Read(&mut raw)])?;
             Ok(())
         })?;
+        Ok(decode_frame(&raw))
+    }
 
-        let status = ((raw[0] as u32) << 16) | ((raw[1] as u32) << 8) | raw[2] as u32;
-        let mut channels = [0i32; CHANNELS];
-        for (index, channel) in channels.iter_mut().enumerate() {
-            let offset = 3 + index * 3;
-            *channel = decode_i24(&raw[offset..offset + 3]);
-        }
-        Ok(Frame { status, channels })
+    /// One frame clocked out as nine 3-byte chunks with decode-gap pauses between,
+    /// CS held for the whole transaction. Same data as [`Self::read_frame`], but the
+    /// 216-clock burst is broken into short runs — the discriminator for whether the
+    /// unbroken burst is what disturbs a converting chip.
+    pub fn read_frame_chunked(&mut self) -> Result<Frame> {
+        let mut raw = [0u8; FRAME_BYTES];
+        self.with_selection(|chip| {
+            chip.spi.write(&[RDATA])?;
+            Ets::delay_us(COMMAND_DECODE_GAP_US);
+            for chunk in raw.chunks_mut(3) {
+                chip.spi.read(chunk)?;
+                Ets::delay_us(COMMAND_DECODE_GAP_US);
+            }
+            Ok(())
+        })?;
+        Ok(decode_frame(&raw))
+    }
+
+    /// Clocks out only the first `data_bytes` of a frame and then raises CS, abandoning
+    /// the rest. Legal while converting: CS rising resets the command decoder
+    /// (SBAS459K §9.5.1.1) and the next DRDY starts a fresh frame, so the truncation
+    /// costs the remaining channels of that sample and nothing else. The dose the
+    /// readout fault responds to scales with data bits shifted, so this is the knob
+    /// that walks down the burst-length axis without leaving continuous conversion.
+    pub fn read_frame_partial(&mut self, data_bytes: usize) -> Result<()> {
+        let mut raw = [0u8; FRAME_BYTES];
+        let wanted = data_bytes.min(FRAME_BYTES);
+        self.with_selection(|chip| {
+            chip.spi.transaction(&mut [
+                Operation::Write(&[RDATA]),
+                Operation::Read(&mut raw[..wanted]),
+            ])?;
+            Ok(())
+        })
+    }
+
+    /// The RDATA opcode with no data clocks at all; the CS rising edge then resets
+    /// the command decoder. Isolates the command path from the data burst.
+    pub fn read_frame_opcode_only(&mut self) -> Result<()> {
+        self.with_selection(|chip| {
+            chip.spi.write(&[RDATA])?;
+            Ok(())
+        })
     }
 
     /// Reads ID `attempts` times and returns how many did not come back as
