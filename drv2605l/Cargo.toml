@@ -1,0 +1,41 @@
+# Empty workspace table makes this a workspace root so cargo doesn't attach it
+# to an unrelated Cargo.toml higher up the directory tree.
+[workspace]
+
+[package]
+name = "drv2605l"
+version = "0.1.0"
+edition = "2021"
+resolver = "2"
+rust-version = "1.81"
+description = "TI DRV2605L haptic driver over I2C, plus an ESP32-S3 bench binary that plays a candidate set of wristband feedback patterns"
+
+[lib]
+name = "drv2605l"
+
+[[bin]]
+name = "drv2605l-bench"
+path = "src/main.rs"
+required-features = ["bench"]
+
+[profile.release]
+opt-level = 3
+
+[profile.dev]
+opt-level = 1
+debug = true
+
+# `embedded-hal` is the only library dependency. Keeping esp-idf out of the lib is what
+# lets opal-firmware take the driver later without inheriting this crate's bench setup.
+[dependencies]
+embedded-hal = "1"
+esp-idf-svc = { version = "0.52", optional = true }
+log = { version = "0.4", optional = true }
+anyhow = { version = "1", optional = true }
+
+[features]
+default = ["bench"]
+bench = ["dep:esp-idf-svc", "dep:log", "dep:anyhow"]
+
+[build-dependencies]
+embuild = "0.33"
