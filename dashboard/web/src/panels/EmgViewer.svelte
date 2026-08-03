@@ -466,17 +466,6 @@
       }
       const mean = counted > 0 ? sum / counted : 0;
 
-      // Auto-gain peak over the (decimated) visible samples, around that mean.
-      let peak = 1e-6;
-      for (let a = startAbs; a <= stream.newestAbs; a += stride) {
-        const pos = a % stream.capacity;
-        if (stream.ringAbs[pos] === a) {
-          const av = Math.abs(ring[pos]! - mean);
-          if (av > peak) peak = av;
-        }
-      }
-      const gain = (laneHeight * 0.42) / peak;
-
       ctx.strokeStyle = chromeColors.trace;
       ctx.lineWidth = 1;
       ctx.beginPath();
@@ -506,15 +495,50 @@
           colFrac += colStep;
           if (colFrac >= cols) colFrac -= cols;
         }
+        // Auto-gain from the binned extremes: the binning walked every sample,
+        // and a peak taken from a decimated walk can miss the true extreme, which
+        // would draw segments past the lane.
+        let peak = 1e-6;
+        for (let col = 0; col < cols; col++) {
+          const lo = colMin[col]!;
+          if (lo !== lo) continue;
+          const hi = colMax[col]!;
+          if (hi > peak) peak = hi;
+          if (-lo > peak) peak = -lo;
+        }
+        const gain = (laneHeight * 0.42) / peak;
         for (let col = 0; col < cols; col++) {
           const lo = colMin[col]!;
           if (lo !== lo) continue; // NaN: empty column → gap shows the baseline
           const x = col + 0.5;
           const hi = colMax[col]!;
-          ctx.moveTo(x, midY - hi * gain);
-          ctx.lineTo(x, midY - lo * gain);
+          let yTop = midY - hi * gain;
+          let yBottom = midY - lo * gain;
+          // A quiet column's min→max can span a small fraction of a pixel, which
+          // antialiases to near-invisible (and exactly zero length paints nothing
+          // under the butt line cap). Hold every segment to at least one full
+          // pixel so flat and quiet stretches read as a trace, not as absence.
+          if (yBottom - yTop < 1) {
+            const center = (yBottom + yTop) / 2;
+            yTop = center - 0.5;
+            yBottom = center + 0.5;
+          }
+          ctx.moveTo(x, yTop);
+          ctx.lineTo(x, yBottom);
         }
       } else {
+        // Auto-gain peak over the decimated visible samples, around the mean. The
+        // polyline below draws exactly these samples, so this peak is the true
+        // extreme of what appears on screen.
+        let peak = 1e-6;
+        for (let a = startAbs; a <= stream.newestAbs; a += stride) {
+          const pos = a % stream.capacity;
+          if (stream.ringAbs[pos] === a) {
+            const av = Math.abs(ring[pos]! - mean);
+            if (av > peak) peak = av;
+          }
+        }
+        const gain = (laneHeight * 0.42) / peak;
         // Connected polyline through the samples; breaks at gaps (invalid slots).
         let drawing = false;
         for (let a = startAbs; a <= stream.newestAbs; a += stride) {
