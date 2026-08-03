@@ -1,13 +1,23 @@
 //! ADS1298 bench harness: one chip, one thread, one text console.
 //!
 //! This exists because `opal-firmware` cannot answer a hardware question. The fault
-//! under investigation: with two or more channel amplifiers powered and converting,
-//! conversions stop 9 ms to 1.7 s after START — stochastically, on both AFE boards,
-//! under every register configuration, input condition, and clock source tested. The
-//! full campaign is written up in `documentation/ads1298-bringup-2026-07-31/`
-//! (TEST-LOG.md for the summary, RESULTS-single-chip.md for the narrative).
+//! that drove the campaign: with two or more channel amplifiers powered and
+//! converting, conversions stop 9 ms to 1.7 s after START — stochastically, on both
+//! AFE boards, under every register configuration, input condition, and clock source
+//! tested. The full campaign is written up in
+//! `documentation/ads1298-bringup-2026-07-31/` (TEST-LOG.md for the summary,
+//! RESULTS-single-chip.md for the narrative). Status 2026-08-03: with DIN held low
+//! during reads, self-clocked chips, and the rebuilt per-chip harness, the fault has
+//! not reproduced on either board (three 20 s survey cells each, zero deaths); the
+//! campaign modes remain as regression checks.
 //!
-//! The harness has four modes, chosen by the knobs below:
+//! The harness has five modes, chosen by the knobs below; every mode but the walk
+//! first runs the SPI clock sweep and a wiring probe (`probe_start_and_data_ready`)
+//! that bisects START-wire, DRDY-wire, and no-conversion faults:
+//!
+//! - **Harness walk** (`RUN_HARNESS_WALK = true`): map the physical wiring with a
+//!   voltmeter by cycling a weak pull-up across the candidate ESP pins. Proves
+//!   continuity and pin order; blind to IO_MUX function-select problems.
 //!
 //! - **Staged stream** (`RUN_SURVEY = false`): configure, START, stream and audit
 //!   CONFIG1-3 between frames, recovering and reporting on every revert.
@@ -36,7 +46,6 @@ use ads1298::{
 use anyhow::Result;
 use esp_idf_svc::hal::delay::{Ets, FreeRtos};
 use esp_idf_svc::hal::gpio::{AnyInputPin, AnyOutputPin, PinDriver, Pull};
-use esp_idf_svc::hal::ledc::{config::TimerConfig, LedcDriver, LedcTimerDriver, Resolution};
 use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::hal::spi::config::{Config as SpiConfig, MODE_1};
 use esp_idf_svc::hal::spi::{SpiDeviceDriver, SpiDriver, SpiDriverConfig};
@@ -50,7 +59,15 @@ use std::sync::Arc;
 
 /// Which board is on the bench, for the banner. The control pins it names are chosen
 /// in the pin map in `main`; keep the two in step.
-const BOARD: &str = "A";
+const BOARD: &str = "B";
+
+/// Map the physical harness instead of assuming it: cycle a weak pull-up across
+/// every candidate left-run pin (everything else pulled down), so a voltmeter on a
+/// J3/J11 lane reads ~3.3 V exactly when its true ESP pin is up. No push-pull
+/// drive anywhere, so a chip output on the far end cannot be fought. Note the
+/// walk is blind to IO_MUX function-select problems: the pull network sits on
+/// the pad downstream of the mux, so it proves wiring, never drivability.
+const RUN_HARNESS_WALK: bool = false;
 
 /// SPI clock for the streaming loop, picked from what the sweep below reports.
 const SPI_BAUD_RATE_HZ: u32 = 2_000_000;
@@ -74,11 +91,11 @@ const DATA_RATE_BITS: u8 = 0b100; // 2000 SPS in HR mode -- the ML target rate
 
 /// CONFIG1: HR=1, DAISY_EN=1 (per-chip readback), CLK_EN=0, DR as above.
 ///
-/// CLK_EN is 0 because the boards are separately clocked here: the wire between the two
-/// CLK pins is gone and this board's CLKSEL is tied high, so nothing is listening. Set
-/// it to 1 only to give a scope a trigger — the CLK output stopping is the cleanest
-/// edge the reversion produces.
-const CONFIG1: u8 = 0b1100_0000 | DATA_RATE_BITS; // CLK_EN=0: the CLK pin is an input now -- the ESP32 drives it
+/// CLK_EN is 0 because nothing listens to the CLK pin: the 2026-08-02 harness has no
+/// clock wire at all, CLKSEL is strapped to 3V3, and the chip runs its internal
+/// oscillator. Set it to 1 only to give a scope a trigger — the CLK output stopping
+/// is the cleanest edge the reversion produces.
+const CONFIG1: u8 = 0b1100_0000 | DATA_RATE_BITS;
 
 /// CONFIG2: internal test-signal generator off, or bit 4 set to switch it on.
 const CONFIG2: u8 = if TEST_SIGNAL_CHANNEL.is_some() {
@@ -261,6 +278,116 @@ const SINGLE_SHOT_REPEATS: u32 = 3;
 
 // ---------------------------------------------------------------------------
 
+/// Falling edges on DRDY over one window, counted by a tight poll. At the post-reset
+/// 250 SPS default a converting chip shows on the order of a hundred edges in
+/// 500 ms; the exact number does not matter, only zero against nonzero.
+fn count_data_ready_edges(chip: &Ads1298, window_ms: u64) -> (u32, u32) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(window_ms);
+    let mut edges = 0u32;
+    let mut samples = 0u64;
+    let mut low_samples = 0u64;
+    let mut was_low = chip.data_ready();
+    while std::time::Instant::now() < deadline {
+        let low = chip.data_ready();
+        if low && !was_low {
+            edges += 1;
+        }
+        was_low = low;
+        samples += 1;
+        low_samples += low as u64;
+    }
+    let percent_low = (low_samples * 100 / samples.max(1)) as u32;
+    (edges, percent_low)
+}
+
+/// Wiring bisect for the two lines the ID read and clock sweep leave unproven. The
+/// ID answering proves SCLK, CS, MOSI, MISO, RESET and PWDN; conversions started by
+/// opcode but not by pin indict the START wire; conversions visible by neither
+/// indict the DRDY wire (or conversions not running at all — a scope on J3.9
+/// separates those).
+fn probe_start_and_data_ready(chip: &mut Ads1298) -> Result<()> {
+    let (idle, idle_low) = count_data_ready_edges(chip, 500);
+    chip.start_conversion()?;
+    let (by_pin, pin_low) = count_data_ready_edges(chip, 500);
+    chip.stop_conversion()?;
+    FreeRtos::delay_ms(5);
+    chip.start_conversion_by_command()?;
+    let (by_command, command_low) = count_data_ready_edges(chip, 500);
+
+    // RDATA polling needs no DRDY at all: valid frames with live codes here mean
+    // the chip is converting and any missing edges are the DRDY line's fault alone.
+    let mut markers_ok = 0u32;
+    let mut first_codes = [0i32; 2];
+    let mut last_codes = [0i32; 2];
+    for poll in 0..5 {
+        let frame = chip.read_frame()?;
+        markers_ok += frame.marker_ok() as u32;
+        last_codes = [frame.channels[0], frame.channels[1]];
+        if poll == 0 {
+            first_codes = last_codes;
+        }
+        FreeRtos::delay_ms(100);
+    }
+    chip.stop_conversion_by_command()?;
+
+    info!("harness probe: DRDY falling edges per 500 ms -- idle {idle} ({idle_low}% low), START pin {by_pin} ({pin_low}% low), START opcode {by_command} ({command_low}% low)");
+    info!("harness probe: RDATA polling while converting by opcode -- {markers_ok}/5 valid markers, ch1/ch2 first {first_codes:?} last {last_codes:?}");
+    match (by_pin, by_command, markers_ok) {
+        (0, 0, 0) => warn!("harness probe: no DRDY edges and no valid frames -- conversions are not running"),
+        (0, 0, _) => warn!("harness probe: the chip converts (valid frames by RDATA) but no DRDY edges arrive -- the DRDY line (J3.9) is the fault"),
+        (0, _, _) => warn!("harness probe: the START opcode converts but the START pin does not -- suspect the START wire (J3.4)"),
+        (_, _, _) => info!("harness probe: START pin and DRDY wire both prove out"),
+    }
+    if idle > 0 {
+        warn!("harness probe: {idle} DRDY edges with conversions stopped -- the DRDY line is toggling on its own, suspect contention or noise");
+    }
+    Ok(())
+}
+
+/// Never returns: walks a weak pull-up over the left-run candidate pins forever.
+/// Probe one J3/J11 lane per 60-second cycle and note which GP is up when it
+/// reads ~3.3 V; a lane that never rises in a full cycle is an open wire.
+fn harness_walk(pins: esp_idf_svc::hal::gpio::Pins) -> Result<()> {
+    // The drivers exist only to hold every candidate in input mode; the pulls are
+    // flipped through the raw IDF call because PinDriver keeps set_pull private.
+    let inputs: [(u8, AnyInputPin); 10] = [
+        (1, pins.gpio1.into()),
+        (2, pins.gpio2.into()),
+        (3, pins.gpio3.into()),
+        (4, pins.gpio4.into()),
+        (5, pins.gpio5.into()),
+        (6, pins.gpio6.into()),
+        (39, pins.gpio39.into()),
+        (40, pins.gpio40.into()),
+        (41, pins.gpio41.into()),
+        (42, pins.gpio42.into()),
+    ];
+    let mut numbers = [0u8; 10];
+    let mut drivers = Vec::with_capacity(inputs.len());
+    for (index, (number, pin)) in inputs.into_iter().enumerate() {
+        numbers[index] = number;
+        drivers.push(PinDriver::input(pin, Pull::Down)?);
+    }
+    loop {
+        for target in 0..numbers.len() {
+            for (index, &number) in numbers.iter().enumerate() {
+                let mode = if index == target {
+                    esp_idf_svc::sys::gpio_pull_mode_t_GPIO_PULLUP_ONLY
+                } else {
+                    esp_idf_svc::sys::gpio_pull_mode_t_GPIO_PULLDOWN_ONLY
+                };
+                esp_idf_svc::sys::esp!(unsafe {
+                    esp_idf_svc::sys::gpio_set_pull_mode(number as i32, mode)
+                })?;
+            }
+            let name = numbers[target];
+            info!("harness walk: GP{name} pulled UP for 6 s -- a J3/J11 lane at ~3.3 V now is wired to GP{name}");
+            FreeRtos::delay_ms(6_000);
+        }
+        info!("harness walk: cycle complete, starting over");
+    }
+}
+
 fn main() -> Result<()> {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
@@ -272,35 +399,46 @@ fn main() -> Result<()> {
     let peripherals = Peripherals::take()?;
     let pins = peripherals.pins;
 
-    // The external master clock: 2.048 MHz from the LEDC peripheral into the chip's
-    // CLK pin, with CLKSEL strapped to GND so the chip uses it instead of its
-    // internal RC oscillator. The oscillator is the one shared conversion-domain
-    // block never yet exonerated: DRDY dying while SPI (clocked by SCLK) stays alive
-    // is exactly what a stopping master clock looks like. The clock must run before
-    // the chip comes out of reset, so this precedes power-up. The driver stays bound
-    // for the whole session; dropping it would silence the clock.
-    let clock_timer = LedcTimerDriver::new(
-        peripherals.ledc.timer0,
-        &TimerConfig::new()
-            .frequency(2_048_000.Hz())
-            .resolution(Resolution::Bits4),
-    )?;
-    let mut master_clock = LedcDriver::new(peripherals.ledc.channel0, &clock_timer, pins.gpio10)?;
-    master_clock.set_duty(master_clock.get_max_duty() / 2)?;
-    info!("external master clock: 2.048 MHz on GPIO10, CLKSEL expected at GND");
+    if RUN_HARNESS_WALK {
+        return harness_walk(pins);
+    }
 
-    // The pin map, rewired 2026-07-31 so the jumpers run in header order on the
-    // breakout: SCLK 2, CS 3, START 4, RST 5, MOSI 6, MISO 7, PWDN 8, DRDY 9.
-    // GPIO 19 and 20 belong to USB-Serial-JTAG.
-    let clock: AnyOutputPin = pins.gpio2.into();
-    let data_in: AnyOutputPin = pins.gpio6.into();
-    let data_out: AnyInputPin = pins.gpio7.into();
-    let start: AnyOutputPin = pins.gpio4.into();
+    // No external master clock on this harness: there is no CLK wire, CLKSEL is
+    // strapped to 3V3 at J10, and the chip runs its internal 2.048 MHz oscillator —
+    // the same clocking the production firmware uses. The old bench's LEDC clock is
+    // gone with the wire; its GPIO10 now carries START.
+    info!("no external master clock: CLKSEL strapped to 3V3, internal oscillator");
 
-    let chip_select: AnyOutputPin = pins.gpio3.into();
-    let data_ready: AnyInputPin = pins.gpio9.into();
-    let reset_n: AnyOutputPin = pins.gpio5.into();
-    let power_down: AnyOutputPin = pins.gpio8.into();
+    // The pin map, matching board B's ribbon in the 2026-08-02 wiring harness (J3 in
+    // reverse header order down the Zero's left column and onto the rear-pad
+    // extension wires; see the wiring block in opal-firmware/src/main.rs): DRDY 1,
+    // MISO 2, GP3 empty (DAISY_IN lane), SCLK 4, CS 5, START 6, PWDN 42, RESET 41,
+    // MOSI 40. Board A's map is in git history and opal-firmware. GPIO 19 and 20
+    // belong to USB-Serial-JTAG.
+    let clock: AnyOutputPin = pins.gpio4.into();
+    let data_in: AnyOutputPin = pins.gpio40.into();
+    let data_out: AnyInputPin = pins.gpio2.into();
+    let start: AnyOutputPin = pins.gpio6.into();
+
+    let chip_select: AnyOutputPin = pins.gpio5.into();
+    let data_ready: AnyInputPin = pins.gpio1.into();
+    let reset_n: AnyOutputPin = pins.gpio41.into();
+    let power_down: AnyOutputPin = pins.gpio42.into();
+
+    // Pads 39-42 come out of reset owned by JTAG (IO_MUX F0 = MTCK/MTDO/MTDI/MTMS;
+    // MTDI and MTMS are input-only there, so a GPIO "output" never reaches the pin).
+    // PinDriver calls only gpio_set_direction, which leaves IO_MUX MCU_SEL alone —
+    // gpio_config is what claims the pad for the GPIO matrix. Without this, RESET
+    // (41) and PWDN (42) are undriven and the chip stays silent. MOSI (40) is
+    // claimed by the SPI driver itself.
+    let jtag_pad_reclaim = esp_idf_svc::sys::gpio_config_t {
+        pin_bit_mask: (1u64 << 41) | (1u64 << 42),
+        mode: esp_idf_svc::sys::gpio_mode_t_GPIO_MODE_OUTPUT,
+        pull_up_en: esp_idf_svc::sys::gpio_pullup_t_GPIO_PULLUP_DISABLE,
+        pull_down_en: esp_idf_svc::sys::gpio_pulldown_t_GPIO_PULLDOWN_DISABLE,
+        intr_type: esp_idf_svc::sys::gpio_int_type_t_GPIO_INTR_DISABLE,
+    };
+    esp_idf_svc::sys::esp!(unsafe { esp_idf_svc::sys::gpio_config(&jtag_pad_reclaim) })?;
 
     let bus = Arc::new(SpiDriver::new(
         peripherals.spi2,
@@ -344,6 +482,8 @@ fn main() -> Result<()> {
     sweep_spi_clock(&mut chip, &bus)?;
     chip.set_spi(spi_device(&bus, SPI_BAUD_RATE_HZ)?);
 
+    probe_start_and_data_ready(&mut chip)?;
+
     if RUN_READOUT_CANDIDATES {
         readout_candidates(&mut chip, &bus)?;
         info!("readout candidates complete; idling");
@@ -356,7 +496,7 @@ fn main() -> Result<()> {
         // An output the ADS1298 cannot see, toggled as a stand-in aggressor: if
         // edge activity on an unconnected ESP pin kills conversions too, the fault
         // is ESP-side supply/ground noise and the SPI port itself is innocent.
-        let mut unrelated_output = PinDriver::output(pins.gpio11)?;
+        let mut unrelated_output = PinDriver::output(pins.gpio43)?;
         survey(&mut chip, &bus, &mut unrelated_output)?;
         info!("survey complete; idling");
         loop {

@@ -1,12 +1,12 @@
-//! Driver for the single TI ADS1298 8-channel ADC front end.
+//! Driver for one TI ADS1298 8-channel ADC; the front end runs two of them.
 //!
 //! Datasheet: <https://www.ti.com/lit/ds/symlink/ads1298.pdf> (SBAS459K).
 //!
-//! One chip, self-clocked (CLKSEL strapped high), eight channels. The two-chip
-//! cascade this driver grew up around is gone: the bring-up campaign
-//! (documentation/ads1298-bringup-2026-07-31/) ran on one board, the product bench
-//! has one board, and the second slot of the model's 16 input channels is
-//! zero-padded until the model is retrained at 8.
+//! Each chip runs on its own SPI bus and self-clocks from its internal 2.048 MHz
+//! oscillator (CLKSEL strapped to 3V3), and each has its own chip select, START,
+//! RESET, DRDY, and PWDN so one can be warm-recovered without touching the other.
+//! The rail sequencing lives in [`super::bring_up`]; this type owns everything
+//! per-chip.
 
 use anyhow::Result;
 use esp_idf_svc::hal::delay::{Ets, FreeRtos};
@@ -35,13 +35,15 @@ use super::spi_commands;
 /// bus is serialised internally by esp-idf's own device lock.
 type SpiDevice = SpiDeviceDriver<'static, Arc<SpiDriver<'static>>>;
 
-/// Gap between the bytes of a multi-byte register command. The ADS1298's command
-/// decoder needs tSDECODE = 4 tCLK (~2 µs at 2.048 MHz) per byte, and clocking a
-/// multi-byte command as one continuous stream is only legal when the SCLK is slow
-/// enough to provide that inside the byte itself (SBAS459K §9.5.1.2.1). The bench
-/// proved this the hard way: without burst framing, 2 MHz and 4 MHz SPI read the ID
-/// register as 0x00. 5 µs rather than 2 for margin; register traffic never sits on
-/// the frame-read hot path.
+/// Gap between the bytes of a multi-byte register command, satisfying tSDECODE =
+/// 4 tCLK (~2 µs at 2.048 MHz) per byte with margin (SBAS459K §9.5.1.2.1).
+///
+/// History, corrected by the spi-timing audit: the old 2/4 MHz ID-reads-0x00
+/// failures were originally blamed on tSDECODE, but both rates satisfy it — the
+/// real cure was CS framing (holding CS low across the whole command instead of
+/// raising it between bytes, which resets the decoder). The gaps are kept anyway:
+/// they are unconditionally legal, cost nothing off the frame-read hot path, and
+/// remove tSDECODE as a variable entirely.
 ///
 /// The gaps must sit INSIDE one `transaction()`, which holds hardware CS asserted
 /// across its operations. Splitting the bytes into separate `write()` calls raises CS
@@ -59,9 +61,11 @@ const CHIP_SELECT_GAP_MICROSECONDS: u32 = 5;
 /// drift out of agreement with the register the driver writes: change `data_rate` or
 /// `high_resolution` below and this number follows.
 ///
-/// It comes out at 2000 Hz. The model trained at 2048 Hz, a 2.3% difference in the time
-/// base that nobody has yet measured for its effect on accuracy. See
-/// [`crate::adc::preprocess`].
+/// It comes out at 2000 SPS nominal from the internal 2.048 MHz oscillator, and
+/// each chip misses it by its own oscillator error (±0.5% at 25 °C). The model
+/// trained at 2048 Hz, so the time base is 2.3% slow — the price of self-clocking,
+/// accepted when CLKSEL moved to 3V3; data collected for training rides the same
+/// path, so the next model absorbs it. See [`crate::adc::preprocess`].
 pub(crate) const SAMPLE_RATE_HZ: u32 = {
     let config1 = device_config1();
     config1
@@ -70,10 +74,12 @@ pub(crate) const SAMPLE_RATE_HZ: u32 = {
 };
 
 /// CONFIG1: high resolution at fMOD/256, which is where [`SAMPLE_RATE_HZ`] comes from.
-/// The clock output stays off — nothing listens to the CLK pin with one self-clocked
-/// chip. The reset default is `0x06` — low power at fMOD/1024 — which converts at
-/// 250 SPS, so a chip that has silently reverted is visible both in a readback and in
-/// the DRDY edge rate; acquisition's slow-period recovery trigger keys on exactly that.
+/// The clock output must stay off: with CLKSEL high the CLK pin is a disabled output
+/// (3-state) and nothing connects to it — driving the oscillator out of an
+/// unconnected pin would only add an aggressor to the board. The reset
+/// default is `0x06` — low power at fMOD/1024 — which converts at 250 SPS, so a chip
+/// that has silently reverted is visible both in a readback and in the DRDY edge
+/// rate; acquisition's slow-period recovery trigger keys on exactly that.
 const fn device_config1() -> Config1 {
     Config1 {
         high_resolution: true,
@@ -239,7 +245,6 @@ pub(super) struct Ads1298Device {
     chip_select: PinDriver<'static, Output>,
     drdy: PinDriver<'static, Input>,
     reset_n: PinDriver<'static, Output>,
-    pwdn: PinDriver<'static, Output>,
 }
 
 impl Ads1298Device {
@@ -248,10 +253,9 @@ impl Ads1298Device {
         mut chip_select: PinDriver<'static, Output>,
         drdy: PinDriver<'static, Input>,
         mut reset_n: PinDriver<'static, Output>,
-        mut pwdn: PinDriver<'static, Output>,
     ) -> Result<Self> {
-        // Held in reset from construction until `power_up()` runs the sequence.
-        pwdn.set_low()?;
+        // Held in reset from construction until `bring_up` runs the shared power
+        // sequence and calls `initialize()`. The shared PWDN line lives there too.
         reset_n.set_low()?;
         chip_select.set_high()?;
 
@@ -260,8 +264,15 @@ impl Ads1298Device {
             chip_select,
             drdy,
             reset_n,
-            pwdn,
         })
+    }
+
+    /// Releases the RESET line after the shared PWDN has been raised, ahead of the
+    /// supply-settling wait `bring_up` owns. [`Self::initialize`] then runs the
+    /// per-chip sequence.
+    pub(super) fn release_reset(&mut self) -> Result<()> {
+        self.reset_n.set_high()?;
+        Ok(())
     }
 
     /// Runs one transaction with CS low, raising CS afterwards even on failure so the
@@ -408,7 +419,9 @@ impl Ads1298Device {
                 Operation::DelayNs(COMMAND_DECODE_GAP_NANOSECONDS),
                 Operation::Write(&[0x00]),
                 Operation::DelayNs(COMMAND_DECODE_GAP_NANOSECONDS),
-                Operation::Read(&mut rx),
+                // Transfer, not Read: drives DIN low during the byte (§9.4.1.3)
+                // instead of leaving MOSI undriven.
+                Operation::Transfer(&mut rx, &[0x00]),
             ])?;
             Ok(rx[0])
         })
@@ -417,9 +430,16 @@ impl Ads1298Device {
     /// Clocks out one frame. Only valid while in RDATAC mode
     // and after `data_ready()` reports true
     pub(super) fn read_frame(&mut self) -> Result<Sample> {
+        // DIN must stay low for the entire read (SBAS459K §9.4.1.3): the command
+        // decoder listens during RDATAC, so every bit on DIN is a potential opcode.
+        // A bare `read` gives esp-idf a null TX buffer, which disables the MOSI
+        // phase and leaves the pin at whatever level it last held — low only by
+        // accident of the previous write's final bit. Transferring against
+        // explicit zeros drives DIN low for all 216 clocks.
+        const DIN_LOW: [u8; FRAME_BYTES] = [0u8; FRAME_BYTES];
         self.with_selection(|device| {
             let mut raw = [0u8; FRAME_BYTES];
-            device.spi.read(&mut raw)?;
+            device.spi.transfer(&mut raw, &DIN_LOW)?;
             Ok(parse_sample(&raw))
         })
     }
@@ -486,17 +506,12 @@ impl Ads1298Device {
         Ok(())
     }
 
-    // Power-up sequencing for each individual device
-    pub(super) fn power_up(&mut self, expected_device_id: u8) -> Result<()> {
-        // Held low since construction (see `new`); wait out the minimum power-down
-        // assertion before bringing the chip up.
-        FreeRtos::delay_ms(5);
-
-        self.pwdn.set_high()?;
-        self.reset_n.set_high()?;
-
-        FreeRtos::delay_ms(2000);
-
+    /// Resets this chip, leaves it in SDATAC, and returns whatever its ID register
+    /// says. Separate from [`Self::initialize`] so bring-up can probe every chip and
+    /// report all of them, rather than stopping at the first one that disagrees —
+    /// with two boards, whether the other chip reads the same wrong byte is what
+    /// separates a harness-wide fault (clock, bus) from one bad board.
+    pub(super) fn probe_identity(&mut self) -> Result<u8> {
         self.reset_pulse()?;
 
         // 18 tCLK (~9 µs at fCLK = 2.048 MHz) are needed after RESET returns high for
@@ -509,27 +524,15 @@ impl Ads1298Device {
 
         FreeRtos::delay_ms(1);
 
-        let device_id = self.read_register(Register::Id)?;
-        if device_id != expected_device_id {
-            anyhow::bail!(
-                "ADS1298 ID mismatch: read {device_id:#04x}, expected \
-                 {expected_device_id:#04x}. {}",
-                match device_id {
-                    0x00 | 0xFF =>
-                        "Bus reads all-zero or all-one, so this is wiring, \
-                                    power, or CS rather than a wrong part.",
-                    _ => "The bus responds, so check SPI mode and the part number.",
-                }
-            );
-        }
+        self.read_register(Register::Id)
+    }
 
-        self.configure()?;
-
-        // Internal reference settling: the datasheet's 150 ms start-up time with
-        // margin, after CONFIG3 powers the reference buffer and before START.
-        FreeRtos::delay_ms(300);
-
-        Ok(())
+    /// Per-chip initialisation, after `bring_up` has raised the shared PWDN, released
+    /// both RESET lines, waited out the supply settling, and probed the identities.
+    /// Reference settling after `configure` is also shared and lives in `bring_up`.
+    /// The chip is already reset and in SDATAC from [`Self::probe_identity`].
+    pub(super) fn initialize(&mut self) -> Result<()> {
+        self.configure()
     }
 
     pub(super) fn enable_test_signal(&mut self, channel: Channel) -> Result<()> {
@@ -569,13 +572,14 @@ impl Ads1298FrontEnd {
         Self { device, start }
     }
 
-    /// Pulls the shared START pin high
+    /// Pulls this chip's START pin high. START is per-chip so a warm recovery here
+    /// never restarts the other chip into the post-START death hazard.
     pub(super) fn start_conversion(&mut self) -> Result<()> {
         self.start.set_high()?;
         Ok(())
     }
 
-    /// Pulls the shared START pin low. Used by [`Self::warm_recover`].
+    /// Pulls this chip's START pin low. Used by [`Self::warm_recover`].
     pub(super) fn stop_conversion(&mut self) -> Result<()> {
         self.start.set_low()?;
         Ok(())
@@ -610,8 +614,8 @@ mod tests {
     /// beside it — change a field on purpose and this test names the byte that moved.
     #[test]
     fn configure_writes_the_bytes_the_bench_validated() {
-        // CONFIG1: high resolution, per-chip readback, fMOD/256 (2000 SPS), clock
-        // output off — one self-clocked chip, nothing listening to CLK.
+        // CONFIG1: high resolution, per-chip readback, fMOD/256, clock output off —
+        // with CLKSEL at 3V3 the CLK pins are 3-stated and unconnected.
         assert_eq!(device_config1().to_byte(), 0xC4);
 
         // CONFIG2: the internal test signal generator off.
@@ -719,6 +723,7 @@ mod tests {
     /// asserts the derivation lands where the hand arithmetic used to.
     #[test]
     fn sample_rate_is_derived_from_the_configured_data_rate() {
+        // 2.048 MHz internal oscillator / 1024 in high-resolution fMOD/256.
         assert_eq!(SAMPLE_RATE_HZ, 2000);
     }
 }

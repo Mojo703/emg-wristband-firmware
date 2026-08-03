@@ -258,7 +258,10 @@ impl Ads1298 {
         self.with_selection(|chip| {
             chip.write_bytes_spaced(&[RREG | address, 0x00])?;
             let mut value = [0u8; 1];
-            chip.spi.read(&mut value)?;
+            // Transfer against zeros, not a bare read: DIN must stay low while
+            // data shifts out (SBAS459K §9.4.1.3), and a null TX buffer leaves
+            // MOSI undriven at whatever level the previous write ended on.
+            chip.spi.transfer(&mut value, &[0x00])?;
             Ok(value[0])
         })
     }
@@ -278,10 +281,17 @@ impl Ads1298 {
     /// loop audit CONFIG1 between frames and so catch a chip reverting at the frame it
     /// happens on, instead of inferring it afterwards from the DRDY period.
     pub fn read_frame(&mut self) -> Result<Frame> {
+        // Every data-clocking path here transfers against explicit zeros rather
+        // than using a bare read: DIN must stay low for the entire read operation
+        // (SBAS459K §9.4.1.3), and a null TX buffer disables the MOSI phase,
+        // leaving the pin at whatever level the previous write's last bit set.
+        const DIN_LOW: [u8; FRAME_BYTES] = [0u8; FRAME_BYTES];
         let mut raw = [0u8; FRAME_BYTES];
         self.with_selection(|chip| {
-            chip.spi
-                .transaction(&mut [Operation::Write(&[RDATA]), Operation::Read(&mut raw)])?;
+            chip.spi.transaction(&mut [
+                Operation::Write(&[RDATA]),
+                Operation::Transfer(&mut raw, &DIN_LOW),
+            ])?;
             Ok(())
         })?;
         Ok(decode_frame(&raw))
@@ -297,7 +307,8 @@ impl Ads1298 {
             chip.spi.write(&[RDATA])?;
             Ets::delay_us(COMMAND_DECODE_GAP_US);
             for chunk in raw.chunks_mut(3) {
-                chip.spi.read(chunk)?;
+                // Zeros on DIN during the data clocks — see read_frame.
+                chip.spi.transfer(chunk, &[0u8; 3])?;
                 Ets::delay_us(COMMAND_DECODE_GAP_US);
             }
             Ok(())
@@ -312,12 +323,14 @@ impl Ads1298 {
     /// readout fault responds to scales with data bits shifted, so this is the knob
     /// that walks down the burst-length axis without leaving continuous conversion.
     pub fn read_frame_partial(&mut self, data_bytes: usize) -> Result<()> {
+        const DIN_LOW: [u8; FRAME_BYTES] = [0u8; FRAME_BYTES];
         let mut raw = [0u8; FRAME_BYTES];
         let wanted = data_bytes.min(FRAME_BYTES);
         self.with_selection(|chip| {
             chip.spi.transaction(&mut [
                 Operation::Write(&[RDATA]),
-                Operation::Read(&mut raw[..wanted]),
+                // Zeros on DIN during the data clocks — see read_frame.
+                Operation::Transfer(&mut raw[..wanted], &DIN_LOW[..wanted]),
             ])?;
             Ok(())
         })

@@ -36,9 +36,10 @@ use core::fmt;
 
 use super::channel::Channel;
 
-/// The ADS1298's oscillator frequency on this board: the internal 2.048 MHz clock,
-/// which chip A drives out to chip B (see CONFIG1's `output_clock_enabled`).
-const CLOCK_HZ: u32 = 2_048_000;
+/// The conversion clock each chip generates for itself: the internal oscillator
+/// (CLKSEL strapped to 3V3 on both boards). Nominal — each chip misses it by its
+/// own oscillator error. See [`super::INTERNAL_OSCILLATOR_HZ`].
+const CLOCK_HZ: u32 = super::INTERNAL_OSCILLATOR_HZ;
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -996,7 +997,8 @@ mod tests {
 
     #[test]
     fn data_rate_matches_the_datasheet_worked_examples() {
-        // High resolution: fMOD = 2.048 MHz / 4 = 512 kHz, over 256 is 2000 SPS.
+        // High resolution: fMOD = 2.048 MHz / 4, over 256 is the datasheet's own
+        // worked example, 2000 SPS.
         assert_eq!(
             DataRate::ModulatorClockOver256.samples_per_second(true),
             2000
@@ -1006,7 +1008,8 @@ mod tests {
             DataRate::ModulatorClockOver256.samples_per_second(false),
             1000
         );
-        // The power-on default, CONFIG1 = 0x06: low power, fMOD/1024.
+        // The power-on default, CONFIG1 = 0x06: low power, fMOD/1024, the
+        // datasheet's 250 SPS.
         assert_eq!(
             DataRate::ModulatorClockOver1024.samples_per_second(false),
             250

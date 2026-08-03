@@ -24,6 +24,7 @@ mod logger;
 mod transport;
 mod wifi;
 
+use adc::acquisition::AcquiredWindow;
 use adc::Channel;
 use config::{Sensitivity, Settings, Store};
 use emg_runtime::model::{Model, NUM_CLASSES};
@@ -170,33 +171,83 @@ fn main() -> anyhow::Result<()> {
     let mut links = Links::new(serial, peripherals.modem, sysloop, nvs_partition, &settings)?;
 
     // ---------------------------------------------------------------------------
-    // ADS1298 wiring. This block is the pin map: if the board disagrees with the
-    // firmware, this is the only place that needs editing. The SPI clock and the
-    // test-signal channel are constants at the top of this file.
+    // ADS1298 wiring for the two-board harness on the ESP32-S3-Zero. This block is
+    // the pin map: if the harness disagrees with the firmware, this is the only
+    // place that needs editing. The SPI clock and the test-signal channel are
+    // constants at the top of this file.
     //
-    // SCLK/DIN/DOUT are shared by both chips. CS, DRDY, RESET and PWDN are per-chip.
-    // START is tied to both so they convert on the same edge. USB-Serial-JTAG above
-    // claims GPIO 19 and 20, so they are not available here.
+    // Two fully independent SPI buses — SBAS459K §9.4.1.2: a rising SCLK edge
+    // pulls DRDY high regardless of CS, so a shared SCLK would toggle the idle
+    // chip's DRDY on every read of its peer; the datasheet's own fix is gating
+    // SCLK per chip, which separate hosts do outright. Both ribbons run J3 in
+    // reverse header order (J3.9 first: DRDY, MISO, DAISY_IN, SCLK, CS, START,
+    // CLK, RESET, MOSI) with the same two lane changes: the DAISY_IN lane
+    // carries no wire because J3.7 ties to GND at the board, and the CLK lane
+    // carries PWDN instead, peeling to J11 — there is no clock wire anywhere,
+    // since CLKSEL (J10) is strapped to 3V3 on both boards and each chip runs
+    // its internal 2.048 MHz oscillator.
+    //
+    // Board A runs down the Zero's right column, shifted one pin below TX after
+    // the TX castellation joint failed open (2026-08-03): TX unused, RX(44)=DRDY,
+    // 13=MISO, 12=SCLK, 11=CS, 10=START, 9=PWDN, 8=RESET, 7=MOSI. With GPIO43
+    // carrying nothing, the ROM's UART0 boot chatter no longer faces a chip
+    // output. Board B runs down the left column and onto the rear-pad extension
+    // wires, DAISY_IN gap intact: 1=DRDY, 2=MISO, GP3 empty, 4=SCLK, 5=CS,
+    // 6=START, 42=PWDN, 41=RESET, 40=MOSI.
+    //
+    // GP3/GP43/GP39 are spare; GP17/GP18 are reserved for the haptics I2C
+    // (SDA/SCL); GP45 (strapping) and GP38 stay unused by design, and the
+    // onboard RGB LED sits on GP21. USB-Serial-JTAG above claims GPIO 19 and 20
+    // internally. The chips' own GPIO pins are tied to GND (SBAS459K forbids
+    // floating them).
     // ---------------------------------------------------------------------------
-    // The single-board pin map, in header order on the AFE breakout. The board is
-    // self-clocked: CLKSEL strapped to 3.3 V, nothing on the CLK pin, and the chip's
-    // own GPIO pins tied to GND (SBAS459K forbids floating them).
-    let adc_pins = adc::AdcPins {
-        clock: peripherals.pins.gpio2.into(), // SCLK
-        chip_select: peripherals.pins.gpio3.into(),
-        start: peripherals.pins.gpio4.into(),
-        reset: peripherals.pins.gpio5.into(),
-        data_in: peripherals.pins.gpio6.into(),  // MOSI
-        data_out: peripherals.pins.gpio7.into(), // MISO
-        power_down: peripherals.pins.gpio8.into(),
-        data_ready: peripherals.pins.gpio9.into(),
+    // Pads 39-42 come out of reset owned by JTAG (IO_MUX F0 = MTCK/MTDO/MTDI/MTMS;
+    // MTDI and MTMS are input-only there, so a GPIO "output" never reaches the
+    // pin). PinDriver calls only gpio_set_direction, which leaves IO_MUX MCU_SEL
+    // alone — gpio_config is what claims the pad for the GPIO matrix. Without
+    // this, board B's RESET (41) and PWDN (42) are undriven and its chip never
+    // enumerates. MOSI (40) is claimed by the SPI driver itself.
+    let jtag_pad_reclaim = esp_idf_svc::sys::gpio_config_t {
+        pin_bit_mask: (1u64 << 41) | (1u64 << 42),
+        mode: esp_idf_svc::sys::gpio_mode_t_GPIO_MODE_OUTPUT,
+        pull_up_en: esp_idf_svc::sys::gpio_pullup_t_GPIO_PULLUP_DISABLE,
+        pull_down_en: esp_idf_svc::sys::gpio_pulldown_t_GPIO_PULLDOWN_DISABLE,
+        intr_type: esp_idf_svc::sys::gpio_int_type_t_GPIO_INTR_DISABLE,
     };
+    esp_idf_svc::sys::esp!(unsafe { esp_idf_svc::sys::gpio_config(&jtag_pad_reclaim) })?;
+
+    let adc_wiring = [
+        // Board A, right-column ribbon, on SPI2.
+        adc::AdcChipWiring {
+            sclk: peripherals.pins.gpio12.into(),
+            data_in: peripherals.pins.gpio7.into(),   // MOSI
+            data_out: peripherals.pins.gpio13.into(), // MISO
+            power_down: peripherals.pins.gpio9.into(),
+            chip_select: peripherals.pins.gpio11.into(),
+            start: peripherals.pins.gpio10.into(),
+            reset: peripherals.pins.gpio8.into(),
+            data_ready: peripherals.pins.gpio44.into(),
+        },
+        // Board B, left-column ribbon, on SPI3.
+        adc::AdcChipWiring {
+            sclk: peripherals.pins.gpio4.into(),
+            data_in: peripherals.pins.gpio40.into(), // MOSI
+            data_out: peripherals.pins.gpio2.into(), // MISO
+            power_down: peripherals.pins.gpio42.into(),
+            chip_select: peripherals.pins.gpio5.into(),
+            start: peripherals.pins.gpio6.into(),
+            reset: peripherals.pins.gpio41.into(),
+            data_ready: peripherals.pins.gpio1.into(),
+        },
+    ];
 
     // The model's own quantisation scale, read straight off the blob header so the ADC
-    // path produces int8 on the same footing training used.
+    // path produces int8 on the same footing training used. These are normalised units
+    // per count, not microvolts per count; `adc::conditioning` documents the difference
+    // and the acquisition path is what puts the signal on that footing.
     let input_scale = emg_runtime::VerifyBatch::new(MODEL_BIN).input_scale;
 
-    // Bring-up blocks ~4.4 s on the ADS1298's mandated settling delays, so it must run
+    // Bring-up blocks ~2.5 s on the ADS1298's mandated settling delays, so it must run
     // before the code below registers the task watchdog.
     //
     // A failure here must not propagate out of `main`. The serve loop below is the only
@@ -208,14 +259,18 @@ fn main() -> anyhow::Result<()> {
     // and provisioning still works. `{error:#}` prints the whole context chain, which
     // is where the useful part lives (an ID-register mismatch names wiring, power, or
     // chip select as the suspects).
-    let source = match adc::bring_up(
+    //
+    // No conversion clock to start: both chips self-clock (CLKSEL at 3V3), and
+    // no clock wire exists in the harness.
+    let adc_result = adc::bring_up(
         peripherals.spi2,
-        adc_pins,
+        peripherals.spi3,
+        adc_wiring,
         ADC_SPI_BAUD_RATE_HZ,
         ADC_TEST_SIGNAL_CHANNEL,
     )
-    .and_then(|pair| adc::acquisition::start(pair, model.input_len, input_scale))
-    {
+    .and_then(|front_ends| adc::acquisition::start(front_ends, model.input_len, input_scale));
+    let source = match adc_result {
         Ok(source) => Some(source),
         Err(error) => {
             error!("ADC bring-up failed: {error:#}");
@@ -264,7 +319,7 @@ fn main() -> anyhow::Result<()> {
         let next_window = source
             .as_ref()
             .and_then(|source| Some((source, source.try_next_window()?)));
-        let Some((source, (input, window_t0_us))) = next_window else {
+        let Some((source, window)) = next_window else {
             // Nothing to warn about when there is no front end at all: the stall
             // warning is for one that came up and then went quiet.
             if let Some(source) = source.as_ref() {
@@ -287,6 +342,11 @@ fn main() -> anyhow::Result<()> {
             FreeRtos::delay_ms(IDLE_POLL_MS);
             continue;
         };
+        let AcquiredWindow {
+            input,
+            started_us: window_t0_us,
+            microvolts_per_count,
+        } = window;
         last_window_at = Instant::now();
         stall_reported = false;
         let infer_start = Instant::now();
@@ -308,7 +368,7 @@ fn main() -> anyhow::Result<()> {
                 seq,
                 window_t0_us,
                 &input,
-                source.input_scale(),
+                microvolts_per_count,
                 model.input_len,
                 sample_rate,
             ),
