@@ -10,7 +10,7 @@ use crate::link_policy::{ClaimOutcome, SerialClaimPolicy};
 use crate::logger;
 use crate::transport::{
     Control, SerialTransport, TcpTransport, Transport, SERIAL_CLAIM_TIMEOUT,
-    SERIAL_RECLAIM_COOLDOWN,
+    SERIAL_HOST_ABSENCE_GRACE, SERIAL_RECLAIM_COOLDOWN,
 };
 use crate::wifi;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
@@ -77,7 +77,11 @@ impl Links {
             tcp: None,
             tcp_deliveries,
             want_tcp,
-            claim: SerialClaimPolicy::new(SERIAL_CLAIM_TIMEOUT, SERIAL_RECLAIM_COOLDOWN),
+            claim: SerialClaimPolicy::new(
+                SERIAL_CLAIM_TIMEOUT,
+                SERIAL_RECLAIM_COOLDOWN,
+                SERIAL_HOST_ABSENCE_GRACE,
+            ),
             scratch: Vec::with_capacity(ENCODE_SCRATCH_BYTES),
         })
     }
@@ -125,12 +129,13 @@ impl Links {
             }
         }
 
-        // Expire a serial claim when heartbeats stop or the cable is gone.
-        if self
+        // Expire a serial claim when heartbeats stop or the cable is gone. The cause
+        // is logged because the two point at opposite ends of the link.
+        if let Some(reason) = self
             .claim
             .expire(Instant::now(), self.serial.host_present())
         {
-            info!("serial link released; resuming wifi");
+            info!("serial link released ({reason:?}); resuming wifi");
             self.want_tcp.store(true, Ordering::SeqCst);
         }
 

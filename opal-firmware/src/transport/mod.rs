@@ -6,7 +6,9 @@
 mod serial;
 mod tcp;
 
-pub use serial::{SerialTransport, SERIAL_CLAIM_TIMEOUT, SERIAL_RECLAIM_COOLDOWN};
+pub use serial::{
+    SerialTransport, SERIAL_CLAIM_TIMEOUT, SERIAL_HOST_ABSENCE_GRACE, SERIAL_RECLAIM_COOLDOWN,
+};
 pub use tcp::TcpTransport;
 
 use anyhow::Result;

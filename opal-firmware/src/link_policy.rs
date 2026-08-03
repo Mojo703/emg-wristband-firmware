@@ -37,21 +37,47 @@ pub struct ClaimOutcome {
     pub announce: bool,
 }
 
+/// Why [`SerialClaimPolicy::expire`] released a claim, for the release log line —
+/// the two causes point at opposite ends of the cable and were once
+/// indistinguishable, which cost a day of misattributed flap debugging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseReason {
+    /// No probe or heartbeat inside the claim timeout.
+    HeartbeatsStale,
+    /// The USB host stayed absent past the absence grace.
+    HostAbsent,
+}
+
 /// State machine for the serial link's claim on the data stream.
 pub struct SerialClaimPolicy {
     claim_timeout: Duration,
     reclaim_cooldown: Duration,
+    /// How long `host_present` must read false, continuously, before the claim
+    /// releases. The USB connected flag is a noisy instantaneous sample — measured
+    /// on the bench it blips false for one poll about every two minutes on a
+    /// perfectly healthy link — and a single bad sample releasing the claim cascades
+    /// into a wifi dial, a registry churn, and the dashboard flashing the device
+    /// offline. A genuinely unplugged host also stops heartbeating, so the claim
+    /// timeout backstops detection even if the flag were never sampled false.
+    host_absence_grace: Duration,
     claimed_at: Option<Instant>,
     stalled_at: Option<Instant>,
+    host_absent_since: Option<Instant>,
 }
 
 impl SerialClaimPolicy {
-    pub fn new(claim_timeout: Duration, reclaim_cooldown: Duration) -> Self {
+    pub fn new(
+        claim_timeout: Duration,
+        reclaim_cooldown: Duration,
+        host_absence_grace: Duration,
+    ) -> Self {
         Self {
             claim_timeout,
             reclaim_cooldown,
+            host_absence_grace,
             claimed_at: None,
             stalled_at: None,
+            host_absent_since: None,
         }
     }
 
@@ -102,17 +128,27 @@ impl SerialClaimPolicy {
     }
 
     /// Release the claim when heartbeats have stopped for `claim_timeout` or the USB
-    /// host is gone. Returns true when a live claim was released.
-    pub fn expire(&mut self, now: Instant, host_present: bool) -> bool {
-        let Some(claimed_at) = self.claimed_at else {
-            return false;
-        };
-        if now.saturating_duration_since(claimed_at) > self.claim_timeout || !host_present {
-            self.claimed_at = None;
-            true
-        } else {
-            false
+    /// host has stayed absent past the grace (see [`Self::host_absence_grace`]).
+    /// Returns the cause when a live claim was released.
+    pub fn expire(&mut self, now: Instant, host_present: bool) -> Option<ReleaseReason> {
+        if host_present {
+            self.host_absent_since = None;
+        } else if self.host_absent_since.is_none() {
+            self.host_absent_since = Some(now);
         }
+        let claimed_at = self.claimed_at?;
+        if now.saturating_duration_since(claimed_at) > self.claim_timeout {
+            self.claimed_at = None;
+            return Some(ReleaseReason::HeartbeatsStale);
+        }
+        if self
+            .host_absent_since
+            .is_some_and(|since| now.saturating_duration_since(since) > self.host_absence_grace)
+        {
+            self.claimed_at = None;
+            return Some(ReleaseReason::HostAbsent);
+        }
+        None
     }
 }
 
@@ -122,10 +158,11 @@ mod tests {
 
     const CLAIM_TIMEOUT: Duration = Duration::from_secs(5);
     const RECLAIM_COOLDOWN: Duration = Duration::from_secs(60);
+    const HOST_ABSENCE_GRACE: Duration = Duration::from_secs(2);
 
     fn policy() -> (SerialClaimPolicy, Instant) {
         (
-            SerialClaimPolicy::new(CLAIM_TIMEOUT, RECLAIM_COOLDOWN),
+            SerialClaimPolicy::new(CLAIM_TIMEOUT, RECLAIM_COOLDOWN, HOST_ABSENCE_GRACE),
             Instant::now(),
         )
     }
@@ -196,7 +233,7 @@ mod tests {
         policy.on_probe(start);
         policy.on_heartbeat(start + Duration::from_secs(4));
         // 7 s after the probe but only 3 s after the heartbeat: still claimed.
-        assert!(!policy.expire(start + Duration::from_secs(7), true));
+        assert_eq!(policy.expire(start + Duration::from_secs(7), true), None);
         assert!(policy.is_claimed());
     }
 
@@ -204,24 +241,52 @@ mod tests {
     fn claim_expires_after_heartbeat_silence() {
         let (mut policy, start) = policy();
         policy.on_probe(start);
-        assert!(!policy.expire(start + Duration::from_secs(5), true));
-        assert!(policy.expire(start + Duration::from_secs(6), true));
+        assert_eq!(policy.expire(start + Duration::from_secs(5), true), None);
+        assert_eq!(
+            policy.expire(start + Duration::from_secs(6), true),
+            Some(ReleaseReason::HeartbeatsStale)
+        );
         assert!(!policy.is_claimed());
     }
 
     #[test]
-    fn claim_expires_immediately_when_host_unplugged() {
+    fn a_momentary_host_absence_does_not_release() {
+        // The USB connected flag is a noisy instantaneous sample: on a healthy bench
+        // link it reads false for a single poll about every two minutes, and one bad
+        // sample releasing the claim cascades into a wifi dial and a dashboard
+        // offline flash.
         let (mut policy, start) = policy();
         policy.on_probe(start);
-        assert!(policy.expire(start + Duration::from_secs(1), false));
+        assert_eq!(policy.expire(start + Duration::from_secs(1), false), None);
+        // The host reads present again on the next poll: the absence run resets.
+        assert_eq!(policy.expire(start + Duration::from_secs(2), true), None);
+        assert_eq!(policy.expire(start + Duration::from_secs(4), false), None);
+        assert!(policy.is_claimed());
+    }
+
+    #[test]
+    fn a_sustained_host_absence_releases() {
+        let (mut policy, start) = policy();
+        policy.on_probe(start);
+        // Heartbeats keep flowing (claim refreshed) while the host reads absent, so
+        // the release is attributable to the absence alone.
+        assert_eq!(policy.expire(start + Duration::from_secs(1), false), None);
+        policy.on_heartbeat(start + Duration::from_secs(2));
+        assert_eq!(
+            policy.expire(
+                start + Duration::from_secs(1) + HOST_ABSENCE_GRACE + Duration::from_millis(1),
+                false
+            ),
+            Some(ReleaseReason::HostAbsent)
+        );
         assert!(!policy.is_claimed());
     }
 
     #[test]
     fn expire_without_a_claim_reports_nothing() {
         let (mut policy, start) = policy();
-        assert!(!policy.expire(start, true));
-        assert!(!policy.expire(start, false));
+        assert_eq!(policy.expire(start, true), None);
+        assert_eq!(policy.expire(start, false), None);
     }
 
     #[test]

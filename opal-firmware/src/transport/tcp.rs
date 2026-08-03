@@ -16,6 +16,14 @@ use std::time::Duration;
 /// bound is a link worth abandoning.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How long the reader thread's blocking read may sit before it re-checks `alive`.
+/// This is what lets [`TcpTransport`]'s `Drop` stay off the socket entirely: the
+/// main task only flips the flag, and the reader — the one thread that owns socket
+/// I/O — notices within this bound, exits, and releases the last `Arc`, closing the
+/// socket from its own thread. lwIP calls from a task that doesn't own the socket
+/// I/O can block indefinitely, and the main loop blocking is a task-watchdog panic.
+const READ_POLL_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// Dials the dashboard over TCP. Writes happen synchronously on the caller's thread,
 /// straight from the shared encode scratch — no per-frame copy, no send queue, no
 /// writer thread. Every multi-kilobyte per-frame allocation this path has ever had
@@ -42,18 +50,21 @@ impl TcpTransport {
         let stream = Arc::new(TcpStream::connect(addr)?);
         stream.set_nodelay(true).ok();
         stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
+        stream.set_read_timeout(Some(READ_POLL_TIMEOUT))?;
         let alive = Arc::new(AtomicBool::new(true));
         let (tx, rx) = mpsc::channel();
 
         // The reader runs lwIP internals and (on error paths) the logger's
-        // formatting; 6 KB stacks were within canary distance of overflow.
+        // formatting; 6 KB stacks were within canary distance of overflow. It takes
+        // its own `Arc`, and being the last holder is the point: the socket closes
+        // on this thread, never on the main task (see [`READ_POLL_TIMEOUT`]).
         {
             let reader = Arc::clone(&stream);
             let alive = Arc::clone(&alive);
             std::thread::Builder::new()
                 .stack_size(8192)
                 .spawn(move || {
-                    read_loop(&reader, tx);
+                    read_loop(&reader, &alive, tx);
                     alive.store(false, Ordering::SeqCst);
                 })?;
         }
@@ -67,13 +78,22 @@ impl TcpTransport {
     }
 }
 
-fn read_loop(reader: &TcpStream, tx: mpsc::Sender<Control>) {
+fn read_loop(reader: &TcpStream, alive: &AtomicBool, tx: mpsc::Sender<Control>) {
     let mut reader = reader;
     let mut scanner = FrameScanner::new();
     let mut chunk = [0u8; 1024];
-    loop {
+    while alive.load(Ordering::SeqCst) {
         let n = match reader.read(&mut chunk) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break,
+            // The read timeout is the liveness poll, not an error: loop back and
+            // re-check `alive`.
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(_) => break,
             Ok(n) => n,
         };
         scanner.extend(&chunk[..n]);
@@ -105,10 +125,12 @@ impl Transport for TcpTransport {
 
 impl Drop for TcpTransport {
     fn drop(&mut self) {
-        // Shutdown rather than relying on the fd closing: the reader thread holds
-        // its own `Arc` and sits in a blocking read, so without this the socket —
-        // and the thread — would outlive the transport indefinitely.
-        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+        // Only flag the closure — never touch the socket from here. Drop runs on
+        // the main task (a fresh serial claim hangs up TCP by dropping it), and an
+        // lwIP call from a thread that doesn't own the socket I/O can block
+        // indefinitely — which, on the main loop, is a task-watchdog panic. The
+        // reader notices the flag within its read-poll bound and closes the socket
+        // from its own thread.
         self.alive.store(false, Ordering::SeqCst);
     }
 }

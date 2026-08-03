@@ -9,7 +9,24 @@ use std::time::Duration;
 
 /// A probed serial link stays the data link as long as dashboard heartbeats keep
 /// arriving within this window (they come every ~2 s).
-pub const SERIAL_CLAIM_TIMEOUT: Duration = Duration::from_secs(5);
+///
+/// The window has to outlast the main loop's own worst-case absence from the serial
+/// RX path, because heartbeats are only *seen* when `links.poll` runs: one EMG frame
+/// sent in [`SERIAL_WRITE_CHUNK_BYTES`] chunks may legally block up to several
+/// seconds against a host whose reader is scheduled away, and heartbeats that
+/// arrived mid-send sit unread the whole time. Fifteen seconds is seven missed
+/// heartbeats on top of that worst case — a host that silent is genuinely gone, and
+/// every false release cascades: wifi dial, registry churn, the dashboard flashing
+/// the device offline.
+pub const SERIAL_CLAIM_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How long the USB host must read as continuously absent before a claim releases.
+/// The connected flag is an instantaneous sample and blips false about every two
+/// minutes on a healthy bench link (measured 2026-08-03, ~110 s period, both at a
+/// 5 s and a 15 s claim timeout — the blip, not the timeout, drove every release).
+/// Two seconds of grace rides those out; a real unplug also stops heartbeats, so
+/// [`SERIAL_CLAIM_TIMEOUT`] backstops detection regardless.
+pub const SERIAL_HOST_ABSENCE_GRACE: Duration = Duration::from_secs(2);
 
 /// After a stalled serial write releases the claim, plain heartbeats may not re-claim
 /// the link until this much time has passed. The backend heartbeats every ~2 s whether
