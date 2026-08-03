@@ -5,6 +5,25 @@ use core::fmt;
 /// Analog input channels on one ADS1298.
 pub(crate) const CHANNELS_PER_DEVICE: usize = 8;
 
+/// ADS1298s on the front end.
+///
+/// Two self-clocked boards, each on its own SPI bus with its own chip select,
+/// START, RESET, PWDN, and DRDY. [`model_slot`] covers all sixteen slots, the
+/// conditioner sizes itself to match, and `preprocess` documents the
+/// synchronisation the pair has to satisfy for the layout to be honest.
+pub(crate) const DEVICE_COUNT: usize = 2;
+
+/// Which of the model's input slots device `device_index` fills with `channel`.
+///
+/// Devices take contiguous blocks in index order, so device 0 owns slots 0..8 and
+/// device 1 owns slots 8..16. That ordering is not arbitrary — it is the order the
+/// two-chip cascade presented its channels in when the training set was recorded, and
+/// the model learned a spatial pattern across them. Reordering it silently costs
+/// accuracy in a way no test here would catch.
+pub(crate) const fn model_slot(device_index: usize, channel: Channel) -> usize {
+    device_index * CHANNELS_PER_DEVICE + channel.index()
+}
+
 /// A zero-indexed channel on one device, guaranteed to sit in
 /// `0..CHANNELS_PER_DEVICE`.
 ///
