@@ -237,6 +237,12 @@ impl<const CHANNELS: usize> SignalConditioner<CHANNELS> {
 
     /// This channel's current amplitude estimate in microvolts, or `None` while it is
     /// warming up.
+    ///
+    /// The tests below are the only readers now that the wire carries raw counts at a
+    /// fixed scale: nothing outside this module needs the estimate, but it is the one
+    /// window onto whether the normalisation is tracking, so the tests assert on it
+    /// rather than inferring it from quantised output.
+    #[allow(dead_code)]
     pub(super) fn amplitude_microvolts(&self, channel: usize) -> Option<f32> {
         self.channels.get(channel)?.amplitude.amplitude()
     }

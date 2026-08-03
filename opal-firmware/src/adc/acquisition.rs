@@ -21,15 +21,23 @@
 //! because its peer died would re-expose it for nothing. Only the sick chip's START
 //! drops; the other keeps converting through its peer's whole recovery.
 //!
+//! Each emitted time step goes into two windows at once: the conditioned int8 the
+//! model reads, and the raw ADC counts the wire and recorded sessions carry (see
+//! [`super::preprocess::wire_time_step`]). Only the first is normalised per channel;
+//! the second is the measurement at a fixed scale, which is what makes a recording
+//! comparable to anything recorded on another day.
+//!
 //! The channel is the whole handoff. The producer blocks on the DRDY interrupts, so
 //! it never starves the idle task. The consumer never blocks: the main loop also
 //! services the links, so waiting here would hold control frames and heartbeats
 //! behind a window that is 250 ms away.
 //!
-//! Depth is two, and overflow is counted rather than absorbed. Inference takes about
-//! 14 ms against a 250 ms window, so the consumer is roughly eighteen times faster than
-//! the producer. A full channel means something is badly wrong, not that the buffer was
-//! sized too small.
+//! The consumer drains the whole queue rather than keeping the newest, because the
+//! stream is recorded: a window that arrives late is still data, and a window
+//! dropped for being 250 ms stale is a hole in the training set. Latency semantics
+//! are unchanged — the main loop still classifies only the newest of a drained batch.
+//! What the queue cannot do is grow: [`QUEUE_DEPTH`] documents the heap that stops it.
+//! Overflow past it is counted, not absorbed.
 
 use anyhow::Result;
 use emg_runtime::model::INPUT_CH;
@@ -45,14 +53,31 @@ use crate::device_now_us as now_us;
 
 use super::ads1298::SAMPLE_RATE_HZ;
 use super::channel::DEVICE_COUNT;
-use super::convert::code_to_voltage;
+use super::convert::{code_to_voltage, GAIN, REFERENCE_VOLTS};
 use super::decode::Sample;
-use super::preprocess::InputStage;
+use super::preprocess::{wire_time_step, InputStage};
 use super::status::describe_status_word;
 use super::FrontEnds;
 
-/// Windows the channel will hold. One in flight plus one being handed over is all the
-/// slack the timing budget calls for.
+/// Windows the channel will hold.
+///
+/// The depth is not about the consumer's speed — inference is far inside the window
+/// period — but about how long a link write may stall before recorded data starts
+/// going missing. It wants to be deeper than this. Heap is what stops it, measured
+/// rather than assumed:
+///
+/// - one window is 8 KB of int8 model input plus 16 KB of raw i16;
+/// - one EMG frame transiently holds three copies of its samples — the 16 KB
+///   channel-major blob, up to 24 KB of delta+varint packing (raw counts on a railed
+///   input barely compress), and the CBOR encoding the transport writes;
+/// - the perf log reports ~133 KB free in steady state with wifi associated, against
+///   246 KB at boot before lwIP takes its buffers.
+///
+/// So a catch-up burst at depth two needs ~48 KB of queued windows on top of ~64 KB of
+/// per-frame transients, and that is already most of the headroom — and total free heap
+/// flatters it, since every one of these is a large contiguous allocation. Raising the
+/// depth is a heap change first: shrink the three copies per frame, then buy more
+/// windows. Overflow past the depth is counted ([`Counters::dropped`]), not absorbed.
 const QUEUE_DEPTH: usize = 2;
 
 /// Stack for the acquisition thread. It holds no large locals (one window buffer lives
@@ -120,7 +145,7 @@ const REFERENCE_SETTLE_AFTER_RECOVERY_US: u64 = 300_000;
 /// settling window; the cold path used to ship those first frames.
 const COLD_START_SETTLE_US: u64 = 10_000;
 
-/// One window of model input, time-major `[t, c]` to match [`emg_runtime::tensor`],
+/// One window of both streams, time-major `[t, c]` to match [`emg_runtime::tensor`],
 /// stamped with when its first sample was read off the chips.
 struct Window {
     /// Device-clock microseconds at the first time step of this window. This is the
@@ -129,13 +154,13 @@ struct Window {
     /// `seq × window_us` timeline would silently paper over. Consumers anchoring
     /// this timeline to their own clock see data stay put instead of drifting.
     started_us: u64,
+    /// Conditioned model input. Never leaves the device.
     samples: Vec<i8>,
-    /// Microvolts per int8 count for *this* window. It travels with the samples rather
-    /// than sitting on [`AdcSource`] because it is no longer a constant: each channel
-    /// is scaled by its own running amplitude estimate, so the conversion back to real
-    /// units drifts with the electrodes. See
-    /// [`InputStage::microvolts_per_count`].
-    microvolts_per_count: f32,
+    /// The same time steps as raw ADC counts at
+    /// [`super::MICROVOLTS_PER_WIRE_COUNT`]. This is what the wire carries and what a
+    /// recorded session stores, so it is accumulated alongside rather than derived
+    /// from `samples` — the conditioning is not invertible.
+    wire_samples: Vec<i16>,
 }
 
 /// A window handed to the main loop, with everything needed to describe it on the wire.
@@ -143,8 +168,9 @@ pub(crate) struct AcquiredWindow {
     pub(crate) input: I8Activation,
     /// Device-clock microseconds at the window's first sample.
     pub(crate) started_us: u64,
-    /// Microvolts per int8 count, for display. See [`Window::microvolts_per_count`].
-    pub(crate) microvolts_per_count: f32,
+    /// Raw counts for the wire, channel-major transposed by [`crate::frames::emg`].
+    /// See [`Window::wire_samples`].
+    pub(crate) wire_samples: Vec<i16>,
 }
 
 /// Where the time between one chip's DRDY edges actually goes.
@@ -286,8 +312,11 @@ pub(crate) struct AdcSource {
 }
 
 impl AdcSource {
-    /// Windows the producer could not hand over, cumulative since boot. Non-zero means
-    /// the main loop is not draining as fast as the ADCs fill.
+    /// Windows lost outright, cumulative since boot: the channel was full at
+    /// [`QUEUE_DEPTH`] when a window came ready, so it was never handed over. Since the
+    /// consumer drains the whole backlog, this only moves when the main loop has been
+    /// away for longer than the queue covers — a wedged link write, not a slow
+    /// consumer. Every one is a hole in a recording.
     pub(crate) fn dropped_windows(&self) -> u32 {
         self.counters.dropped.load(Ordering::Relaxed)
     }
@@ -318,34 +347,34 @@ impl AdcSource {
         self.counters.clock_slips.load(Ordering::Relaxed)
     }
 
-    /// The newest window and the device-clock time of its first sample, or `None`
-    /// if none is waiting. Never blocks.
+    /// Every window waiting, oldest first, or empty if none is. Never blocks.
     ///
-    /// If more than one has queued up, this discards the older ones and counts them.
-    /// A gesture recogniser wants the most recent 250 ms of muscle activity, not a
-    /// backlog it will never catch up on.
-    pub(crate) fn try_next_window(&self) -> Option<AcquiredWindow> {
-        let mut window = self.windows.try_recv().ok()?;
-        while let Ok(newer) = self.windows.try_recv() {
-            self.counters.dropped.fetch_add(1, Ordering::Relaxed);
-            window = newer;
+    /// The whole backlog comes out because the stream is recorded: the caller sends
+    /// each window on the wire in order and classifies only the last, so a link stall
+    /// costs latency on the decision rather than a gap in the data. Nothing is
+    /// discarded here — [`Counters::dropped`] now only counts what the producer could
+    /// not hand over at all.
+    pub(crate) fn drain_windows(&self) -> Vec<AcquiredWindow> {
+        let mut drained = Vec::new();
+        while let Ok(window) = self.windows.try_recv() {
+            // `I8Activation::from_i8_slice` asserts on a length mismatch, and an assert
+            // here is a reboot with no console, so check it first.
+            let expected = self.window_length * INPUT_CH;
+            if window.samples.len() != expected || window.wire_samples.len() != expected {
+                warn!(
+                    "discarding malformed window: {} model samples, {} wire samples, expected {expected} of each",
+                    window.samples.len(),
+                    window.wire_samples.len()
+                );
+                continue;
+            }
+            drained.push(AcquiredWindow {
+                input: I8Activation::from_i8_slice(&window.samples, self.window_length, INPUT_CH),
+                started_us: window.started_us,
+                wire_samples: window.wire_samples,
+            });
         }
-
-        // `I8Activation::from_i8_slice` asserts on a length mismatch, and an assert
-        // here is a reboot with no console, so check it first.
-        let expected = self.window_length * INPUT_CH;
-        if window.samples.len() != expected {
-            warn!(
-                "discarding malformed window: {} samples, expected {expected}",
-                window.samples.len()
-            );
-            return None;
-        }
-        Some(AcquiredWindow {
-            input: I8Activation::from_i8_slice(&window.samples, self.window_length, INPUT_CH),
-            started_us: window.started_us,
-            microvolts_per_count: window.microvolts_per_count,
-        })
+        drained
     }
 }
 
@@ -377,6 +406,9 @@ pub(crate) fn start(
             // filter state across frames, and this thread is the only writer.
             let mut input_stage = InputStage::new(input_scale, SAMPLE_RATE_HZ as f32);
             let mut building: Vec<i8> = Vec::with_capacity(samples_per_window);
+            // The wire stream, filled in lockstep with `building`; the two are always
+            // the same length and are cleared together.
+            let mut building_wire: Vec<i16> = Vec::with_capacity(samples_per_window);
             // Device-clock time of the first time step in `building`; stamped when
             // the first samples land, cleared with the buffer.
             let mut building_started_us: u64 = 0;
@@ -403,6 +435,7 @@ pub(crate) fn start(
                         warn!("chip {index} warm recovery failed: {error}");
                     }
                     building.clear();
+                    building_wire.clear();
                     pending[index] = None;
                     // That chip's stream is about to jump: the reset pulse
                     // re-settles its reference and its electrodes may come back
@@ -562,12 +595,14 @@ pub(crate) fn start(
                     }
                     states[index].consecutive_bad_status = 0;
 
-                    // TEMP bench diagnostic (see ChipState): 2.4 V reference and
-                    // gain 6, matching `preprocess`.
+                    // TEMP bench diagnostic (see ChipState), on the same reference and
+                    // gain constants the conversion path uses.
                     let frame_mean_abs: f32 = frame
                         .channels
                         .iter()
-                        .map(|&code| (code_to_voltage(code, 2.4, 6.0) * 1_000_000.0).abs())
+                        .map(|&code| {
+                            (code_to_voltage(code, REFERENCE_VOLTS, GAIN) * 1_000_000.0).abs()
+                        })
                         .sum::<f32>()
                         / frame.channels.len() as f32;
                     states[index].abs_microvolt_sum += frame_mean_abs;
@@ -607,6 +642,7 @@ pub(crate) fn start(
                     building_started_us = woke_us;
                 }
                 building.extend_from_slice(&input_stage.time_step(&frames));
+                building_wire.extend_from_slice(&wire_time_step(&frames));
 
                 if building.len() >= samples_per_window {
                     let full = Window {
@@ -615,7 +651,10 @@ pub(crate) fn start(
                             &mut building,
                             Vec::with_capacity(samples_per_window),
                         ),
-                        microvolts_per_count: input_stage.microvolts_per_count(),
+                        wire_samples: std::mem::replace(
+                            &mut building_wire,
+                            Vec::with_capacity(samples_per_window),
+                        ),
                     };
                     match sender.try_send(full) {
                         Ok(()) => {}

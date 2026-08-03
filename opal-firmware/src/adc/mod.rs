@@ -38,6 +38,7 @@ mod status;
 
 pub(crate) use channel::Channel;
 use channel::DEVICE_COUNT;
+pub(crate) use convert::MICROVOLTS_PER_WIRE_COUNT;
 
 use anyhow::{Context, Result};
 use esp_idf_svc::hal::delay::FreeRtos;

@@ -11,7 +11,7 @@
 //!
 //! | File | What it is |
 //! |------|------------|
-//! | `emg.i16` | The raw stream: little-endian `i16`, channel-major per window, windows concatenated in `seq` order, exactly as received in `Frame::Emg`. Never windowed, never filtered. |
+//! | `emg.i16` | The raw stream: little-endian `i16`, channel-major per window, windows concatenated in `seq` order, exactly as received in `Frame::Emg`. Never windowed, never filtered. Raw ADC counts; [`HardwareIdentity::scale_uv`] is the µV per count they convert back with. |
 //! | `events.jsonl` | One [`SessionEvent`] as JSON per line, in time order. Self-contained: a windowing tool needs nothing else to label `emg.i16`. |
 //! | `session.json` | The [`SessionManifest`]: tags, hardware identity, track, goal. |
 //! | `video.mkv` | Webcam capture, present when the camera ran. |
@@ -44,6 +44,9 @@ pub struct HardwareIdentity {
     pub transport: DeviceTransport,
     pub channels: u16,
     pub sample_rate: u32,
+    /// Microvolts per count in `emg.i16`. Fixed by the front end's reference and gain,
+    /// so it describes the whole file rather than the window it was read from — the
+    /// stored samples are uninterpretable without it.
     pub scale_uv: f32,
     /// The device's full functional config at session start, verbatim.
     pub device_config: DeviceConfig,

@@ -449,12 +449,29 @@
       ctx.lineTo(width, laneTop);
       ctx.stroke();
 
-      // Auto-gain peak over the (decimated) visible samples.
+      // Display-time DC removal, per lane. The device sends raw ADC counts, so every
+      // lane rides on its own electrode offset — routinely tens of millivolts against
+      // a signal of tens of microvolts. Left in, the offset alone would set the
+      // auto-gain below and squash the trace flat against the lane midline. The mean
+      // comes from the same decimated pass the peak does, so this costs one extra
+      // walk over ~2 samples per column and nothing per drawn sample.
+      let sum = 0;
+      let counted = 0;
+      for (let a = startAbs; a <= stream.newestAbs; a += stride) {
+        const pos = a % stream.capacity;
+        if (stream.ringAbs[pos] === a) {
+          sum += ring[pos]!;
+          counted++;
+        }
+      }
+      const mean = counted > 0 ? sum / counted : 0;
+
+      // Auto-gain peak over the (decimated) visible samples, around that mean.
       let peak = 1e-6;
       for (let a = startAbs; a <= stream.newestAbs; a += stride) {
         const pos = a % stream.capacity;
         if (stream.ringAbs[pos] === a) {
-          const av = Math.abs(ring[pos]!);
+          const av = Math.abs(ring[pos]! - mean);
           if (av > peak) peak = av;
         }
       }
@@ -478,7 +495,7 @@
           if (stream.ringAbs[pos] === a) {
             let col = colFrac | 0;
             if (col >= cols) col = cols - 1;
-            const v = ring[pos]!;
+            const v = ring[pos]! - mean;
             const colMinVal = colMin[col]!;
             const colMaxVal = colMax[col]!;
             if (!(v >= colMinVal)) colMin[col] = v;
@@ -508,7 +525,7 @@
           }
           const t = stream.anchorMs + a * stream.msPerSample;
           const x = (((t % spanMs) + spanMs) % spanMs) * invSpan * cols;
-          const y = midY - ring[pos]! * gain;
+          const y = midY - (ring[pos]! - mean) * gain;
           if (drawing) {
             ctx.lineTo(x, y);
           } else {

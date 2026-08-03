@@ -7,6 +7,11 @@
 //! (sensitivity, keymap, wifi) and honors browser control frames, persisting them to
 //! NVS.
 //!
+//! The EMG frames carry raw ADC counts at a fixed scale, not the conditioned model
+//! input (`frames::emg` says why), and every window the ADC thread produces is sent
+//! even if the loop fell behind — the host records this stream, so continuity is worth
+//! more than dropping stale windows. The classifier still only sees the newest.
+//!
 //! Links: the USB-Serial-JTAG CDC transport exists from boot and is always polled, so
 //! provisioning over USB works no matter what wifi is doing. When wifi credentials
 //! are configured, a link thread associates and dials the dashboard in the
@@ -73,8 +78,9 @@ const IDLE_POLL_MS: u32 = 5;
 /// normal jitter never trips it, short enough to notice a stalled ADC quickly.
 const STALL_WARNING_MS: u128 = 1000;
 
-/// Windows between periodic performance log lines (~31 s at the 244 ms window
-/// period). Long enough that the log stays single events, not spam.
+/// Batches between periodic performance log lines (~31 s at the 244 ms window
+/// period, since a batch is normally one window). Long enough that the log stays
+/// single events, not spam.
 const PERF_LOG_INTERVAL: u32 = 128;
 
 /// Running inference-latency, total-processing-latency, and loop-throughput stats
@@ -85,7 +91,12 @@ const PERF_LOG_INTERVAL: u32 = 128;
 #[derive(Default)]
 struct PerfStats {
     interval_start: Option<Instant>,
+    /// Batches recorded, which is also the number of inferences: one per batch,
+    /// whatever the backlog was.
     count: u32,
+    /// Windows sent across those batches. Equal to `count` except while catching up
+    /// after a link stall, and the difference is exactly how much catching up happened.
+    windows: u32,
     infer_sum_us: u64,
     infer_max_us: u64,
     total_sum_us: u64,
@@ -96,15 +107,17 @@ struct PerfStats {
 }
 
 impl PerfStats {
-    /// Record one window's inference time and total processing time (inference
-    /// through frame send, excluding the intentional real-time pacing sleep);
-    /// logs and resets every [`PERF_LOG_INTERVAL`] windows.
-    fn record(&mut self, infer_us: u64, total_us: u64, dropped_total: u32) {
+    /// Record one batch: its inference time (the newest window only), its total
+    /// processing time (inference through frame send, excluding the intentional
+    /// real-time pacing sleep), and how many windows it carried. Logs and resets every
+    /// [`PERF_LOG_INTERVAL`] batches.
+    fn record(&mut self, infer_us: u64, total_us: u64, windows: usize, dropped_total: u32) {
         let start = *self.interval_start.get_or_insert_with(Instant::now);
         if self.count == 0 {
             self.dropped_at_interval_start = dropped_total;
         }
         self.count += 1;
+        self.windows += windows as u32;
         self.infer_sum_us += infer_us;
         self.infer_max_us = self.infer_max_us.max(infer_us);
         self.total_sum_us += total_us;
@@ -113,11 +126,15 @@ impl PerfStats {
         if self.count >= PERF_LOG_INTERVAL {
             let infer_mean_us = self.infer_sum_us / self.count as u64;
             let total_mean_us = self.total_sum_us / self.count as u64;
-            let throughput_hz = self.count as f64 / start.elapsed().as_secs_f64();
+            let throughput_hz = self.windows as f64 / start.elapsed().as_secs_f64();
             let dropped = dropped_total.saturating_sub(self.dropped_at_interval_start);
+            // Free heap rides along because the window buffers are now the biggest
+            // transient allocation on the device (see `acquisition::QUEUE_DEPTH`), and
+            // an out-of-memory abort here would otherwise arrive with no warning.
+            let free_heap_kilobytes = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() / 1024 };
             info!(
-                "inference: mean {infer_mean_us} us | max {} us || total processing: mean {total_mean_us} us | max {} us || throughput {throughput_hz:.1} windows/sec (over {} windows) || dropped {dropped}",
-                self.infer_max_us, self.total_max_us, self.count
+                "inference: mean {infer_mean_us} us | max {} us || total processing: mean {total_mean_us} us | max {} us || throughput {throughput_hz:.1} windows/sec ({} windows over {} batches) || dropped {dropped} || free heap {free_heap_kilobytes} KB",
+                self.infer_max_us, self.total_max_us, self.windows, self.count
             );
             *self = PerfStats::default();
         }
@@ -305,21 +322,25 @@ fn main() -> anyhow::Result<()> {
             config_changed |= apply_control(control, &mut settings, &mut pipeline, &store);
         }
 
-        // One window of work. `infer_start` marks where the device's own contribution
-        // to onset-to-output latency begins; acquisition happens upstream of it, on
-        // the ADC thread. `perf.record` below closes it out after the frames are on
-        // the wire.
+        // One batch of work: every window the ADC thread has ready, oldest first.
+        // Usually that is exactly one — the ADCs produce one every ~250 ms and this
+        // loop runs every 5 ms — but a link write that stalled for a second hands back
+        // several at once, and all of them are sent, because the dashboard records
+        // this stream and a missing window is a hole in the training set. Only the
+        // newest is classified: the decision is about now, and running inference per
+        // window would multiply the measured ~58 ms mean (126 ms max) inference cost
+        // through the catch-up burst.
         //
-        // No window yet is the common case, not an error: the ADCs produce one every
-        // ~250 ms and this loop runs every 5 ms. Sleep and come back, so the loop keeps
-        // servicing the links and feeding the watchdog.
+        // No window yet is the common case, not an error. Sleep and come back, so the
+        // loop keeps servicing the links and feeding the watchdog.
         // `source` is `None` when bring-up failed, and the loop then serves links only.
-        // The window carries the source along so the code below can read its counters
+        // The batch carries the source along so the code below can read its counters
         // without unwrapping.
-        let next_window = source
-            .as_ref()
-            .and_then(|source| Some((source, source.try_next_window()?)));
-        let Some((source, window)) = next_window else {
+        let batch = source.as_ref().and_then(|source| {
+            let windows = source.drain_windows();
+            (!windows.is_empty()).then_some((source, windows))
+        });
+        let Some((source, windows)) = batch else {
             // Nothing to warn about when there is no front end at all: the stall
             // warning is for one that came up and then went quiet.
             if let Some(source) = source.as_ref() {
@@ -342,15 +363,12 @@ fn main() -> anyhow::Result<()> {
             FreeRtos::delay_ms(IDLE_POLL_MS);
             continue;
         };
-        let AcquiredWindow {
-            input,
-            started_us: window_t0_us,
-            microvolts_per_count,
-        } = window;
         last_window_at = Instant::now();
         stall_reported = false;
+        // The batch is never empty (checked above), and its last window is the newest.
+        let newest: &AcquiredWindow = windows.last().expect("batch is non-empty");
         let infer_start = Instant::now();
-        let ForwardResult::Logits(raw_logits) = model.forward(&input);
+        let ForwardResult::Logits(raw_logits) = model.forward(&newest.input);
         let infer_us = infer_start.elapsed().as_micros() as u64;
         let logits: [f32; NUM_CLASSES] =
             std::array::from_fn(|class| raw_logits[class] as f32 * model.logit_scale);
@@ -363,32 +381,50 @@ fn main() -> anyhow::Result<()> {
         // from their present line.
         let t_us = device_now_us();
 
-        let mut window_frames = vec![
-            frames::emg(
+        // One EMG frame per drained window, each with its own first-sample timestamp,
+        // in the order they were sampled. Each window is consumed and freed as its
+        // frame goes out, rather than packing the whole batch first: a window is 16 KB
+        // of raw samples and its packed copy is up to 24 KB more, and holding a full
+        // catch-up burst of both at once does not fit the heap the boot log reports.
+        let batch_size = windows.len();
+        let mut newest_seq = seq;
+        for window in windows {
+            newest_seq = seq;
+            let frame = frames::emg(
                 seq,
-                window_t0_us,
-                &input,
-                microvolts_per_count,
+                window.started_us,
+                &window.wire_samples,
                 model.input_len,
                 sample_rate,
-            ),
-            frames::prediction(seq, logits, softmax, &decision, pipeline.tau),
-        ];
-        window_frames.extend(frames::events(prev_wake, &decision, &settings, t_us));
+            );
+            seq = seq.wrapping_add(1);
+            links.send_window(None, std::slice::from_ref(&frame));
+        }
+
+        // The prediction and its events describe the newest window only, and carry its
+        // `seq`, so a consumer can still line the decision up with the data it came from.
+        let mut decision_frames = vec![frames::prediction(
+            newest_seq,
+            logits,
+            softmax,
+            &decision,
+            pipeline.tau,
+        )];
+        decision_frames.extend(frames::events(prev_wake, &decision, &settings, t_us));
 
         let hello = config_changed.then(|| Frame::DeviceHello {
             device_id: device_id.clone(),
             config: settings.to_wire(),
         });
-        links.send_window(hello.as_ref(), &window_frames);
+        links.send_window(hello.as_ref(), &decision_frames);
         perf.record(
             infer_us,
             infer_start.elapsed().as_micros() as u64,
+            batch_size,
             source.dropped_windows(),
         );
 
         prev_wake = decision.wake_state;
-        seq = seq.wrapping_add(1);
     }
 }
 

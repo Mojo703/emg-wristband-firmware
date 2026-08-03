@@ -34,13 +34,22 @@ logger = logging.getLogger("pose-service")
 
 
 def decode_emg(frame: dict[str, Any]) -> np.ndarray:
-    """Convert a CBOR Emg frame into a [channels, time] float array in µV."""
+    """Convert a CBOR Emg frame into a [channels, time] float array in µV.
+
+    The frame carries raw ADC counts, so each channel sits on its own electrode
+    offset — tens of millivolts, against a signal of tens to hundreds of
+    microvolts. Both estimators here read amplitude (the mock takes an RMS
+    directly; emg2pose was trained on high-passed EMG), so the offset has to come
+    off or every window looks maximally activated. Per-channel mean removal over
+    the window is the cheap version of the high-pass the offset calls for.
+    """
     samples = frame["samples"]  # little-endian int16 bytes
     channels = frame["channels"]
     scale_uv = frame["scale_uv"]
     time = len(samples) // 2 // channels
     ints = np.frombuffer(samples, dtype=np.int16).reshape(channels, time)
-    return ints.astype(np.float32) * scale_uv
+    microvolts = ints.astype(np.float32) * scale_uv
+    return microvolts - microvolts.mean(axis=1, keepdims=True)
 
 
 async def handle(websocket: websockets.ServerConnection) -> None:

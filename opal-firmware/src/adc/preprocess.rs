@@ -1,8 +1,14 @@
-//! ADC codes to the model's int8 input.
+//! ADC codes to the model's int8 input, and to the raw counts the wire carries.
 //!
 //! One time step of model input is assembled here from one frame per device. The chain
 //! is: sign-extended code, to volts, to microvolts, through [`conditioning`] to the
 //! model's dimensionless footing, and only then to int8 at the model's `input_scale`.
+//!
+//! [`wire_time_step`] is the other half: the same sixteen slots as raw ADC counts at a
+//! fixed scale, for the dashboard and for recorded sessions. The two streams are
+//! deliberately separate. The model needs conditioned, per-channel-normalised input;
+//! a recording needs the measurement, at a scale that does not move, or it cannot be
+//! trained on later against anything else.
 //!
 //! # The conditioning stage is not optional
 //!
@@ -30,23 +36,15 @@
 
 use super::channel::{model_slot, Channel, CHANNELS_PER_DEVICE, DEVICE_COUNT};
 use super::conditioning::{Microvolts, NormalizedUnits, SignalConditioner};
-use super::convert::code_to_voltage;
+use super::convert::{
+    code_to_voltage, code_to_wire_count, GAIN, MICROVOLTS_PER_VOLT, REFERENCE_VOLTS,
+};
 use crate::adc::decode::Sample;
 use emg_runtime::model::INPUT_CH;
 
 /// The model cannot be fed more channels than it has inputs. If a third device ever
 /// appears, the model has to grow first.
 const _: () = assert!(DEVICE_COUNT * CHANNELS_PER_DEVICE <= INPUT_CH);
-
-/// Internal reference voltage. `config3_for` sets `four_volt_reference: false`, which
-/// selects the 2.4 V reference.
-const REFERENCE_VOLTS: f32 = 2.4;
-
-/// Programmable gain amplifier setting. `configure` writes `Gain::Six` to every CHnSET
-/// register.
-const GAIN: f32 = 6.0;
-
-const MICROVOLTS_PER_VOLT: f32 = 1_000_000.0;
 
 /// Everything between a decoded ADC frame and the model's input vector.
 ///
@@ -118,32 +116,30 @@ impl InputStage {
         self.conditioner
             .reset_channels_after_gap(device_index * CHANNELS_PER_DEVICE, CHANNELS_PER_DEVICE);
     }
+}
 
-    /// Microvolts per int8 count, for consumers that want to plot the window in real
-    /// units.
-    ///
-    /// This is a reconstruction, not a constant. Each channel is divided by its own
-    /// amplitude before quantisation, so strictly there is one conversion per channel;
-    /// this reports the mean over the warmed-up channels, which is the single number
-    /// the wire format has room for. It is right in magnitude and right on average,
-    /// and it is only ever used for display.
-    ///
-    /// Falls back to the raw `input_scale` before any channel has warmed up, when every
-    /// sample is zero anyway and the value cannot matter.
-    pub(super) fn microvolts_per_count(&self) -> f32 {
-        let mut total = 0.0;
-        let mut warm = 0u32;
-        for slot in 0..INPUT_CH {
-            if let Some(amplitude) = self.conditioner.amplitude_microvolts(slot) {
-                total += amplitude;
-                warm += 1;
-            }
+/// One time step of the wire stream: the same sixteen slots, as raw ADC counts at
+/// [`super::convert::MICROVOLTS_PER_WIRE_COUNT`].
+///
+/// Stateless, and deliberately not part of [`InputStage`]: the point of this stream is
+/// that nothing adaptive touches it. An absent device's slots read zero, matching
+/// [`InputStage::time_step`] — there is no measurement to report for a chip that is
+/// dead or still settling.
+///
+/// A lead-off flagged channel, unlike in the model input, keeps its real code. The
+/// flag says the electrode is not on skin, which makes the sample useless as model
+/// input but still a true statement about what the converter saw; a recording is the
+/// measurement record, and a railed channel is self-evident in it.
+pub(super) fn wire_time_step(devices: &[Option<Sample>; DEVICE_COUNT]) -> [i16; INPUT_CH] {
+    let mut out = [0i16; INPUT_CH];
+    for (device_index, frame) in devices.iter().enumerate() {
+        let Some(sample) = frame else { continue };
+        for channel in Channel::ALL {
+            out[model_slot(device_index, channel)] =
+                code_to_wire_count(sample.channels[channel.index()]);
         }
-        if warm == 0 {
-            return self.input_scale;
-        }
-        self.input_scale * (total / warm as f32)
     }
+    out
 }
 
 /// Normalised units to int8 at `scale` units per count, saturating rather than
@@ -168,6 +164,7 @@ fn quantize(NormalizedUnits(value): NormalizedUnits, scale: f32) -> i8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adc::MICROVOLTS_PER_WIRE_COUNT;
 
     /// The fixed marker every real status word carries. A word without it does not
     /// decode at all, so any test that means to say something about the lead-off bits
@@ -315,17 +312,31 @@ mod tests {
     }
 
     #[test]
-    fn the_reported_conversion_recovers_the_input_amplitude() {
-        let mut stage = InputStage::new(INPUT_SCALE, SAMPLE_RATE_HZ);
-        drive(&mut stage, 0.0, 250.0, 8000);
-        // counts × µV-per-count should come back to the amplitude that went in.
-        let microvolts = (1.0 / INPUT_SCALE) * stage.microvolts_per_count();
-        assert!((microvolts - 250.0).abs() < 30.0, "{microvolts}");
+    fn the_wire_stream_reports_microvolts_at_the_fixed_scale() {
+        // No warm-up, no state: the first time step is already in real units, which is
+        // the whole difference from the model path above.
+        let code = code_for(65_000.0);
+        let out = wire_time_step(&[Some(sample_with([code; 8], STATUS_MARKER)), None]);
+        let microvolts = out[0] as f32 * MICROVOLTS_PER_WIRE_COUNT;
+        assert!((microvolts - 65_000.0).abs() < 10.0, "{microvolts}");
     }
 
     #[test]
-    fn the_reported_conversion_falls_back_before_warm_up() {
-        let stage = InputStage::new(INPUT_SCALE, SAMPLE_RATE_HZ);
-        assert_eq!(stage.microvolts_per_count(), INPUT_SCALE);
+    fn the_wire_stream_zeroes_an_absent_devices_slots() {
+        let code = code_for(200.0);
+        let out = wire_time_step(&[Some(sample_with([code; 8], STATUS_MARKER)), None]);
+        assert_eq!(out[CHANNELS_PER_DEVICE..], [0i16; 8]);
+        assert_eq!(wire_time_step(&[None, None]), [0i16; INPUT_CH]);
+    }
+
+    #[test]
+    fn the_wire_stream_keeps_a_lead_off_channels_real_code() {
+        // The model path zeroes this channel; the measurement record does not.
+        let code = code_for(200.0);
+        let out = wire_time_step(&[
+            Some(sample_with([code; 8], STATUS_MARKER | (1 << 12))),
+            None,
+        ]);
+        assert_ne!(out[0], 0);
     }
 }

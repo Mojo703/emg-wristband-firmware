@@ -61,6 +61,13 @@ pub enum Frame {
 
     /// Bulk EMG window. `samples` is little-endian `i16`, channel-major:
     /// `channels * samples_per_channel` values; `scale_uv` converts counts → µV.
+    ///
+    /// The values are raw ADC counts, not model input: unfiltered, DC offsets and all,
+    /// at a scale fixed by the front end's reference and gain. `scale_uv` is therefore
+    /// a constant for a given device configuration, which is what lets a recorded
+    /// stream be interpreted in real units after the fact. Consumers that want a
+    /// centred trace (a scope, an amplitude estimate) have to remove the DC themselves;
+    /// electrode offsets of tens of millivolts are normal.
     Emg {
         seq: u32,
         t0_us: u64,

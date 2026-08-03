@@ -582,10 +582,48 @@ struct CueState {
     peak_activity: f32,
 }
 
-/// Rolling mean-absolute-amplitude baseline for the activity detector. Only
+/// Rolling baseline of [`mean_absolute_deviation`] for the activity detector. Only
 /// updated away from cues, so gesture bursts don't inflate it.
 struct ActivityBaseline {
     value: Option<f32>,
+}
+
+/// One window's mean absolute deviation from each channel's own mean, in ADC counts,
+/// or `None` for a window with no samples.
+///
+/// The mean has to come out per channel first. `Frame::Emg` carries raw counts, so a
+/// channel's samples sit on whatever electrode offset that channel has — tens of
+/// millivolts, hundreds of times the muscle signal, and different per channel. Mean
+/// absolute *amplitude* would measure the offsets and barely move when a muscle
+/// fires, which is what the ratio against [`ActivityBaseline`] depends on. Removing
+/// the per-window mean also removes slow drift for free.
+fn mean_absolute_deviation(channels: u16, samples: &[u8]) -> Option<f32> {
+    let channels = usize::from(channels);
+    let total = samples.len() / 2;
+    if channels == 0 || total == 0 {
+        return None;
+    }
+    // Channel-major: each channel's samples are one contiguous run.
+    let per_channel = total / channels;
+    if per_channel == 0 {
+        return None;
+    }
+    let value_at = |index: usize| -> f32 {
+        i16::from_le_bytes([samples[index * 2], samples[index * 2 + 1]]) as f32
+    };
+    let mut deviation_sum = 0.0f64;
+    for channel in 0..channels {
+        let start = channel * per_channel;
+        let mut sum = 0.0f64;
+        for index in start..start + per_channel {
+            sum += value_at(index) as f64;
+        }
+        let mean = sum / per_channel as f64;
+        for index in start..start + per_channel {
+            deviation_sum += (value_at(index) as f64 - mean).abs();
+        }
+    }
+    Some((deviation_sum / (channels * per_channel) as f64) as f32)
 }
 
 impl ActivityBaseline {
@@ -688,8 +726,8 @@ impl RunningSession {
                     None => break Ending::Review, // manager dropped; shouldn't happen
                 },
                 frame = next_emg(&mut self.emg_receiver) => match frame {
-                    Ok(Frame::Emg { seq, t0_us, samples, .. }) => {
-                        self.ingest_window(seq, t0_us, &samples);
+                    Ok(Frame::Emg { seq, t0_us, channels, samples, .. }) => {
+                        self.ingest_window(seq, t0_us, channels, &samples);
                     }
                     Ok(_) => {}
                     Err(broadcast::error::RecvError::Lagged(_)) => {}
@@ -735,7 +773,7 @@ impl RunningSession {
         self.publish_state();
     }
 
-    fn ingest_window(&mut self, seq: u32, t0_us: u64, samples: &[u8]) {
+    fn ingest_window(&mut self, seq: u32, t0_us: u64, channels: u16, samples: &[u8]) {
         if let Some(recorder) = &mut self.recorder {
             if let Err(error) = recorder.append_emg(EmgWindow {
                 seq,
@@ -745,18 +783,9 @@ impl RunningSession {
                 tracing::warn!("EMG append failed: {error:#}");
             }
         }
-        // Activity detection on the window's mean absolute amplitude.
-        let mut sum = 0u64;
-        let mut count = 0u64;
-        for pair in samples.chunks_exact(2) {
-            let value = i16::from_le_bytes([pair[0], pair[1]]);
-            sum += value.unsigned_abs() as u64;
-            count += 1;
-        }
-        if count == 0 {
+        let Some(mean_absolute) = mean_absolute_deviation(channels, samples) else {
             return;
-        }
-        let mean_absolute = sum as f32 / count as f32;
+        };
         let arrival = now().get();
         let mut near_cue = false;
         for cue in &mut self.cues {
@@ -1006,5 +1035,43 @@ impl RunningSession {
                 self.manager.publish_idle();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mean_absolute_deviation;
+
+    /// Channel-major blob from per-channel sample runs.
+    fn blob(channels: &[&[i16]]) -> Vec<u8> {
+        channels
+            .iter()
+            .flat_map(|channel| channel.iter().flat_map(|value| value.to_le_bytes()))
+            .collect()
+    }
+
+    #[test]
+    fn an_electrode_offset_does_not_change_the_activity_measure() {
+        let quiet = [-2i16, 2, -2, 2];
+        let offset: Vec<i16> = quiet.iter().map(|value| value + 20_000).collect();
+        assert_eq!(
+            mean_absolute_deviation(1, &blob(&[&quiet])),
+            mean_absolute_deviation(1, &blob(&[&offset])),
+        );
+    }
+
+    #[test]
+    fn each_channels_own_offset_comes_off_separately() {
+        // Two channels with the same 2-count swing on wildly different offsets: the
+        // measure is the swing, not the difference between the channels.
+        let low = [-2i16, 2, -2, 2];
+        let high = [29_998i16, 30_002, 29_998, 30_002];
+        assert_eq!(mean_absolute_deviation(2, &blob(&[&low, &high])), Some(2.0));
+    }
+
+    #[test]
+    fn an_empty_or_channel_less_window_has_no_measure() {
+        assert_eq!(mean_absolute_deviation(16, &[]), None);
+        assert_eq!(mean_absolute_deviation(0, &blob(&[&[1i16, 2]])), None);
     }
 }
