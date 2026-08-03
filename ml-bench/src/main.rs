@@ -19,9 +19,16 @@ const WARMUP: usize = 20;
 const ITERS: usize = 200;
 const PROFILE_ITERS: usize = 50;
 
+/// Alignment wrapper for the embedded blob. `include_bytes!` produces an align-1
+/// array, but `emg-runtime` borrows the weight tensors out of the blob in place and
+/// its SIMD kernels load weight rows with `ee.vld.128`, so the blob's base address has
+/// to be 16-byte aligned for the rows to be.
+#[repr(align(16))]
+struct AlignedBlob<Bytes: ?Sized>(Bytes);
+
 /// The int8 model blob exported by `emg-tds export-int8`. Embedded here and handed
 /// to `emg-runtime`, which carries no model data of its own.
-const MODEL_BIN: &[u8] = include_bytes!("../data/model_int8.bin");
+static MODEL_BIN: &AlignedBlob<[u8]> = &AlignedBlob(*include_bytes!("../data/model_int8.bin"));
 
 fn free_heap_discontinuous() -> u32 {
     unsafe { sys::esp_get_free_heap_size() }
@@ -65,8 +72,26 @@ fn dw_self_test() -> bool {
         let mut padded = I8Activation::zeros(1, 1);
         let mut ref_out = I8Activation::zeros(1, 1);
         let mut simd_out = I8Activation::zeros(1, 1);
-        layers::depthwise_scalar(&input, &w, &bias, kernel, 2, rq, &mut padded, &mut ref_out);
-        layers::depthwise_simd(&input, &w, &bias, kernel, 2, rq, &mut padded, &mut simd_out);
+        layers::depthwise_scalar(
+            &input,
+            w.as_slice(),
+            &bias,
+            kernel,
+            2,
+            rq,
+            &mut padded,
+            &mut ref_out,
+        );
+        layers::depthwise_simd(
+            &input,
+            w.as_slice(),
+            &bias,
+            kernel,
+            2,
+            rq,
+            &mut padded,
+            &mut simd_out,
+        );
 
         let rs = ref_out.as_slice();
         let ss = simd_out.as_slice();
@@ -131,7 +156,7 @@ fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
     dot / (na.sqrt() * nb.sqrt()).max(1e-8)
 }
 
-fn verify_real_model(model: &mut Model, batch: &mut VerifyBatch) -> (f32, f32, f32) {
+fn verify_real_model(model: &mut Model<'_>, batch: &mut VerifyBatch<'_>) -> (f32, f32, f32) {
     let mut top1_correct = 0usize;
     let mut agreement = 0usize;
     let mut total_cosine = 0.0f32;
@@ -207,7 +232,7 @@ fn main() -> anyhow::Result<()> {
     // ---- Real model verification ----
     info!("--- Real model (BN-folded, ReLU, int8) ---");
     let heap_pre = free_heap_discontinuous();
-    let mut real_model = Model::load(MODEL_BIN);
+    let mut real_model = Model::load(&MODEL_BIN.0);
     let heap_post = free_heap_discontinuous();
     info!(
         "real model RAM: ~{} KB | input_len: {} | kernel: {} | free heap: {} KB",
@@ -217,7 +242,7 @@ fn main() -> anyhow::Result<()> {
         heap_post / 1024
     );
 
-    let mut verify = VerifyBatch::new(MODEL_BIN);
+    let mut verify = VerifyBatch::new(&MODEL_BIN.0);
     info!(
         "verify batch: streaming {} windows | input scale={:.6}",
         verify.total, verify.input_scale

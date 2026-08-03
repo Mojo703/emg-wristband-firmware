@@ -606,12 +606,44 @@ fn argmax_i32(v: &[i32]) -> usize {
         .unwrap_or(0)
 }
 
+/// Writer that knows its own byte offset, so every section can be padded to the
+/// alignment its consumer needs. `emg-runtime` reads the weight tensors in place out
+/// of memory-mapped flash instead of copying them to the heap, and the ESP32-S3 SIMD
+/// kernels load weight rows with `ee.vld.128`, which faults on an address that is not
+/// 16-byte aligned. The loader mirrors these same alignment steps as it walks the
+/// blob, so any change here has to change there too.
+struct AlignedWriter {
+    inner: BufWriter<File>,
+    offset: usize,
+}
+
+impl AlignedWriter {
+    fn new(file: File) -> Self {
+        Self {
+            inner: BufWriter::new(file),
+            offset: 0,
+        }
+    }
+
+    fn write_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+        self.inner.write_all(bytes)?;
+        self.offset += bytes.len();
+        Ok(())
+    }
+
+    /// Pad with zero bytes until the next `n`-byte boundary.
+    fn align_to(&mut self, n: usize) -> Result<()> {
+        let padding = (n - self.offset % n) % n;
+        self.write_bytes(&vec![0u8; padding])
+    }
+}
+
 fn serialize(q: &QuantizedModel, path: &Path) -> Result<()> {
     let file = File::create(path)?;
-    let mut w = BufWriter::new(file);
+    let mut w = AlignedWriter::new(file);
 
     const MAGIC: u32 = 0x454D4739;
-    const VERSION: u32 = 2;
+    const VERSION: u32 = 3;
     write_u32(&mut w, MAGIC)?;
     write_u32(&mut w, VERSION)?;
     write_u32(&mut w, q.input_len as u32)?;
@@ -624,61 +656,68 @@ fn serialize(q: &QuantizedModel, path: &Path) -> Result<()> {
     for block in &q.blocks {
         write_u32(&mut w, block.in_channels as u32)?;
         write_u32(&mut w, block.out_channels as u32)?;
+        w.align_to(16)?;
         write_i8s(&mut w, &block.depthwise)?;
+        w.align_to(4)?;
         write_i32s(&mut w, &block.depthwise_bias)?;
         write_i32(&mut w, block.depthwise_mult)?;
         write_u32(&mut w, block.depthwise_shift)?;
+        w.align_to(16)?;
         write_i8s(&mut w, &block.pointwise)?;
+        w.align_to(4)?;
         write_i32s(&mut w, &block.pointwise_bias)?;
         write_i32(&mut w, block.pointwise_mult)?;
         write_u32(&mut w, block.pointwise_shift)?;
     }
 
+    w.align_to(16)?;
     write_i8s(&mut w, &q.head.weight)?;
+    w.align_to(4)?;
     write_i32s(&mut w, &q.head.bias)?;
     write_f32(&mut w, q.head.logit_scale)?;
 
     write_f32(&mut w, q.verify.input_scale)?;
     write_u32(&mut w, q.verify.windows.len() as u32)?;
     for window in &q.verify.windows {
+        // The verification windows are copied into an aligned activation buffer one at
+        // a time on the device, so their int8 samples only have to keep the following
+        // label and float logits on a 4-byte boundary.
+        w.align_to(4)?;
         write_i8s(&mut w, &window.input)?;
+        w.align_to(4)?;
         write_u32(&mut w, window.label)?;
         for &logit in &window.float_logits {
             write_f32(&mut w, logit)?;
         }
     }
 
-    w.flush()?;
+    w.inner.flush()?;
     Ok(())
 }
 
-fn write_u32(w: &mut BufWriter<File>, v: u32) -> Result<()> {
-    w.write_all(&v.to_le_bytes())?;
-    Ok(())
+fn write_u32(w: &mut AlignedWriter, v: u32) -> Result<()> {
+    w.write_bytes(&v.to_le_bytes())
 }
 
-fn write_i32(w: &mut BufWriter<File>, v: i32) -> Result<()> {
-    w.write_all(&v.to_le_bytes())?;
-    Ok(())
+fn write_i32(w: &mut AlignedWriter, v: i32) -> Result<()> {
+    w.write_bytes(&v.to_le_bytes())
 }
 
-fn write_f32(w: &mut BufWriter<File>, v: f32) -> Result<()> {
-    w.write_all(&v.to_le_bytes())?;
-    Ok(())
+fn write_f32(w: &mut AlignedWriter, v: f32) -> Result<()> {
+    w.write_bytes(&v.to_le_bytes())
 }
 
-fn write_i32s(w: &mut BufWriter<File>, v: &[i32]) -> Result<()> {
+fn write_i32s(w: &mut AlignedWriter, v: &[i32]) -> Result<()> {
     for &x in v {
         write_i32(w, x)?;
     }
     Ok(())
 }
 
-fn write_i8s(w: &mut BufWriter<File>, v: &[i8]) -> Result<()> {
+fn write_i8s(w: &mut AlignedWriter, v: &[i8]) -> Result<()> {
     // SAFETY: i8 and u8 have the same size and alignment; the bytes are written as-is.
     let bytes = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len()) };
-    w.write_all(bytes)?;
-    Ok(())
+    w.write_bytes(bytes)
 }
 
 impl Config {

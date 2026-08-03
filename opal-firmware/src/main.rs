@@ -143,9 +143,18 @@ impl PerfStats {
     }
 }
 
+/// Alignment wrapper for the embedded blob. `include_bytes!` produces an align-1
+/// array, but `emg-runtime` borrows the weight tensors out of the blob in place —
+/// keeping ~35 KB of weights in flash instead of on the heap — and its SIMD kernels
+/// load weight rows with `ee.vld.128`, so the blob's base has to be 16-byte aligned
+/// for the rows to be.
+#[repr(align(16))]
+struct AlignedBlob<Bytes: ?Sized>(Bytes);
+
 /// The int8 model blob exported by `emg-tds export-int8`. Embedded and handed to
 /// `emg-runtime`. Shared with `ml-bench`.
-const MODEL_BIN: &[u8] = include_bytes!("../../ml-bench/data/model_int8.bin");
+static MODEL_BIN: &AlignedBlob<[u8]> =
+    &AlignedBlob(*include_bytes!("../../ml-bench/data/model_int8.bin"));
 
 /// Microseconds since boot on the device clock — the same clock the acquisition
 /// thread stamps windows with and the logger stamps log lines with.
@@ -168,7 +177,7 @@ fn main() -> anyhow::Result<()> {
     info!("device id: {device_id}");
 
     // Mutable for `forward`, which runs through the model's own scratch buffers.
-    let mut model = Model::load(MODEL_BIN);
+    let mut model = Model::load(&MODEL_BIN.0);
     let mut pipeline = RejectPipeline::new(NUM_CLASSES, settings.sensitivity.tau());
 
     // Heap headroom is the constraint when sizing wifi/lwIP buffers (see
@@ -265,7 +274,7 @@ fn main() -> anyhow::Result<()> {
     // path produces int8 on the same footing training used. These are normalised units
     // per count, not microvolts per count; `adc::conditioning` documents the difference
     // and the acquisition path is what puts the signal on that footing.
-    let input_scale = emg_runtime::VerifyBatch::new(MODEL_BIN).input_scale;
+    let input_scale = emg_runtime::VerifyBatch::new(&MODEL_BIN.0).input_scale;
 
     // Bring-up blocks ~2.5 s on the ADS1298's mandated settling delays, so it must run
     // before the code below registers the task watchdog.

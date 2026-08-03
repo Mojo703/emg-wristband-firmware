@@ -41,11 +41,11 @@ fn pad_input_into(x: &I8Activation, pad: usize, padded: &mut I8Activation) {
 }
 
 /// Scalar depthwise 1D conv into `out`, via `padded` (bounds-check-free inner
-/// loop). Weight layout `[K, C]`: `ws[j * c + ch]`. Retained as the correctness
+/// loop). Weight layout `[K, C]`: `w[j * c + ch]`. Retained as the correctness
 /// oracle for the SIMD self-test.
 pub fn depthwise_scalar(
     x: &I8Activation,
-    w: &AlignedI8,
+    w: &[i8],
     bias: &[i32],
     k: usize,
     stride: usize,
@@ -57,7 +57,6 @@ pub fn depthwise_scalar(
     let t_out = x.t.div_ceil(stride);
     let pad = k / 2;
     pad_input_into(x, pad, padded);
-    let ws = w.as_slice();
     let pd = padded.data.as_slice();
     out.reuse(t_out, c);
     let od = out.data.as_mut_slice();
@@ -66,7 +65,7 @@ pub fn depthwise_scalar(
         for ch in 0..c {
             let mut acc = bias[ch];
             for j in 0..k {
-                acc += ws[j * c + ch] as i32 * pd[(base + j) * c + ch] as i32;
+                acc += w[j * c + ch] as i32 * pd[(base + j) * c + ch] as i32;
             }
             od[to * c + ch] = rq.apply(acc);
         }
@@ -99,10 +98,11 @@ fn extract_qacc_half(data: &[u8], out: &mut [i32]) {
 
 /// SIMD depthwise using QACC (16 independent 20-bit accumulators), into `out` via
 /// `padded`. Processes 16 channels per vector instruction. Weight layout `[K, C]`.
+/// **Requires** `w` to be 16-byte aligned: the tap loop reads it with `ee.vld.128.xp`.
 #[cfg(target_arch = "xtensa")]
 pub fn depthwise_simd(
     x: &I8Activation,
-    w: &AlignedI8,
+    w: &[i8],
     bias: &[i32],
     k: usize,
     stride: usize,
@@ -114,7 +114,6 @@ pub fn depthwise_simd(
     let t_out = x.t.div_ceil(stride);
     let pad = k / 2;
     pad_input_into(x, pad, padded);
-    let ws = w.as_slice();
     let pd = padded.data.as_slice();
     out.reuse(t_out, c);
     let od = out.data.as_mut_slice();
@@ -129,7 +128,7 @@ pub fn depthwise_simd(
             let mut scratch = QScratch([0u8; 32]);
             let mut acc = [0i32; 16];
 
-            let fp = ws.as_ptr().wrapping_add(ch);
+            let fp = w.as_ptr().wrapping_add(ch);
             let ip = pd.as_ptr().wrapping_add(base * c + ch);
 
             unsafe {
@@ -181,7 +180,7 @@ pub fn depthwise_simd(
 #[cfg(not(target_arch = "xtensa"))]
 pub fn depthwise_simd(
     x: &I8Activation,
-    w: &AlignedI8,
+    w: &[i8],
     bias: &[i32],
     k: usize,
     stride: usize,
@@ -193,10 +192,10 @@ pub fn depthwise_simd(
 }
 
 /// Depthwise 1D conv into `out` via `padded`: SIMD on ESP32-S3, scalar fallback
-/// off-target. Weight layout `[K, C]`: `ws[j * c + ch]`.
+/// off-target. Weight layout `[K, C]`: `w[j * c + ch]`.
 pub fn depthwise(
     x: &I8Activation,
-    w: &AlignedI8,
+    w: &[i8],
     bias: &[i32],
     k: usize,
     stride: usize,
@@ -211,20 +210,19 @@ pub fn depthwise(
 /// step. MAC-heavy; routes through [`mac::dot_i8`] (SIMD-capable).
 pub fn pointwise(
     x: &I8Activation,
-    w: &AlignedI8,
+    w: &[i8],
     bias: &[i32],
     out_ch: usize,
     rq: Requantize,
     out: &mut I8Activation,
 ) {
     let cin = x.c;
-    let ws = w.as_slice();
     out.reuse(x.t, out_ch);
     let od = out.data.as_mut_slice();
     for ti in 0..x.t {
         let xs = x.row(ti);
         for oc in 0..out_ch {
-            let row = &ws[oc * cin..(oc + 1) * cin];
+            let row = &w[oc * cin..(oc + 1) * cin];
             od[ti * out_ch + oc] = rq.apply(bias[oc] + mac::dot_i8(row, xs));
         }
     }
@@ -242,10 +240,9 @@ pub fn global_avg_pool(x: &I8Activation) -> AlignedI8 {
 }
 
 /// Fully-connected `cin -> out` returning raw i32 logits (final head).
-pub fn linear_i32(v: &[i8], w: &AlignedI8, bias: &[i32], out: usize) -> Vec<i32> {
+pub fn linear_i32(v: &[i8], w: &[i8], bias: &[i32], out: usize) -> Vec<i32> {
     let cin = v.len();
-    let ws = w.as_slice();
     (0..out)
-        .map(|oc| bias[oc] + mac::dot_i8(&ws[oc * cin..(oc + 1) * cin], v))
+        .map(|oc| bias[oc] + mac::dot_i8(&w[oc * cin..(oc + 1) * cin], v))
         .collect()
 }

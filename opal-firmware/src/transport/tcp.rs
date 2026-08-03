@@ -2,89 +2,62 @@
 
 use super::{decode, encode_into, Control, Transport};
 use anyhow::Result;
-use protocol::{Frame, FrameScanner};
-use std::collections::VecDeque;
+use protocol::FrameScanner;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::sync::{mpsc, Arc};
+use std::time::Duration;
 
-/// Recent EMG windows the link hasn't sent yet. When it can't keep up, the oldest are
-/// dropped so the device streams fresh windows rather than a growing backlog.
+/// How long one socket write may block before the link is declared lost. The caller
+/// is the main loop, so this bounds how long a dead or drowning link can hold it —
+/// the same contract the serial transport's chunk timeout provides. A healthy wifi
+/// link drains a whole EMG frame in single-digit milliseconds, so anything near this
+/// bound is a link worth abandoning.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Dials the dashboard over TCP. Writes happen synchronously on the caller's thread,
+/// straight from the shared encode scratch — no per-frame copy, no send queue, no
+/// writer thread. Every multi-kilobyte per-frame allocation this path has ever had
+/// eventually lost a fragmentation race and aborted the device, so the send path
+/// owns none; backpressure is the blocking write itself, bounded by
+/// [`WRITE_TIMEOUT`], and window shedding under sustained backpressure happens where
+/// it is counted, at the acquisition window channel.
 ///
-/// Two, not more, and heap is why: a raw-count EMG frame that compresses badly (a
-/// railed input) runs ~24 KB encoded, so this queue's worst case is CAP × 24 KB
-/// against ~107 KB of steady-state free heap — a deeper queue can eat the whole
-/// heap under wifi backpressure.
-const DATA_QUEUE_CAP: usize = 2;
-
-/// Frames waiting for the writer thread. `reliable` (device hello, predictions, events,
-/// logs) drains first and is never dropped; `data` (the bulk EMG windows) is capped and
-/// drops oldest. Only EMG is shed because it dominates the bandwidth; predictions are
-/// tiny, so keeping them keeps the classifier gauge continuous.
-#[derive(Default)]
-struct SendQueue {
-    reliable: VecDeque<Vec<u8>>,
-    data: VecDeque<Vec<u8>>,
-    closed: bool,
-}
-
-/// Dials the dashboard over TCP. A reader thread decodes inbound control frames; a writer
-/// thread drains the send queue at the link's pace, dropping stale EMG windows when it
-/// falls behind so fresh data is prioritized over an unbroken series.
+/// A reader thread decodes inbound control frames and doubles as disconnect
+/// detection: its blocking read returns when the peer closes, and `alive` goes false.
 ///
 /// The socket is shared through an `Arc` rather than duplicated: `TcpStream::try_clone`
 /// maps to `dup()`, which lwIP does not implement (ENOSYS) on ESP-IDF. `Read` and
-/// `Write` are both available on `&TcpStream`, so one fd serves both threads — and
-/// only those threads; the handle here deliberately holds no reference to it.
+/// `Write` are both available on `&TcpStream`, so one fd serves the reader thread and
+/// the writing caller.
 pub struct TcpTransport {
-    queue: Arc<(Mutex<SendQueue>, Condvar)>,
+    stream: Arc<TcpStream>,
     rx: mpsc::Receiver<Control>,
     alive: Arc<AtomicBool>,
-    /// EMG windows shed because the writer fell behind (diagnostic).
-    dropped: u32,
 }
 
 impl TcpTransport {
     pub fn connect(addr: &str) -> Result<Self> {
         let stream = Arc::new(TcpStream::connect(addr)?);
         stream.set_nodelay(true).ok();
-        let queue = Arc::new((Mutex::new(SendQueue::default()), Condvar::new()));
+        stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
         let alive = Arc::new(AtomicBool::new(true));
         let (tx, rx) = mpsc::channel();
 
-        // Both threads run lwIP internals and (on error paths) the logger's
+        // The reader runs lwIP internals and (on error paths) the logger's
         // formatting; 6 KB stacks were within canary distance of overflow.
         {
             let reader = Arc::clone(&stream);
-            let queue = Arc::clone(&queue);
             let alive = Arc::clone(&alive);
             std::thread::Builder::new()
                 .stack_size(8192)
                 .spawn(move || {
                     read_loop(&reader, tx);
-                    mark_closed(&queue, &alive);
-                })?;
-        }
-        {
-            let writer = Arc::clone(&stream);
-            let queue = Arc::clone(&queue);
-            let alive = Arc::clone(&alive);
-            std::thread::Builder::new()
-                .stack_size(8192)
-                .spawn(move || {
-                    write_loop(&writer, &queue);
                     alive.store(false, Ordering::SeqCst);
-                    // Unblock the reader so it exits too and the socket is released.
-                    let _ = writer.shutdown(std::net::Shutdown::Both);
                 })?;
         }
-        Ok(Self {
-            queue,
-            rx,
-            alive,
-            dropped: 0,
-        })
+        Ok(Self { stream, rx, alive })
     }
 
     /// Shared liveness flag, so the link-management thread can see the transport die
@@ -92,14 +65,6 @@ impl TcpTransport {
     pub fn alive_handle(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.alive)
     }
-}
-
-/// Mark the link dead and wake anyone waiting on the queue.
-fn mark_closed(queue: &(Mutex<SendQueue>, Condvar), alive: &AtomicBool) {
-    alive.store(false, Ordering::SeqCst);
-    let (lock, cv) = queue;
-    lock.lock().unwrap().closed = true;
-    cv.notify_all();
 }
 
 fn read_loop(reader: &TcpStream, tx: mpsc::Sender<Control>) {
@@ -122,69 +87,14 @@ fn read_loop(reader: &TcpStream, tx: mpsc::Sender<Control>) {
     }
 }
 
-/// Drain the queue to the socket at the link's pace. Writes stay blocking so framing is
-/// never torn; the queue's drop-oldest policy is what sheds load.
-fn write_loop(writer: &TcpStream, queue: &(Mutex<SendQueue>, Condvar)) {
-    let (lock, cv) = queue;
-    let mut writer = writer;
-    loop {
-        let bytes = {
-            let mut q = lock.lock().unwrap();
-            loop {
-                if q.closed {
-                    return;
-                }
-                if let Some(bytes) = q.reliable.pop_front() {
-                    break bytes;
-                }
-                if let Some(bytes) = q.data.pop_front() {
-                    break bytes;
-                }
-                q = cv.wait(q).unwrap();
-            }
-        };
-        let write_start = std::time::Instant::now();
-        if writer.write_all(&bytes).is_err() {
-            return;
-        }
-        let elapsed_ms = write_start.elapsed().as_millis();
-        if elapsed_ms > 100 {
-            log::warn!(
-                "slow socket write: {elapsed_ms}ms for {} bytes",
-                bytes.len()
-            );
-        }
-    }
-}
-
-/// Only bulk EMG windows may be dropped to stay current; everything else must arrive.
-fn is_droppable(frame: &Frame) -> bool {
-    matches!(frame, Frame::Emg { .. })
-}
-
 impl Transport for TcpTransport {
-    fn send(&mut self, frame: &Frame, scratch: &mut Vec<u8>) -> Result<()> {
+    fn send(&mut self, frame: &protocol::Frame, scratch: &mut Vec<u8>) -> Result<()> {
         if !self.alive.load(Ordering::SeqCst) {
             anyhow::bail!("dashboard link closed");
         }
-        // The queue needs owned bytes; `to_vec` is one exact-size allocation.
-        let bytes = encode_into(frame, scratch).to_vec();
-        let (lock, cv) = &*self.queue;
-        let mut q = lock.lock().unwrap();
-        if is_droppable(frame) {
-            q.data.push_back(bytes);
-            while q.data.len() > DATA_QUEUE_CAP {
-                q.data.pop_front();
-                self.dropped = self.dropped.wrapping_add(1);
-                if self.dropped % 16 == 1 {
-                    log::warn!("EMG windows dropped so far: {}", self.dropped);
-                }
-            }
-        } else {
-            q.reliable.push_back(bytes);
-        }
-        drop(q);
-        cv.notify_one();
+        let bytes = encode_into(frame, scratch);
+        let mut writer: &TcpStream = &self.stream;
+        writer.write_all(bytes)?;
         Ok(())
     }
 
@@ -195,10 +105,10 @@ impl Transport for TcpTransport {
 
 impl Drop for TcpTransport {
     fn drop(&mut self) {
-        // Only flag the closure — never touch the socket from here. Drop runs on the
-        // main task, and calling into lwIP from a thread that doesn't own the socket
-        // I/O can block indefinitely. The writer thread wakes on the condvar, sees
-        // `closed`, and does the shutdown itself, which in turn unblocks the reader.
-        mark_closed(&self.queue, &self.alive);
+        // Shutdown rather than relying on the fd closing: the reader thread holds
+        // its own `Arc` and sits in a blocking read, so without this the socket —
+        // and the thread — would outlive the transport indefinitely.
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+        self.alive.store(false, Ordering::SeqCst);
     }
 }
