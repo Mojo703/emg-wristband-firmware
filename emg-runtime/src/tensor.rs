@@ -55,6 +55,21 @@ impl AlignedI8 {
         let cap = self.blocks.len() * 16;
         unsafe { core::slice::from_raw_parts_mut(self.blocks.as_mut_ptr() as *mut i8, cap) }
     }
+
+    /// Re-shape this buffer to `len` zeroed elements, reusing the existing blocks.
+    /// Grows only when `len` exceeds what has ever been held, so a buffer sized to
+    /// its worst case at construction never allocates again — the property the
+    /// per-inference scratch depends on.
+    pub(crate) fn reset_zeroed(&mut self, len: usize) {
+        let blocks_needed = len.div_ceil(16).max(1);
+        if self.blocks.len() < blocks_needed {
+            self.blocks.resize(blocks_needed, B16([0; 16]));
+        }
+        for block in &mut self.blocks[..blocks_needed] {
+            block.0 = [0; 16];
+        }
+        self.len = len;
+    }
 }
 
 /// Deterministic PRNG for repeatable synthetic data.
@@ -130,5 +145,30 @@ impl I8Activation {
             t,
             c,
         }
+    }
+
+    /// Re-shape to `[t, c]`, zero-filled, reusing the allocation (see
+    /// [`AlignedI8::reset_zeroed`]). This is what lets the layer kernels write into
+    /// caller-owned buffers instead of allocating their outputs: per-inference
+    /// allocation churn in the multi-kilobyte size class is what fragments the
+    /// device heap.
+    pub(crate) fn reuse(&mut self, t: usize, c: usize) {
+        self.data.reset_zeroed(t * c);
+        self.t = t;
+        self.c = c;
+    }
+
+    /// [`Self::from_i8_slice`] into an existing activation, reusing its allocation —
+    /// for callers that feed a fresh window into the same tensor every inference.
+    ///
+    /// # Panics
+    ///
+    /// If `s.len() != t * c`.
+    pub fn copy_from_i8_slice(&mut self, s: &[i8], t: usize, c: usize) {
+        assert_eq!(s.len(), t * c);
+        self.data.reset_zeroed(t * c);
+        self.data.as_mut_slice().copy_from_slice(s);
+        self.t = t;
+        self.c = c;
     }
 }

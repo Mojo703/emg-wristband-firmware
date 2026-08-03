@@ -8,7 +8,7 @@
 //! NVS.
 //!
 //! The EMG frames carry raw ADC counts at a fixed scale, not the conditioned model
-//! input (`frames::emg` says why), and every window the ADC thread produces is sent
+//! input (`frames::emg` says why), and every window acquisition produces is sent
 //! even if the loop fell behind — the host records this stream, so continuity is worth
 //! more than dropping stale windows. The classifier still only sees the newest.
 //!
@@ -32,7 +32,8 @@ mod wifi;
 use adc::acquisition::AcquiredWindow;
 use adc::Channel;
 use config::{Sensitivity, Settings, Store};
-use emg_runtime::model::{Model, NUM_CLASSES};
+use emg_runtime::model::{Model, INPUT_CH, NUM_CLASSES};
+use emg_runtime::tensor::I8Activation;
 use emg_runtime::{softmax, ForwardResult, RejectPipeline};
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::delay::FreeRtos;
@@ -86,8 +87,8 @@ const PERF_LOG_INTERVAL: u32 = 128;
 /// Running inference-latency, total-processing-latency, and loop-throughput stats
 /// between periodic log lines. "Total" is inference plus the reject-pipeline
 /// decision, CBOR frame build, and transport write -- everything the device itself
-/// contributes to onset-to-output latency, short of acquisition (which runs on its own
-/// thread) and BLE dispatch (not wired into this firmware yet).
+/// contributes to onset-to-output latency, short of acquisition (which runs on its
+/// own threads) and BLE dispatch (not wired into this firmware yet).
 #[derive(Default)]
 struct PerfStats {
     interval_start: Option<Instant>,
@@ -129,7 +130,8 @@ impl PerfStats {
             let throughput_hz = self.windows as f64 / start.elapsed().as_secs_f64();
             let dropped = dropped_total.saturating_sub(self.dropped_at_interval_start);
             // Free heap rides along because the window buffers are now the biggest
-            // transient allocation on the device (see `acquisition::QUEUE_DEPTH`), and
+            // transient allocation on the device (see
+            // `acquisition::WINDOW_QUEUE_DEPTH`), and
             // an out-of-memory abort here would otherwise arrive with no warning.
             let free_heap_kilobytes = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() / 1024 };
             info!(
@@ -165,7 +167,8 @@ fn main() -> anyhow::Result<()> {
     let device_id = device_id();
     info!("device id: {device_id}");
 
-    let model = Model::load(MODEL_BIN);
+    // Mutable for `forward`, which runs through the model's own scratch buffers.
+    let mut model = Model::load(MODEL_BIN);
     let mut pipeline = RejectPipeline::new(NUM_CLASSES, settings.sensitivity.tau());
 
     // Heap headroom is the constraint when sizing wifi/lwIP buffers (see
@@ -304,6 +307,10 @@ fn main() -> anyhow::Result<()> {
     }
 
     let sample_rate = adc::ads1298::SAMPLE_RATE_HZ;
+    // The one input tensor inference reads through, allocated while the heap is
+    // fresh; each window's samples are copied in rather than wrapped in a new
+    // allocation.
+    let mut model_input = I8Activation::zeros(model.input_len, INPUT_CH);
     let mut seq: u32 = 0;
     let mut prev_wake = WakeState::Idle;
     let mut perf = PerfStats::default();
@@ -322,7 +329,7 @@ fn main() -> anyhow::Result<()> {
             config_changed |= apply_control(control, &mut settings, &mut pipeline, &store);
         }
 
-        // One batch of work: every window the ADC thread has ready, oldest first.
+        // One batch of work: every window acquisition has ready, oldest first.
         // Usually that is exactly one — the ADCs produce one every ~250 ms and this
         // loop runs every 5 ms — but a link write that stalled for a second hands back
         // several at once, and all of them are sent, because the dashboard records
@@ -365,40 +372,46 @@ fn main() -> anyhow::Result<()> {
         };
         last_window_at = Instant::now();
         stall_reported = false;
-        // The batch is never empty (checked above), and its last window is the newest.
+        // The batch is never empty (checked above), and its last window is the
+        // newest: inference reads it through the persistent input tensor rather than
+        // allocating one.
         let newest: &AcquiredWindow = windows.last().expect("batch is non-empty");
         let infer_start = Instant::now();
-        let ForwardResult::Logits(raw_logits) = model.forward(&newest.input);
+        model_input.copy_from_i8_slice(&newest.samples, model.input_len, INPUT_CH);
+        let ForwardResult::Logits(raw_logits) = model.forward(&model_input);
         let infer_us = infer_start.elapsed().as_micros() as u64;
         let logits: [f32; NUM_CLASSES] =
             std::array::from_fn(|class| raw_logits[class] as f32 * model.logit_scale);
         let softmax = softmax(&logits);
         let decision = pipeline.step(&softmax);
-        // Real device-clock time for the decision the events describe. The EMG
-        // window itself carries its first sample's timestamp; both used to be
+        // Real device-clock time for the decision the events describe; the EMG
+        // window carries its first sample's device-clock timestamp. Neither is
         // synthesized from `seq` at the nominal rate, which the actual oscillator
-        // misses by several percent — the drift consumers saw as data sliding away
-        // from their present line.
+        // misses by several percent — that drift reads as data sliding away from a
+        // consumer's present line.
         let t_us = device_now_us();
 
         // One EMG frame per drained window, each with its own first-sample timestamp,
-        // in the order they were sampled. Each window is consumed and freed as its
-        // frame goes out, rather than packing the whole batch first: a window is 16 KB
-        // of raw samples and its packed copy is up to 24 KB more, and holding a full
-        // catch-up burst of both at once does not fit the heap the boot log reports.
+        // in the order they were sampled. Each window is consumed as its frame goes
+        // out and its model-input buffer goes straight back to the combiner's pool,
+        // so a catch-up burst holds one window's payload at a time.
         let batch_size = windows.len();
         let mut newest_seq = seq;
         for window in windows {
             newest_seq = seq;
-            let frame = frames::emg(
-                seq,
-                window.started_us,
-                &window.wire_samples,
-                model.input_len,
-                sample_rate,
-            );
+            let frame = frames::emg(seq, window.started_us, window.packed_wire, sample_rate);
             seq = seq.wrapping_add(1);
             links.send_window(None, std::slice::from_ref(&frame));
+            // Both buffers go straight back to the combiner's pool: the model
+            // input as-is, the packed payload reclaimed from the frame it rode in.
+            let Frame::Emg {
+                samples: packed_wire,
+                ..
+            } = frame
+            else {
+                unreachable!("frames::emg builds an Emg frame");
+            };
+            source.recycle(window.samples, packed_wire);
         }
 
         // The prediction and its events describe the newest window only, and carry its

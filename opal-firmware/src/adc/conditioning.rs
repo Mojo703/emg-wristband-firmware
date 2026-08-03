@@ -247,24 +247,17 @@ impl<const CHANNELS: usize> SignalConditioner<CHANNELS> {
         self.channels.get(channel)?.amplitude.amplitude()
     }
 
-    /// Drops the DC blockers' filter state after a break in the stream, so the next
-    /// sample re-seeds them instead of arriving as a step.
+    /// Drops the DC blockers' filter state for a contiguous run of channels after a
+    /// break in their stream — one device's channels, when only that device's stream
+    /// broke — so the next sample re-seeds them instead of arriving as a step. The
+    /// channels of a device that kept converting saw no discontinuity, and resetting
+    /// their blockers would throw away good filter state for nothing. Out-of-range
+    /// channels are ignored rather than panicking, matching [`Self::condition`].
     ///
     /// The amplitude estimates deliberately survive. They describe the electrodes,
     /// which a warm recovery does not change, and rebuilding them would cost the full
     /// warm-up every time — the bring-up campaign measured recoveries at roughly two
     /// per second at their worst, which would leave the estimate permanently cold.
-    pub(super) fn reset_after_gap(&mut self) {
-        for channel in &mut self.channels {
-            channel.blocker.reset();
-        }
-    }
-
-    /// [`Self::reset_after_gap`] for a contiguous run of channels, for when only one
-    /// device's stream broke. The channels of the device that kept converting saw no
-    /// discontinuity, and resetting their blockers would throw away good filter state
-    /// for nothing. Out-of-range channels are ignored rather than panicking, matching
-    /// [`Self::condition`].
     pub(super) fn reset_channels_after_gap(&mut self, first: usize, count: usize) {
         for channel in self.channels.iter_mut().skip(first).take(count) {
             channel.blocker.reset();
@@ -356,7 +349,7 @@ mod tests {
         let mut conditioner = SignalConditioner::<1>::new(SAMPLE_RATE_HZ);
         drive(&mut conditioner, 5_000.0, 100.0, 8000);
         // The gap, and an electrode that came back sitting somewhere else entirely.
-        conditioner.reset_after_gap();
+        conditioner.reset_channels_after_gap(0, 1);
         let first = conditioner.condition(0, Microvolts(-20_000.0)).unwrap();
         assert_eq!(first.0, 0.0, "the step should be seeded away, not filtered");
     }
@@ -366,7 +359,7 @@ mod tests {
         let mut conditioner = SignalConditioner::<1>::new(SAMPLE_RATE_HZ);
         drive(&mut conditioner, 0.0, 250.0, 8000);
         let before = conditioner.amplitude_microvolts(0).unwrap();
-        conditioner.reset_after_gap();
+        conditioner.reset_channels_after_gap(0, 1);
         let after = conditioner.amplitude_microvolts(0).unwrap();
         assert_eq!(before, after);
     }

@@ -974,13 +974,49 @@ pub fn frame_bytes(payload: &[u8]) -> Vec<u8> {
 /// device. The backend calls [`unpack_samples`] before fanning out, so the browser and
 /// Python consumers still receive the raw `i16` blob and need no change.
 pub fn pack_samples(raw: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(raw.len() / 2 + 8);
+    pack_sample_stream(
+        raw.chunks_exact(2)
+            .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]])),
+    )
+}
+
+/// [`pack_samples`] straight from sample values, for producers that would otherwise
+/// have to materialise the little-endian blob first (on the device that
+/// intermediate copy is 16 KB of scarce heap per frame).
+///
+/// Two passes, one allocation: the first walk prices every delta's varint, the
+/// second writes into a buffer reserved at exactly that size. A `Vec` grown by
+/// pushing transiently holds both its old and new buffers, a doubled peak the
+/// device's fragmented heap cannot promise; sizing exactly also avoids
+/// over-reserving the 3-bytes-per-sample worst case when the data compresses well
+/// (the common case runs closer to one byte per sample).
+pub fn pack_sample_stream(samples: impl Iterator<Item = i16> + Clone) -> Vec<u8> {
+    let mut out = Vec::new();
+    pack_sample_stream_into(&mut out, samples);
+    out
+}
+
+/// [`pack_sample_stream`] into a caller-owned buffer, reusing its allocation — for
+/// producers that pack at a steady rate and recycle the payload buffer instead of
+/// allocating one per window. The buffer is cleared first and reserved to the priced
+/// size, so it grows only until it has seen its worst case.
+pub fn pack_sample_stream_into(out: &mut Vec<u8>, samples: impl Iterator<Item = i16> + Clone) {
+    fn zigzag_delta(prev: &mut i32, sample: i16) -> u32 {
+        let delta = sample as i32 - *prev;
+        *prev = sample as i32;
+        ((delta << 1) ^ (delta >> 31)) as u32
+    }
+    let mut packed_len = 0usize;
     let mut prev = 0i32;
-    for chunk in raw.chunks_exact(2) {
-        let sample = i16::from_le_bytes([chunk[0], chunk[1]]) as i32;
-        let delta = sample - prev;
-        prev = sample;
-        let mut zigzag = ((delta << 1) ^ (delta >> 31)) as u32;
+    for sample in samples.clone() {
+        let zigzag = zigzag_delta(&mut prev, sample);
+        packed_len += ((32 - zigzag.leading_zeros()).max(1) as usize).div_ceil(7);
+    }
+    out.clear();
+    out.reserve(packed_len);
+    prev = 0;
+    for sample in samples {
+        let mut zigzag = zigzag_delta(&mut prev, sample);
         loop {
             let byte = (zigzag & 0x7f) as u8;
             zigzag >>= 7;
@@ -991,7 +1027,7 @@ pub fn pack_samples(raw: &[u8]) -> Vec<u8> {
             out.push(byte | 0x80);
         }
     }
-    out
+    debug_assert_eq!(out.len(), packed_len);
 }
 
 /// Inverse of [`pack_samples`]: reconstruct the little-endian `i16` blob. Stops at the end
@@ -1023,6 +1059,20 @@ pub fn unpack_samples(packed: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pack_sample_stream_matches_pack_samples_and_allocates_once() {
+        // The two entry points must stay one wire format; the stream form exists so
+        // the device can skip materialising the byte blob.
+        let values: Vec<i16> = (-40..40).map(|v| (v * 907) as i16).collect();
+        let raw: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let packed = pack_sample_stream(values.iter().copied());
+        assert_eq!(packed, pack_samples(&raw));
+        // The pricing pass must agree with the writing pass exactly: the buffer is
+        // reserved at the priced size and never grows.
+        assert_eq!(packed.capacity(), packed.len(), "pricing missed");
+        assert_eq!(unpack_samples(&packed), raw);
+    }
 
     #[test]
     fn media_key_id_matches_serde_encoding() {

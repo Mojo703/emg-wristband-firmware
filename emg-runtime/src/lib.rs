@@ -9,7 +9,8 @@
 //! emg-tds model (see [`model`]); the int8 weight blob is supplied by the caller via
 //! [`model::Model::load`] rather than embedded here, so the lib stays blob-agnostic.
 
-#![no_std]
+// `no_std` everywhere except under `cargo test`, whose harness needs std on the host.
+#![cfg_attr(not(test), no_std)]
 // The Xtensa SIMD kernels use experimental inline asm; the feature is only needed
 // (and only available, on the esp toolchain) when building for the device.
 #![cfg_attr(target_arch = "xtensa", feature(asm_experimental_arch))]
@@ -17,6 +18,7 @@
 #[macro_use]
 extern crate alloc;
 
+pub mod alignment;
 pub mod layers;
 pub mod mac;
 pub mod model;

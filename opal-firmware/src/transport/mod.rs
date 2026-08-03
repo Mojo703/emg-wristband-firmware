@@ -43,18 +43,29 @@ pub enum Control {
 
 /// One end of a dashboard link.
 pub trait Transport {
-    fn send(&mut self, frame: &Frame) -> Result<()>;
+    /// Send one frame, encoding it through `scratch` — the caller-owned reusable
+    /// buffer ([`Links`](crate::links::Links) holds the one instance). A bulk EMG
+    /// frame encodes to ~24 KB, an ask the fragmented steady-state heap cannot
+    /// promise per frame, so the buffer is reserved once at boot and reused. Its
+    /// contents do not survive the call.
+    fn send(&mut self, frame: &Frame, scratch: &mut Vec<u8>) -> Result<()>;
     /// Non-blocking: the next control frame from the dashboard, if any is ready.
     fn poll(&mut self) -> Option<Control>;
 }
 
-/// Encode a frame ready for the wire: magic + length + CBOR in one buffer, so each
-/// frame is a single write (with `TCP_NODELAY`, a separate header write would cost a
-/// tiny extra packet per frame).
-fn encode(frame: &Frame) -> Vec<u8> {
-    let mut payload = Vec::new();
-    ciborium::into_writer(frame, &mut payload).expect("CBOR encode");
-    protocol::frame_bytes(&payload)
+/// Encode a frame ready for the wire into `scratch`: magic + length + CBOR in one
+/// buffer, so each frame is a single write (with `TCP_NODELAY`, a separate header
+/// write would cost a tiny extra packet per frame). Reuses `scratch`'s allocation;
+/// returns the encoded bytes.
+fn encode_into<'a>(frame: &Frame, scratch: &'a mut Vec<u8>) -> &'a [u8] {
+    const HEADER_BYTES: usize = protocol::FRAME_MAGIC.len() + 4;
+    scratch.clear();
+    scratch.extend_from_slice(&protocol::FRAME_MAGIC);
+    scratch.extend_from_slice(&[0u8; 4]);
+    ciborium::into_writer(frame, &mut *scratch).expect("CBOR encode");
+    let length = (scratch.len() - HEADER_BYTES) as u32;
+    scratch[protocol::FRAME_MAGIC.len()..HEADER_BYTES].copy_from_slice(&length.to_le_bytes());
+    scratch
 }
 
 fn decode(bytes: &[u8]) -> Option<Control> {

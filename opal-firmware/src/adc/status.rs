@@ -42,11 +42,6 @@ impl LeadOffFlags {
     pub(super) const fn contains(self, channel: Channel) -> bool {
         self.0.contains(channel)
     }
-
-    #[allow(dead_code)] // Reads better than `== LeadOffFlags::default()` at a call site.
-    pub(super) const fn is_empty(self) -> bool {
-        self.0.is_empty()
-    }
 }
 
 impl fmt::Display for LeadOffFlags {

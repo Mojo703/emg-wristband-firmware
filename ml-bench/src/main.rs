@@ -62,8 +62,11 @@ fn dw_self_test() -> bool {
         let w = tensor::AlignedI8::from_slice(&rng.fill_i8(kernel * c));
         let bias = rng.fill_i32_small(c);
 
-        let ref_out = layers::depthwise_scalar(&input, &w, &bias, kernel, 2, rq);
-        let simd_out = layers::depthwise_simd(&input, &w, &bias, kernel, 2, rq);
+        let mut padded = I8Activation::zeros(1, 1);
+        let mut ref_out = I8Activation::zeros(1, 1);
+        let mut simd_out = I8Activation::zeros(1, 1);
+        layers::depthwise_scalar(&input, &w, &bias, kernel, 2, rq, &mut padded, &mut ref_out);
+        layers::depthwise_simd(&input, &w, &bias, kernel, 2, rq, &mut padded, &mut simd_out);
 
         let rs = ref_out.as_slice();
         let ss = simd_out.as_slice();
@@ -128,7 +131,7 @@ fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
     dot / (na.sqrt() * nb.sqrt()).max(1e-8)
 }
 
-fn verify_real_model(model: &Model, batch: &mut VerifyBatch) -> (f32, f32, f32) {
+fn verify_real_model(model: &mut Model, batch: &mut VerifyBatch) -> (f32, f32, f32) {
     let mut top1_correct = 0usize;
     let mut agreement = 0usize;
     let mut total_cosine = 0.0f32;
@@ -177,7 +180,7 @@ fn main() -> anyhow::Result<()> {
     // ---- Synthetic benchmark (timing, same shapes as the real model) ----
     info!("--- Synthetic model benchmark (timing) ---");
     let heap_boot = free_heap_discontinuous();
-    let synth = Model::synthetic();
+    let mut synth = Model::synthetic();
     let heap_loaded = free_heap_discontinuous();
     info!(
         "synthetic model RAM: ~{} KB | free heap: {} KB",
@@ -204,7 +207,7 @@ fn main() -> anyhow::Result<()> {
     // ---- Real model verification ----
     info!("--- Real model (BN-folded, ReLU, int8) ---");
     let heap_pre = free_heap_discontinuous();
-    let real_model = Model::load(MODEL_BIN);
+    let mut real_model = Model::load(MODEL_BIN);
     let heap_post = free_heap_discontinuous();
     info!(
         "real model RAM: ~{} KB | input_len: {} | kernel: {} | free heap: {} KB",
@@ -220,7 +223,7 @@ fn main() -> anyhow::Result<()> {
         verify.total, verify.input_scale
     );
 
-    let (top1, agreement, cos) = verify_real_model(&real_model, &mut verify);
+    let (top1, agreement, cos) = verify_real_model(&mut real_model, &mut verify);
     info!("device top-1 accuracy: {:.3}", top1);
     info!("device/float argmax agreement: {:.3}", agreement);
     info!("mean logit cosine vs float: {:.6}", cos);

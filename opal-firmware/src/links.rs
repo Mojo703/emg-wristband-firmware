@@ -31,7 +31,21 @@ pub struct Links {
     /// Stands the dialer thread down while a dashboard holds the serial link.
     want_tcp: Arc<AtomicBool>,
     claim: SerialClaimPolicy,
+    /// The one wire-encoding buffer, threaded through every [`Transport::send`].
+    /// Reserved once at boot while the heap is still unfragmented: a bulk EMG frame
+    /// encodes to ~24 KB, and the steady-state heap's largest free block hovers
+    /// around 31 KB, so allocating that per send is an out-of-memory abort waiting
+    /// on fragmentation luck.
+    scratch: Vec<u8>,
 }
+
+/// [`Links::scratch`]'s boot-time reservation: a typical worst encoded EMG frame —
+/// one railed chip packing at ~3 varint bytes per sample, the other near one — plus
+/// CBOR structure and framing. A frame beyond it (both chips railed) grows the
+/// buffer once and the capacity sticks; reserving the absolute worst case up front
+/// costs 8 KB of permanent headroom against a heap where TCP's link threads need
+/// two 8 KB contiguous stacks at dial time.
+const ENCODE_SCRATCH_BYTES: usize = 18 * 1024;
 
 impl Links {
     /// Take ownership of the serial link and, when wifi credentials are configured,
@@ -64,6 +78,7 @@ impl Links {
             tcp_deliveries,
             want_tcp,
             claim: SerialClaimPolicy::new(SERIAL_CLAIM_TIMEOUT, SERIAL_RECLAIM_COOLDOWN),
+            scratch: Vec::with_capacity(ENCODE_SCRATCH_BYTES),
         })
     }
 
@@ -81,7 +96,7 @@ impl Links {
             } else {
                 self.tcp = Some(transport);
                 if let Some(transport) = self.tcp.as_mut() {
-                    let _ = announce(transport, device_id, settings);
+                    let _ = announce(transport, &mut self.scratch, device_id, settings);
                 }
             }
         }
@@ -130,10 +145,18 @@ impl Links {
     pub fn send_window(&mut self, hello: Option<&Frame>, frames: &[Frame]) {
         let serial_active = self.claim.is_claimed();
         if serial_active || self.tcp.is_some() {
+            // Destructured so the active transport and the shared encode scratch can
+            // be borrowed at once.
+            let Self {
+                serial,
+                tcp,
+                scratch,
+                ..
+            } = self;
             let active: &mut dyn Transport = if serial_active {
-                &mut self.serial
+                serial
             } else {
-                self.tcp.as_mut().expect("tcp checked above")
+                tcp.as_mut().expect("tcp checked above")
             };
 
             let mut ok = true;
@@ -142,7 +165,7 @@ impl Links {
             // next link.
             let mut pending_logs = logger::drain().into_iter();
             while let Some(log_frame) = pending_logs.next() {
-                if active.send(&log_frame).is_err() {
+                if active.send(&log_frame, scratch).is_err() {
                     let mut unsent = vec![log_frame];
                     unsent.extend(pending_logs);
                     logger::restore(unsent);
@@ -155,12 +178,12 @@ impl Links {
             // this window is stale by the next iteration anyway).
             if ok {
                 if let Some(hello) = hello {
-                    ok = active.send(hello).is_ok();
+                    ok = active.send(hello, scratch).is_ok();
                 }
             }
             for frame in frames {
                 if ok {
-                    ok = active.send(frame).is_ok();
+                    ok = active.send(frame, scratch).is_ok();
                 }
             }
 
@@ -192,7 +215,7 @@ impl Links {
             self.tcp = None; // dropping hangs up; the backend sees a clean close
         }
         if outcome.announce {
-            let _ = announce(&mut self.serial, device_id, settings);
+            let _ = announce(&mut self.serial, &mut self.scratch, device_id, settings);
         }
     }
 }
@@ -257,11 +280,15 @@ fn spawn_link_thread(
 /// Send the current identity + functional config.
 fn announce(
     transport: &mut dyn Transport,
+    scratch: &mut Vec<u8>,
     device_id: &str,
     settings: &Settings,
 ) -> anyhow::Result<()> {
-    transport.send(&Frame::DeviceHello {
-        device_id: device_id.into(),
-        config: settings.to_wire(),
-    })
+    transport.send(
+        &Frame::DeviceHello {
+            device_id: device_id.into(),
+            config: settings.to_wire(),
+        },
+        scratch,
+    )
 }

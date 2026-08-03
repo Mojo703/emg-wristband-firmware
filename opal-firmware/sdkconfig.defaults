@@ -11,8 +11,12 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="$ENV{PROJECT_DIR}/partitions.csv"
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=240
 
-# The Rust main task runs inference + framing; give it a generous stack.
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=24000
+# The Rust main task runs inference + framing. Inference works through the model's
+# own heap-resident scratch buffers and framing through the links' shared encode
+# buffer, so the stack holds no window-sized locals; 16 KB is still generous, and
+# every KB here is contiguous internal RAM the heap needs back (TCP's link threads
+# alone want two 8 KB stacks at dial time).
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=16000
 CONFIG_FREERTOS_HZ=1000
 
 # TCP throughput to the dashboard. The lwIP default send buffer (5760 B, 4 segments)

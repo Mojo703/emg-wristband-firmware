@@ -59,6 +59,46 @@ pub struct Model {
     pub input_len: usize,
     pub kernel: usize,
     pub logit_scale: f32,
+    scratch: ForwardScratch,
+}
+
+/// The three activation buffers one forward pass needs, allocated once with the
+/// model and reused every inference. The buffer roles are fixed: each block's
+/// depthwise reads the previous pointwise output (or the caller's input) and writes
+/// `depthwise_out` via `padded`; its pointwise reads `depthwise_out` and writes
+/// `pointwise_out`, which the next block treats as its input. On the device an
+/// inference runs four times a second, and per-inference allocations in the
+/// multi-kilobyte size class fragment a heap whose free margin is already thin —
+/// an allocation failure mid-forward is an abort with no console.
+struct ForwardScratch {
+    padded: I8Activation,
+    depthwise_out: I8Activation,
+    pointwise_out: I8Activation,
+}
+
+impl ForwardScratch {
+    /// Sizes every buffer to its worst case across the block walk, so `reuse` never
+    /// grows them afterwards.
+    fn sized_for(input_len: usize, kernel: usize, blocks: &[Block]) -> Self {
+        let pad = kernel / 2;
+        let mut t = input_len;
+        let mut c = INPUT_CH;
+        let mut padded_max = 0usize;
+        let mut depthwise_max = 0usize;
+        let mut pointwise_max = 0usize;
+        for block in blocks {
+            padded_max = padded_max.max((t + 2 * pad) * c);
+            t = t.div_ceil(STRIDE);
+            depthwise_max = depthwise_max.max(t * c);
+            c = block.out_ch;
+            pointwise_max = pointwise_max.max(t * c);
+        }
+        Self {
+            padded: I8Activation::zeros(padded_max.max(1), 1),
+            depthwise_out: I8Activation::zeros(depthwise_max.max(1), 1),
+            pointwise_out: I8Activation::zeros(pointwise_max.max(1), 1),
+        }
+    }
 }
 
 pub struct VerifyWindow {
@@ -129,7 +169,7 @@ impl Model {
             relu: true,
         };
         let kernel = 25;
-        let blocks = BLOCKS
+        let blocks: Vec<Block> = BLOCKS
             .iter()
             .map(|&(in_ch, out_ch)| Block {
                 out_ch,
@@ -145,6 +185,7 @@ impl Model {
                 pw_rq: rq,
             })
             .collect();
+        let scratch = ForwardScratch::sized_for(500, kernel, &blocks);
         Model {
             blocks,
             head: (
@@ -154,6 +195,7 @@ impl Model {
             input_len: 500,
             kernel,
             logit_scale: 1.0,
+            scratch,
         }
     }
 
@@ -212,26 +254,55 @@ impl Model {
         let head_b = c.i32_vec(NUM_CLASSES);
         let logit_scale = c.f32();
 
+        let scratch = ForwardScratch::sized_for(input_len, kernel, &blocks);
         Model {
             blocks,
             head: (head_w, head_b),
             input_len,
             kernel,
             logit_scale,
+            scratch,
         }
     }
 
-    pub fn forward(&self, input: &I8Activation) -> ForwardResult {
-        let mut cur: Option<I8Activation> = None;
-        for blk in &self.blocks {
-            let xin = cur.as_ref().unwrap_or(input);
-            let d = layers::depthwise(xin, &blk.dw, &blk.dw_bias, self.kernel, STRIDE, blk.dw_rq);
-            let p = layers::pointwise(&d, &blk.pw, &blk.pw_bias, blk.out_ch, blk.pw_rq);
-            cur = Some(p);
+    /// One inference. `&mut` because the pass runs through the model's own
+    /// [`ForwardScratch`] buffers rather than allocating activations.
+    pub fn forward(&mut self, input: &I8Activation) -> ForwardResult {
+        let Self {
+            blocks,
+            head,
+            kernel,
+            scratch,
+            ..
+        } = self;
+        let ForwardScratch {
+            padded,
+            depthwise_out,
+            pointwise_out,
+        } = scratch;
+        for (index, blk) in blocks.iter().enumerate() {
+            let xin: &I8Activation = if index == 0 { input } else { pointwise_out };
+            layers::depthwise(
+                xin,
+                &blk.dw,
+                &blk.dw_bias,
+                *kernel,
+                STRIDE,
+                blk.dw_rq,
+                padded,
+                depthwise_out,
+            );
+            layers::pointwise(
+                depthwise_out,
+                &blk.pw,
+                &blk.pw_bias,
+                blk.out_ch,
+                blk.pw_rq,
+                pointwise_out,
+            );
         }
-        let x = cur.expect("at least one block");
-        let pooled = layers::global_avg_pool(&x);
-        let (hw, hb) = &self.head;
+        let pooled = layers::global_avg_pool(pointwise_out);
+        let (hw, hb) = head;
         let logits = layers::linear_i32(pooled.as_slice(), hw, hb, NUM_CLASSES);
         ForwardResult::Logits(logits)
     }
@@ -239,26 +310,50 @@ impl Model {
     /// Like [`Self::forward`], but each stage runs through `timer` for per-stage
     /// profiling. Caller-driven iteration count; this does no bookkeeping of its own.
     pub fn forward_profiled<T: StageTimer>(
-        &self,
+        &mut self,
         input: &I8Activation,
         timer: &mut T,
     ) -> ForwardResult {
-        let mut cur: Option<I8Activation> = None;
-        for (b, blk) in self.blocks.iter().enumerate() {
-            let d = {
-                let xin = cur.as_ref().unwrap_or(input);
-                timer.stage(b * 2, || {
-                    layers::depthwise(xin, &blk.dw, &blk.dw_bias, self.kernel, STRIDE, blk.dw_rq)
-                })
-            };
-            cur = Some(timer.stage(b * 2 + 1, || {
-                layers::pointwise(&d, &blk.pw, &blk.pw_bias, blk.out_ch, blk.pw_rq)
-            }));
+        let Self {
+            blocks,
+            head,
+            kernel,
+            scratch,
+            ..
+        } = self;
+        let ForwardScratch {
+            padded,
+            depthwise_out,
+            pointwise_out,
+        } = scratch;
+        for (index, blk) in blocks.iter().enumerate() {
+            timer.stage(index * 2, || {
+                let xin: &I8Activation = if index == 0 { input } else { pointwise_out };
+                layers::depthwise(
+                    xin,
+                    &blk.dw,
+                    &blk.dw_bias,
+                    *kernel,
+                    STRIDE,
+                    blk.dw_rq,
+                    padded,
+                    depthwise_out,
+                );
+            });
+            timer.stage(index * 2 + 1, || {
+                layers::pointwise(
+                    depthwise_out,
+                    &blk.pw,
+                    &blk.pw_bias,
+                    blk.out_ch,
+                    blk.pw_rq,
+                    pointwise_out,
+                );
+            });
         }
-        let x = cur.expect("at least one block");
-        let pooled = timer.stage(8, || layers::global_avg_pool(&x));
+        let pooled = timer.stage(8, || layers::global_avg_pool(pointwise_out));
         timer.stage(9, || {
-            let (hw, hb) = &self.head;
+            let (hw, hb) = head;
             ForwardResult::Logits(layers::linear_i32(pooled.as_slice(), hw, hb, NUM_CLASSES))
         })
     }

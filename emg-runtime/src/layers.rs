@@ -27,18 +27,22 @@ impl Requantize {
     }
 }
 
-fn pad_input(x: &I8Activation, pad: usize) -> I8Activation {
+/// Copies `x` into `padded` with `pad` zeroed time steps either side, reusing
+/// `padded`'s allocation. Every layer output here is written into a caller-owned
+/// buffer for the same reason: per-inference allocations in the multi-kilobyte size
+/// class fragment the device heap, and an inference that cannot allocate is an
+/// abort with no console.
+fn pad_input_into(x: &I8Activation, pad: usize, padded: &mut I8Activation) {
     let t_padded = x.t + 2 * pad;
-    let mut padded = I8Activation::zeros(t_padded, x.c);
+    padded.reuse(t_padded, x.c);
     let src = x.data.as_slice();
     let dst = padded.data.as_mut_slice();
     dst[pad * x.c..(pad + x.t) * x.c].copy_from_slice(src);
-    padded
 }
 
-/// Scalar depthwise 1D conv. Weight layout `[K, C]`: `ws[j * c + ch]`.
-/// Pre-pads input to avoid inner-loop bounds checks. Retained as the
-/// correctness oracle for the SIMD self-test.
+/// Scalar depthwise 1D conv into `out`, via `padded` (bounds-check-free inner
+/// loop). Weight layout `[K, C]`: `ws[j * c + ch]`. Retained as the correctness
+/// oracle for the SIMD self-test.
 pub fn depthwise_scalar(
     x: &I8Activation,
     w: &AlignedI8,
@@ -46,14 +50,16 @@ pub fn depthwise_scalar(
     k: usize,
     stride: usize,
     rq: Requantize,
-) -> I8Activation {
+    padded: &mut I8Activation,
+    out: &mut I8Activation,
+) {
     let c = x.c;
     let t_out = x.t.div_ceil(stride);
     let pad = k / 2;
-    let padded = pad_input(x, pad);
+    pad_input_into(x, pad, padded);
     let ws = w.as_slice();
     let pd = padded.data.as_slice();
-    let mut out = I8Activation::zeros(t_out, c);
+    out.reuse(t_out, c);
     let od = out.data.as_mut_slice();
     for to in 0..t_out {
         let base = to * stride;
@@ -65,7 +71,6 @@ pub fn depthwise_scalar(
             od[to * c + ch] = rq.apply(acc);
         }
     }
-    out
 }
 
 #[cfg(target_arch = "xtensa")]
@@ -92,8 +97,8 @@ fn extract_qacc_half(data: &[u8], out: &mut [i32]) {
     out[7] = sext20(w4 >> 12);
 }
 
-/// SIMD depthwise using QACC (16 independent 20-bit accumulators). Processes
-/// 16 channels per vector instruction. Weight layout `[K, C]`.
+/// SIMD depthwise using QACC (16 independent 20-bit accumulators), into `out` via
+/// `padded`. Processes 16 channels per vector instruction. Weight layout `[K, C]`.
 #[cfg(target_arch = "xtensa")]
 pub fn depthwise_simd(
     x: &I8Activation,
@@ -102,14 +107,16 @@ pub fn depthwise_simd(
     k: usize,
     stride: usize,
     rq: Requantize,
-) -> I8Activation {
+    padded: &mut I8Activation,
+    out: &mut I8Activation,
+) {
     let c = x.c;
     let t_out = x.t.div_ceil(stride);
     let pad = k / 2;
-    let padded = pad_input(x, pad);
+    pad_input_into(x, pad, padded);
     let ws = w.as_slice();
     let pd = padded.data.as_slice();
-    let mut out = I8Activation::zeros(t_out, c);
+    out.reuse(t_out, c);
     let od = out.data.as_mut_slice();
 
     #[repr(align(16))]
@@ -169,7 +176,6 @@ pub fn depthwise_simd(
             ch += 16;
         }
     }
-    out
 }
 
 #[cfg(not(target_arch = "xtensa"))]
@@ -180,12 +186,14 @@ pub fn depthwise_simd(
     k: usize,
     stride: usize,
     rq: Requantize,
-) -> I8Activation {
-    depthwise_scalar(x, w, bias, k, stride, rq)
+    padded: &mut I8Activation,
+    out: &mut I8Activation,
+) {
+    depthwise_scalar(x, w, bias, k, stride, rq, padded, out)
 }
 
-/// Depthwise 1D conv: SIMD on ESP32-S3, scalar fallback off-target.
-/// Weight layout `[K, C]`: `ws[j * c + ch]`.
+/// Depthwise 1D conv into `out` via `padded`: SIMD on ESP32-S3, scalar fallback
+/// off-target. Weight layout `[K, C]`: `ws[j * c + ch]`.
 pub fn depthwise(
     x: &I8Activation,
     w: &AlignedI8,
@@ -193,22 +201,25 @@ pub fn depthwise(
     k: usize,
     stride: usize,
     rq: Requantize,
-) -> I8Activation {
-    depthwise_simd(x, w, bias, k, stride, rq)
+    padded: &mut I8Activation,
+    out: &mut I8Activation,
+) {
+    depthwise_simd(x, w, bias, k, stride, rq, padded, out)
 }
 
-/// Pointwise (1x1) conv: independent `cin -> out_ch` matmul at each time step.
-/// MAC-heavy; routes through [`mac::dot_i8`] (SIMD-capable).
+/// Pointwise (1x1) conv into `out`: independent `cin -> out_ch` matmul at each time
+/// step. MAC-heavy; routes through [`mac::dot_i8`] (SIMD-capable).
 pub fn pointwise(
     x: &I8Activation,
     w: &AlignedI8,
     bias: &[i32],
     out_ch: usize,
     rq: Requantize,
-) -> I8Activation {
+    out: &mut I8Activation,
+) {
     let cin = x.c;
     let ws = w.as_slice();
-    let mut out = I8Activation::zeros(x.t, out_ch);
+    out.reuse(x.t, out_ch);
     let od = out.data.as_mut_slice();
     for ti in 0..x.t {
         let xs = x.row(ti);
@@ -217,7 +228,6 @@ pub fn pointwise(
             od[ti * out_ch + oc] = rq.apply(bias[oc] + mac::dot_i8(row, xs));
         }
     }
-    out
 }
 
 /// Global average pool over time: `[T, C] -> [C]`.

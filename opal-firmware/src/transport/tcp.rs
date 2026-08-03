@@ -1,6 +1,6 @@
 //! The wifi link: framed CBOR over a TCP socket dialed to the dashboard backend.
 
-use super::{decode, encode, Control, Transport};
+use super::{decode, encode_into, Control, Transport};
 use anyhow::Result;
 use protocol::{Frame, FrameScanner};
 use std::collections::VecDeque;
@@ -11,7 +11,12 @@ use std::sync::{mpsc, Arc, Condvar, Mutex};
 
 /// Recent EMG windows the link hasn't sent yet. When it can't keep up, the oldest are
 /// dropped so the device streams fresh windows rather than a growing backlog.
-const DATA_QUEUE_CAP: usize = 6;
+///
+/// Two, not more, and heap is why: a raw-count EMG frame that compresses badly (a
+/// railed input) runs ~24 KB encoded, so this queue's worst case is CAP × 24 KB
+/// against ~107 KB of steady-state free heap — a deeper queue can eat the whole
+/// heap under wifi backpressure.
+const DATA_QUEUE_CAP: usize = 2;
 
 /// Frames waiting for the writer thread. `reliable` (device hello, predictions, events,
 /// logs) drains first and is never dropped; `data` (the bulk EMG windows) is capped and
@@ -158,11 +163,12 @@ fn is_droppable(frame: &Frame) -> bool {
 }
 
 impl Transport for TcpTransport {
-    fn send(&mut self, frame: &Frame) -> Result<()> {
+    fn send(&mut self, frame: &Frame, scratch: &mut Vec<u8>) -> Result<()> {
         if !self.alive.load(Ordering::SeqCst) {
             anyhow::bail!("dashboard link closed");
         }
-        let bytes = encode(frame);
+        // The queue needs owned bytes; `to_vec` is one exact-size allocation.
+        let bytes = encode_into(frame, scratch).to_vec();
         let (lock, cv) = &*self.queue;
         let mut q = lock.lock().unwrap();
         if is_droppable(frame) {

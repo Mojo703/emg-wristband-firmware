@@ -24,15 +24,17 @@
 //! [`time_step`](InputStage::time_step) takes one frame per device and [`model_slot`]
 //! owns the sixteen-slot layout. The devices self-clock from independent internal
 //! oscillators (CLKSEL at 3V3), so the inter-device offset is *not* fixed: it
-//! wanders continuously within one sample period (≤500 µs) and wraps when the
-//! faster device laps the slower one, at which point acquisition drops the older
-//! surplus frame and counts a `clock_slip`. The layout stays honest on two
-//! grounds: the wandering skew is bounded to under one sample, and data collected
-//! for training runs through this same path, so whatever skew statistics the
-//! hardware produces are in-distribution by construction. Each device has its own
-//! START line and is warm-recovered independently, which avoids restarting a
-//! healthy chip into the front-loaded post-START death hazard the bring-up
-//! campaign measured.
+//! wanders continuously within one sample period (≤500 µs). The grid aligner
+//! ([`emg_runtime::alignment`]) is what pairs the two streams: each device's frame
+//! nearest to the grid tick fills its slots, surplus frames from the faster
+//! oscillator are dropped and counted, and the accounting the combiner logs is the
+//! measured inter-device rate difference. The layout stays honest on two grounds:
+//! the wandering skew is bounded to under one sample, and data collected for
+//! training runs through this same path, so whatever skew statistics the hardware
+//! produces are in-distribution by construction. Each device has its own START
+//! line and is warm-recovered independently, which avoids restarting a healthy
+//! chip into the front-loaded post-START death hazard the bring-up campaign
+//! measured.
 
 use super::channel::{model_slot, Channel, CHANNELS_PER_DEVICE, DEVICE_COUNT};
 use super::conditioning::{Microvolts, NormalizedUnits, SignalConditioner};
@@ -102,16 +104,9 @@ impl InputStage {
         out
     }
 
-    /// Tells the conditioning a break in the stream just happened. See
-    /// [`SignalConditioner::reset_after_gap`].
-    #[allow(dead_code)] // Kept for a whole-front-end gap; recovery is per-device now.
-    pub(super) fn reset_after_gap(&mut self) {
-        self.conditioner.reset_after_gap();
-    }
-
-    /// [`Self::reset_after_gap`] for one device's eight slots, after that device alone
-    /// was warm-recovered. The other device's stream is continuous and its filter
-    /// state stays.
+    /// Tells one device's eight slots that a break in their stream just happened,
+    /// after that device alone was warm-recovered. The other device's stream is
+    /// continuous and its filter state stays.
     pub(super) fn reset_device_after_gap(&mut self, device_index: usize) {
         self.conditioner
             .reset_channels_after_gap(device_index * CHANNELS_PER_DEVICE, CHANNELS_PER_DEVICE);

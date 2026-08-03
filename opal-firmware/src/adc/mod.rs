@@ -15,19 +15,22 @@
 //!
 //! Layout. [`registers`] is the typed register map and [`ads1298`] the register-level
 //! driver; [`decode`]/[`status`]/[`convert`]/[`conditioning`] are the hardware-free
-//! frame and signal maths, [`preprocess`] turns ADC codes into the model's int8 input,
-//! and [`acquisition`] runs the sampling thread. [`bring_up`] does the wiring and hands
-//! back a configured, streaming pair.
+//! frame and signal maths, and [`preprocess`] turns ADC codes into the model's int8
+//! input. [`bring_up`] does the wiring and hands back a configured, streaming pair.
 //!
 //! Threading. Sampling cannot live on the main loop: at ~2 kSPS a frame arrives from
 //! each chip every ~487 µs, while the main loop runs one inference window per
-//! iteration and feeds the task watchdog. [`acquisition::start`] moves the drivers
-//! onto their own thread, so everything here owns its peripherals at `'static`
-//! instead of borrowing them.
+//! iteration and feeds the task watchdog. [`acquisition::start`] spawns one
+//! [`chip_pipeline`] thread per chip — each owning its chip's SPI bus, DRDY
+//! interrupt, and health, so the two chips' reads overlap instead of serialising —
+//! plus a combiner thread that places both streams onto one time grid
+//! ([`emg_runtime::alignment`]) and builds the model and wire windows. Everything
+//! here owns its peripherals at `'static` instead of borrowing them.
 
 pub(crate) mod acquisition;
 pub(crate) mod ads1298;
 mod channel;
+mod chip_pipeline;
 mod conditioning;
 mod convert;
 mod decode;

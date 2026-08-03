@@ -10,30 +10,25 @@ use emg_runtime::model::{INPUT_CH, NUM_CLASSES};
 use emg_runtime::Decision;
 use protocol::{Frame, WakeState};
 
-/// The bulk EMG window. `samples` is raw ADC counts, time-major `[t, c]`, at the fixed
-/// [`MICROVOLTS_PER_WIRE_COUNT`] scale; the wire layout is channel-major
-/// little-endian i16, so we transpose. The blob is then delta+varint packed for the
-/// link (the backend unpacks it); see [`protocol::pack_samples`].
+/// The bulk EMG window. `packed_samples` is the already-packed payload the combiner
+/// produced off its persistent buffer — raw ADC counts at the fixed
+/// [`MICROVOLTS_PER_WIRE_COUNT`] scale, channel-major, delta+varint packed
+/// ([`protocol::pack_sample_stream`]) — moved into the frame verbatim so this
+/// window's only heap transient is that one payload.
 ///
 /// Raw, not the conditioned model input. Recorded sessions are the reason: the model
 /// input is DC-blocked and divided by a per-channel amplitude estimate that drifts with
 /// the electrodes, so its scale is not a number a stored file can be interpreted
 /// against later. `scale_uv` is therefore a constant here, not a per-window
 /// reconstruction.
-pub fn emg(seq: u32, t0_us: u64, samples: &[i16], input_len: usize, sample_rate: u32) -> Frame {
-    let mut blob = Vec::with_capacity(input_len * INPUT_CH * 2);
-    for ch in 0..INPUT_CH {
-        for ti in 0..input_len {
-            blob.extend_from_slice(&samples[ti * INPUT_CH + ch].to_le_bytes());
-        }
-    }
+pub fn emg(seq: u32, t0_us: u64, packed_samples: Vec<u8>, sample_rate: u32) -> Frame {
     Frame::Emg {
         seq,
         t0_us,
         channels: INPUT_CH as u16,
         sample_rate,
         scale_uv: MICROVOLTS_PER_WIRE_COUNT,
-        samples: protocol::pack_samples(&blob),
+        samples: packed_samples,
     }
 }
 

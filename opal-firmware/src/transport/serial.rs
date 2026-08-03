@@ -1,6 +1,6 @@
 //! The serial link: framed CBOR over the USB-Serial-JTAG CDC channel.
 
-use super::{decode, encode, Control, Transport};
+use super::{decode, encode_into, Control, Transport};
 use anyhow::Result;
 use esp_idf_svc::hal::delay;
 use esp_idf_svc::hal::usb_serial::UsbSerialDriver;
@@ -61,9 +61,8 @@ impl SerialTransport {
 }
 
 impl Transport for SerialTransport {
-    fn send(&mut self, frame: &Frame) -> Result<()> {
-        let bytes = encode(frame);
-        let mut remaining = bytes.as_slice();
+    fn send(&mut self, frame: &Frame, scratch: &mut Vec<u8>) -> Result<()> {
+        let mut remaining = encode_into(frame, scratch);
         while !remaining.is_empty() {
             let chunk_len = remaining.len().min(SERIAL_WRITE_CHUNK_BYTES);
             let written = self.driver.write(
