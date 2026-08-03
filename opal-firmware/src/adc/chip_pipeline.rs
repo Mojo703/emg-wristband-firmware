@@ -64,8 +64,11 @@ const DATA_READY_TIMEOUT_US: u64 = DATA_READY_TIMEOUT_MS as u64 * 1000;
 /// the fault. The counters carry the true total, so staying quiet loses nothing.
 const READ_ERROR_LOG_INTERVAL: u32 = 2000;
 
-/// DRDY edges between per-chip timing summaries.
-const TIMING_LOG_INTERVAL: u32 = 500;
+/// DRDY edges between per-chip timing summaries. 20 000 edges is ~10 s per chip:
+/// frequent enough to watch a live bench, sparse enough that the two chips'
+/// summaries do not drown events or evict them from the dashboard's log
+/// retention (the backend keeps 200 lines, the frontend 500).
+const TIMING_LOG_INTERVAL: u32 = 20_000;
 
 /// Consecutive bad-status frames before a chip is warm-recovered. One corrupt frame
 /// is a glitch; a run of them is that chip gone, and the bring-up campaign showed
@@ -446,41 +449,45 @@ impl Pipeline {
     }
 }
 
-/// Spawns the sampling thread for one chip. `power_down` is the chip's PWDN line,
-/// parked in the thread so it stays high for as long as the chip is being sampled.
+/// Spawns the sampling thread for one chip, pinned to `core` (the caller takes
+/// that from the core plan). `power_down` is the chip's PWDN line, parked in the
+/// thread so it stays high for as long as the chip is being sampled.
 pub(super) fn spawn(
     index: usize,
+    core: esp_idf_svc::hal::cpu::Core,
     chip: Ads1298FrontEnd,
     power_down: PinDriver<'static, Output>,
     events: SyncSender<(usize, ChipEvent)>,
     counters: Arc<HealthCounters>,
 ) -> anyhow::Result<()> {
-    std::thread::Builder::new()
-        .name(format!("adc{index}"))
-        .stack_size(THREAD_STACK_BYTES)
-        .spawn(move || {
-            crate::adc::acquisition::set_current_thread_priority(THREAD_PRIORITY);
-            info!("chip {index} pipeline running");
-            let _power_down = power_down;
-            let started_us = now_us();
-            Pipeline {
-                index,
-                chip,
-                events,
-                counters,
-                last_edge_us: started_us,
-                settling_until_us: started_us + COLD_START_SETTLE_US,
-                consecutive_bad_status: 0,
-                consecutive_slow_periods: 0,
-                last_status: 0,
-                edges: 0,
-                timing: EdgeTiming::default(),
-                abs_microvolt_sum: 0.0,
-                abs_microvolt_frames: 0,
-                announced_present: false,
-                batch: Vec::with_capacity(FRAMES_PER_BATCH),
-            }
-            .run();
-        })?;
+    crate::cores::spawn_pinned(core, || {
+        std::thread::Builder::new()
+            .name(format!("adc{index}"))
+            .stack_size(THREAD_STACK_BYTES)
+            .spawn(move || {
+                crate::adc::acquisition::set_current_thread_priority(THREAD_PRIORITY);
+                info!("chip {index} pipeline running");
+                let _power_down = power_down;
+                let started_us = now_us();
+                Pipeline {
+                    index,
+                    chip,
+                    events,
+                    counters,
+                    last_edge_us: started_us,
+                    settling_until_us: started_us + COLD_START_SETTLE_US,
+                    consecutive_bad_status: 0,
+                    consecutive_slow_periods: 0,
+                    last_status: 0,
+                    edges: 0,
+                    timing: EdgeTiming::default(),
+                    abs_microvolt_sum: 0.0,
+                    abs_microvolt_frames: 0,
+                    announced_present: false,
+                    batch: Vec::with_capacity(FRAMES_PER_BATCH),
+                }
+                .run();
+            })
+    })??;
     Ok(())
 }

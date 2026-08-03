@@ -61,12 +61,12 @@ impl TcpTransport {
         {
             let reader = Arc::clone(&stream);
             let alive = Arc::clone(&alive);
-            std::thread::Builder::new()
-                .stack_size(8192)
-                .spawn(move || {
+            crate::cores::spawn_pinned(crate::cores::TCP_READER_CORE, || {
+                std::thread::Builder::new().stack_size(8192).spawn(move || {
                     read_loop(&reader, &alive, tx);
                     alive.store(false, Ordering::SeqCst);
-                })?;
+                })
+            })??;
         }
         Ok(Self { stream, rx, alive })
     }

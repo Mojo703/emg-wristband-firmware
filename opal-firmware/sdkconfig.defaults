@@ -11,6 +11,15 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="$ENV{PROJECT_DIR}/partitions.csv"
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=240
 
+# The core plan lives in src/cores.rs; these pin the tasks that sdkconfig owns.
+# Main and wifi are the esp-idf defaults, stated so the plan does not rest on
+# them staying default; lwIP floats by default and is pinned to core 0 here to
+# keep networking off the acquisition core (measured: no cost on the serial
+# bench, and it removes the one task that could wander onto core 1 under load).
+CONFIG_ESP_MAIN_TASK_AFFINITY_CPU0=y
+CONFIG_ESP_WIFI_TASK_PINNED_TO_CORE_0=y
+CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0=y
+
 # The Rust main task runs inference + framing. Inference works through the model's
 # own heap-resident scratch buffers and framing through the links' shared encode
 # buffer, so the stack holds no window-sized locals; 16 KB is still generous, and

@@ -22,6 +22,7 @@
 
 mod adc;
 mod config;
+mod cores;
 mod frames;
 mod link_policy;
 mod links;

@@ -13,6 +13,30 @@ pub(crate) const CHANNELS_PER_DEVICE: usize = 8;
 /// synchronisation the pair has to satisfy for the layout to be honest.
 pub(crate) const DEVICE_COUNT: usize = 2;
 
+/// One of the two analog-front-end boards, as wired in `main`: A is the
+/// right-column ribbon on SPI2, B the left-column ribbon on SPI3. This is
+/// hardware identity — it keys the wiring, the aligner source slot, and the
+/// core plan (`crate::cores`) — and stays put even when any of those
+/// assignments change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Board {
+    A,
+    B,
+}
+
+impl Board {
+    /// Both boards, in device-index order.
+    pub(crate) const ALL: [Board; DEVICE_COUNT] = [Board::A, Board::B];
+
+    /// This board's aligner source slot and [`model_slot`] block.
+    pub(crate) const fn device_index(self) -> usize {
+        match self {
+            Board::A => 0,
+            Board::B => 1,
+        }
+    }
+}
+
 /// Which of the model's input slots device `device_index` fills with `channel`.
 ///
 /// Devices take contiguous blocks in index order, so device 0 owns slots 0..8 and

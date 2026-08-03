@@ -44,7 +44,7 @@ use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
 
 use super::ads1298::SAMPLE_RATE_HZ;
-use super::channel::DEVICE_COUNT;
+use super::channel::{Board, DEVICE_COUNT};
 use super::chip_pipeline::{self, ChipEvent};
 use super::decode::Sample;
 use super::preprocess::{wire_time_step, InputStage};
@@ -233,35 +233,36 @@ pub(crate) fn start(
         chips,
         _power_down: power_down,
     } = front_ends;
-    let mut index = 0;
-    for (chip, power_down) in chips.into_iter().zip(power_down) {
+    for ((chip, power_down), board) in chips.into_iter().zip(power_down).zip(Board::ALL) {
         chip_pipeline::spawn(
-            index,
+            board.device_index(),
+            crate::cores::front_end_core(board),
             chip,
             power_down,
             event_sender.clone(),
             counters.clone(),
         )?;
-        index += 1;
     }
     drop(event_sender); // the pipelines hold the only senders now
 
     let combiner_counters = counters.clone();
-    std::thread::Builder::new()
-        .name("adc-combine".into())
-        .stack_size(THREAD_STACK_BYTES)
-        .spawn(move || {
-            set_current_thread_priority(THREAD_PRIORITY);
-            info!("combiner running");
-            combine(
-                events,
-                window_sender,
-                recycled,
-                combiner_counters,
-                window_length,
-                input_scale,
-            );
-        })?;
+    crate::cores::spawn_pinned(crate::cores::COMBINER_CORE, || {
+        std::thread::Builder::new()
+            .name("adc-combine".into())
+            .stack_size(THREAD_STACK_BYTES)
+            .spawn(move || {
+                set_current_thread_priority(THREAD_PRIORITY);
+                info!("combiner running");
+                combine(
+                    events,
+                    window_sender,
+                    recycled,
+                    combiner_counters,
+                    window_length,
+                    input_scale,
+                );
+            })
+    })??;
 
     Ok(AdcSource {
         windows,

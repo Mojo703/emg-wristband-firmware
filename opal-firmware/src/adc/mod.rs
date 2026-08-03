@@ -29,7 +29,7 @@
 
 pub(crate) mod acquisition;
 pub(crate) mod ads1298;
-mod channel;
+pub(crate) mod channel;
 mod chip_pipeline;
 mod conditioning;
 mod convert;
@@ -147,12 +147,14 @@ pub(crate) fn bring_up<SpiA: SpiAnyPins + 'static, SpiB: SpiAnyPins + 'static>(
     // The ADS1298 samples DIN on the falling edge and shifts DOUT on the rising edge:
     // SPI mode 1 (CPOL=0, CPHA=1).
     //
-    // Interrupt-driven transactions, not the default polling: a polled transfer
-    // busy-spins the CPU for its whole duration, and two chips at 2000 SPS spin
-    // ~4000 times a second — enough, with the rest of the acquisition path, to
-    // starve the idle task and trip the task watchdog. Blocking on the transfer
-    // instead costs some per-transaction latency, which the ~500 µs sample period
-    // absorbs easily.
+    // Interrupt-driven transactions, not polling. This is load-bearing given both
+    // pipeline threads share core 1 (see `chip_pipeline::spawn`): a polled
+    // transfer spins at priority without yielding, and its equal-priority sibling
+    // waits for a FreeRTOS tick boundary (1 ms — two whole sample periods) to run
+    // at all. Measured on the bench: polling doubled the per-chip miss rate to
+    // ~13.5% and multiplied bad-status reads tenfold, while saving only ~15 µs on
+    // an uncontended read. Blocking transfers let the two chips' reads interleave
+    // within the period, and the ~100 µs ISR turnaround is absorbed by it.
     let spi_config = SpiConfig::new()
         .baudrate(baud_rate_hz.Hz())
         .data_mode(MODE_1)
@@ -160,7 +162,28 @@ pub(crate) fn bring_up<SpiA: SpiAnyPins + 'static, SpiB: SpiAnyPins + 'static>(
 
     let [wiring_a, wiring_b] = wiring;
     let (front_end_a, power_down_a) = build_front_end(spi_a, wiring_a, &spi_config)?;
-    let (front_end_b, power_down_b) = build_front_end(spi_b, wiring_b, &spi_config)?;
+    // Chip B's bus is initialised from a thread pinned to core 1, for two
+    // interrupt placements that follow from where code runs rather than from any
+    // config: the SPI host's completion interrupt is allocated on the core that
+    // calls `spi_bus_initialize`, and the shared GPIO ISR dispatcher installs on
+    // the core that first enables it. Both belong on chip B's core — see
+    // `crate::cores` for the whole plan — because a read-completion or DRDY wake
+    // that fires on the loaded core pays that core's interrupt load as added
+    // latency before the cross-core hop.
+    let spi_config_b = spi_config.clone();
+    let built_b =
+        crate::cores::spawn_pinned(crate::cores::GPIO_INTERRUPT_DISPATCHER_CORE, || {
+            std::thread::Builder::new()
+                .name("adc-init-b".into())
+                .stack_size(8192)
+                .spawn(move || {
+                    esp_idf_svc::hal::gpio::enable_isr_service()?;
+                    build_front_end(spi_b, wiring_b, &spi_config_b)
+                })
+        })??
+        .join();
+    let (front_end_b, power_down_b) =
+        built_b.map_err(|_| anyhow::anyhow!("chip B front-end init thread panicked"))??;
     let mut chips = [front_end_a, front_end_b];
     let mut power_down = [power_down_a, power_down_b];
 

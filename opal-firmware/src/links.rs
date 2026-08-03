@@ -241,44 +241,46 @@ fn spawn_link_thread(
     let server_addr = settings.server_addr.clone();
     // Wifi bring-up and association run deep into esp-idf; they previously lived on
     // the 24 KB main task, so give this thread real headroom (8 KB overflowed).
-    std::thread::Builder::new()
-        .stack_size(20480)
-        .spawn(move || {
-            let mut wifi = match wifi::start(modem, sysloop, nvs, &ssid, &psk) {
-                Ok(wifi) => wifi,
-                Err(e) => {
-                    warn!("wifi failed to start ({e}); serial only");
-                    return;
-                }
-            };
-            let mut current: Option<Arc<AtomicBool>> = None;
-            loop {
-                let delivered_alive = current
-                    .as_ref()
-                    .is_some_and(|alive| alive.load(Ordering::SeqCst));
-                if !want_tcp.load(Ordering::SeqCst) || delivered_alive {
-                    FreeRtos::delay_ms(500);
-                    continue;
-                }
-                if !wifi::ensure_connected(&mut wifi) {
-                    FreeRtos::delay_ms(3000);
-                    continue;
-                }
-                match TcpTransport::connect(&server_addr) {
-                    Ok(transport) => {
-                        info!("connected to dashboard at {server_addr}");
-                        current = Some(transport.alive_handle());
-                        if deliveries.send(transport).is_err() {
-                            return;
+    crate::cores::spawn_pinned(crate::cores::WIFI_LINK_MANAGEMENT_CORE, || {
+        std::thread::Builder::new()
+            .stack_size(20480)
+            .spawn(move || {
+                let mut wifi = match wifi::start(modem, sysloop, nvs, &ssid, &psk) {
+                    Ok(wifi) => wifi,
+                    Err(e) => {
+                        warn!("wifi failed to start ({e}); serial only");
+                        return;
+                    }
+                };
+                let mut current: Option<Arc<AtomicBool>> = None;
+                loop {
+                    let delivered_alive = current
+                        .as_ref()
+                        .is_some_and(|alive| alive.load(Ordering::SeqCst));
+                    if !want_tcp.load(Ordering::SeqCst) || delivered_alive {
+                        FreeRtos::delay_ms(500);
+                        continue;
+                    }
+                    if !wifi::ensure_connected(&mut wifi) {
+                        FreeRtos::delay_ms(3000);
+                        continue;
+                    }
+                    match TcpTransport::connect(&server_addr) {
+                        Ok(transport) => {
+                            info!("connected to dashboard at {server_addr}");
+                            current = Some(transport.alive_handle());
+                            if deliveries.send(transport).is_err() {
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            warn!("dial {server_addr} failed ({e}); retrying");
+                            FreeRtos::delay_ms(2000);
                         }
                     }
-                    Err(e) => {
-                        warn!("dial {server_addr} failed ({e}); retrying");
-                        FreeRtos::delay_ms(2000);
-                    }
                 }
-            }
-        })?;
+            })
+    })??;
     Ok(())
 }
 
