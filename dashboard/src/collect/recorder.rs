@@ -33,6 +33,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const EMG_FILE_NAME: &str = "emg.i16";
+const EMG_MISSING_FILE_NAME: &str = "emg.missing";
 const EVENTS_FILE_NAME: &str = "events.jsonl";
 const MANIFEST_FILE_NAME: &str = "session.json";
 /// Where the manifest is staged before being renamed over `session.json`.
@@ -53,6 +54,7 @@ pub struct FileSessionRecorder {
     directory: PathBuf,
     manifest: SessionManifest,
     emg_file: File,
+    emg_missing_file: File,
     events_file: File,
     /// Bytes of `emg.i16` that `events.jsonl` accounts for. `health()` checks
     /// the file's real length against this, so a counter that drifts from the
@@ -104,6 +106,7 @@ impl FileSessionRecorder {
     ) -> anyhow::Result<FileSessionRecorder> {
         let mut recorder = FileSessionRecorder {
             emg_file: create_new_file(&directory.join(EMG_FILE_NAME))?,
+            emg_missing_file: create_new_file(&directory.join(EMG_MISSING_FILE_NAME))?,
             events_file: create_new_file(&directory.join(EVENTS_FILE_NAME))?,
             directory,
             manifest,
@@ -242,6 +245,12 @@ impl SessionRecorder for FileSessionRecorder {
             self.tail_desynced = true;
             return Err(anyhow::Error::new(failure).context("appending EMG samples"));
         }
+        // The mask rides in a sidecar file, same window order as `emg.i16`. A
+        // failure here loses gap information, not data, so it does not desync
+        // the sample tail.
+        self.emg_missing_file
+            .write_all(window.missing)
+            .context("appending the EMG missing mask")?;
         Ok(())
     }
 
@@ -436,6 +445,7 @@ mod tests {
                     seq: *sequence_number,
                     t0_us: 1_000 * (index as u64 + 1),
                     samples: blob,
+                    missing: &[0b0000_0001],
                 })
                 .unwrap();
         }
@@ -536,6 +546,7 @@ mod tests {
                 seq: 1,
                 t0_us: 1_000,
                 samples: &[1, 0, 2, 0],
+                missing: &[],
             })
             .unwrap();
         let healthy = recorder.health();
@@ -560,6 +571,7 @@ mod tests {
                 seq: 2,
                 t0_us: 2_000,
                 samples: &[3, 0, 4, 0],
+                missing: &[],
             })
             .unwrap();
         assert!(!recorder.health().advancing);

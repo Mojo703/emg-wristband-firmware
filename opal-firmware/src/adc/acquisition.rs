@@ -121,6 +121,11 @@ pub(crate) struct AcquiredWindow {
     /// The window's raw counts at [`super::MICROVOLTS_PER_WIRE_COUNT`],
     /// channel-major, delta+varint packed — the `Frame::Emg` payload byte-for-byte.
     pub(crate) packed_wire: Vec<u8>,
+    /// Which steps of which source are aligner gaps — the `Frame::Emg::missing`
+    /// bit planes byte-for-byte, so a consumer can tell the placeholder zeros in
+    /// the wire stream from measurements. The model input needs no equivalent:
+    /// zero already means "no signal" there.
+    pub(crate) missing: Vec<u8>,
 }
 
 /// Health totals across the front end. These outlive any single window, so they sit
@@ -146,7 +151,7 @@ pub(super) struct HealthCounters {
 pub(crate) struct AdcSource {
     windows: Receiver<AcquiredWindow>,
     /// Returns spent window buffers to the combiner. See [`Self::recycle`].
-    recycled: SyncSender<(Vec<i8>, Vec<u8>)>,
+    recycled: SyncSender<(Vec<i8>, Vec<u8>, Vec<u8>)>,
     counters: Arc<HealthCounters>,
     window_length: usize,
 }
@@ -206,11 +211,12 @@ impl AdcSource {
         drained
     }
 
-    /// Hand a spent window's buffers back for reuse: its model-input samples and its
-    /// packed wire payload (reclaimed from the sent frame). Fire-and-forget: a full
-    /// pool just lets the buffers drop, so this can never block the main loop.
-    pub(crate) fn recycle(&self, samples: Vec<i8>, packed_wire: Vec<u8>) {
-        let _ = self.recycled.try_send((samples, packed_wire));
+    /// Hand a spent window's buffers back for reuse: its model-input samples, its
+    /// packed wire payload, and its missing-mask planes (the latter two reclaimed
+    /// from the sent frame). Fire-and-forget: a full pool just lets the buffers
+    /// drop, so this can never block the main loop.
+    pub(crate) fn recycle(&self, samples: Vec<i8>, packed_wire: Vec<u8>, missing: Vec<u8>) {
+        let _ = self.recycled.try_send((samples, packed_wire, missing));
     }
 }
 
@@ -226,7 +232,8 @@ pub(crate) fn start(
 ) -> Result<AdcSource> {
     let (window_sender, windows) = sync_channel::<AcquiredWindow>(WINDOW_QUEUE_DEPTH);
     let (event_sender, events) = sync_channel::<(usize, ChipEvent)>(EVENT_QUEUE_DEPTH);
-    let (recycle_sender, recycled) = sync_channel::<(Vec<i8>, Vec<u8>)>(RECYCLE_POOL_DEPTH);
+    let (recycle_sender, recycled) =
+        sync_channel::<(Vec<i8>, Vec<u8>, Vec<u8>)>(RECYCLE_POOL_DEPTH);
     let counters = Arc::new(HealthCounters::default());
 
     let FrontEnds {
@@ -278,7 +285,7 @@ pub(crate) fn start(
 fn combine(
     events: Receiver<(usize, ChipEvent)>,
     windows: SyncSender<AcquiredWindow>,
-    recycled: Receiver<(Vec<i8>, Vec<u8>)>,
+    recycled: Receiver<(Vec<i8>, Vec<u8>, Vec<u8>)>,
     counters: Arc<HealthCounters>,
     window_length: usize,
     input_scale: f32,
@@ -292,6 +299,10 @@ fn combine(
     // The wire stream, filled in lockstep with `building`; the two are always the
     // same length and are cleared together.
     let mut building_wire: Vec<i16> = Vec::with_capacity(samples_per_window);
+    // The window's missing-mask bit planes (`Frame::Emg::missing`), set in
+    // lockstep with the buffers above and zeroed whenever they are cleared.
+    let missing_mask_len = DEVICE_COUNT * protocol::missing_plane_stride(window_length);
+    let mut building_missing: Vec<u8> = vec![0u8; missing_mask_len];
     // Device-clock time of the first time step in `building`; stamped when the
     // first step lands, cleared with the buffer.
     let mut building_started_us: u64 = 0;
@@ -319,6 +330,7 @@ fn combine(
                 // channels; discard it rather than stitch across the gap.
                 building.clear();
                 building_wire.clear();
+                building_missing.fill(0);
             }
             ChipEvent::Frames(frames) => {
                 for (at_us, frame) in frames {
@@ -333,10 +345,18 @@ fn combine(
                     {
                         building.clear();
                         building_wire.clear();
+                        building_missing.fill(0);
                     }
                     previous_step_us = Some(step.at_us);
                     if building.is_empty() {
                         building_started_us = step.at_us;
+                    }
+                    let step_index = building.len() / INPUT_CH;
+                    for (source, slot) in step.slots.iter().enumerate() {
+                        if slot.is_none() {
+                            let plane = source * protocol::missing_plane_stride(window_length);
+                            building_missing[plane + step_index / 8] |= 1 << (step_index % 8);
+                        }
                     }
                     building.extend_from_slice(&input_stage.time_step(&step.slots));
                     building_wire.extend_from_slice(&wire_time_step(&step.slots));
@@ -345,11 +365,17 @@ fn combine(
                         // Both outgoing buffers cycle through the pool: whatever the
                         // main loop has returned is reused, and only an empty pool
                         // (cold start, or a dropped window) costs fresh allocations.
-                        let (mut next_building, mut packed_wire) =
+                        let (mut next_building, mut packed_wire, mut next_missing) =
                             recycled.try_recv().unwrap_or_else(|_| {
-                                (Vec::with_capacity(samples_per_window), Vec::new())
+                                (
+                                    Vec::with_capacity(samples_per_window),
+                                    Vec::new(),
+                                    Vec::new(),
+                                )
                             });
                         next_building.clear();
+                        next_missing.clear();
+                        next_missing.resize(missing_mask_len, 0);
                         // The wire payload leaves here already packed, straight off
                         // the persistent i16 buffer (channel-major, matching the
                         // `Frame::Emg` layout), into the pooled payload buffer that
@@ -366,6 +392,7 @@ fn combine(
                             started_us: building_started_us,
                             samples: std::mem::replace(&mut building, next_building),
                             packed_wire,
+                            missing: std::mem::replace(&mut building_missing, next_missing),
                         };
                         match windows.try_send(full) {
                             Ok(()) => {}

@@ -12,6 +12,7 @@
 //! | File | What it is |
 //! |------|------------|
 //! | `emg.i16` | The raw stream: little-endian `i16`, channel-major per window, windows concatenated in `seq` order, exactly as received in `Frame::Emg`. Never windowed, never filtered. Raw ADC counts; [`HardwareIdentity::scale_uv`] is the µV per count they convert back with. |
+//! | `emg.missing` | The windows' `Frame::Emg::missing` bit planes, concatenated in the same window order as `emg.i16` (see the protocol crate for the plane layout). A set bit marks that source's samples at that step as aligner-gap placeholders, not measurements. Absent or short means no gap information — read as all-data. |
 //! | `events.jsonl` | One [`SessionEvent`] as JSON per line, in time order. Self-contained: a windowing tool needs nothing else to label `emg.i16`. |
 //! | `session.json` | The [`SessionManifest`]: tags, hardware identity, track, goal. |
 //! | `video.mkv` | Webcam capture, present when the camera ran. |
@@ -120,6 +121,8 @@ pub struct EmgWindow<'samples> {
     pub t0_us: u64,
     /// The raw little-endian `i16` blob, channel-major.
     pub samples: &'samples [u8],
+    /// The window's missing-mask bit planes, verbatim from the frame.
+    pub missing: &'samples [u8],
 }
 
 /// Unit 1: writes one session's `emg.i16`, `events.jsonl`, and `session.json`.

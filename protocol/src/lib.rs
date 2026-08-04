@@ -76,6 +76,18 @@ pub enum Frame {
         scale_uv: f32,
         #[serde(with = "serde_bytes")]
         samples: Vec<u8>,
+        /// Which time steps carry no measurement from a source. The sixteen
+        /// channels arrive as two eight-channel acquisition sources (channel
+        /// blocks `0..8` and `8..16`), and a source that misses a grid tick has
+        /// zeros written into `samples` as placeholders — against an electrode's
+        /// DC offset those read as full-scale spikes unless a consumer knows to
+        /// treat them as gaps. This field is that knowledge on the wire: one bit
+        /// plane per source, in channel-block order, each
+        /// [`missing_plane_stride`] bytes; time step `t` lives at byte `t / 8`,
+        /// bit `t % 8`. A set bit means "gap": that source's eight samples at
+        /// that step are placeholders, not data.
+        #[serde(with = "serde_bytes")]
+        missing: Vec<u8>,
     },
 
     /// Classifier output for one window (backend → browser).
@@ -1056,6 +1068,23 @@ pub fn unpack_samples(packed: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Bytes one source's bit plane occupies in [`Frame::Emg`]'s `missing` field,
+/// for a window of `samples_per_channel` time steps.
+pub const fn missing_plane_stride(samples_per_channel: usize) -> usize {
+    samples_per_channel.div_ceil(8)
+}
+
+/// Whether `missing` flags time step `t` of eight-channel source `source` as a
+/// gap. Out-of-range indices read as "not a gap", so a consumer of an older
+/// stream without the field (or a truncated one) sees every sample as data —
+/// exactly what it would have assumed anyway.
+pub fn missing_at(missing: &[u8], samples_per_channel: usize, source: usize, t: usize) -> bool {
+    let byte = source * missing_plane_stride(samples_per_channel) + t / 8;
+    missing
+        .get(byte)
+        .is_some_and(|bits| bits & (1 << (t % 8)) != 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1092,8 +1121,9 @@ mod tests {
     }
 
     #[test]
-    fn emg_frame_roundtrips_with_byte_blob() {
+    fn emg_frame_roundtrips_with_byte_blobs() {
         let samples: Vec<u8> = (0..64u16).flat_map(|v| v.to_le_bytes()).collect();
+        let missing = alloc::vec![0b0000_0101u8, 0b1000_0000];
         let frame = Frame::Emg {
             seq: 7,
             t0_us: 1_234_567,
@@ -1101,16 +1131,47 @@ mod tests {
             sample_rate: 2000,
             scale_uv: 0.5,
             samples: samples.clone(),
+            missing: missing.clone(),
         };
         match roundtrip(&frame) {
             Frame::Emg {
-                seq, samples: out, ..
+                seq,
+                samples: out,
+                missing: mask,
+                ..
             } => {
                 assert_eq!(seq, 7);
                 assert_eq!(out, samples);
+                assert_eq!(mask, missing);
             }
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn missing_bits_index_by_source_plane_then_step() {
+        // Two sources, 10 steps: stride is 2 bytes, source 1's plane starts at
+        // byte 2. Source 0 gaps at steps 0 and 9; source 1 at step 3.
+        let samples_per_channel = 10;
+        assert_eq!(missing_plane_stride(samples_per_channel), 2);
+        let mask = [0b0000_0001u8, 0b0000_0010, 0b0000_1000, 0b0000_0000];
+        for (source, step, expected) in [
+            (0, 0, true),
+            (0, 1, false),
+            (0, 9, true),
+            (1, 3, true),
+            (1, 0, false),
+            (1, 9, false),
+        ] {
+            assert_eq!(
+                missing_at(&mask, samples_per_channel, source, step),
+                expected,
+                "source {source} step {step}"
+            );
+        }
+        // Truncated or absent masks read as all-data.
+        assert!(!missing_at(&[], samples_per_channel, 0, 0));
+        assert!(!missing_at(&mask[..1], samples_per_channel, 1, 3));
     }
 
     #[test]

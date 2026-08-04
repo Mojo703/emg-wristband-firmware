@@ -49,7 +49,39 @@ def decode_emg(frame: dict[str, Any]) -> np.ndarray:
     time = len(samples) // 2 // channels
     ints = np.frombuffer(samples, dtype=np.int16).reshape(channels, time)
     microvolts = ints.astype(np.float32) * scale_uv
+    microvolts = repair_missing(microvolts, frame.get("missing", b""), time)
     return microvolts - microvolts.mean(axis=1, keepdims=True)
+
+
+def repair_missing(microvolts: np.ndarray, missing: bytes, time: int) -> np.ndarray:
+    """Hold the previous sample across aligner-gap steps.
+
+    The frame's `missing` bit planes (one per eight-channel source; see the
+    protocol crate) mark steps whose samples are zero placeholders, which
+    against an electrode's DC offset read as full-scale spikes — exactly the
+    amplitude both estimators measure. The pose input wants a continuous
+    signal, so a gap holds the last real sample; the recorded data keeps its
+    honest zeros and mask elsewhere.
+    """
+    if not missing:
+        return microvolts
+    stride = (time + 7) // 8
+    bits = np.unpackbits(
+        np.frombuffer(missing, dtype=np.uint8), bitorder="little"
+    )
+    for source in range(len(missing) // stride):
+        plane = bits[source * stride * 8 : source * stride * 8 + time]
+        gap_steps = np.flatnonzero(plane)
+        if gap_steps.size == time:
+            continue  # nothing real to hold; leave the zeros
+        block = microvolts[source * 8 : source * 8 + 8]
+        # Ascending order makes this a forward fill: step-1 is already repaired
+        # by the time a later gap reads it. A leading run has nothing behind it,
+        # so it takes the first real sample after it instead.
+        first_real = int(np.flatnonzero(plane == 0)[0])
+        for step in gap_steps:
+            block[:, step] = block[:, step - 1] if step > 0 else block[:, first_real]
+    return microvolts
 
 
 async def handle(websocket: websockets.ServerConnection) -> None:

@@ -21,7 +21,13 @@ use protocol::{Frame, WakeState};
 /// the electrodes, so its scale is not a number a stored file can be interpreted
 /// against later. `scale_uv` is therefore a constant here, not a per-window
 /// reconstruction.
-pub fn emg(seq: u32, t0_us: u64, packed_samples: Vec<u8>, sample_rate: u32) -> Frame {
+pub fn emg(
+    seq: u32,
+    t0_us: u64,
+    packed_samples: Vec<u8>,
+    missing: Vec<u8>,
+    sample_rate: u32,
+) -> Frame {
     Frame::Emg {
         seq,
         t0_us,
@@ -29,6 +35,7 @@ pub fn emg(seq: u32, t0_us: u64, packed_samples: Vec<u8>, sample_rate: u32) -> F
         sample_rate,
         scale_uv: MICROVOLTS_PER_WIRE_COUNT,
         samples: packed_samples,
+        missing,
     }
 }
 

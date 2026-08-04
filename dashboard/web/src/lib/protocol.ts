@@ -302,6 +302,10 @@ export interface EmgFrame {
   readonly sample_rate: number;
   readonly scale_uv: number;
   readonly samples: Uint8Array;
+  // Missing-mask bit planes, one per eight-channel source in channel-block
+  // order; see the protocol crate's Frame::Emg docs for the layout. A set bit
+  // means that source's samples at that step are aligner-gap placeholders.
+  readonly missing: Uint8Array;
 }
 
 export interface DecodedEmg {
@@ -312,6 +316,8 @@ export interface DecodedEmg {
   readonly sampleRate: number;
   readonly scaleUv: number;
   readonly int16: Int16Array;
+  // The frame's missing-mask bit planes, verbatim; query with isMissingAt.
+  readonly missing: Uint8Array;
 }
 
 export interface PredictionFrame {
@@ -628,7 +634,8 @@ export function isEmgFrame(value: unknown): value is EmgFrame {
     isNumber(value['channels']) &&
     isNumber(value['sample_rate']) &&
     isNumber(value['scale_uv']) &&
-    isUint8Array(value['samples'])
+    isUint8Array(value['samples']) &&
+    isUint8Array(value['missing'])
   );
 }
 
@@ -962,5 +969,21 @@ export function decodeEmg(frame: EmgFrame): DecodedEmg {
     sampleRate: frame.sample_rate,
     scaleUv: frame.scale_uv,
     int16,
+    missing: frame.missing,
   };
+}
+
+/// Whether the missing mask flags time step `t` of eight-channel source
+/// `source` (channel block `8*source..8*source+8`) as an aligner-gap
+/// placeholder. `time` is the window's samples per channel. Out-of-range reads
+/// are "not a gap", so an absent or truncated mask reads as all-data.
+export function isMissingAt(
+  missing: Uint8Array,
+  time: number,
+  source: number,
+  t: number,
+): boolean {
+  const stride = Math.ceil(time / 8);
+  const byte = source * stride + (t >> 3);
+  return byte < missing.length && (missing[byte]! & (1 << (t & 7))) !== 0;
 }

@@ -726,8 +726,8 @@ impl RunningSession {
                     None => break Ending::Review, // manager dropped; shouldn't happen
                 },
                 frame = next_emg(&mut self.emg_receiver) => match frame {
-                    Ok(Frame::Emg { seq, t0_us, channels, samples, .. }) => {
-                        self.ingest_window(seq, t0_us, channels, &samples);
+                    Ok(Frame::Emg { seq, t0_us, channels, samples, missing, .. }) => {
+                        self.ingest_window(seq, t0_us, channels, &samples, &missing);
                     }
                     Ok(_) => {}
                     Err(broadcast::error::RecvError::Lagged(_)) => {}
@@ -773,12 +773,20 @@ impl RunningSession {
         self.publish_state();
     }
 
-    fn ingest_window(&mut self, seq: u32, t0_us: u64, channels: u16, samples: &[u8]) {
+    fn ingest_window(
+        &mut self,
+        seq: u32,
+        t0_us: u64,
+        channels: u16,
+        samples: &[u8],
+        missing: &[u8],
+    ) {
         if let Some(recorder) = &mut self.recorder {
             if let Err(error) = recorder.append_emg(EmgWindow {
                 seq,
                 t0_us,
                 samples,
+                missing,
             }) {
                 tracing::warn!("EMG append failed: {error:#}");
             }

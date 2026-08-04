@@ -11,7 +11,7 @@
   import { onMount } from 'svelte';
   import { live, on } from '../lib/socket.svelte';
   import { theme } from '../lib/theme.svelte';
-  import { WakeState, type ClassInfo, type DecodedEmg, type EventFrame, type PredictionFrame, type StateInfo } from '../lib/protocol';
+  import { WakeState, isMissingAt, type ClassInfo, type DecodedEmg, type EventFrame, type PredictionFrame, type StateInfo } from '../lib/protocol';
   import Select from '../lib/ui/Select.svelte';
 
   const SPANS = [1, 2, 5, 10, 15, 20, 30] as const; // ring sizes; the visible span is a subset
@@ -159,7 +159,7 @@
       reinit(emg);
     }
     if (stream === null) return; // reinit should have set this
-    const { int16, time, scaleUv } = emg;
+    const { int16, time, scaleUv, missing } = emg;
     // Absolute sample index of this window's first sample, from the backend clock.
     const idx0 = Math.round((emg.t0us / 1e6) * stream.sampleRate);
 
@@ -170,7 +170,10 @@
       const pos = ((a % stream.capacity) + stream.capacity) % stream.capacity;
       stream.ringAbs[pos] = a;
       for (let ch = 0; ch < stream.channels; ch++) {
-        stream.rings[ch]![pos] = int16[ch * time + i]! * scaleUv;
+        // An aligner-gap placeholder is not a measurement: store NaN so the
+        // drawing loops render a gap instead of a zero spike at the DC offset.
+        const gap = isMissingAt(missing, time, ch >> 3, i);
+        stream.rings[ch]![pos] = gap ? NaN : int16[ch * time + i]! * scaleUv;
       }
     }
     stream.newestAbs = idx0 + time - 1;
@@ -460,7 +463,9 @@
       for (let a = startAbs; a <= stream.newestAbs; a += stride) {
         const pos = a % stream.capacity;
         if (stream.ringAbs[pos] === a) {
-          sum += ring[pos]!;
+          const v = ring[pos]!;
+          if (v !== v) continue; // NaN: an aligner-gap placeholder, not data
+          sum += v;
           counted++;
         }
       }
@@ -485,10 +490,14 @@
             let col = colFrac | 0;
             if (col >= cols) col = cols - 1;
             const v = ring[pos]! - mean;
-            const colMinVal = colMin[col]!;
-            const colMaxVal = colMax[col]!;
-            if (!(v >= colMinVal)) colMin[col] = v;
-            if (!(v <= colMaxVal)) colMax[col] = v;
+            if (v === v) {
+              // NaN (an aligner-gap placeholder) contributes nothing; a column
+              // of nothing but gaps stays NaN and shows the baseline.
+              const colMinVal = colMin[col]!;
+              const colMaxVal = colMax[col]!;
+              if (!(v >= colMinVal)) colMin[col] = v;
+              if (!(v <= colMaxVal)) colMax[col] = v;
+            }
           }
           pos++;
           if (pos >= stream.capacity) pos = 0;
@@ -535,15 +544,16 @@
           const pos = a % stream.capacity;
           if (stream.ringAbs[pos] === a) {
             const av = Math.abs(ring[pos]! - mean);
-            if (av > peak) peak = av;
+            if (av > peak) peak = av; // NaN fails the comparison and is skipped
           }
         }
         const gain = (laneHeight * 0.42) / peak;
-        // Connected polyline through the samples; breaks at gaps (invalid slots).
+        // Connected polyline through the samples; breaks at gaps (invalid
+        // slots and NaN aligner-gap placeholders).
         let drawing = false;
         for (let a = startAbs; a <= stream.newestAbs; a += stride) {
           const pos = a % stream.capacity;
-          if (stream.ringAbs[pos] !== a) {
+          if (stream.ringAbs[pos] !== a || ring[pos]! !== ring[pos]!) {
             drawing = false;
             continue;
           }

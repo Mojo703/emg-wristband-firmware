@@ -409,19 +409,27 @@ fn main() -> anyhow::Result<()> {
         let mut newest_seq = seq;
         for window in windows {
             newest_seq = seq;
-            let frame = frames::emg(seq, window.started_us, window.packed_wire, sample_rate);
+            let frame = frames::emg(
+                seq,
+                window.started_us,
+                window.packed_wire,
+                window.missing,
+                sample_rate,
+            );
             seq = seq.wrapping_add(1);
             links.send_window(None, std::slice::from_ref(&frame));
-            // Both buffers go straight back to the combiner's pool: the model
-            // input as-is, the packed payload reclaimed from the frame it rode in.
+            // The buffers go straight back to the combiner's pool: the model
+            // input as-is, the packed payload and missing mask reclaimed from
+            // the frame they rode in.
             let Frame::Emg {
                 samples: packed_wire,
+                missing,
                 ..
             } = frame
             else {
                 unreachable!("frames::emg builds an Emg frame");
             };
-            source.recycle(window.samples, packed_wire);
+            source.recycle(window.samples, packed_wire, missing);
         }
 
         // The prediction and its events describe the newest window only, and carry its
