@@ -123,12 +123,47 @@ plots session history per metric, grouping min/mean/max families into bands and
 indexed families (`chip0_…`/`chip1_…`) into multi-series cards by name shape
 alone.
 
-## Open
+## Addendum, 2026-08-04: the stalls split in two
 
-The correlated stalls remain: both chips freeze together for 2–7 ms at ~7× the
-independent rate, suspects being flash-cache suspension, wifi bursts, and USB
-interrupt load. `edge_period_max_us` at 1 Hz per chip now instruments exactly
-this. Investigation is running as of this entry.
+An overnight investigation (one implementing agent, one adversarial replicator)
+resolved the correlated stalls into two causes and landed a fix for the first
+(6feee81).
+
+The dominant self-inflicted cause: the DRDY interrupt was re-armed only after
+the SPI read, and esp-idf-hal discards edges outright while an interrupt is
+disabled, so a late service cascaded into lost conversions. Re-arming before
+the read, with a two-test discard filter for the frameless wakes the re-arm
+creates (interrupt-stamp repetition, then the DRDY level) and a
+32-consecutive-discard recovery bound, recovers essentially all of it.
+
+The replication also corrected the metric. Gap percentage redistributes into
+aligner duplicates and misled a whole afternoon of chip A comparisons; serviced
+edges per second, straight off `edge_count`, is the honest number. Replicated
+at n≥3 boots per configuration, against a true conversion rate of ~1996/2000:
+
+```text
+                       chip A edges/s     chip B edges/s
+HEAD, wifi on          1961.8 +/- 0.9     1965.2 +/- 0.6
+fixed, wifi on         1965.8 +/- 1.6     1978.6 +/- 1.1
+fixed, radio off       ~1994              ~1998
+```
+
+Method note the hard way: single 90 s cells vary by ~0.2 pp between boots, and
+build-to-build differences under ~0.5% are unresolved even with stable
+conditions (binary layout moves flash-cache behaviour). Nothing below that
+threshold from a single cell means anything.
+
+The second cause stays open: something scheduler-mediated on core 0, below
+priority 24, preempts chip A mid-transfer for ~3 ms at a time whenever the
+radio is up. The priority experiment cleared flash-cache suspension as a
+suspect, and pipelines at priority 24 measured 1990/1991 edges/s — the best
+sampling of the session — but broke TCP (zero bytes sent, then a watchdog
+panic, backtrace not captured). That is an open starvation question, not a
+refutation; it is the most promising lever. The structural alternative, if
+priority and networking cannot be reconciled: read the frame inside the DRDY
+interrupt, which makes the deadline immune to scheduling entirely. The ADS1298
+has no FIFO — a conversion not clocked out within one period is gone — so
+every path to the remaining ~1% runs through meeting that deadline.
 
 ## Next steps
 
