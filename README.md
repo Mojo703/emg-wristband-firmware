@@ -20,7 +20,9 @@ Firmware (ESP32-S3, Xtensa toolchain):
 
 | Path | What it is |
 |------|------------|
-| [`ota-client/`](ota-client) | OTA update client. Pulls a firmware image over HTTP and reboots into it. The first milestone, since it makes every later firmware change faster to ship. |
+| [`opal-firmware/`](opal-firmware) | The device. Two ADS1298s sample 16 channels on their own thread, the int8 model classifies each window, and the result streams to the dashboard over wifi or USB serial. `BRINGUP.md` is the bench procedure for new hardware. |
+| [`drv2605l/`](drv2605l) | TI DRV2605L haptic driver over I2C, plus a bench binary that plays candidate wristband feedback patterns. The library is `embedded-hal` generic, so the firmware can take it without the bench setup. |
+| [`ota-client/`](ota-client) | OTA update client. Pulls a firmware image over HTTP and reboots into it. Not yet folded into `opal-firmware`, which still boots from a single app partition. |
 | [`ota-server/`](ota-server) | Dev-machine HTTP server that hosts firmware `.bin` images for the client. Plain host Rust, no ESP toolchain. |
 | [`ble-media/`](ble-media) | BLE HID media remote. Bonds with an iPhone and sends media keys. Serial-driven for bring-up, gesture-driven later. |
 
@@ -31,7 +33,8 @@ Machine learning and tooling (host, plain Rust or Python):
 | [`emg-tds/`](emg-tds) | The current gesture model: a depthwise-separable (TDS) conv encoder in Rust/candle, with swappable classifier and pose heads. Trains, evaluates, and exports. The `.npy` training/eval/pose windows live in its `data/` directory. |
 | [`dashboard/`](dashboard) | Web dashboard. An axum backend replays exported EMG windows through the host classifier and streams CBOR frames to a Svelte frontend. Host-only, no hardware needed. |
 | [`pose-service/`](pose-service) | Python WebSocket service that turns EMG windows into 3-D hand pose. Runs a mock estimator or Meta's `emg2pose` model. |
-| [`protocol/`](protocol) | A `no_std` crate of the CBOR frame types shared by the dashboard backend, the browser, and (later) the firmware. |
+| [`emg-runtime/`](emg-runtime) | The on-device inference path: int8 kernels with hand-written ESP32-S3 SIMD and a scalar fallback off target, plus the reject pipeline. Builds on the host too. `data/` holds the exported model blobs. |
+| [`protocol/`](protocol) | A `no_std` crate of the CBOR frame types shared by the dashboard backend, the browser, and the firmware. |
 | [`engineering-logs/`](engineering-logs) | Dated log of the ML and on-device optimisation work, one goal, method, measurement, and analysis per entry. Read it first to learn why the model is what it is. |
 
 ## Conventions

@@ -1,14 +1,18 @@
 # Engineering logs
 
-Iterative log of the effort to cut int8 forward-pass latency on the ESP32-S3,
-so the rest of the system (BLE HID, sampling ISR, 3-of-3 smoothing, wake-gate
-state machine) fits inside the onset-to-action budget.
+Why the machine learning and the on-device code turned out the way they did. Each
+entry settles one question with a measurement, so a later reader can tell a tested
+decision from a guess. Read the entry before reopening the question it closed.
+
+What the entries are about has moved with the project. 0001 through 0004 cut int8
+forward-pass latency on the ESP32-S3 and found the kernel floor. 0005 through 0014
+went after accuracy: encoder architecture, augmentation, per-user calibration, and
+how to handle the negative class. 0015 onward cover the int8 export, the input
+conditioning that feeds it, and the timing of the acquisition path.
 
 Each entry: **Goal → Method → Hypothesis → Measured → Analysis → Next steps.**
-Numbers are p50 over 200 timed inferences, `--release`, 240 MHz, real int8 model
-(`data/model_int8.bin`, 500-sample window), captured on hardware over
-`/dev/ttyACM0`. Correctness gate: SIMD self-test bit-exact vs scalar oracle at
-boot, plus cosine ≥ 0.90 vs the Python float32 reference.
+Every number came from a run. Each entry names the hardware, dataset, and build it
+measured, because those changed underneath the series more than once.
 
 ## Constraints (from the project owner, 2026-06-21)
 
