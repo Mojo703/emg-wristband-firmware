@@ -23,7 +23,6 @@ Firmware (ESP32-S3, Xtensa toolchain):
 | [`ota-client/`](ota-client) | OTA update client. Pulls a firmware image over HTTP and reboots into it. The first milestone, since it makes every later firmware change faster to ship. |
 | [`ota-server/`](ota-server) | Dev-machine HTTP server that hosts firmware `.bin` images for the client. Plain host Rust, no ESP toolchain. |
 | [`ble-media/`](ble-media) | BLE HID media remote. Bonds with an iPhone and sends media keys. Serial-driven for bring-up, gesture-driven later. |
-| [`ml-bench/`](ml-bench) | On-device latency and throughput benchmark for the int8 gesture model, including the hand-written ESP32-S3 SIMD kernels. |
 
 Machine learning and tooling (host, plain Rust or Python):
 
@@ -41,7 +40,8 @@ No shared workspace. Every Cargo project carries an empty `[workspace]` table so
 cargo treats it as its own root and does not try to attach it to a parent. Build
 each project from inside its own directory.
 
-Two toolchains. The firmware projects (`ota-client`, `ble-media`, `ml-bench`) use
+Two toolchains. The firmware projects (`ota-client`, `ble-media`, `drv2605l`,
+`opal-firmware`) use
 the Espressif Rust fork; their `rust-toolchain.toml` pins `channel = "esp"`, and
 every build shell must first source `. ~/export-esp.sh`. The host projects build
 with ordinary stable or nightly Rust.

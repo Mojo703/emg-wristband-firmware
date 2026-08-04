@@ -1,7 +1,6 @@
 //! On-device EMG gesture runtime: the int8 inference path (with hand-written
 //! ESP32-S3 SIMD kernels and a scalar fallback off-target) plus the model-free
-//! reject pipeline. Shared by the device firmware (`opal-firmware`) and the
-//! on-device benchmark (`ml-bench`).
+//! reject pipeline. Consumed by the device firmware (`opal-firmware`).
 //!
 //! `no_std` + `alloc`. The SIMD kernels in [`mac`]/[`layers`] compile only for
 //! Xtensa; every other target uses the scalar oracle, so the crate type-checks and

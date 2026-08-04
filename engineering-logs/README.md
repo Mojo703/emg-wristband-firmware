@@ -1,4 +1,4 @@
-# Engineering logs — ml-bench inference optimization
+# Engineering logs
 
 Iterative log of the effort to cut int8 forward-pass latency on the ESP32-S3,
 so the rest of the system (BLE HID, sampling ISR, 3-of-3 smoothing, wake-gate

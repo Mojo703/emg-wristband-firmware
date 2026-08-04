@@ -6,7 +6,7 @@ firmware image over HTTP, writes it to the inactive OTA slot, sets that slot as 
 boot partition, and reboots into it.
 
 Its toolchain setup is the one the other firmware projects (`ble-media`,
-`ml-bench`) reuse.
+`drv2605l`, `opal-firmware`) reuse.
 
 ## Flash layout
 

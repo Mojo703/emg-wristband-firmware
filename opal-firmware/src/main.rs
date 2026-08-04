@@ -180,10 +180,9 @@ impl PerfStats {
 #[repr(align(16))]
 struct AlignedBlob<Bytes: ?Sized>(Bytes);
 
-/// The int8 model blob exported by `emg-tds export-int8`. Embedded and handed to
-/// `emg-runtime`. Shared with `ml-bench`.
+/// The int8 model blob exported by `emg-tds export-int8`.
 static MODEL_BIN: &AlignedBlob<[u8]> =
-    &AlignedBlob(*include_bytes!("../../ml-bench/data/model_int8.bin"));
+    &AlignedBlob(*include_bytes!("../../emg-runtime/data/model_int8.bin"));
 
 /// Microseconds since boot on the device clock — the same clock the acquisition
 /// thread stamps windows with and the logger stamps log lines with.

@@ -1,3 +1,0 @@
-/target
-# Managed ESP-IDF checkout + tools (downloaded on first build, ~GBs).
-/.embuild

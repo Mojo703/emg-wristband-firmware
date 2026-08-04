@@ -36,7 +36,7 @@ impl Default for ExportArgs {
         Self {
             checkpoint: std::path::PathBuf::from("models/gesture-classifier-v1.safetensors"),
             data_dir: std::path::PathBuf::from("data"),
-            out: std::path::PathBuf::from("../ml-bench/data/model_int8.bin"),
+            out: std::path::PathBuf::from("../emg-runtime/data/model_int8.bin"),
             calib_windows: 256,
             num_verify: 32,
             channels: 16,

@@ -38,7 +38,7 @@ CUDARC_CUDA_VERSION=13020 ./target/release/emg-tds train \
 ./target/release/emg-tds train --init checkpoints/pose.safetensors
 
 # export the trained classifier to int8 for the ESP32-S3 runtime
-./target/release/emg-tds export-int8 --out ../ml-bench/data/model_int8.bin --num-verify 32
+./target/release/emg-tds export-int8 --out ../emg-runtime/data/model_int8.bin --num-verify 32
 ```
 
 `forward-test` builds with random weights and runs one forward pass to check
@@ -59,7 +59,7 @@ source the int8 export quantizes).
 `export-int8` loads the float checkpoint, folds BatchNorm into the pointwise
 convs, calibrates activation ranges on a balanced training subset, quantizes to
 symmetric int8, computes fixed-point requantization params, and writes the device
-blob `../ml-bench/data/model_int8.bin`. It also embeds a balanced batch of labeled
+blob `../emg-runtime/data/model_int8.bin`. It also embeds a balanced batch of labeled
 test windows and runs a host int8 accuracy gate before writing. The default
 activation-range calibration is 99.9 percentile (use `--percentile 100.0` for
 plain max-abs).

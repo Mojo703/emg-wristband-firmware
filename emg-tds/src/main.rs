@@ -50,7 +50,7 @@ enum Command {
         #[arg(long, default_value = "data")]
         data_dir: PathBuf,
         /// Output path for the device-ready int8 blob.
-        #[arg(long, default_value = "../ml-bench/data/model_int8.bin")]
+        #[arg(long, default_value = "../emg-runtime/data/model_int8.bin")]
         out: PathBuf,
         /// Number of training windows used for activation calibration.
         #[arg(long, default_value_t = 256)]
