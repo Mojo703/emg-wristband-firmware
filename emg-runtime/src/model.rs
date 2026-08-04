@@ -16,20 +16,6 @@ use crate::layers::{self, Requantize};
 use crate::tensor::I8Activation;
 use alloc::vec::Vec;
 
-/// Per-stage labels, in `forward_profiled` order, for a [`StageTimer`].
-pub const STAGES: [&str; 10] = [
-    "block0.dw",
-    "block0.pw",
-    "block1.dw",
-    "block1.pw",
-    "block2.dw",
-    "block2.pw",
-    "block3.dw",
-    "block3.pw",
-    "pool",
-    "head",
-];
-
 pub const INPUT_CH: usize = 16;
 pub(crate) const STRIDE: usize = 2;
 pub const NUM_CLASSES: usize = 5;
@@ -39,13 +25,6 @@ const FEATURE_DIM: usize = 128;
 
 const MAGIC: u32 = 0x454D4739;
 const VERSION: u32 = 4;
-
-/// Hook for per-stage timing in [`Model::forward_profiled`]. Implemented by the
-/// benchmark; keeps this crate free of any clock so it stays `no_std`/portable.
-pub trait StageTimer {
-    /// Run `f` as the stage at `index` (see [`STAGES`]), accounting its time.
-    fn stage<R>(&mut self, index: usize, f: impl FnOnce() -> R) -> R;
-}
 
 struct Block<'a> {
     out_ch: usize,
@@ -320,57 +299,6 @@ impl<'a> Model<'a> {
         let (hw, hb) = head;
         let logits = layers::linear_i32(pooled.as_slice(), hw, hb, NUM_CLASSES);
         ForwardResult::Logits(logits)
-    }
-
-    /// Like [`Self::forward`], but each stage runs through `timer` for per-stage
-    /// profiling. Caller-driven iteration count; this does no bookkeeping of its own.
-    pub fn forward_profiled<T: StageTimer>(
-        &mut self,
-        input: &I8Activation,
-        timer: &mut T,
-    ) -> ForwardResult {
-        let Self {
-            blocks,
-            head,
-            kernel,
-            scratch,
-            ..
-        } = self;
-        let ForwardScratch {
-            padded,
-            depthwise_out,
-            pointwise_out,
-        } = scratch;
-        for (index, blk) in blocks.iter().enumerate() {
-            timer.stage(index * 2, || {
-                let xin: &I8Activation = if index == 0 { input } else { pointwise_out };
-                layers::depthwise(
-                    xin,
-                    blk.dw,
-                    blk.dw_bias,
-                    *kernel,
-                    STRIDE,
-                    blk.dw_rq,
-                    padded,
-                    depthwise_out,
-                );
-            });
-            timer.stage(index * 2 + 1, || {
-                layers::pointwise(
-                    depthwise_out,
-                    blk.pw,
-                    blk.pw_bias,
-                    blk.out_ch,
-                    blk.pw_rq,
-                    pointwise_out,
-                );
-            });
-        }
-        let pooled = timer.stage(8, || layers::global_avg_pool(pointwise_out));
-        timer.stage(9, || {
-            let (hw, hb) = head;
-            ForwardResult::Logits(layers::linear_i32(pooled.as_slice(), hw, hb, NUM_CLASSES))
-        })
     }
 }
 

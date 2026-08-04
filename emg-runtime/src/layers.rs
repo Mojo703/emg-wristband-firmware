@@ -2,8 +2,7 @@
 //!
 //! Accumulate in i32, then requantize to int8 (fixed-point multiply/shift +
 //! optional ReLU). The requant params come from the exported model blob (folded
-//! per-tensor scales); the synthetic model uses placeholders that keep values in
-//! range, representative of the *cost* the benchmark measures.
+//! per-tensor scales).
 
 use crate::mac;
 use crate::tensor::{AlignedI8, I8Activation};

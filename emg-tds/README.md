@@ -58,11 +58,17 @@ source the int8 export quantizes).
 
 `export-int8` loads the float checkpoint, folds BatchNorm into the pointwise
 convs, calibrates activation ranges on a balanced training subset, quantizes to
-symmetric int8, computes fixed-point requantization params, and writes the device
-blob `../emg-runtime/data/model_int8.bin`. It also embeds a balanced batch of labeled
-test windows and runs a host int8 accuracy gate before writing. The default
-activation-range calibration is 99.9 percentile (use `--percentile 100.0` for
-plain max-abs).
+symmetric int8, computes fixed-point requantization params, and runs a host int8
+accuracy gate before writing. The default activation-range calibration is 99.9
+percentile (use `--percentile 100.0` for plain max-abs).
+
+It writes two blobs. `--out` is the device blob the firmware embeds: weights
+only, about 36 KB. `--verify-out` is the fixture blob, the same weights plus
+`--num-verify` labeled test windows and their float logits, which
+`opal-firmware`'s device tests read. Keeping the windows out of the device blob
+is worth ~250 KB of flash, which is OTA slot headroom. Both come from one export
+run, so they always describe the same weights — never ship one against a stale
+copy of the other.
 
 Weight-decay, eval frequency, and the early-stop delta are constants now, not CLI
 flags; engineering-logs 0010 through 0013 record why.
