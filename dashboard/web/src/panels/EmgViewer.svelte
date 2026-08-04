@@ -75,6 +75,14 @@
     newestAbs: number;
     anchorMs: number | null;
     msPerSample: number;
+    // Maps a window's `seq` onto the absolute-sample timeline: the absolute
+    // index of window seq's first sample is `sequenceBase + seq * windowSamples`.
+    // Predictions carry only `seq`, and `seq * windowSamples` alone is wrong on
+    // two counts: window 0 starts seconds after device time zero (ADS1298
+    // bring-up settling), and the nominal rate drifts percents from the real
+    // oscillator. Refreshed from every EMG frame's real `t0_us`, which absorbs
+    // both.
+    sequenceBase: number | null;
   }
 
   let canvas: HTMLCanvasElement | undefined = $state(undefined);
@@ -150,6 +158,7 @@
       ringAbs: new Float64Array(capacity).fill(-1),
       newestAbs: -1,
       anchorMs: null,
+      sequenceBase: null,
     };
     preds.length = 0;
   }
@@ -162,6 +171,8 @@
     const { int16, time, scaleUv, missing } = emg;
     // Absolute sample index of this window's first sample, from the backend clock.
     const idx0 = Math.round((emg.t0us / 1e6) * stream.sampleRate);
+    // Every frame re-ties `seq` to the real timeline (see StreamState).
+    stream.sequenceBase = idx0 - emg.seq * stream.windowSamples;
 
     // A backwards jump means the stream reset (e.g. source switch / seq wrap).
     const reset = idx0 < stream.newestAbs - 1;
@@ -690,13 +701,16 @@
     ctx.setLineDash([]);
 
     if (classCount === 0) return;
-    if (stream === null || stream.anchorMs === null) return;
+    if (stream === null || stream.anchorMs === null || stream.sequenceBase === null) return;
 
-    // Predictions in the current sweep pass, timed off their window's backend
-    // index. Each covers window `seq`, i.e. samples [seq*window, (seq+1)*window).
+    // Predictions on the same real timeline as the EMG traces: window `seq`
+    // covers absolute samples [sequenceBase + seq*window, +window). Synthesizing
+    // the position from `seq` alone put the track seconds behind the traces (the
+    // device's boot-to-first-window time) and drifting further with the
+    // oscillator error.
     const visible: VisiblePrediction[] = [];
     for (const p of preds) {
-      const endAbs = p.seq * stream.windowSamples + stream.windowSamples - 1;
+      const endAbs = stream.sequenceBase + p.seq * stream.windowSamples + stream.windowSamples - 1;
       const t = localMs(endAbs);
       if (t >= passStart && t <= now) {
         visible.push({ ...p, x: phaseX(t) });
