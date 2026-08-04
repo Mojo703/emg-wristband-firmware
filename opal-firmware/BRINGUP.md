@@ -140,10 +140,11 @@ stretch in the time base, small enough to be harmless and large enough to be wor
 measuring rather than assuming. Nobody has measured it.
 
 To tell a model problem from an acquisition problem, feed the same model a window that is
-known good. Flash `ml-bench` instead: it runs the same int8 blob over the verification
-windows embedded in it, on the same chip, and reports accuracy against the float
-reference. Sensible numbers there and poor predictions on live data put the fault in
-acquisition or preprocessing rather than the model.
+known good. Run `cargo test-device`: `device_forward_pass_matches_float_reference` runs the
+same int8 blob over the exporter's verification windows, on the same chip and in the same
+binary, and checks accuracy against the float reference. A pass there alongside poor
+predictions on live data puts the fault in acquisition or preprocessing rather than the
+model.
 
 ## What to write down
 

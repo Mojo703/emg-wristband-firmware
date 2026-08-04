@@ -27,6 +27,8 @@ mod frames;
 mod link_policy;
 mod links;
 mod logger;
+#[cfg(test)]
+mod model_checks;
 mod telemetry;
 mod transport;
 mod wifi;

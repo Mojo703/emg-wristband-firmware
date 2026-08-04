@@ -7,3 +7,8 @@
 # so tests re-enable the console; watch the espflash monitor for `test result:`.
 CONFIG_ESP_CONSOLE_NONE=n
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# libtest runs each test on a pthread, and the ESP-IDF default 3 KB stack is too
+# thin for the conditioning and model tests: the overflow presents as a wild
+# pointer load, not as a stack-overflow message.
+CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=16384
