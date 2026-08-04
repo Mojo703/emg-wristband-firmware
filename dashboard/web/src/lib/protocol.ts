@@ -358,6 +358,23 @@ export interface LogFrame {
   readonly message: string;
 }
 
+/**
+ * Periodic numeric device telemetry: one source's named measurements, units as
+ * name suffixes. Self-describing and loss-tolerant — the stream is not
+ * complete, and counters are cumulative since boot for exactly that reason.
+ */
+export interface TelemetryFrame {
+  readonly type: 'telemetry';
+  readonly t_us: number;
+  readonly source: string;
+  readonly metrics: readonly TelemetryMetric[];
+}
+
+export interface TelemetryMetric {
+  readonly name: string;
+  readonly value: number;
+}
+
 export interface SelectDeviceFrame {
   readonly type: 'select_device';
   readonly device_id: string;
@@ -468,6 +485,7 @@ export type IncomingFrame =
   | EventFrame
   | PoseFrame
   | LogFrame
+  | TelemetryFrame
   | CollectionCatalogFrame
   | CollectionStateFrame
   | BeatmapFrame
@@ -702,6 +720,20 @@ export function isLogFrame(value: unknown): value is LogFrame {
   );
 }
 
+export function isTelemetryFrame(value: unknown): value is TelemetryFrame {
+  return (
+    hasType(value, 'telemetry') &&
+    isObject(value) &&
+    isNumber(value['t_us']) &&
+    isString(value['source']) &&
+    Array.isArray(value['metrics']) &&
+    value['metrics'].every(
+      (metric: unknown) =>
+        isObject(metric) && isString(metric['name']) && isNumber(metric['value']),
+    )
+  );
+}
+
 export function isArm(value: unknown): value is Arm {
   return value === Arm.Left || value === Arm.Right;
 }
@@ -923,6 +955,7 @@ export function asIncomingFrame(value: unknown): IncomingFrame | null {
   if (isEventFrame(value)) return value;
   if (isPoseFrame(value)) return value;
   if (isLogFrame(value)) return value;
+  if (isTelemetryFrame(value)) return value;
   if (isCollectionCatalogFrame(value)) return value;
   if (isCollectionStateFrame(value)) return value;
   if (isBeatmapFrame(value)) return value;

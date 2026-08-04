@@ -28,8 +28,15 @@ import {
   type PoseFrame,
   type PredictionFrame,
   type SessionMetadata,
+  type TelemetryFrame,
   type UnixMilliseconds,
 } from './protocol';
+
+/** One point of a telemetry metric's session history, on the device clock. */
+export interface TelemetrySample {
+  readonly t_us: number;
+  readonly value: number;
+}
 
 // `int64AsNumber` matters: ciborium encodes any integer above 2^32 (epoch-scale
 // timestamps, a long-uptime device's `t0_us`) as an 8-byte CBOR integer, which
@@ -59,6 +66,13 @@ class LiveStateManager {
   // active panel is mounted; cleared on every hello, which the backend follows
   // with a replay of the selected device's retained logs.
   logs = $state<readonly LogFrame[]>([]);
+  // Telemetry history, accumulated for the whole browser session:
+  // source → metric name → bounded series of {t_us, value}. The stream is
+  // loss-tolerant, so gaps between samples are normal; series are cleared only
+  // when the selected device changes (another device's "chip0" is not the same
+  // series) or the connection resets.
+  telemetry = $state<Record<string, Record<string, TelemetrySample[]>>>({});
+  #telemetryDevice: string | null = null;
   // Collection (the falling-notes capture game). The catalog is a descriptor the
   // backend sends once per connection, like hello; the state frame is the
   // backend's authoritative session phase, and the beatmap arrives once per
@@ -99,8 +113,30 @@ class LiveStateManager {
   setHello(value: HelloFrame): void {
     this.#hello = value;
     this.logs = [];
+    const device = value.selection?.device_id ?? null;
+    if (device !== this.#telemetryDevice) {
+      this.#telemetryDevice = device;
+      this.telemetry = {};
+    }
     if (this.status === 'handshake') {
       this.status = 'online';
+    }
+  }
+
+  appendTelemetry(frame: TelemetryFrame): void {
+    // The chip sources report at ~1 Hz, so this holds over an hour of trend
+    // per metric; the cost is a few numbers per sample.
+    const MAX_TELEMETRY_SAMPLES = 4096;
+    const source = (this.telemetry[frame.source] ??= {});
+    for (const { name, value } of frame.metrics) {
+      const series = (source[name] ??= []);
+      const newest = series[series.length - 1];
+      // The backend replays the newest retained frame per source after every
+      // hello while live frames keep flowing, so the same report can arrive
+      // twice; the device-clock stamp identifies it.
+      if (newest !== undefined && newest.t_us === frame.t_us) continue;
+      if (series.length >= MAX_TELEMETRY_SAMPLES) series.shift();
+      series.push({ t_us: frame.t_us, value });
     }
   }
 
@@ -316,6 +352,8 @@ export function connect(): void {
     } else if (frame.type === 'log') {
       live.appendLog(frame);
       for (const cb of listeners.log) cb(frame);
+    } else if (frame.type === 'telemetry') {
+      live.appendTelemetry(frame);
     } else if (frame.type === 'collection_catalog') {
       live.setCatalog(frame);
     } else if (frame.type === 'collection_state') {

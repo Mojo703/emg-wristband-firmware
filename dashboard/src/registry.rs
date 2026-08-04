@@ -27,6 +27,10 @@ struct DeviceEntry {
     /// Recent `Frame::Log`s, retained so a browser opened after the fact still sees
     /// them (the broadcast only reaches subscribers that existed at send time).
     logs: VecDeque<Frame>,
+    /// Newest `Frame::Telemetry` per source, so a browser opened after the fact
+    /// starts with the current values. Only the newest: telemetry is loss-tolerant
+    /// and its history accumulates in the browser session, not here.
+    telemetry: HashMap<String, Frame>,
     /// Identifies this connection, so a reconnect under the same id can't be evicted by
     /// the old session. See [`Registry::deregister`].
     token: u64,
@@ -101,6 +105,7 @@ impl Registry {
                 frames: frames.clone(),
                 control,
                 logs: VecDeque::new(),
+                telemetry: HashMap::new(),
                 token,
                 connected: true,
             },
@@ -200,6 +205,26 @@ impl Registry {
                 entry.logs.push_back(frame);
             }
         }
+    }
+
+    /// Retain a device's newest telemetry frame per source — token-gated like
+    /// `push_log`.
+    pub fn push_telemetry(&self, id: &str, token: u64, source: String, frame: Frame) {
+        if let Some(entry) = self.devices.lock().unwrap().get_mut(id) {
+            if entry.token == token {
+                entry.telemetry.insert(source, frame);
+            }
+        }
+    }
+
+    /// The newest retained telemetry frame of each of a device's sources.
+    pub fn telemetry_of(&self, id: &str) -> Vec<Frame> {
+        self.devices
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|entry| entry.telemetry.values().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// The retained log frames of a device, oldest first.

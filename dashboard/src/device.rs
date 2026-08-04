@@ -105,6 +105,11 @@ async fn device_session(
                     }
                     registry.push_log(&device_id, token, other.clone());
                 }
+                if let Frame::Telemetry { source, .. } = &other {
+                    // Newest per source, so a browser that connects later starts
+                    // with current values instead of waiting out an interval.
+                    registry.push_telemetry(&device_id, token, source.clone(), other.clone());
+                }
                 let _ = frames.send(other);
             }
         }

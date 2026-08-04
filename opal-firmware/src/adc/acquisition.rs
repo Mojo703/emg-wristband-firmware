@@ -86,9 +86,9 @@ const THREAD_STACK_BYTES: usize = 8192;
 /// loop's default, below wifi.
 const THREAD_PRIORITY: u8 = 9;
 
-/// Grid ticks between aligner accounting log lines: ~33 s at 2 kHz, long enough
-/// that the log stays single events rather than spam.
-const ALIGNER_LOG_TICKS: u64 = 65_536;
+/// Grid ticks between aligner telemetry reports: ~4 s at 2 kHz. Telemetry never
+/// touches log retention, so the rate is set by trend resolution alone.
+const ALIGNER_REPORT_TICKS: u64 = 8_192;
 
 /// An emitted-step gap larger than this means the grid skipped ticks (every present
 /// source gapped, or the whole front end was out): the partial window spans a hole
@@ -409,24 +409,31 @@ fn combine(
                     }
                 }
                 let ticks = aligner.ticks_emitted();
-                if ticks - ticks_at_last_log >= ALIGNER_LOG_TICKS {
+                if ticks - ticks_at_last_log >= ALIGNER_REPORT_TICKS {
                     ticks_at_last_log = ticks;
                     // The alignment accounting IS the measured clock behaviour:
                     // surplus on a healthy chip is its oscillator running fast
                     // against the grid, duplicates are it running slow, missing is
-                    // a genuine gap in its stream.
-                    let mut line = format!(
-                        "aligner: {ticks} ticks emitted, {} skipped",
-                        aligner.ticks_skipped()
-                    );
+                    // a genuine gap in its stream. All counters cumulative since
+                    // boot, so a dropped report costs nothing.
+                    let metric = crate::telemetry::metric;
+                    let mut metrics = vec![
+                        metric("ticks_emitted", ticks as f64),
+                        metric("ticks_skipped", aligner.ticks_skipped() as f64),
+                    ];
                     for source in 0..DEVICE_COUNT {
-                        let c = aligner.counters(source);
-                        line.push_str(&format!(
-                            " || chip {source}: surplus {} dup {} missing {} rejected {} overflow {}",
-                            c.surplus_dropped, c.duplicated, c.missing, c.rejected, c.overflowed
-                        ));
+                        let counters = aligner.counters(source);
+                        for (name, value) in [
+                            ("surplus_dropped", counters.surplus_dropped),
+                            ("duplicated", counters.duplicated),
+                            ("missing", counters.missing),
+                            ("rejected", counters.rejected),
+                            ("overflowed", counters.overflowed),
+                        ] {
+                            metrics.push(metric(&format!("chip{source}_{name}"), value as f64));
+                        }
                     }
-                    info!("{line}");
+                    crate::telemetry::report("aligner", metrics);
                 }
             }
         }

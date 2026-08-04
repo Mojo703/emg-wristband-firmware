@@ -178,6 +178,17 @@ impl Links {
                     break;
                 }
             }
+            // Telemetry rides after the logs, fire-and-forget: a report a dead
+            // link failed to send is not restored — the next interval re-reports,
+            // and every counter in it is cumulative (see `telemetry`).
+            if ok {
+                for telemetry_frame in crate::telemetry::drain() {
+                    if active.send(&telemetry_frame, scratch).is_err() {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
             // Stop at the first failure: every further send would block its full
             // timeout against the same dead link (and the data is a live stream —
             // this window is stale by the next iteration anyway).

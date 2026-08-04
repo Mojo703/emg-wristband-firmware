@@ -7,6 +7,7 @@ import ConfigApp from '../panels/ConfigApp.svelte';
 import LogViewer from '../panels/LogViewer.svelte';
 import PoseViewer from '../panels/PoseViewer.svelte';
 import Stub from '../panels/Stub.svelte';
+import Telemetry from '../panels/Telemetry.svelte';
 
 export interface Panel {
   readonly id: string;
@@ -24,6 +25,8 @@ export const panels: readonly Panel[] = [
   { id: 'collect', title: 'Collect', icon: 'play', component: Collect },
   { id: 'eval', title: 'Eval', icon: 'chart', component: Stub, props: { title: 'Eval dashboard' } },
   { id: 'pose', title: 'Pose', icon: 'scan', component: PoseViewer },
+  // Periodic device measurements as live values + session trend plots.
+  { id: 'telemetry', title: 'Telemetry', icon: 'chart', component: Telemetry },
   // The device's log console (replaces the serial text monitor).
   { id: 'logs', title: 'Logs', icon: 'terminal', component: LogViewer },
 ];

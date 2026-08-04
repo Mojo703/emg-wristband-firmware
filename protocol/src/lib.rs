@@ -175,6 +175,27 @@ pub enum Frame {
         message: String,
     },
 
+    /// Periodic numeric device telemetry (device → backend → browser): the
+    /// measurements the firmware re-reports on fixed intervals — per-chip edge
+    /// timing, aligner accounting, inference performance — as named values
+    /// rather than prose, so they never occupy log retention and a consumer
+    /// needs no knowledge of any particular metric to display it.
+    ///
+    /// Self-describing and loss-tolerant by design: each frame carries its
+    /// metric names (units as name suffixes, e.g. `edge_period_mean_us`), and a
+    /// dropped frame just widens the gap to the next report — nothing
+    /// downstream may treat the stream as complete. Counters are cumulative
+    /// since boot for exactly that reason.
+    Telemetry {
+        /// Microseconds since device boot (`esp_timer` epoch, not the EMG timeline).
+        t_us: u64,
+        /// The emitting subsystem, e.g. "chip0", "aligner", "inference". One
+        /// frame carries one source's metrics; sources report on their own
+        /// schedules.
+        source: String,
+        metrics: Vec<TelemetryMetric>,
+    },
+
     /// Backend → device over a freshly opened serial port: "a dashboard is now on
     /// this link — announce yourself and make it the active data link." The device
     /// replies with `DeviceHello` on the same link. TCP needs no probe (connecting
@@ -281,6 +302,15 @@ pub enum Frame {
 
 /// An instant on the wall clock browser and backend share (unix epoch
 /// milliseconds; both run on the same laptop, so `Date.now()` and the backend
+/// One named measurement inside [`Frame::Telemetry`]. `f64` covers every
+/// counter and duration the firmware reports; the unit rides in the name's
+/// suffix so the pair is self-contained.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TelemetryMetric {
+    pub name: String,
+    pub value: f64,
+}
+
 /// clock agree). The value is private so all arithmetic goes through the named
 /// operations below — adding two instants, say, does not exist.
 ///
@@ -1143,6 +1173,38 @@ mod tests {
                 assert_eq!(seq, 7);
                 assert_eq!(out, samples);
                 assert_eq!(mask, missing);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn telemetry_frame_roundtrips() {
+        let frame = Frame::Telemetry {
+            t_us: 826_316_000,
+            source: "chip1".into(),
+            metrics: alloc::vec![
+                TelemetryMetric {
+                    name: "edge_period_mean_us".into(),
+                    value: 510.0,
+                },
+                TelemetryMetric {
+                    name: "bad_status".into(),
+                    value: 68.0,
+                },
+            ],
+        };
+        match roundtrip(&frame) {
+            Frame::Telemetry {
+                t_us,
+                source,
+                metrics,
+            } => {
+                assert_eq!(t_us, 826_316_000);
+                assert_eq!(source, "chip1");
+                assert_eq!(metrics.len(), 2);
+                assert_eq!(metrics[0].name, "edge_period_mean_us");
+                assert_eq!(metrics[1].value, 68.0);
             }
             other => panic!("wrong variant: {other:?}"),
         }

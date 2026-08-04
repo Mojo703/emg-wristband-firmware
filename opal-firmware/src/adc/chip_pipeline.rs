@@ -33,7 +33,7 @@ use super::acquisition::HealthCounters;
 use super::ads1298::Ads1298FrontEnd;
 use super::convert::{code_to_voltage, GAIN, REFERENCE_VOLTS};
 use super::decode::Sample;
-use super::status::describe_status_word;
+use super::status::StatusWord;
 
 /// Stack for a pipeline thread. It holds no large locals, but esp-idf's default is
 /// tight, and a stack overflow here presents as an unexplained reboot rather than an
@@ -64,11 +64,10 @@ const DATA_READY_TIMEOUT_US: u64 = DATA_READY_TIMEOUT_MS as u64 * 1000;
 /// the fault. The counters carry the true total, so staying quiet loses nothing.
 const READ_ERROR_LOG_INTERVAL: u32 = 2000;
 
-/// DRDY edges between per-chip timing summaries. 20 000 edges is ~10 s per chip:
-/// frequent enough to watch a live bench, sparse enough that the two chips'
-/// summaries do not drown events or evict them from the dashboard's log
-/// retention (the backend keeps 200 lines, the frontend 500).
-const TIMING_LOG_INTERVAL: u32 = 20_000;
+/// DRDY edges between per-chip telemetry reports: ~1 s per chip. Telemetry
+/// frames cost a few hundred bytes each and never touch log retention, so the
+/// rate is set by trend resolution, not by scroll noise.
+const TIMING_REPORT_INTERVAL: u32 = 2_000;
 
 /// Consecutive bad-status frames before a chip is warm-recovered. One corrupt frame
 /// is a glitch; a run of them is that chip gone, and the bring-up campaign showed
@@ -167,29 +166,37 @@ impl EdgeTiming {
         self.read_sum_us += elapsed_us;
     }
 
-    /// A one-line summary, and a reset, once `TIMING_LOG_INTERVAL` edges have gone by.
-    fn summary(&mut self) -> Option<String> {
-        if self.count < TIMING_LOG_INTERVAL {
+    /// The interval's numbers, and a reset, once `TIMING_REPORT_INTERVAL` edges have
+    /// gone by.
+    fn summary(&mut self) -> Option<EdgeTimingReport> {
+        if self.count < TIMING_REPORT_INTERVAL {
             return None;
         }
-        let period_mean = self.period_sum_us / self.count as u64;
-        let read_mean = self.read_sum_us / self.count as u64;
-        let line = format!(
-            "edge period min/mean/max {}/{}/{} us || SPI read min/mean/max {}/{}/{} us",
-            self.period_min_us,
-            period_mean,
-            self.period_max_us,
-            self.read_min_us,
-            read_mean,
-            self.read_max_us
-        );
+        let report = EdgeTimingReport {
+            period_min_us: self.period_min_us,
+            period_mean_us: self.period_sum_us / self.count as u64,
+            period_max_us: self.period_max_us,
+            read_min_us: self.read_min_us,
+            read_mean_us: self.read_sum_us / self.count as u64,
+            read_max_us: self.read_max_us,
+        };
         let last_edge_us = self.last_edge_us;
         *self = Self {
             last_edge_us,
             ..Self::default()
         };
-        Some(line)
+        Some(report)
     }
+}
+
+/// One interval's edge and read timing, ready to report.
+struct EdgeTimingReport {
+    period_min_us: u64,
+    period_mean_us: u64,
+    period_max_us: u64,
+    read_min_us: u64,
+    read_mean_us: u64,
+    read_max_us: u64,
 }
 
 /// The thread's whole world: its chip, its health state, and its line to the
@@ -305,7 +312,7 @@ impl Pipeline {
         if self.edges == 1 {
             info!("chip {} DRDY edge #1", self.index);
         }
-        if let Some(line) = self.timing.summary() {
+        if let Some(report) = self.timing.summary() {
             let mean_abs_microvolts = if self.abs_microvolt_frames > 0 {
                 self.abs_microvolt_sum / self.abs_microvolt_frames as f32
             } else {
@@ -313,19 +320,57 @@ impl Pipeline {
             };
             self.abs_microvolt_sum = 0.0;
             self.abs_microvolt_frames = 0;
-            // The status words ride along because the lead-off bits in them track
-            // LOFF_SENSP/N, which `configure` sets and reset clears. So a chip that
+            // The status word rides along because the lead-off bits in it track
+            // LOFF_SENSP/N, which `configure` sets and reset clears — a chip that
             // quietly reverts to its power-on defaults announces itself here,
-            // mid-stream, in named channels rather than a hex word to be decoded by
-            // hand.
-            info!(
-                "chip {} edge #{} || {line} || mean |input| {mean_abs_microvolts:.1} uV || status ({}) || bad status {} recoveries {}",
-                self.index,
-                self.edges,
-                describe_status_word(self.last_status),
-                self.counters.bad_status.load(Ordering::Relaxed),
-                self.counters.recoveries.load(Ordering::Relaxed)
-            );
+            // mid-stream. A word with its marker intact goes out decoded (the
+            // comparator bit sets an operator hunts electrodes with); one
+            // without goes out raw — the bits of a marker-less word are noise,
+            // and the validity flag says which reading this is.
+            let metric = crate::telemetry::metric;
+            let mut metrics = vec![
+                metric("edge_count", self.edges as f64),
+                metric("edge_period_min_us", report.period_min_us as f64),
+                metric("edge_period_mean_us", report.period_mean_us as f64),
+                metric("edge_period_max_us", report.period_max_us as f64),
+                metric("spi_read_min_us", report.read_min_us as f64),
+                metric("spi_read_mean_us", report.read_mean_us as f64),
+                metric("spi_read_max_us", report.read_max_us as f64),
+                metric("mean_absolute_input_uv", mean_abs_microvolts as f64),
+                metric(
+                    "bad_status",
+                    self.counters.bad_status.load(Ordering::Relaxed) as f64,
+                ),
+                metric(
+                    "recoveries",
+                    self.counters.recoveries.load(Ordering::Relaxed) as f64,
+                ),
+            ];
+            match StatusWord::from_word(self.last_status) {
+                Some(status) => {
+                    metrics.push(metric("status_marker_valid", 1.0));
+                    metrics.push(metric(
+                        "lead_off_positive_bits",
+                        status.positive_lead_off.bits() as f64,
+                    ));
+                    metrics.push(metric(
+                        "lead_off_negative_bits",
+                        status.negative_lead_off.bits() as f64,
+                    ));
+                    metrics.push(metric(
+                        "general_purpose_input_bits",
+                        status.general_purpose_inputs as f64,
+                    ));
+                }
+                None => {
+                    // The raw word is not reported: a bitfield has no magnitude
+                    // to plot, and the read path already logs it in hex as the
+                    // rate-limited "status marker invalid" warning — the right
+                    // home for a discrete diagnostic.
+                    metrics.push(metric("status_marker_valid", 0.0));
+                }
+            }
+            crate::telemetry::report(&format!("chip{}", self.index), metrics);
         }
 
         // tUPDATE (SBAS459K §9.4.1.3, 4 tCLK ≈ 2 µs around the DRDY edge, no SCLK

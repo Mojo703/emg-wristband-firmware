@@ -42,6 +42,12 @@ impl LeadOffFlags {
     pub(super) const fn contains(self, channel: Channel) -> bool {
         self.0.contains(channel)
     }
+
+    /// The raw comparator bits, channel 0 at bit 0 — the telemetry encoding of
+    /// the flag set.
+    pub(super) const fn bits(self) -> u8 {
+        self.0.bits()
+    }
 }
 
 impl fmt::Display for LeadOffFlags {
@@ -94,19 +100,6 @@ impl fmt::Display for StatusWord {
             "lead-off positive [{}] negative [{}], gpio {:#03x}",
             self.positive_lead_off, self.negative_lead_off, self.general_purpose_inputs
         )
-    }
-}
-
-/// Renders a raw status word for a periodic log line.
-///
-/// A word with an intact marker gets its flags named; one without gets its raw hex and
-/// a note, because the individual bits of a misaligned read mean nothing and printing
-/// them as lead-off state would invent a fault. One `String` per periodic line is fine;
-/// nothing here runs per frame.
-pub(super) fn describe_status_word(word: u32) -> String {
-    match StatusWord::from_word(word) {
-        Some(status) => format!("{status}"),
-        None => format!("{word:#08x} (marker missing)"),
     }
 }
 
@@ -198,16 +191,17 @@ mod tests {
 
     #[test]
     fn a_healthy_frame_describes_itself_in_names() {
-        // This is the line the acquisition log prints. `0xc00000` used to be the whole
-        // of it.
+        // The `Display` form still backs ad-hoc debugging output.
         assert_eq!(
-            describe_status_word(MARKER),
+            format!("{}", StatusWord::from_word(MARKER).unwrap()),
             "lead-off positive [none] negative [none], gpio 0x0"
         );
         assert_eq!(
-            describe_status_word(MARKER | (0x1 << 12) | (0x1 << 19)),
+            format!(
+                "{}",
+                StatusWord::from_word(MARKER | (0x1 << 12) | (0x1 << 19)).unwrap()
+            ),
             "lead-off positive [0,7] negative [none], gpio 0x0"
         );
-        assert_eq!(describe_status_word(0x00_0000), "0x000000 (marker missing)");
     }
 }

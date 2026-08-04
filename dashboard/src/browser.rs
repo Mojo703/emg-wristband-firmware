@@ -8,7 +8,7 @@ use crate::registry::Registry;
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
 use protocol::Frame;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,11 +29,15 @@ const OUTBOUND_CAP: usize = 256;
 /// browser falls behind: the device emits each EMG window immediately followed by its
 /// prediction, so a single "latest live frame" slot would race the pair and near-always
 /// discard the EMG half of the stream.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum LiveKind {
     Emg,
     Prediction,
     Pose,
+    /// Keyed per emitting source: two sources' reports are different data, so
+    /// one must not coalesce the other away — only a newer report from the
+    /// same source may.
+    Telemetry(String),
     Other,
 }
 
@@ -45,6 +49,7 @@ struct LatestLive {
     emg: Option<Message>,
     prediction: Option<Message>,
     pose: Option<Message>,
+    telemetry: HashMap<String, Message>,
     other: Option<Message>,
 }
 
@@ -54,6 +59,9 @@ impl LatestLive {
             LiveKind::Emg => self.emg = Some(message),
             LiveKind::Prediction => self.prediction = Some(message),
             LiveKind::Pose => self.pose = Some(message),
+            LiveKind::Telemetry(source) => {
+                self.telemetry.insert(source, message);
+            }
             LiveKind::Other => self.other = Some(message),
         }
     }
@@ -62,6 +70,7 @@ impl LatestLive {
         [self.emg, self.prediction, self.pose, self.other]
             .into_iter()
             .flatten()
+            .chain(self.telemetry.into_values())
     }
 }
 
@@ -152,10 +161,16 @@ fn server_suggestions(port: u16) -> Vec<String> {
 }
 
 /// Send a device's retained logs to a browser that just started (or switched to)
-/// viewing it, so the log panel has scrollback instead of starting empty.
+/// viewing it, so the log panel has scrollback instead of starting empty. The
+/// newest retained telemetry per source rides along, so current values show
+/// before the next report interval.
 fn replay_logs(registry: &Registry, selected: Option<&str>, tx: &mpsc::Sender<Out>) {
     if let Some(id) = selected {
-        for frame in registry.logs_of(id) {
+        for frame in registry
+            .logs_of(id)
+            .into_iter()
+            .chain(registry.telemetry_of(id))
+        {
             let msg = Message::Binary(frame::encode(&frame));
             if send(tx, Out::Reliable(msg)).is_err() {
                 return;
@@ -400,6 +415,9 @@ pub async fn handle_browser(
                     Frame::Event { .. } | Frame::Log { .. } => Out::Reliable(msg),
                     Frame::Emg { .. } => Out::Live(LiveKind::Emg, msg),
                     Frame::Prediction { .. } => Out::Live(LiveKind::Prediction, msg),
+                    Frame::Telemetry { source, .. } => {
+                        Out::Live(LiveKind::Telemetry(source.clone()), msg)
+                    }
                     _ => Out::Live(LiveKind::Other, msg),
                 };
                 if send(&browser_tx, out).is_err() {

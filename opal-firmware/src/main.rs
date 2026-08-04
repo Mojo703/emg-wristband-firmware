@@ -27,6 +27,7 @@ mod frames;
 mod link_policy;
 mod links;
 mod logger;
+mod telemetry;
 mod transport;
 mod wifi;
 
@@ -90,10 +91,10 @@ const IDLE_POLL_MS: u32 = 5;
 /// normal jitter never trips it, short enough to notice a stalled ADC quickly.
 const STALL_WARNING_MS: u128 = 1000;
 
-/// Batches between periodic performance log lines (~31 s at the 244 ms window
-/// period, since a batch is normally one window). Long enough that the log stays
-/// single events, not spam.
-const PERF_LOG_INTERVAL: u32 = 128;
+/// Batches between inference-performance telemetry reports (~4 s at the 244 ms
+/// window period, since a batch is normally one window). Telemetry never touches
+/// log retention, so the rate is set by trend resolution alone.
+const PERF_REPORT_INTERVAL: u32 = 16;
 
 /// Running inference-latency, total-processing-latency, and loop-throughput stats
 /// between periodic log lines. "Total" is inference plus the reject-pipeline
@@ -122,7 +123,7 @@ impl PerfStats {
     /// Record one batch: its inference time (the newest window only), its total
     /// processing time (inference through frame send, excluding the intentional
     /// real-time pacing sleep), and how many windows it carried. Logs and resets every
-    /// [`PERF_LOG_INTERVAL`] batches.
+    /// [`PERF_REPORT_INTERVAL`] batches.
     fn record(&mut self, infer_us: u64, total_us: u64, windows: usize, dropped_total: u32) {
         let start = *self.interval_start.get_or_insert_with(Instant::now);
         if self.count == 0 {
@@ -135,9 +136,7 @@ impl PerfStats {
         self.total_sum_us += total_us;
         self.total_max_us = self.total_max_us.max(total_us);
 
-        if self.count >= PERF_LOG_INTERVAL {
-            let infer_mean_us = self.infer_sum_us / self.count as u64;
-            let total_mean_us = self.total_sum_us / self.count as u64;
+        if self.count >= PERF_REPORT_INTERVAL {
             let throughput_hz = self.windows as f64 / start.elapsed().as_secs_f64();
             let dropped = dropped_total.saturating_sub(self.dropped_at_interval_start);
             // Free heap rides along because the window buffers are now the biggest
@@ -145,9 +144,26 @@ impl PerfStats {
             // `acquisition::WINDOW_QUEUE_DEPTH`), and
             // an out-of-memory abort here would otherwise arrive with no warning.
             let free_heap_kilobytes = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() / 1024 };
-            info!(
-                "inference: mean {infer_mean_us} us | max {} us || total processing: mean {total_mean_us} us | max {} us || throughput {throughput_hz:.1} windows/sec ({} windows over {} batches) || dropped {dropped} || free heap {free_heap_kilobytes} KB",
-                self.infer_max_us, self.total_max_us, self.windows, self.count
+            let metric = telemetry::metric;
+            telemetry::report(
+                "inference",
+                vec![
+                    metric(
+                        "inference_mean_us",
+                        (self.infer_sum_us / self.count as u64) as f64,
+                    ),
+                    metric("inference_max_us", self.infer_max_us as f64),
+                    metric(
+                        "total_processing_mean_us",
+                        (self.total_sum_us / self.count as u64) as f64,
+                    ),
+                    metric("total_processing_max_us", self.total_max_us as f64),
+                    metric("throughput_windows_per_second", throughput_hz),
+                    metric("windows", self.windows as f64),
+                    metric("batches", self.count as f64),
+                    metric("dropped", dropped as f64),
+                    metric("free_heap_kilobytes", free_heap_kilobytes as f64),
+                ],
             );
             *self = PerfStats::default();
         }
