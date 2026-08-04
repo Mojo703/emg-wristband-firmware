@@ -1,28 +1,32 @@
-//! One ADS1298's private sampling loop: read every frame the chip converts, keep the
-//! chip alive, and hand timestamped frames to the combiner.
+//! One ADS1298's private stream: drain the frames its DRDY interrupt captured, keep
+//! the chip alive, and hand timestamped frames to the combiner.
 //!
 //! Each chip gets one of these threads, and nothing in here knows the other chip
-//! exists. That isolation is the point: the chips sit on independent SPI hosts with
-//! independent DRDY lines, and serialising their reads through one loop makes each
-//! chip's read block the other's — at ~200 µs per read against a ~487 µs sample
-//! period, that halves the serviced sample rate. Here each thread blocks on its own
-//! chip's DRDY notification and its own chip's SPI transfer; two threads overlap
-//! wherever the scheduler allows.
+//! exists. The read itself is not here — [`super::frame_reader`] clocks every frame
+//! out inside the DRDY interrupt, because the chip has no FIFO and a conversion left
+//! unread for one ~487 µs period is gone. What that buys this thread is the freedom
+//! to be late: frames sit in a lock-free ring roughly 32 ms deep, so a scheduling
+//! delay, a wifi burst, or a flash write costs latency here instead of conversions
+//! at the chip.
 //!
 //! The thread owns everything about its chip's health: DRDY-staleness death
 //! detection, the silent-revert (slow period) detector, status-marker validation,
-//! warm recovery, and the post-recovery reference-settling discard. What leaves the thread is only what the combiner
-//! needs: batches of trustworthy timestamped frames, and [`ChipEvent::Absent`] /
-//! [`ChipEvent::Present`] transitions bracketing every stretch the chip cannot be
-//! believed. The absent/present contract matters beyond bookkeeping — the grid
-//! aligner downstream waits on every present source, so a chip that stops
-//! delivering MUST be marked absent within a bounded time, and the
-//! [`DATA_READY_TIMEOUT_MS`] death detection is that bound.
+//! warm recovery, and the post-recovery reference-settling discard. What leaves the
+//! thread is only what the combiner needs: batches of trustworthy timestamped
+//! frames, and [`ChipEvent::Absent`] / [`ChipEvent::Present`] transitions bracketing
+//! every stretch the chip cannot be believed. The absent/present contract matters
+//! beyond bookkeeping — the grid aligner downstream waits on every present source,
+//! so a chip that stops delivering MUST be marked absent within a bounded time, and
+//! the [`DATA_READY_TIMEOUT_MS`] death detection is that bound.
+//!
+//! The thread is also the only place that hands the chip's SPI host back to the
+//! esp-idf driver: [`Pipeline::recover`] closes the interrupt window, runs the
+//! recovery through the driver, and reopens it. `frame_reader` states that
+//! ownership contract in full.
 
+use esp_idf_svc::hal::delay::FreeRtos;
 use esp_idf_svc::hal::gpio::{Output, PinDriver};
-use esp_idf_svc::hal::task::notification::Notification;
 use log::{info, warn};
-use std::num::NonZeroU32;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::SyncSender;
 use std::sync::Arc;
@@ -32,7 +36,8 @@ use crate::device_now_us as now_us;
 use super::acquisition::HealthCounters;
 use super::ads1298::Ads1298FrontEnd;
 use super::convert::{code_to_voltage, GAIN, REFERENCE_VOLTS};
-use super::decode::Sample;
+use super::decode::{parse_sample, Sample};
+use super::frame_reader::FrameReader;
 use super::status::StatusWord;
 
 /// Stack for a pipeline thread. It holds no large locals, but esp-idf's default is
@@ -40,8 +45,9 @@ use super::status::StatusWord;
 /// error. The TCP thread in `links.rs` hit exactly that.
 const THREAD_STACK_BYTES: usize = 8192;
 
-/// Above the combiner and the main loop, so frame reads win under contention. Below
-/// esp-idf's wifi and timer tasks, so sampling does not starve networking.
+/// Above the combiner and the main loop, below esp-idf's wifi and timer tasks.
+/// The frame deadline no longer depends on this — the interrupt owns it — but the
+/// ring's depth is this thread's lateness budget, and there is no reason to spend it.
 const THREAD_PRIORITY: u8 = 10;
 
 /// Frames per batch handed to the combiner: 16 frames is ~8 ms of latency against a
@@ -49,22 +55,28 @@ const THREAD_PRIORITY: u8 = 10;
 /// ~128 Hz.
 const FRAMES_PER_BATCH: usize = 16;
 
-/// How long a chip may go without a DRDY edge before it is declared dead. Edges come
+/// How long the thread sleeps between drains. At the ~2 kHz conversion rate each
+/// wake finds about two frames, so the batch above still fills in ~8 ms. Sleeping
+/// rather than waiting on a notification is the point of moving the read: the
+/// interrupt no longer needs to wake anything, so it makes no FreeRTOS call at all,
+/// and this thread's wake rate halves.
+const DRAIN_POLL_MS: u32 = 1;
+
+/// How long a chip may go without a frame before it is declared dead. Frames come
 /// every ~487 µs, so 10 ms is already twenty missed periods. Detection latency is
 /// lost signal: the front end dies stochastically (see the bring-up campaign) and
 /// every death costs this timeout plus ~3 ms of warm recovery. The bench measured
 /// 97% verified yield with this value. This is also the bound on how long a dead
 /// chip may hold the aligner's grid before its absence is announced.
 const DATA_READY_TIMEOUT_MS: u32 = 10;
-const DATA_READY_TIMEOUT_TICKS: u32 = DATA_READY_TIMEOUT_MS; // CONFIG_FREERTOS_HZ=1000
 const DATA_READY_TIMEOUT_US: u64 = DATA_READY_TIMEOUT_MS as u64 * 1000;
 
-/// Log one read failure in this many. A stuck bus fails every frame, thousands of
+/// Log one read fault in this many. A stuck host faults every frame, thousands of
 /// times a second; logging each one would wedge the link thread rather than describe
 /// the fault. The counters carry the true total, so staying quiet loses nothing.
 const READ_ERROR_LOG_INTERVAL: u32 = 2000;
 
-/// DRDY edges between per-chip telemetry reports: ~1 s per chip. Telemetry
+/// Frames between per-chip telemetry reports: ~1 s per chip. Telemetry
 /// frames cost a few hundred bytes each and never touch log retention, so the
 /// rate is set by trend resolution, not by scroll noise.
 const TIMING_REPORT_INTERVAL: u32 = 2_000;
@@ -76,7 +88,7 @@ const BAD_STATUS_RECOVERY_THRESHOLD: u32 = 8;
 
 /// Consecutive slow DRDY periods before a chip is warm-recovered. A chip that
 /// silently reverts to its power-on defaults keeps converting — at ~256 SPS instead
-/// of ~2056, so its wake period physically quadruples. This is a rate measurement,
+/// of ~2056, so its edge period physically quadruples. This is a rate measurement,
 /// not an inference: sixteen straight periods at better than double the nominal
 /// ~487 µs cannot be produced by a correctly configured chip.
 const SLOW_PERIOD_RECOVERY_THRESHOLD: u32 = 16;
@@ -94,9 +106,9 @@ const RECOVERY_LOG_INTERVAL: u32 = 32;
 /// back up, and the datasheet gives the reference a 150 ms start-up (the cold-boot
 /// path waits 300 ms before START for the same reason). Conversions during that
 /// window carry valid status markers but silently wrong amplitude — the one kind of
-/// bad data nothing downstream can detect. Discarding rather than sleeping keeps
-/// DRDY serviced and the death detectors live through the window; the other chip's
-/// pipeline never notices.
+/// bad data nothing downstream can detect. Discarding rather than sleeping keeps the
+/// interrupt reading and the death detectors live through the window; the other
+/// chip's pipeline never notices.
 const REFERENCE_SETTLE_AFTER_RECOVERY_US: u64 = 300_000;
 
 /// How long after the cold-boot START a chip's frames are read but discarded.
@@ -106,24 +118,13 @@ const REFERENCE_SETTLE_AFTER_RECOVERY_US: u64 = 300_000;
 /// settling") — taken with margin.
 const COLD_START_SETTLE_US: u64 = 10_000;
 
-/// Consecutive wakes discarded for carrying no frame before the chip is
-/// warm-recovered. Discards are normal in ones and twos — the bench sees a few
-/// per thousand edges — but they return early, short of the timeout path that
-/// owns death detection, so a chip wedged into waking this thread without ever
-/// converting would keep the wait fed, deliver nothing, and hold the aligner's
-/// grid open on a source it still believes present. This bounds that. At the
-/// conversion rate the threshold is ~16 ms of silence, past
-/// [`DATA_READY_TIMEOUT_MS`], and a run this long cannot come from the measured
-/// discard rate by chance.
-const DISCARDED_WAKE_RECOVERY_THRESHOLD: u32 = 32;
-
 /// What a pipeline tells the combiner. Frames and presence transitions share one
 /// ordered channel, so "these frames, then the chip went dark" cannot reorder into
 /// its opposite.
 pub(super) enum ChipEvent {
     /// Trustworthy timestamped frames, oldest first. Timestamps are the device
-    /// clock at the DRDY wake that produced each frame — strictly monotonic, which
-    /// the aligner requires.
+    /// clock as the DRDY interrupt read it for each frame — strictly monotonic,
+    /// which the aligner requires.
     Frames(Vec<(u64, Sample)>),
     /// The chip can no longer be believed: it died, is being warm-recovered, or is
     /// waiting out a settling window. No frames until [`ChipEvent::Present`].
@@ -134,144 +135,101 @@ pub(super) enum ChipEvent {
 
 /// Where the time between one chip's DRDY edges actually goes.
 ///
-/// The observed edge rate falling is either the loop coming back late or the chip
-/// producing edges slowly, and those need opposite fixes. The difference is visible
-/// in one number: how long the SPI read takes as a fraction of the wake-to-wake
-/// period.
-///
-/// A wake-to-wake period conflates two delays that need opposite fixes of their
-/// own, so the interrupt's own view of the edge is timed separately. An edge
-/// interval that stretches while the service delay stays flat is the interrupt
-/// arriving late — the chip, the shared dispatcher, or a core that cannot take
-/// the interrupt. A service delay that stretches is this thread being held off
-/// the core after the interrupt already ran, which is scheduling.
+/// Every number here is now measured at the edge itself rather than at whatever
+/// wake followed it. The edge period is the chip's own conversion rate as the
+/// interrupt saw it, so a period that stretches is the chip or the interrupt
+/// controller and nothing else; the read duration is the transfer plus the
+/// handler around it; and the service delay — the gap between the edge and this
+/// thread getting to the frame — no longer risks data at all. It is kept because
+/// it is exactly how much of the ring's depth is in use, which is the early
+/// warning for an overrun.
 #[derive(Default)]
 struct EdgeTiming {
     count: u32,
     last_edge_us: Option<u64>,
+    period_count: u32,
     period_min_us: u64,
     period_sum_us: u64,
     period_max_us: u64,
+    /// Edge intervals past 1 ms: at least one conversion went unread.
+    period_over_1ms: u32,
     read_min_us: u64,
     read_sum_us: u64,
     read_max_us: u64,
-    /// The previous edge as the interrupt stamped it. 32-bit because the stamp
-    /// crosses out of interrupt context through an atomic and Xtensa has no
-    /// 64-bit atomics; the counter wraps every ~71 minutes and only differences
-    /// are ever taken, which wrapping arithmetic gets right across the wrap.
-    last_interrupt_edge_us: Option<u32>,
-    interrupt_edge_period_count: u32,
-    interrupt_edge_period_min_us: u64,
-    interrupt_edge_period_max_us: u64,
-    /// Edge intervals past 1 ms: at least one conversion went unread.
-    ///
-    /// The family reports no mean. Measured over the same serviced edges as
-    /// the wake-to-wake period beside it, both telescope to the same total and
-    /// the two means agree to a microsecond, so it would carry nothing. Making
-    /// it differ means advancing this interval across discarded wakes too, and
-    /// the bench charges ~10 serviced edges per second per chip for doing so —
-    /// too much for a metric. The minimum and the maximum still separate a
-    /// late interrupt from a late thread, which is the whole point of the pair.
-    interrupt_edge_period_over_1ms: u32,
-    service_delay_count: u32,
     service_delay_min_us: u64,
     service_delay_sum_us: u64,
     service_delay_max_us: u64,
-    /// Service delays past 1 ms: the thread lost the core for two whole periods.
+    /// Service delays past 1 ms: this thread lost the core for two whole periods.
     service_delay_over_1ms: u32,
 }
 
 impl EdgeTiming {
-    /// Called on every edge, before any work.
-    fn record_edge(&mut self, edge_us: u64) {
+    /// Called once per drained frame, with the interrupt's stamp for it, the
+    /// handler's own read duration, and this thread's clock reading.
+    fn record(&mut self, edge_us: u64, read_us: u32, drained_us: u64) {
         if let Some(last) = self.last_edge_us {
             let period = edge_us.saturating_sub(last);
-            self.period_min_us = if self.count == 0 {
+            self.period_min_us = if self.period_count == 0 {
                 period
             } else {
                 self.period_min_us.min(period)
             };
             self.period_max_us = self.period_max_us.max(period);
             self.period_sum_us += period;
-            self.count += 1;
-        }
-        self.last_edge_us = Some(edge_us);
-    }
-
-    /// Called on every edge with the interrupt's stamp for it and this thread's
-    /// own clock reading, in that order.
-    fn record_interrupt_edge(&mut self, interrupt_edge_us: u32, thread_now_us: u32) {
-        if let Some(last) = self.last_interrupt_edge_us {
-            let period = interrupt_edge_us.wrapping_sub(last) as u64;
-            self.interrupt_edge_period_min_us = if self.interrupt_edge_period_count == 0 {
-                period
-            } else {
-                self.interrupt_edge_period_min_us.min(period)
-            };
-            self.interrupt_edge_period_max_us = self.interrupt_edge_period_max_us.max(period);
-            self.interrupt_edge_period_count += 1;
+            self.period_count += 1;
             if period > 1_000 {
-                self.interrupt_edge_period_over_1ms += 1;
+                self.period_over_1ms += 1;
             }
         }
-        self.last_interrupt_edge_us = Some(interrupt_edge_us);
-        // The stamp can be newer than this thread's reading: the interrupt is
-        // re-armed before the read, so an edge arriving mid-service overwrites
-        // the stamp for the notification already pending. The difference is
-        // genuinely negative there and the delay for that edge is not
-        // measurable from here, so it counts as zero rather than wrapping to
-        // four billion and destroying the mean.
-        let delay = (thread_now_us.wrapping_sub(interrupt_edge_us) as i32).max(0) as u64;
-        self.service_delay_min_us = if self.service_delay_count == 0 {
+        self.last_edge_us = Some(edge_us);
+
+        let read = read_us as u64;
+        self.read_min_us = if self.count == 0 {
+            read
+        } else {
+            self.read_min_us.min(read)
+        };
+        self.read_max_us = self.read_max_us.max(read);
+        self.read_sum_us += read;
+
+        let delay = drained_us.saturating_sub(edge_us);
+        self.service_delay_min_us = if self.count == 0 {
             delay
         } else {
             self.service_delay_min_us.min(delay)
         };
         self.service_delay_max_us = self.service_delay_max_us.max(delay);
         self.service_delay_sum_us += delay;
-        self.service_delay_count += 1;
         if delay > 1_000 {
             self.service_delay_over_1ms += 1;
         }
+
+        self.count += 1;
     }
 
-    fn record_read(&mut self, elapsed_us: u64) {
-        self.read_min_us = if self.read_sum_us == 0 {
-            elapsed_us
-        } else {
-            self.read_min_us.min(elapsed_us)
-        };
-        self.read_max_us = self.read_max_us.max(elapsed_us);
-        self.read_sum_us += elapsed_us;
-    }
-
-    /// The interval's numbers, and a reset, once `TIMING_REPORT_INTERVAL` edges have
+    /// The interval's numbers, and a reset, once `TIMING_REPORT_INTERVAL` frames have
     /// gone by.
     fn summary(&mut self) -> Option<EdgeTimingReport> {
         if self.count < TIMING_REPORT_INTERVAL {
             return None;
         }
+        let frames = self.count as u64;
         let report = EdgeTimingReport {
             period_min_us: self.period_min_us,
-            period_mean_us: self.period_sum_us / self.count as u64,
+            period_mean_us: self.period_sum_us / self.period_count.max(1) as u64,
             period_max_us: self.period_max_us,
+            period_over_1ms: self.period_over_1ms,
             read_min_us: self.read_min_us,
-            read_mean_us: self.read_sum_us / self.count as u64,
+            read_mean_us: self.read_sum_us / frames,
             read_max_us: self.read_max_us,
-            interrupt_edge_period_min_us: self.interrupt_edge_period_min_us,
-            interrupt_edge_period_max_us: self.interrupt_edge_period_max_us,
-            interrupt_edge_period_over_1ms: self.interrupt_edge_period_over_1ms,
             service_delay_min_us: self.service_delay_min_us,
-            service_delay_mean_us: self.service_delay_sum_us
-                / self.service_delay_count.max(1) as u64,
+            service_delay_mean_us: self.service_delay_sum_us / frames,
             service_delay_max_us: self.service_delay_max_us,
             service_delay_over_1ms: self.service_delay_over_1ms,
         };
         let last_edge_us = self.last_edge_us;
-        let last_interrupt_edge_us = self.last_interrupt_edge_us;
         *self = Self {
             last_edge_us,
-            last_interrupt_edge_us,
             ..Self::default()
         };
         Some(report)
@@ -283,36 +241,36 @@ struct EdgeTimingReport {
     period_min_us: u64,
     period_mean_us: u64,
     period_max_us: u64,
+    period_over_1ms: u32,
     read_min_us: u64,
     read_mean_us: u64,
     read_max_us: u64,
-    interrupt_edge_period_min_us: u64,
-    interrupt_edge_period_max_us: u64,
-    interrupt_edge_period_over_1ms: u32,
     service_delay_min_us: u64,
     service_delay_mean_us: u64,
     service_delay_max_us: u64,
     service_delay_over_1ms: u32,
 }
 
-/// The thread's whole world: its chip, its health state, and its line to the
-/// combiner.
+/// The thread's whole world: its chip, its frame ring, its health state, and its
+/// line to the combiner.
 struct Pipeline {
     index: usize,
     chip: Ads1298FrontEnd,
+    reader: FrameReader,
     events: SyncSender<(usize, ChipEvent)>,
     counters: Arc<HealthCounters>,
-    /// Device-clock time of the most recent DRDY edge. Seeded with the thread's
-    /// start so a chip that never produces a first edge is declared dead by the
+    /// Device-clock time the last frame was drained. Seeded with the thread's
+    /// start so a chip that never produces a first frame is declared dead by the
     /// same staleness rule as one that stops.
-    last_edge_us: u64,
+    last_frame_us: u64,
     /// Frames before this instant are read and discarded: the chip's reference is
     /// still settling (cold start or post-recovery).
     settling_until_us: u64,
+    /// The previous frame's interrupt stamp, for the silent-revert detector.
+    previous_edge_us: Option<u64>,
     consecutive_bad_status: u32,
     consecutive_slow_periods: u32,
     last_status: u32,
-    edges: u32,
     timing: EdgeTiming,
     /// TEMP bench diagnostic: running mean of |input| in microvolts across this
     /// chip's eight channels, reported and reset with each timing summary. Tells
@@ -324,38 +282,30 @@ struct Pipeline {
     /// transitions so absence is announced exactly once per outage.
     announced_present: bool,
     batch: Vec<(u64, Sample)>,
-    /// The interrupt stamp the last serviced wake carried. A wake repeating it
-    /// has no conversion behind it.
-    last_serviced_interrupt_edge_us: Option<u32>,
-    /// Wakes discarded for repeating that stamp, cumulative.
-    repeated_edge_wakes: u32,
-    /// Wakes discarded for finding DRDY unasserted, cumulative.
-    data_ready_clear_wakes: u32,
-    /// Discarded wakes since the last one that carried a frame.
-    consecutive_discarded_wakes: u32,
     /// This chip's own frames whose status word lost its marker, cumulative.
     /// [`HealthCounters::bad_status`] sums both chips for the device-wide
     /// report, which cannot answer which chip is failing.
     bad_status: u32,
-    /// The device clock as read inside the DRDY interrupt, published before the
-    /// notification that wakes this thread. Low 32 bits only: Xtensa has no
-    /// 64-bit atomics, and [`EdgeTiming`] takes nothing but differences.
-    interrupt_edge_us: Arc<std::sync::atomic::AtomicU32>,
+    /// Interrupt-side read faults already folded into
+    /// [`HealthCounters::read_errors`], so only the new ones are added.
+    reported_read_faults: u32,
 }
 
-/// The combiner hung up; nothing left to sample for.
-struct CombinerGone;
+/// This chip's pipeline must end: either the combiner hung up and there is
+/// nothing left to sample for, or the SPI host could not be handed back and
+/// carrying on would race the driver against the interrupt.
+struct PipelineStopped;
 
 impl Pipeline {
     /// Sends `event`; the error means the combiner is gone and the thread must end.
-    fn send(&self, event: ChipEvent) -> Result<(), CombinerGone> {
+    fn send(&self, event: ChipEvent) -> Result<(), PipelineStopped> {
         self.events
             .send((self.index, event))
-            .map_err(|_| CombinerGone)
+            .map_err(|_| PipelineStopped)
     }
 
     /// Hands over whatever the batch holds.
-    fn flush(&mut self) -> Result<(), CombinerGone> {
+    fn flush(&mut self) -> Result<(), PipelineStopped> {
         if self.batch.is_empty() {
             return Ok(());
         }
@@ -367,7 +317,12 @@ impl Pipeline {
     /// discarded: the combiner throws away the partial window the moment it hears
     /// `Absent`, so delivering frames destined for that window would be wasted
     /// motion.
-    fn recover(&mut self, reason: &str) -> Result<(), CombinerGone> {
+    ///
+    /// This is the SPI host handover. The interrupt window closes first, so the
+    /// esp-idf driver owns the bus alone for the reset and reconfigure, and the
+    /// ring is emptied before it reopens — the frames in it were converted under
+    /// the configuration the reset just destroyed.
+    fn recover(&mut self, reason: &str) -> Result<(), PipelineStopped> {
         let total = self.counters.recoveries.fetch_add(1, Ordering::Relaxed) + 1;
         if total == 1 || total % RECOVERY_LOG_INTERVAL == 0 {
             warn!(
@@ -380,208 +335,75 @@ impl Pipeline {
             self.announced_present = false;
             self.send(ChipEvent::Absent)?;
         }
+        // The interrupt window closes before any driver call and there is no
+        // recovering without that: driver traffic racing a live handler on the
+        // same host is the one thing the ownership contract forbids, and a chip
+        // already announced absent is a better outcome than a corrupted bus.
+        if let Err(error) = self.reader.disable() {
+            warn!(
+                "chip {} could not close its interrupt window ({error}); stopping its \
+                 pipeline rather than running the recovery against a live interrupt",
+                self.index
+            );
+            return Err(PipelineStopped);
+        }
         if let Err(error) = self.chip.warm_recover() {
             warn!("chip {} warm recovery failed: {error}", self.index);
+        }
+        self.reader.clear();
+        if let Err(error) = self.reader.enable() {
+            warn!(
+                "chip {} could not reopen its interrupt window: {error}; its pipeline is \
+                 stopping",
+                self.index
+            );
+            return Err(PipelineStopped);
         }
         let now = now_us();
         self.consecutive_bad_status = 0;
         self.consecutive_slow_periods = 0;
-        self.last_edge_us = now;
+        self.previous_edge_us = None;
+        self.last_frame_us = now;
         self.timing = EdgeTiming::default();
         self.settling_until_us = now + REFERENCE_SETTLE_AFTER_RECOVERY_US;
         Ok(())
     }
 
-    /// One DRDY wake (or timeout) worth of work.
-    fn service(&mut self, woken: bool) -> Result<(), CombinerGone> {
+    /// One drained frame's worth of work. `Ok(true)` means the chip was recovered
+    /// and the rest of the ring is stale.
+    fn accept(
+        &mut self,
+        edge_us: u64,
+        read_us: u32,
+        raw: [u8; super::decode::FRAME_BYTES],
+    ) -> Result<bool, PipelineStopped> {
         let now = now_us();
-        if !woken {
-            // Nothing to read; the batch should not sit on 8 ms of latency budget
-            // while the chip idles, and a stale edge means the chip is dead.
-            self.flush()?;
-            if now.saturating_sub(self.last_edge_us) > DATA_READY_TIMEOUT_US {
-                self.recover("no DRDY edge")?;
-            }
-            return Ok(());
-        }
+        self.last_frame_us = now;
+        self.timing.record(edge_us, read_us, now);
 
-        // Two ways a wake arrives with no conversion behind it, both created by
-        // re-arming before the read: the notification carries a bit rather than
-        // a count, so one can be left set for an edge already serviced, and the
-        // interrupt is live during the read, where this chip's own SCLK drives
-        // DRDY and can raise an edge of its own. Reading on either clocks a
-        // frame the chip has not finished producing, which returns without a
-        // status marker and inflates the front end's integrity counter.
-        //
-        // Both tests are cheap and neither is sufficient alone. An interrupt
-        // stamp that has not advanced since the last serviced wake proves no
-        // edge has fired since, which no bus traffic can forge. DRDY, active-low
-        // and held until the frame is clocked out, catches the rest — the
-        // datasheet warns that a rising SCLK edge erases DRDY regardless of chip
-        // select (SBAS459K §9.4.1.2, and `spi-timing-audit.md` records bus
-        // traffic consuming pulses), which would make a clear line ambiguous,
-        // but reading those wakes instead of discarding them recovers no
-        // measurable frame: the bench excludes a real-frame loss above ~0.2%.
-        //
-        // What produces the discards, at a few per thousand edges, is not
-        // established; the counters exist to keep the rate visible.
-        let interrupt_edge_us = self.interrupt_edge_us.load(Ordering::Relaxed);
-        let discarded = if self.last_serviced_interrupt_edge_us == Some(interrupt_edge_us) {
-            self.repeated_edge_wakes += 1;
-            true
-        } else {
-            self.last_serviced_interrupt_edge_us = Some(interrupt_edge_us);
-            if self.chip.device.data_ready().unwrap_or(false) {
-                false
-            } else {
-                self.data_ready_clear_wakes += 1;
-                true
-            }
-        };
-        if discarded {
-            // The interrupt fired, so the interrupt family tracks it even though
-            // no frame follows; that is what separates it from the wake-to-wake
-            // period beside it.
-            self.consecutive_discarded_wakes += 1;
-            if self.consecutive_discarded_wakes >= DISCARDED_WAKE_RECOVERY_THRESHOLD {
-                return self.recover("wakes carrying no frame");
-            }
-            return Ok(());
-        }
-        self.consecutive_discarded_wakes = 0;
-
-        self.edges += 1;
         // The silent-revert detector: a chip back at power-on defaults still
         // converts, but four times slower. Sustained slow periods mean its
-        // configuration is gone even though frames keep coming.
-        let period = now.saturating_sub(self.last_edge_us);
-        self.last_edge_us = now;
-        self.timing.record_edge(now);
-        self.timing
-            .record_interrupt_edge(interrupt_edge_us, now as u32);
-        if period > SLOW_PERIOD_US {
-            self.consecutive_slow_periods += 1;
-            if self.consecutive_slow_periods >= SLOW_PERIOD_RECOVERY_THRESHOLD {
-                return self.recover("sustained slow DRDY period");
-            }
-        } else {
-            self.consecutive_slow_periods = 0;
-        }
-        // TEMP bring-up diagnostic: confirms the chip's interrupt fires at all,
-        // without spamming a log per edge at ~2 kHz.
-        if self.edges == 1 {
-            info!("chip {} DRDY edge #1", self.index);
-        }
-        if let Some(report) = self.timing.summary() {
-            let mean_abs_microvolts = if self.abs_microvolt_frames > 0 {
-                self.abs_microvolt_sum / self.abs_microvolt_frames as f32
+        // configuration is gone even though frames keep coming. Measured on the
+        // interrupt's own stamps, so a late drain cannot fake it.
+        if let Some(previous) = self.previous_edge_us {
+            if edge_us.saturating_sub(previous) > SLOW_PERIOD_US {
+                self.consecutive_slow_periods += 1;
+                if self.consecutive_slow_periods >= SLOW_PERIOD_RECOVERY_THRESHOLD {
+                    self.recover("sustained slow DRDY period")?;
+                    return Ok(true);
+                }
             } else {
-                0.0
-            };
-            self.abs_microvolt_sum = 0.0;
-            self.abs_microvolt_frames = 0;
-            // The status word rides along because the lead-off bits in it track
-            // LOFF_SENSP/N, which `configure` sets and reset clears — a chip that
-            // quietly reverts to its power-on defaults announces itself here,
-            // mid-stream. A word with its marker intact goes out decoded (the
-            // comparator bit sets an operator hunts electrodes with); one
-            // without goes out raw — the bits of a marker-less word are noise,
-            // and the validity flag says which reading this is.
-            let metric = crate::telemetry::metric;
-            let mut metrics = vec![
-                metric("edge_count", self.edges as f64),
-                metric("edge_period_min_us", report.period_min_us as f64),
-                metric("edge_period_mean_us", report.period_mean_us as f64),
-                metric("edge_period_max_us", report.period_max_us as f64),
-                metric("spi_read_min_us", report.read_min_us as f64),
-                metric("spi_read_mean_us", report.read_mean_us as f64),
-                metric("spi_read_max_us", report.read_max_us as f64),
-                metric(
-                    "interrupt_edge_period_min_us",
-                    report.interrupt_edge_period_min_us as f64,
-                ),
-                metric(
-                    "interrupt_edge_period_max_us",
-                    report.interrupt_edge_period_max_us as f64,
-                ),
-                metric(
-                    "interrupt_edge_period_over_1ms_count",
-                    report.interrupt_edge_period_over_1ms as f64,
-                ),
-                metric("repeated_edge_wake_count", self.repeated_edge_wakes as f64),
-                metric(
-                    "data_ready_clear_wake_count",
-                    self.data_ready_clear_wakes as f64,
-                ),
-                metric("service_delay_min_us", report.service_delay_min_us as f64),
-                metric("service_delay_mean_us", report.service_delay_mean_us as f64),
-                metric("service_delay_max_us", report.service_delay_max_us as f64),
-                metric(
-                    "service_delay_over_1ms_count",
-                    report.service_delay_over_1ms as f64,
-                ),
-                metric("mean_absolute_input_uv", mean_abs_microvolts as f64),
-                metric("bad_status", self.bad_status as f64),
-                metric(
-                    "recoveries",
-                    self.counters.recoveries.load(Ordering::Relaxed) as f64,
-                ),
-            ];
-            match StatusWord::from_word(self.last_status) {
-                Some(status) => {
-                    metrics.push(metric("status_marker_valid", 1.0));
-                    metrics.push(metric(
-                        "lead_off_positive_bits",
-                        status.positive_lead_off.bits() as f64,
-                    ));
-                    metrics.push(metric(
-                        "lead_off_negative_bits",
-                        status.negative_lead_off.bits() as f64,
-                    ));
-                    metrics.push(metric(
-                        "general_purpose_input_bits",
-                        status.general_purpose_inputs as f64,
-                    ));
-                }
-                None => {
-                    // The raw word is not reported: a bitfield has no magnitude
-                    // to plot, and the read path already logs it in hex as the
-                    // rate-limited "status marker invalid" warning — the right
-                    // home for a discrete diagnostic.
-                    metrics.push(metric("status_marker_valid", 0.0));
-                }
+                self.consecutive_slow_periods = 0;
             }
-            crate::telemetry::report(&format!("chip{}", self.index), metrics);
         }
+        self.previous_edge_us = Some(edge_us);
 
-        // tUPDATE (SBAS459K §9.4.1.3, 4 tCLK ≈ 2 µs around the DRDY edge, no SCLK
-        // allowed): satisfied structurally, not by a delay — the ISR-to-task
-        // notification and scheduling latency between the DRDY edge and this read
-        // is tens of microseconds at minimum.
-        let read_started_us = now_us();
-        let read = self.chip.read_frame();
-        self.timing
-            .record_read(now_us().saturating_sub(read_started_us));
-        let frame = match read {
-            Ok(frame) => frame,
-            Err(error) => {
-                let total = self.counters.read_errors.fetch_add(1, Ordering::Relaxed) + 1;
-                if total % READ_ERROR_LOG_INTERVAL == 1 {
-                    warn!(
-                        "chip {} frame read failed ({total} so far): {error}",
-                        self.index
-                    );
-                }
-                return Ok(());
-            }
-        };
-
+        let frame = parse_sample(&raw);
         self.last_status = frame.status;
 
-        // The transaction succeeded, but that only means the SPI driver got 27
-        // bytes back -- not that they were the right 27 bytes. The status word's
-        // fixed marker bits catch a bit-misaligned or corrupted read that
-        // read_errors can't.
+        // The transfer completed, but that only means the host clocked 27 bytes --
+        // not that they were the right 27 bytes. The status word's fixed marker
+        // bits catch a bit-misaligned or corrupted read that a completion cannot.
         if frame.status_word().is_none() {
             self.bad_status += 1;
             let total = self.counters.bad_status.fetch_add(1, Ordering::Relaxed) + 1;
@@ -596,9 +418,10 @@ impl Pipeline {
             }
             self.consecutive_bad_status += 1;
             if self.consecutive_bad_status >= BAD_STATUS_RECOVERY_THRESHOLD {
-                return self.recover("sustained bad status markers");
+                self.recover("sustained bad status markers")?;
+                return Ok(true);
             }
-            return Ok(());
+            return Ok(false);
         }
         self.consecutive_bad_status = 0;
 
@@ -613,91 +436,184 @@ impl Pipeline {
         self.abs_microvolt_sum += frame_mean_abs;
         self.abs_microvolt_frames += 1;
 
-        // Settling frames are consumed (DRDY stays serviced, the detectors above
-        // keep seeing a live stream) but never leave the thread.
+        // Settling frames are consumed (the detectors above keep seeing a live
+        // stream) but never leave the thread.
         if now < self.settling_until_us {
-            return Ok(());
+            return Ok(false);
         }
         // The first trustworthy frame after a settle ends the outage.
         if !self.announced_present {
             self.announced_present = true;
             self.send(ChipEvent::Present)?;
         }
-        self.batch.push((now, frame));
+        // The timestamp is the interrupt's, not this thread's: it is the DRDY edge
+        // to within interrupt entry latency, and the aligner's grid is only as
+        // honest as the stamps it places frames by.
+        self.batch.push((edge_us, frame));
         if self.batch.len() >= FRAMES_PER_BATCH {
             self.flush()?;
         }
-        Ok(())
+        Ok(false)
+    }
+
+    /// Emits this chip's telemetry when enough frames have gone by.
+    fn report(&mut self) {
+        let Some(report) = self.timing.summary() else {
+            return;
+        };
+        let mean_abs_microvolts = if self.abs_microvolt_frames > 0 {
+            self.abs_microvolt_sum / self.abs_microvolt_frames as f32
+        } else {
+            0.0
+        };
+        self.abs_microvolt_sum = 0.0;
+        self.abs_microvolt_frames = 0;
+        let interrupt = self.reader.counters();
+        // The status word rides along because the lead-off bits in it track
+        // LOFF_SENSP/N, which `configure` sets and reset clears — a chip that
+        // quietly reverts to its power-on defaults announces itself here,
+        // mid-stream. A word with its marker intact goes out decoded (the
+        // comparator bit sets an operator hunts electrodes with); one without
+        // goes out raw — the bits of a marker-less word are noise, and the
+        // validity flag says which reading this is.
+        let metric = crate::telemetry::metric;
+        let mut metrics = vec![
+            // Serviced edges: conversions the interrupt actually clocked out of
+            // this chip, which is the honest sampling rate. Cumulative.
+            metric("edge_count", interrupt.edges as f64),
+            metric("edge_period_min_us", report.period_min_us as f64),
+            metric("edge_period_mean_us", report.period_mean_us as f64),
+            metric("edge_period_max_us", report.period_max_us as f64),
+            metric("edge_period_over_1ms_count", report.period_over_1ms as f64),
+            metric("spi_read_min_us", report.read_min_us as f64),
+            metric("spi_read_mean_us", report.read_mean_us as f64),
+            metric("spi_read_max_us", report.read_max_us as f64),
+            metric("service_delay_min_us", report.service_delay_min_us as f64),
+            metric("service_delay_mean_us", report.service_delay_mean_us as f64),
+            metric("service_delay_max_us", report.service_delay_max_us as f64),
+            metric(
+                "service_delay_over_1ms_count",
+                report.service_delay_over_1ms as f64,
+            ),
+            // Frames the interrupt read and this thread had no room for. Zero is
+            // the only acceptable value; it is reported so that stays checkable.
+            metric("frame_ring_overrun_count", interrupt.overruns as f64),
+            metric("frame_read_fault_count", interrupt.read_faults as f64),
+            metric("mean_absolute_input_uv", mean_abs_microvolts as f64),
+            metric("bad_status", self.bad_status as f64),
+            metric(
+                "recoveries",
+                self.counters.recoveries.load(Ordering::Relaxed) as f64,
+            ),
+        ];
+        match StatusWord::from_word(self.last_status) {
+            Some(status) => {
+                metrics.push(metric("status_marker_valid", 1.0));
+                metrics.push(metric(
+                    "lead_off_positive_bits",
+                    status.positive_lead_off.bits() as f64,
+                ));
+                metrics.push(metric(
+                    "lead_off_negative_bits",
+                    status.negative_lead_off.bits() as f64,
+                ));
+                metrics.push(metric(
+                    "general_purpose_input_bits",
+                    status.general_purpose_inputs as f64,
+                ));
+            }
+            None => {
+                // The raw word is not reported: a bitfield has no magnitude
+                // to plot, and the read path already logs it in hex as the
+                // rate-limited "status marker invalid" warning — the right
+                // home for a discrete diagnostic.
+                metrics.push(metric("status_marker_valid", 0.0));
+            }
+        }
+        crate::telemetry::report(&format!("chip{}", self.index), metrics);
+    }
+
+    /// Folds the interrupt's read faults into the device-wide counter, and says so
+    /// the first time and then rarely.
+    fn absorb_read_faults(&mut self) {
+        let faults = self.reader.counters().read_faults;
+        let new = faults.saturating_sub(self.reported_read_faults);
+        if new == 0 {
+            return;
+        }
+        self.reported_read_faults = faults;
+        let total = self.counters.read_errors.fetch_add(new, Ordering::Relaxed) + new;
+        if total % READ_ERROR_LOG_INTERVAL < new {
+            warn!(
+                "chip {} frame transfer did not complete ({total} so far)",
+                self.index
+            );
+        }
     }
 
     fn run(mut self) {
-        // Wake on the chip's DRDY falling edge rather than polling. The thread has
-        // to block between frames: it runs above the idle task, the idle-task
-        // watchdog panics after 5 s on either core, and a spin loop here would
-        // starve idle and reboot the board within seconds of first light.
-        //
-        // The ISR does one thing: notify this thread. Everything else, including
-        // the SPI read, happens back here where blocking calls are legal.
-        let notification = Notification::new();
-        let notifier = notification.notifier();
-        let bit = NonZeroU32::new(1).expect("1 is not 0");
-        let interrupt_edge_us = Arc::clone(&self.interrupt_edge_us);
-        if let Err(error) = unsafe {
-            self.chip.device.subscribe_data_ready(move || {
-                interrupt_edge_us.store(now_us() as u32, Ordering::Relaxed);
-                notifier.notify_and_yield(bit);
-            })
-        } {
+        if let Err(error) = self.reader.enable() {
             warn!(
-                "could not subscribe to chip {} DRDY: {error}; its pipeline is stopping",
+                "could not open chip {} DRDY interrupt: {error}; its pipeline is stopping",
                 self.index
             );
             return;
         }
+        info!("chip {} pipeline running", self.index);
 
+        let mut first_frame_logged = false;
         loop {
-            // esp-idf-hal disables the interrupt inside its own ISR to avoid
-            // re-entering, so it has to be re-armed after every notification, from
-            // outside interrupt context.
-            if let Err(error) = self.chip.device.arm_data_ready_interrupt() {
-                warn!(
-                    "could not arm chip {} DRDY interrupt: {error}; its pipeline is stopping",
-                    self.index
-                );
-                return;
+            let mut drained = false;
+            // Bounded by the ring's capacity, so a chip converting faster than this
+            // thread drains can lengthen a pass but not trap it.
+            while let Some(frame) = self.reader.pop() {
+                drained = true;
+                if !first_frame_logged {
+                    first_frame_logged = true;
+                    // TEMP bring-up diagnostic: confirms the chip's interrupt fires
+                    // at all, without a log per frame at ~2 kHz.
+                    info!("chip {} frame #1", self.index);
+                }
+                match self.accept(frame.edge_us, frame.read_us, frame.bytes) {
+                    Ok(false) => {}
+                    // Recovered: everything else in the ring predates the reset.
+                    Ok(true) => break,
+                    Err(_) => {
+                        info!("chip {} pipeline stopping", self.index);
+                        return;
+                    }
+                }
             }
-            let woken = notification.wait(DATA_READY_TIMEOUT_TICKS).is_some();
-            // Re-armed before the read, not after it. The interrupt is disabled
-            // from the moment it fires, and a read holds the thread for ~150 µs
-            // of the ~500 µs period, so an edge landing in that stretch is lost
-            // outright unless the interrupt is already live to latch a pending
-            // notification for it. Measured on the bench with the radio quiet:
-            // whole-block gaps fell from ~0.7-1.2% per chip to ~0.1%, and the
-            // mean edge period fell to the conversion rate.
-            // A bit set for an edge already serviced then wakes this thread
-            // with nothing to read, which `service` discards on the interrupt
-            // stamp before it touches the bus.
-            if woken {
-                let _ = self.chip.device.arm_data_ready_interrupt();
+            self.report();
+            self.absorb_read_faults();
+
+            if !drained {
+                // The batch should not sit on 8 ms of latency budget while the chip
+                // idles, and a stale stream means the chip is dead.
+                if self.flush().is_err() {
+                    info!("chip {} pipeline stopping", self.index);
+                    return;
+                }
+                if now_us().saturating_sub(self.last_frame_us) > DATA_READY_TIMEOUT_US
+                    && self.recover("no DRDY edge").is_err()
+                {
+                    info!("chip {} pipeline stopping", self.index);
+                    return;
+                }
             }
-            if self.service(woken).is_err() {
-                info!(
-                    "combiner disconnected; chip {} pipeline stopping",
-                    self.index
-                );
-                return;
-            }
+            FreeRtos::delay_ms(DRAIN_POLL_MS);
         }
     }
 }
 
-/// Spawns the sampling thread for one chip, pinned to `core` (the caller takes
+/// Spawns the draining thread for one chip, pinned to `core` (the caller takes
 /// that from the core plan). `power_down` is the chip's PWDN line, parked in the
 /// thread so it stays high for as long as the chip is being sampled.
 pub(super) fn spawn(
     index: usize,
     core: esp_idf_svc::hal::cpu::Core,
     chip: Ads1298FrontEnd,
+    reader: FrameReader,
     power_down: PinDriver<'static, Output>,
     events: SyncSender<(usize, ChipEvent)>,
     counters: Arc<HealthCounters>,
@@ -708,33 +624,27 @@ pub(super) fn spawn(
             .stack_size(THREAD_STACK_BYTES)
             .spawn(move || {
                 crate::adc::acquisition::set_current_thread_priority(THREAD_PRIORITY);
-                info!("chip {index} pipeline running");
                 let _power_down = power_down;
                 let started_us = now_us();
                 Pipeline {
                     index,
                     chip,
+                    reader,
                     events,
                     counters,
-                    last_edge_us: started_us,
+                    last_frame_us: started_us,
                     settling_until_us: started_us + COLD_START_SETTLE_US,
+                    previous_edge_us: None,
                     consecutive_bad_status: 0,
                     consecutive_slow_periods: 0,
                     last_status: 0,
-                    edges: 0,
                     timing: EdgeTiming::default(),
                     abs_microvolt_sum: 0.0,
                     abs_microvolt_frames: 0,
                     announced_present: false,
-                    last_serviced_interrupt_edge_us: None,
-                    repeated_edge_wakes: 0,
-                    data_ready_clear_wakes: 0,
-                    consecutive_discarded_wakes: 0,
                     bad_status: 0,
+                    reported_read_faults: 0,
                     batch: Vec::with_capacity(FRAMES_PER_BATCH),
-                    interrupt_edge_us: Arc::new(std::sync::atomic::AtomicU32::new(
-                        started_us as u32,
-                    )),
                 }
                 .run();
             })

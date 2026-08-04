@@ -1,9 +1,10 @@
 //! The combining stage: two per-chip sample streams onto one grid, through
 //! conditioning, into windows the main loop consumes.
 //!
-//! Acquisition is three threads. Each chip has a [`super::chip_pipeline`] thread
-//! that owns its SPI bus, its DRDY interrupt, and its health, and emits batches of
-//! timestamped 8-channel frames. This module's combiner thread drains both
+//! Acquisition is three threads and two interrupts. Each chip's frames are clocked
+//! out inside its DRDY interrupt ([`super::frame_reader`]); each chip then has a
+//! [`super::chip_pipeline`] thread that drains that ring, owns the chip's health,
+//! and emits batches of timestamped 8-channel frames. This module's combiner drains both
 //! pipelines into an [`emg_runtime::alignment::GridAligner`], which places the two
 //! independently clocked streams onto one 2 kHz grid on the device clock, with the
 //! pairing policy and its accounting in one explicit, host-tested place. Each
@@ -136,7 +137,8 @@ pub(crate) struct AcquiredWindow {
 pub(super) struct HealthCounters {
     /// Windows the channel had no room for.
     pub(super) dropped: AtomicU32,
-    /// Frames the driver failed to read, both chips.
+    /// Frames the interrupt read path could not clock out, both chips: the SPI
+    /// host never reported the transfer complete.
     pub(super) read_errors: AtomicU32,
     /// Frames whose status word lost its fixed marker bits, summed over both
     /// chips. Each pipeline keeps its own count for its telemetry, since a
@@ -240,13 +242,20 @@ pub(crate) fn start(
 
     let FrontEnds {
         chips,
+        readers,
         _power_down: power_down,
     } = front_ends;
-    for ((chip, power_down), board) in chips.into_iter().zip(power_down).zip(Board::ALL) {
+    for (((chip, reader), power_down), board) in chips
+        .into_iter()
+        .zip(readers)
+        .zip(power_down)
+        .zip(Board::ALL)
+    {
         chip_pipeline::spawn(
             board.device_index(),
             crate::cores::front_end_core(board),
             chip,
+            reader,
             power_down,
             event_sender.clone(),
             counters.clone(),

@@ -10,7 +10,7 @@
 
 use anyhow::Result;
 use esp_idf_svc::hal::delay::{Ets, FreeRtos};
-use esp_idf_svc::hal::gpio::{Input, InterruptType, Output, PinDriver};
+use esp_idf_svc::hal::gpio::{Input, Output, PinDriver};
 use esp_idf_svc::hal::spi::{Operation, SpiDeviceDriver, SpiDriver};
 use log::{info, warn};
 use std::sync::Arc;
@@ -295,34 +295,17 @@ impl Ads1298Device {
         result
     }
 
-    /// DRDY is active-low. It falls when a new frame is ready to be sampled.
-    /// Acquisition waits on the interrupt to know an edge happened and reads
-    /// this to confirm a frame is actually waiting before it clocks one out.
-    pub(super) fn data_ready(&self) -> Result<bool> {
-        Ok(self.drdy.is_low())
+    /// This chip's DRDY pin number, for the interrupt-side frame reader, which
+    /// works in GPIO numbers rather than through `PinDriver`.
+    pub(super) fn data_ready_pin(&self) -> u8 {
+        self.drdy.pin()
     }
 
-    /// Routes this chip's DRDY falling edge to `callback`, which runs in ISR context.
-    ///
-    /// # Safety
-    ///
-    /// `callback` runs in an interrupt. It must not call into std, libc or most of
-    /// FreeRTOS. Notifying a task is one of the few things it may do.
-    pub(super) unsafe fn subscribe_data_ready(
-        &mut self,
-        callback: impl FnMut() + Send + 'static,
-    ) -> Result<()> {
-        self.drdy.set_interrupt_type(InterruptType::NegEdge)?;
-        unsafe { self.drdy.subscribe(callback)? };
-        Ok(())
-    }
-
-    /// Arms the DRDY interrupt. esp-idf-hal disables it inside its own ISR to avoid
-    /// re-entering, so this has to be called again after every notification, from
-    /// outside interrupt context.
-    pub(super) fn arm_data_ready_interrupt(&mut self) -> Result<()> {
-        self.drdy.enable_interrupt()?;
-        Ok(())
+    /// This chip's CS pin number. The interrupt-side reader drives CS straight
+    /// from the GPIO output registers; the driver holds this `PinDriver` so the
+    /// pad stays configured as an output and nothing else can claim it.
+    pub(super) fn chip_select_pin(&self) -> u8 {
+        self.chip_select.pin()
     }
 
     pub(super) fn reset_pulse(&mut self) -> Result<()> {

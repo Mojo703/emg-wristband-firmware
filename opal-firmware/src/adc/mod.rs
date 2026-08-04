@@ -18,12 +18,13 @@
 //! frame and signal maths, and [`preprocess`] turns ADC codes into the model's int8
 //! input. [`bring_up`] does the wiring and hands back a configured, streaming pair.
 //!
-//! Threading. Sampling cannot live on the main loop: at ~2 kSPS a frame arrives from
-//! each chip every ~487 µs, while the main loop runs one inference window per
-//! iteration and feeds the task watchdog. [`acquisition::start`] spawns one
-//! [`chip_pipeline`] thread per chip — each owning its chip's SPI bus, DRDY
-//! interrupt, and health, so the two chips' reads overlap instead of serialising —
-//! plus a combiner thread that places both streams onto one time grid
+//! Threading. The frame read itself is not on a thread at all: [`frame_reader`]
+//! clocks each frame out inside the chip's DRDY interrupt, because a conversion
+//! not read within one ~487 µs period is gone and no scheduling policy can
+//! promise that. What the threads do is everything after the bytes are safe.
+//! [`acquisition::start`] spawns one [`chip_pipeline`] thread per chip — draining
+//! that chip's frame ring, validating it, and owning its health — plus a combiner
+//! thread that places both streams onto one time grid
 //! ([`emg_runtime::alignment`]) and builds the model and wire windows. Everything
 //! here owns its peripherals at `'static` instead of borrowing them.
 
@@ -34,6 +35,7 @@ mod chip_pipeline;
 mod conditioning;
 mod convert;
 mod decode;
+mod frame_reader;
 mod preprocess;
 mod registers;
 mod spi_commands;
@@ -84,6 +86,10 @@ pub(crate) struct AdcChipWiring {
 /// for as long as the front end exists.
 pub(crate) struct FrontEnds {
     pub(super) chips: [Ads1298FrontEnd; DEVICE_COUNT],
+    /// Each chip's interrupt-side frame path, claimed and proven against the
+    /// driver path in [`bring_up`] but not yet enabled: the pipeline thread that
+    /// drains a ring is the thing that opens its interrupt window.
+    pub(super) readers: [frame_reader::FrameReader; DEVICE_COUNT],
     pub(super) _power_down: [PinDriver<'static, Output>; DEVICE_COUNT],
 }
 
@@ -97,7 +103,11 @@ fn build_front_end<SPI: SpiAnyPins + 'static>(
     wiring: AdcChipWiring,
     command_config: &SpiConfig,
     frame_config: &SpiConfig,
-) -> Result<(Ads1298FrontEnd, PinDriver<'static, Output>)> {
+) -> Result<(
+    Ads1298FrontEnd,
+    PinDriver<'static, Output>,
+    esp_idf_svc::sys::spi_host_device_t,
+)> {
     let bus = Arc::new(
         SpiDriver::new(
             spi,
@@ -129,6 +139,11 @@ fn build_front_end<SPI: SpiAnyPins + 'static>(
     Ok((
         Ads1298FrontEnd::new(device, PinDriver::output(wiring.start)?),
         power_down,
+        // Carried out with the front end rather than looked up later: the host
+        // is fixed by the peripheral this call consumed, and the interrupt-side
+        // reader addresses it by register base, which must not be able to name
+        // the wrong one.
+        <SPI as esp_idf_svc::hal::spi::Spi>::device(),
     ))
 }
 
@@ -172,16 +187,14 @@ pub(crate) fn bring_up<SpiA: SpiAnyPins + 'static, SpiB: SpiAnyPins + 'static>(
         .polling(false);
 
     let [wiring_a, wiring_b] = wiring;
-    let (front_end_a, power_down_a) =
+    let (front_end_a, power_down_a, spi_host_a) =
         build_front_end(spi_a, wiring_a, &command_config, &frame_config)?;
-    // Chip B's bus is initialised from a thread pinned to core 1, for two
-    // interrupt placements that follow from where code runs rather than from any
-    // config: the SPI host's completion interrupt is allocated on the core that
-    // calls `spi_bus_initialize`, and the shared GPIO ISR dispatcher installs on
-    // the core that first enables it. Both belong on chip B's core — see
-    // `crate::cores` for the whole plan — because a read-completion or DRDY wake
-    // that fires on the loaded core pays that core's interrupt load as added
-    // latency before the cross-core hop.
+    // The GPIO interrupt dispatcher is installed from a thread pinned to core 1
+    // because esp-idf allocates an interrupt on whichever core runs the
+    // allocating call, and that dispatcher is now the frame-read path for both
+    // chips: every DRDY edge is serviced there. Chip B's bus initialises in the
+    // same thread, which puts its (command-path only) completion interrupt on
+    // the same quiet core. See `crate::cores` for the whole plan.
     let command_config_b = command_config.clone();
     let frame_config_b = frame_config.clone();
     let built_b =
@@ -190,15 +203,16 @@ pub(crate) fn bring_up<SpiA: SpiAnyPins + 'static, SpiB: SpiAnyPins + 'static>(
                 .name("adc-init-b".into())
                 .stack_size(8192)
                 .spawn(move || {
-                    esp_idf_svc::hal::gpio::enable_isr_service()?;
+                    frame_reader::install_interrupt_dispatcher()?;
                     build_front_end(spi_b, wiring_b, &command_config_b, &frame_config_b)
                 })
         })??
         .join();
-    let (front_end_b, power_down_b) =
+    let (front_end_b, power_down_b, spi_host_b) =
         built_b.map_err(|_| anyhow::anyhow!("chip B front-end init thread panicked"))??;
     let mut chips = [front_end_a, front_end_b];
     let mut power_down = [power_down_a, power_down_b];
+    let spi_hosts = [spi_host_a, spi_host_b];
 
     // Shared power sequencing: minimum PWDN assertion, release, then the supply
     // settling both chips wait out together. Roughly 2.5 s all told, which must stay
@@ -284,8 +298,66 @@ pub(crate) fn bring_up<SpiA: SpiAnyPins + 'static, SpiB: SpiAnyPins + 'static>(
         "ADS1298 pair: streaming, frame reads at {frame_baud_rate_hz} Hz SPI, commands at {command_baud_rate_hz} Hz"
     );
 
+    let mut claimed = Vec::with_capacity(DEVICE_COUNT);
+    for (index, chip) in chips.iter_mut().enumerate() {
+        claimed.push(claim_frame_reader(index, chip, spi_hosts[index])?);
+    }
+    let readers: [frame_reader::FrameReader; DEVICE_COUNT] = claimed
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("one frame reader per chip"))?;
+
     Ok(FrontEnds {
         chips,
+        readers,
         _power_down: power_down,
     })
+}
+
+/// Hands one streaming chip's SPI host over to its interrupt-side reader, and
+/// proves the handover before anything depends on it.
+///
+/// The driver reads one frame — which is also what leaves the host's registers
+/// holding the frame configuration the recipe is snapshotted from — and then the
+/// reader's own code path reads the next one, still in task context. Two
+/// consecutive frames off the same streaming chip: a recipe that clocks the
+/// wrong length, mode, or bit order cannot produce a second valid status marker
+/// by accident. The interrupt is attached but left disabled; the chip's pipeline
+/// thread opens the window once it is ready to drain.
+fn claim_frame_reader(
+    index: usize,
+    chip: &mut Ads1298FrontEnd,
+    spi_host: esp_idf_svc::sys::spi_host_device_t,
+) -> Result<frame_reader::FrameReader> {
+    // A conversion has to have finished, or the read clocks out a frame the chip
+    // is still producing and both sides of the comparison are garbage.
+    FreeRtos::delay_ms(2);
+    let driver_frame = chip
+        .read_frame()
+        .with_context(|| format!("chip {index} driver frame read"))?;
+    let reader = frame_reader::FrameReader::claim(
+        index,
+        spi_host,
+        chip.device.chip_select_pin(),
+        chip.device.data_ready_pin(),
+    )?;
+    FreeRtos::delay_ms(2);
+    match reader.validate().map(|bytes| decode::parse_sample(&bytes)) {
+        Some(frame) if frame.status_word().is_some() => info!(
+            "chip {index} interrupt-side frame path verified: driver status {:#08x}, \
+             interrupt-path status {:#08x}",
+            driver_frame.status, frame.status
+        ),
+        Some(frame) => warn!(
+            "chip {index} interrupt-side frame path read {:#08x} with no status marker (the \
+             driver read {:#08x}): the register recipe is wrong and this chip's data cannot \
+             be trusted",
+            frame.status, driver_frame.status
+        ),
+        None => warn!(
+            "chip {index} interrupt-side frame path produced no frame: the SPI host did not \
+             complete the transfer"
+        ),
+    }
+    reader.attach()?;
+    Ok(reader)
 }
