@@ -10,6 +10,8 @@
   // mutually exclusive chips (a radio set) is one row.
   import {
     Arm,
+    DifficultyLevel,
+    DIFFICULTY_LEVELS,
     nowUnixMilliseconds,
     type CollectionCatalogFrame,
     type SessionMetadata,
@@ -29,7 +31,11 @@
     catalog: CollectionCatalogFrame;
     placementPhoto: UnixMilliseconds | null;
     disabled: boolean;
-    onStart: (metadata: SessionMetadata, trackId: string) => void;
+    onStart: (
+      metadata: SessionMetadata,
+      trackId: string,
+      difficulty: DifficultyLevel,
+    ) => void;
     onCapturePlacementPhoto: () => void;
   }
 
@@ -64,6 +70,9 @@
   let selectedSweat = $state<string | null>(null);
   let noteText = $state('');
   let selectedTrack = $state<string | null>(null);
+  // How demanding the cues are. Every track ships a schedule per level, so this
+  // picks one of the backend's rather than shaping anything here.
+  let selectedDifficulty = $state<DifficultyLevel>(DifficultyLevel.Medium);
 
   // A coarse clock, only fine enough to keep the "n min ago" beside the donned
   // stamp honest. Nothing else re-renders on it.
@@ -152,7 +161,7 @@
       sweat,
       note: trimmedNote === '' ? null : trimmedNote,
     };
-    onStart(metadata, trackId);
+    onStart(metadata, trackId, selectedDifficulty);
   }
 </script>
 
@@ -294,9 +303,16 @@
       {/if}
       {#if track !== null}
         <span class="muted">
-          ~{catalog.goal_per_class} cues/class · ~{formatWholeMinutes(track.duration)} min
+          ~{formatWholeMinutes(track.duration)} min
         </span>
       {/if}
+    </div>
+
+    <span class="field-label">Difficulty</span>
+    <div class="chips">
+      {#each DIFFICULTY_LEVELS as level (level)}
+        {@render chip(level, selectedDifficulty === level, () => (selectedDifficulty = level))}
+      {/each}
     </div>
   </div>
 

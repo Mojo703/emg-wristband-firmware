@@ -50,10 +50,10 @@
     beatmap: BeatmapFrame;
     phase: PlayablePhase;
     onTrackStarted: (atUnixMilliseconds: UnixMilliseconds) => void;
-    onAbort: () => void;
+    onFinish: () => void;
   }
 
-  let { catalog, beatmap, phase, onTrackStarted, onAbort }: Props = $props();
+  let { catalog, beatmap, phase, onTrackStarted, onFinish }: Props = $props();
 
   let canvas: HTMLCanvasElement | undefined = $state(undefined);
   let audio: HTMLAudioElement | undefined = $state(undefined);
@@ -62,7 +62,7 @@
   // Whether audio is running right now, from the element's own events.
   let playing = $state(false);
   let ended = $state(false);
-  let confirmingAbort = $state(false);
+  let confirmingFinish = $state(false);
   // A reactive mirror of this session's module-scope record, so the gate below can
   // depend on it. The module variable stays the authority for the send guard.
   let sessionAudioStart = $state<UnixMilliseconds | null>(null);
@@ -132,9 +132,91 @@
     startRequested = false;
     playing = false;
     ended = false;
-    confirmingAbort = false;
+    confirmingFinish = false;
+    nextClickIndex = null;
+    nextBeatIndex = null;
     sessionAudioStart = recordedAudioStart(sessionId);
   });
+
+  // A click the moment each cue's onset crosses the hit line, from the same
+  // clock the field is drawn from (the audio element's position). Audible truth
+  // for the schedule: if the falling blocks look offset from where the clicks
+  // land in the music, the *rendering* is off; if the clicks themselves sit off
+  // the beat, the measured beat times are off.
+  let clickContext: AudioContext | null = null;
+  // Index of the next note that has not clicked yet, or null when it must be
+  // re-derived from the current position (fresh session, remount mid-track).
+  let nextClickIndex: number | null = null;
+
+  /** Created/resumed inside the Start and Resume click handlers, where the
+   * browser's autoplay policy allows audio output. */
+  function ensureClickContext(): void {
+    clickContext ??= new AudioContext();
+    if (clickContext.state === 'suspended') void clickContext.resume();
+  }
+
+  function playTone(frequency: number, gain: number, seconds: number): void {
+    if (clickContext === null || clickContext.state !== 'running') return;
+    const oscillator = clickContext.createOscillator();
+    const envelope = clickContext.createGain();
+    const at = clickContext.currentTime;
+    oscillator.type = 'square';
+    oscillator.frequency.value = frequency;
+    envelope.gain.setValueAtTime(gain, at);
+    envelope.gain.exponentialRampToValueAtTime(0.001, at + seconds);
+    oscillator.connect(envelope);
+    envelope.connect(clickContext.destination);
+    oscillator.start(at);
+    oscillator.stop(at + seconds + 0.01);
+  }
+
+  /** The cue click: loud and high, when a note's onset crosses the hit line. */
+  function playClick(): void {
+    playTone(1100, 0.25, 0.04);
+  }
+
+  /** The debug metronome tick: soft and low, on every measured beat, so the
+   * grid itself is audible under the cue clicks. */
+  function playMetronomeTick(): void {
+    playTone(700, 0.1, 0.025);
+  }
+
+  /** Fire clicks for every onset the playhead passed since the previous frame.
+   * Notes arrive time-ordered, so a single advancing index suffices; seeded
+   * from the current position so a mid-track remount does not replay the past. */
+  function clickPassedOnsets(position: TrackMilliseconds): void {
+    if (!playing) return;
+    if (nextClickIndex === null) {
+      const upcoming = beatmap.notes.findIndex((note) => note.at > position);
+      nextClickIndex = upcoming === -1 ? beatmap.notes.length : upcoming;
+      return;
+    }
+    for (;;) {
+      const note = beatmap.notes[nextClickIndex];
+      if (note === undefined || note.at > position) break;
+      playClick();
+      nextClickIndex += 1;
+    }
+  }
+
+  // The metronome walks the measured beat list the same way the cue clicks
+  // walk the schedule.
+  let nextBeatIndex: number | null = null;
+
+  function tickPassedBeats(position: TrackMilliseconds): void {
+    if (!playing) return;
+    if (nextBeatIndex === null) {
+      const upcoming = beatmap.beat_times.findIndex((beat) => beat > position);
+      nextBeatIndex = upcoming === -1 ? beatmap.beat_times.length : upcoming;
+      return;
+    }
+    for (;;) {
+      const beat = beatmap.beat_times[nextBeatIndex];
+      if (beat === undefined || beat > position) break;
+      playMetronomeTick();
+      nextBeatIndex += 1;
+    }
+  }
 
   onMount(() => {
     const offNoteResult = on('noteResult', (result) => {
@@ -154,6 +236,8 @@
     return () => {
       offNoteResult();
       cancelAnimationFrame(animationFrame);
+      void clickContext?.close();
+      clickContext = null;
     };
 
     function frame(): void {
@@ -182,6 +266,8 @@
     // position, with no wall-clock arithmetic anywhere in the loop.
     const position = asTrackMilliseconds((audio?.currentTime ?? 0) * 1000);
     positionMilliseconds = position;
+    clickPassedOnsets(position);
+    tickPassedBeats(position);
     renderField(context, {
       playfield,
       laneColors,
@@ -196,6 +282,7 @@
   function start(): void {
     if (audio === undefined) return;
     startRequested = true;
+    ensureClickContext();
     // Autoplay policy: this call is inside the click handler, which is what makes
     // it allowed. A rejection puts the gate back so the operator can retry.
     void audio.play().catch((error: unknown) => {
@@ -210,6 +297,11 @@
    * restarting the track is not. */
   function resume(): void {
     if (audio === undefined || sessionAudioStart === null) return;
+    ensureClickContext();
+    // The playhead is about to jump; the click indexes re-derive from wherever
+    // it lands rather than machine-gunning everything in between.
+    nextClickIndex = null;
+    nextBeatIndex = null;
     const elapsedSeconds = Math.max(0, (nowUnixMilliseconds() - sessionAudioStart) / 1000);
     audio.currentTime = Number.isFinite(audio.duration)
       ? Math.min(elapsedSeconds, audio.duration)
@@ -242,9 +334,11 @@
     }
   }
 
-  function abort(): void {
+  /** Ends the session where it stands. The backend finalizes the recording and
+   * moves to review; keep-or-discard is decided there, summary in view. */
+  function finish(): void {
     audio?.pause();
-    onAbort();
+    onFinish();
   }
 
   function clock(milliseconds: number): string {
@@ -292,11 +386,11 @@
       {/if}
     </span>
 
-    {#if confirmingAbort}
+    {#if confirmingFinish}
       <span class="confirm">
-        <span class="muted">Discard this session?</span>
-        <Button variant="destructive" size="sm" onclick={abort}>Abort session</Button>
-        <Button variant="ghost" size="sm" onclick={() => (confirmingAbort = false)}>
+        <span class="muted">End the session here? What's recorded so far goes to review.</span>
+        <Button size="sm" onclick={finish}>Finish session</Button>
+        <Button variant="ghost" size="sm" onclick={() => (confirmingFinish = false)}>
           Keep playing
         </Button>
       </span>
@@ -309,15 +403,15 @@
           <Icon name={playing ? 'pause' : 'play'} size={16} />
         </button>
       {/if}
-      <button class="btn" onclick={() => (confirmingAbort = true)}>Abort</button>
+      <button class="btn" onclick={() => (confirmingFinish = true)}>Finish</button>
     {/if}
   </div>
 
   {#if gate === 'late'}
     <p class="muted">This session is playing on the backend, but the page reloaded after
       audio began, so the moment the track started is gone. The field would be drawn on
-      the wrong timeline, so it is left out; the recording itself is unaffected. Abort
-      above to end the session.</p>
+      the wrong timeline, so it is left out; the recording itself is unaffected. Finish
+      above to end the session and review it.</p>
   {:else}
   <div class="field">
     <canvas bind:this={canvas}></canvas>

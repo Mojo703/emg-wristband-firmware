@@ -380,14 +380,16 @@ pub async fn handle_browser(
                             }
                         }
                         // Collection control frames go to the session manager.
-                        Frame::StartCollection { metadata, track_id } => {
+                        Frame::StartCollection { metadata, track_id, difficulty } => {
                             collection.start_collection(
                                 metadata,
                                 track_id,
+                                difficulty,
                                 selection.device_id().map(str::to_string),
                             );
                         }
                         Frame::TrackStarted { at_unix_ms } => collection.track_started(at_unix_ms),
+                        Frame::FinishCollection {} => collection.finish_collection(),
                         Frame::StopCollection { save } => collection.stop_collection(save),
                         Frame::CapturePlacementPhoto {} => collection.capture_placement_photo(),
                         _ => {} // device/backend-origin frames are ignored if echoed

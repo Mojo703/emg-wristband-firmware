@@ -1,0 +1,9 @@
+# For ingest_track.py. Set up once with:
+#   python -m venv .venv
+#   .venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   .venv/bin/pip install -r requirements.txt
+# (the separate torch step keeps it CPU-only; the default wheel drags in CUDA)
+# ffmpeg must also be on PATH (it does the transcode).
+librosa>=0.10
+soundfile>=0.12
+beat_this>=1.1

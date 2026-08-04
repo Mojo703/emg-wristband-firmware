@@ -1,64 +1,69 @@
 //! The collection catalog and the note-schedule generator — [`BeatmapGenerator`].
 //!
-//! The whole catalog is one JSON file (`dashboard/config/collection.json` by
-//! default): the subject roster, the gesture classes with their lane colours, the
-//! activity and sweat vocabularies, the per-class rep goal, and the playable
-//! tracks. Everything the session-setup form offers comes from here, so adding a
-//! subject or a track is an edit to that file and not a recompile. Audio files are
-//! named relative to the config file's own directory, which keeps the catalog
-//! movable: config and audio travel together.
+//! The catalog comes from two places. `dashboard/config/collection.json` holds
+//! the vocabularies — the subject roster, the gesture classes with their lane
+//! colours, the activity and sweat lists — and is small, hand-editable, and
+//! committed. The playable tracks are a *library* on disk, one directory per
+//! track under the tracks root (`dashboard/tracks/` by default):
 //!
-//! # How a schedule is built
+//! ```text
+//! tracks/lisa-crossing-field/
+//!   track.json     identity, tempo, and one cue schedule per difficulty
+//!   audio.ogg      what the dashboard serves over /collection/audio/{id}
+//!   source/        the Beat Saber map it was converted from
+//! ```
 //!
-//! Notes only ever land on the track's beat grid (`first_beat + k · beat_period`),
-//! because a cue that falls off the beat is unplayable. Three constraints then
-//! carve the grid down, in this order:
+//! A track is therefore added, inspected, or deleted as one directory, and the
+//! library stays out of version control — it is personal music and derived map
+//! data, regenerable by re-running the ingest.
 //!
-//! 1. **Trailing silence.** Nothing in the last [`TRAILING_SILENCE`] of the track,
-//!    so the final gesture is fully recorded before the audio ends.
-//! 2. **Hand recovery.** Consecutive cues sit at least [`MINIMUM_NOTE_SPACING`]
-//!    apart regardless of lane, which becomes a stride in whole beats — the
-//!    smallest number of beats whose span reaches the minimum. Grid slots between
-//!    strides are simply not used.
-//! 3. **Capacity.** The stride and the usable span fix how many notes the track can
-//!    hold. If that is short of `goal_per_class × classes`, the schedule shrinks;
-//!    the per-class balance is preserved either way.
+//! # Where a track's notes come from
 //!
-//! Placement is random but spread, not front-loaded: the slack left over after
-//! reserving one stride per note is dealt out across the whole track (see
-//! [`slot_offsets`]). Randomness is a small inline splitmix64 seeded by the caller,
-//! so a session's schedule is reproducible from its seed alone and the crate needs
-//! no random-number dependency.
+//! `tools/ingest_track.py` writes each `track.json` from a Beat Saber map —
+//! either a hand-made one or InfernoSaber's output for a song that has none.
+//! Timing is the map's own, verbatim, and only the right hand's notes are used
+//! (one Beat Saber hand spans the lattice the way one instrumented hand
+//! should). The 4×3 lattice flattens left-to-right dominant into cells
+//! `3·x + y`. Cues advance in whole beats, so every repeat of a sustain stays
+//! on the grid; the ingest also stores, per column count 1..=6, the split
+//! boundaries over those cells that balance the columns for that song.
+//!
+//! # What a session adds
+//!
+//! `generate` only looks things up: it picks the chosen level's schedule, and
+//! each note's column is how many of the stored boundaries sit at or below its
+//! cell (order-preserving by construction). The column→class binding then
+//! rotates by a seed-derived offset — a song's spatial pattern is identical
+//! every session while which *gesture* each column asks for rotates, evening
+//! per-class reps out across sessions. No map parsing happens here.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context};
 use protocol::{
-    ActivityCondition, Beatmap, BeatsPerMinute, ClassId, CollectionClass, DurationMilliseconds,
-    Note, SubjectId, SweatLevel, TrackId, TrackInfo, TrackMilliseconds,
+    ActivityCondition, Beatmap, BeatsPerMinute, ClassId, CollectionClass, DifficultyLevel,
+    DurationMilliseconds, Note, SubjectId, SweatLevel, TrackId, TrackInfo, TrackMilliseconds,
 };
 use serde::Deserialize;
 
 use super::interfaces::BeatmapGenerator;
 
-/// Shortest rest between one hold's release and the next hold's onset,
-/// whatever their lanes: the hand needs this long to release one pinch and
-/// form the next, and it guarantees a labeled rest segment between gestures.
-/// Rounded up to whole beats on each track's grid.
-pub const MINIMUM_REST_BETWEEN_NOTES: DurationMilliseconds = DurationMilliseconds::new(1000);
-
-/// Tail of the track left empty, so the last cue's gesture finishes well before
-/// the audio (and therefore the session) ends.
-pub const TRAILING_SILENCE: DurationMilliseconds = DurationMilliseconds::new(2000);
-
-/// Head of the track left empty: the operator taps Start, finds the field, and
-/// watches the first block fall the whole way — no cue lands before this.
+/// Head of the track left empty of *rendering* time: the operator taps Start
+/// and watches the first block fall the whole way. The map's own notes start
+/// wherever the model put them; this only sizes the browser's fall-in lead.
 pub const LEAD_IN: DurationMilliseconds = DurationMilliseconds::new(5000);
 
-/// The whole collection catalog as it appears in the JSON file. Deserialized
-/// verbatim; the only conversion is [`TrackEntry`] → [`TrackInfo`], since a track's
-/// audio filename is a backend concern the browser never sees.
+/// The most columns the cell folding supports — and the most gesture lanes the
+/// game offers.
+pub const MAXIMUM_COLUMNS: usize = 6;
+
+/// How many lattice cells a map note can name: Beat Saber's 4 columns × 3 rows.
+const LATTICE_CELLS: u8 = 12;
+
+/// The vocabularies the setup form offers, as they appear in
+/// `config/collection.json`. Tracks are deliberately absent: they are a
+/// directory library, not configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CollectionConfig {
     /// The subject roster the setup form offers.
@@ -69,105 +74,179 @@ pub struct CollectionConfig {
     pub activities: Vec<ActivityCondition>,
     /// How sweaty the skin is at session start.
     pub sweat_levels: Vec<SweatLevel>,
-    /// Reps per class a full session aims for.
-    pub goal_per_class: u16,
-    /// The hold lengths the generator may deal, in beats — every note's hold is
-    /// one of these, so segment durations stay musical and tempo-scaled.
-    pub hold_lengths_beats: Vec<u16>,
-    /// The playable tracks, in the order the picker shows them.
-    pub tracks: Vec<TrackEntry>,
 }
 
-/// One track as written in the config file. Milliseconds are plain numbers here
-/// and become the newtyped [`TrackInfo`] fields on load.
+/// One note of a track's ingested map: the automapper's onset on the audio
+/// timeline, the lattice cell it chose, and how long the hold lasts.
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct MapNote {
+    pub time_ms: u32,
+    /// Beat Saber lattice cell, column-major: `3·lineIndex + lineLayer`, 0..12.
+    pub cell: u8,
+    /// Hold length; ingest guarantees the release stays short of the next onset.
+    pub hold_ms: u32,
+}
+
+/// One track's `track.json`, as the ingest tool wrote it. The audio and the
+/// source map sit beside it in the same directory, so nothing here names a
+/// file.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TrackEntry {
     pub id: TrackId,
     pub title: String,
-    /// Audio filename, relative to the directory holding the config file.
-    pub file: String,
-    pub beats_per_minute: BeatsPerMinute,
-    /// Where the first beat of the grid falls on the audio timeline. Almost never
-    /// zero: encoders and intros put the downbeat a little way in.
-    pub first_beat_ms: u32,
+    /// The map's tempo — the grid its note times quantize to, and the
+    /// browser's display and metronome tempo.
+    pub beats_per_minute: f64,
+    /// One ready-made schedule per difficulty level, keyed by level name.
+    pub levels: std::collections::BTreeMap<String, LevelEntry>,
     pub duration_ms: u32,
 }
 
+/// One difficulty level's schedule for a track, as the ingest wrote it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LevelEntry {
+    /// The cue schedule, time-ordered.
+    pub map_notes: Vec<MapNote>,
+    /// Column boundaries over the flattened cell array, keyed by column count
+    /// ("1".."6"): a note's column is how many boundaries sit at or below its
+    /// cell. Placed at ingest to balance this level's per-column cue counts;
+    /// the backend only looks them up.
+    pub column_splits: std::collections::BTreeMap<String, Vec<u8>>,
+}
+
 impl TrackEntry {
-    /// The browser-facing view of this track: identity and beat grid, no filename.
-    fn track_info(&self) -> TrackInfo {
-        TrackInfo {
+    /// The browser-facing view of this track: identity, tempo, length — no
+    /// filename and no map; the map reaches the browser per session, as the
+    /// generated beatmap.
+    fn track_info(&self) -> anyhow::Result<TrackInfo> {
+        let rounded = self.beats_per_minute.round();
+        let display = (rounded as u32)
+            .try_into()
+            .ok()
+            .and_then(core::num::NonZeroU16::new)
+            .ok_or_else(|| {
+                anyhow!(
+                    "track {} has an undisplayable tempo {}",
+                    self.id,
+                    self.beats_per_minute
+                )
+            })?;
+        Ok(TrackInfo {
             id: self.id.clone(),
             title: self.title.clone(),
-            beats_per_minute: self.beats_per_minute,
-            first_beat: TrackMilliseconds::new(self.first_beat_ms),
+            beats_per_minute: BeatsPerMinute(display),
             duration: DurationMilliseconds::new(self.duration_ms),
-        }
+        })
     }
 }
 
-/// A loaded track: the browser-facing info plus where its audio actually lives.
+/// A loaded track: the browser-facing info, one schedule per difficulty level,
+/// and where the audio actually lives.
 #[derive(Debug, Clone)]
 struct CatalogTrack {
     info: TrackInfo,
+    /// The map's exact tempo, unrounded — `info.beats_per_minute` is the
+    /// whole-number display value, this is what the beat grid is built from.
+    beats_per_minute: f64,
+    levels: std::collections::BTreeMap<DifficultyLevel, CatalogLevel>,
     audio_path: PathBuf,
 }
 
-/// The loaded catalog. Owns the config so the session manager can project it into
-/// [`protocol::Frame::CollectionCatalog`], and implements [`BeatmapGenerator`].
+/// One level's loaded schedule: its cues and, keyed by column count, the
+/// `count - 1` cell boundaries that fold cells into columns.
+#[derive(Debug, Clone)]
+struct CatalogLevel {
+    map_notes: Vec<MapNote>,
+    column_splits: std::collections::BTreeMap<usize, Vec<u8>>,
+}
+
+/// The loaded catalog. Owns the config so the session manager can project it
+/// into [`protocol::Frame::CollectionCatalog`], and implements
+/// [`BeatmapGenerator`].
 #[derive(Debug, Clone)]
 pub struct TrackCatalog {
     config: CollectionConfig,
     tracks: Vec<CatalogTrack>,
 }
 
+/// The file each track directory is recognized by.
+const TRACK_FILE_NAME: &str = "track.json";
+
+/// The audio each track directory serves, beside its `track.json`.
+const TRACK_AUDIO_NAME: &str = "audio.ogg";
+
 impl TrackCatalog {
-    /// Read and validate the catalog at `config_path`. Audio paths are resolved
-    /// against the config file's directory but are *not* required to exist: a
-    /// missing file is logged and the track stays selectable, so a catalog can be
-    /// edited before the audio is dropped in and the dashboard still starts.
-    pub fn load(config_path: &Path) -> anyhow::Result<TrackCatalog> {
+    /// Read the vocabularies from `config_path` and the track library from
+    /// `tracks_root`.
+    ///
+    /// Every immediate subdirectory holding a [`TRACK_FILE_NAME`] is a track,
+    /// loaded in directory-name order so the picker is stable. A track whose
+    /// file fails to parse or validate is *skipped with a warning* rather than
+    /// refusing the whole library: one bad import should not stop a session.
+    /// A missing tracks root is an empty library, which is what a fresh
+    /// checkout has before anything is imported.
+    pub fn load(config_path: &Path, tracks_root: &Path) -> anyhow::Result<TrackCatalog> {
         let text = std::fs::read_to_string(config_path)
             .with_context(|| format!("reading collection config {}", config_path.display()))?;
         let config: CollectionConfig = serde_json::from_str(&text)
             .with_context(|| format!("parsing collection config {}", config_path.display()))?;
-        let directory = config_path.parent().unwrap_or(Path::new("."));
-        Self::from_config(config, directory)
+
+        let mut directories: Vec<PathBuf> = match std::fs::read_dir(tracks_root) {
+            Ok(entries) => entries
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.path())
+                .filter(|path| path.join(TRACK_FILE_NAME).is_file())
+                .collect(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                tracing::warn!(
+                    path = %tracks_root.display(),
+                    "no track library yet; import one with tools/ingest_track.py"
+                );
+                Vec::new()
+            }
+            Err(error) => {
+                return Err(anyhow::Error::new(error))
+                    .with_context(|| format!("reading track library {}", tracks_root.display()))
+            }
+        };
+        directories.sort();
+
+        let mut tracks = Vec::with_capacity(directories.len());
+        for directory in directories {
+            match load_track(&directory) {
+                Ok(track) => tracks.push(track),
+                Err(error) => tracing::warn!(
+                    path = %directory.display(),
+                    "skipping unusable track: {error:#}"
+                ),
+            }
+        }
+        Self::from_parts(config, tracks)
     }
 
-    /// The loading half that needs no filesystem read, so tests can exercise the
-    /// generator against synthetic tracks without writing a config file.
-    fn from_config(config: CollectionConfig, directory: &Path) -> anyhow::Result<TrackCatalog> {
+    /// The half that needs no filesystem read, so tests can exercise the
+    /// generator against synthetic tracks without writing a library to disk.
+    fn from_parts(
+        config: CollectionConfig,
+        tracks: Vec<CatalogTrack>,
+    ) -> anyhow::Result<TrackCatalog> {
         if config.collection_classes.is_empty() {
             anyhow::bail!("collection config lists no collection_classes");
         }
-        if config.hold_lengths_beats.is_empty() {
-            anyhow::bail!("collection config lists no hold_lengths_beats");
+        if config.collection_classes.len() > MAXIMUM_COLUMNS {
+            anyhow::bail!(
+                "collection config lists {} classes; the game supports at most {}",
+                config.collection_classes.len(),
+                MAXIMUM_COLUMNS
+            );
         }
-        if config.hold_lengths_beats.contains(&0) {
-            anyhow::bail!("collection config allows a zero-beat hold");
-        }
-
         let mut seen_ids = BTreeSet::new();
-        let mut tracks = Vec::with_capacity(config.tracks.len());
-        for entry in &config.tracks {
-            if !seen_ids.insert(entry.id.clone()) {
+        for track in &tracks {
+            if !seen_ids.insert(track.info.id.clone()) {
                 // Duplicate ids would make `audio_path` and `generate` pick an
-                // arbitrary one of the two — better to refuse the file.
-                anyhow::bail!("collection config has two tracks with id {}", entry.id);
+                // arbitrary one of the two.
+                anyhow::bail!("two tracks claim the id {}", track.info.id);
             }
-            let audio_path = directory.join(&entry.file);
-            if !audio_path.exists() {
-                tracing::warn!(
-                    track = %entry.id,
-                    path = %audio_path.display(),
-                    "collection track audio file is missing; the track stays in the catalog"
-                );
-            }
-            tracks.push(CatalogTrack {
-                info: entry.track_info(),
-                audio_path,
-            });
         }
         Ok(TrackCatalog { config, tracks })
     }
@@ -188,12 +267,8 @@ impl TrackCatalog {
         &self.config.sweat_levels
     }
 
-    pub fn goal_per_class(&self) -> u16 {
-        self.config.goal_per_class
-    }
-
-    /// The class ids of every collected class, lane order — what the manager hands
-    /// to [`BeatmapGenerator::generate`] when the form offers the whole set.
+    /// The class ids of every collected class, lane order — what the manager
+    /// hands to [`BeatmapGenerator::generate`].
     pub fn class_ids(&self) -> Vec<ClassId> {
         self.config
             .collection_classes
@@ -202,9 +277,141 @@ impl TrackCatalog {
             .collect()
     }
 
+    /// A uniform grid at the automapper's tempo, for the browser's debug
+    /// metronome — the clock the map's note times quantize to.
+    pub fn beat_times(&self, track_id: &TrackId) -> Option<Vec<TrackMilliseconds>> {
+        let track = self.find(track_id)?;
+        let period = 60_000.0 / track.beats_per_minute;
+        let count = (track.info.duration.get() as f64 / period) as u32;
+        Some(
+            (0..=count)
+                .map(|index| TrackMilliseconds::new((index as f64 * period).round() as u32))
+                .filter(|beat| beat.get() < track.info.duration.get())
+                .collect(),
+        )
+    }
+
     fn find(&self, track_id: &TrackId) -> Option<&CatalogTrack> {
         self.tracks.iter().find(|track| &track.info.id == track_id)
     }
+}
+
+/// Load one track directory: its `track.json`, validated, with the audio path
+/// beside it. The audio is not required to exist — a missing file is logged
+/// and the track stays selectable, so a half-finished import is visible in the
+/// picker rather than silently absent.
+fn load_track(directory: &Path) -> anyhow::Result<CatalogTrack> {
+    let path = directory.join(TRACK_FILE_NAME);
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let entry: TrackEntry =
+        serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    let audio_path = directory.join(TRACK_AUDIO_NAME);
+    if !audio_path.exists() {
+        tracing::warn!(
+            track = %entry.id,
+            path = %audio_path.display(),
+            "track audio is missing; the track stays in the catalog"
+        );
+    }
+    Ok(CatalogTrack {
+        info: entry.track_info()?,
+        beats_per_minute: entry.beats_per_minute,
+        levels: load_levels(&entry)?,
+        audio_path,
+    })
+}
+
+/// Validate and load every difficulty level of one track.
+///
+/// A level's schedule must already satisfy the session invariants — cues
+/// time-ordered with non-overlapping holds, cells inside the lattice, nothing
+/// running past the audio — because the backend never edits it. Every level
+/// the game offers has to be present, with split boundaries for every column
+/// count the game supports.
+fn load_levels(
+    entry: &TrackEntry,
+) -> anyhow::Result<std::collections::BTreeMap<DifficultyLevel, CatalogLevel>> {
+    if !(entry.beats_per_minute.is_finite() && entry.beats_per_minute > 0.0) {
+        anyhow::bail!("track {} has tempo {}", entry.id, entry.beats_per_minute);
+    }
+
+    let mut levels = std::collections::BTreeMap::new();
+    for level in DifficultyLevel::ALL {
+        let Some(loaded) = entry.levels.get(&level.to_string()) else {
+            anyhow::bail!(
+                "track {} has no {level} schedule; re-run tools/ingest_track.py",
+                entry.id
+            );
+        };
+        if loaded.map_notes.len() < 2 {
+            anyhow::bail!(
+                "track {} has {} cues at {level}",
+                entry.id,
+                loaded.map_notes.len()
+            );
+        }
+        for pair in loaded.map_notes.windows(2) {
+            if pair[0].time_ms + pair[0].hold_ms >= pair[1].time_ms {
+                anyhow::bail!(
+                    "track {} at {level} has a hold at {} ms overlapping the next onset",
+                    entry.id,
+                    pair[0].time_ms
+                );
+            }
+        }
+        for note in &loaded.map_notes {
+            if note.cell >= LATTICE_CELLS {
+                anyhow::bail!("track {} names lattice cell {}", entry.id, note.cell);
+            }
+            if note.hold_ms == 0 {
+                anyhow::bail!(
+                    "track {} at {level} has a zero-length hold at {} ms",
+                    entry.id,
+                    note.time_ms
+                );
+            }
+            if note.time_ms + note.hold_ms >= entry.duration_ms {
+                anyhow::bail!(
+                    "track {} at {level} has a cue at {} ms running past the audio",
+                    entry.id,
+                    note.time_ms
+                );
+            }
+        }
+
+        let mut column_splits = std::collections::BTreeMap::new();
+        for column_count in 1..=MAXIMUM_COLUMNS {
+            let Some(splits) = loaded.column_splits.get(&column_count.to_string()) else {
+                anyhow::bail!(
+                    "track {} at {level} has no column splits for {column_count} columns",
+                    entry.id
+                );
+            };
+            if splits.len() != column_count - 1 {
+                anyhow::bail!(
+                    "track {} at {level} has {} splits for {column_count} columns",
+                    entry.id,
+                    splits.len()
+                );
+            }
+            if !splits.windows(2).all(|pair| pair[0] <= pair[1])
+                || splits.iter().any(|&boundary| boundary > LATTICE_CELLS)
+            {
+                anyhow::bail!("track {} at {level} has malformed column splits", entry.id);
+            }
+            column_splits.insert(column_count, splits.clone());
+        }
+
+        levels.insert(
+            level,
+            CatalogLevel {
+                map_notes: loaded.map_notes.clone(),
+                column_splits,
+            },
+        );
+    }
+    Ok(levels)
 }
 
 impl BeatmapGenerator for TrackCatalog {
@@ -220,265 +427,204 @@ impl BeatmapGenerator for TrackCatalog {
         &self,
         track_id: &TrackId,
         classes: &[ClassId],
-        goal_per_class: u16,
+        difficulty: DifficultyLevel,
         seed: u64,
     ) -> anyhow::Result<Beatmap> {
-        let track = &self
+        let track = self
             .find(track_id)
-            .ok_or_else(|| anyhow!("no track {track_id} in the collection catalog"))?
-            .info;
+            .ok_or_else(|| anyhow!("no track {track_id} in the collection catalog"))?;
         if classes.is_empty() {
             anyhow::bail!("cannot generate a beatmap for {track_id} with no classes");
         }
+        if classes.len() > MAXIMUM_COLUMNS {
+            anyhow::bail!(
+                "{} classes offered for {track_id}; the lattice folds to at most {}",
+                classes.len(),
+                MAXIMUM_COLUMNS
+            );
+        }
 
-        let grid = BeatGrid::of(track)?;
-        let mut random = DeterministicRandom::new(seed);
+        let level = track
+            .levels
+            .get(&difficulty)
+            .ok_or_else(|| anyhow!("{track_id} has no {difficulty} schedule"))?;
+        let column_count = classes.len();
+        let splits = level.column_splits.get(&column_count).ok_or_else(|| {
+            anyhow!("{track_id} has no ingested splits for {column_count} columns")
+        })?;
+        // The one seeded decision: which gesture class column 0 means this
+        // session. Rotation (not a shuffle) keeps neighbouring columns
+        // neighbouring, so the map's flow reads the same every session.
+        let rotation = splitmix64(seed) as usize % column_count;
 
-        // Draw a hold for every note the goal asks for, then keep the longest
-        // prefix that fits the track (variable holds make capacity a property of
-        // the draw, not the grid alone). The class deck is dealt against the
-        // *surviving* count, so truncation never unbalances the classes.
-        let target = goal_per_class as usize * classes.len();
-        let hold_draws: Vec<u32> = (0..target)
-            .map(|_| {
-                let choice = random.below(self.config.hold_lengths_beats.len() as u64) as usize;
-                self.config.hold_lengths_beats[choice] as u32
-            })
-            .collect();
-        let placements = grid.fit(&hold_draws);
-        let deck = class_deck(classes, placements.len(), &mut random);
-
-        // Spread the leftover slack as a sorted sample, as before: non-decreasing
-        // offsets can never eat into the hold-plus-rest footprint between
-        // neighbours, and the notes spread over the whole track.
-        let slack = grid.slack_after(&placements, &hold_draws);
-        let mut offsets: Vec<usize> = (0..placements.len())
-            .map(|_| random.below(slack as u64 + 1) as usize)
-            .collect();
-        offsets.sort_unstable();
-
-        let notes: Vec<Note> = placements
+        let notes: Vec<Note> = level
+            .map_notes
             .iter()
-            .zip(offsets)
-            .zip(deck)
-            .map(|((&(base_slot, hold_beats), offset), class_id)| Note {
-                class_id,
-                at: grid.position_of(base_slot + offset),
-                hold: DurationMilliseconds::new(hold_beats * grid.beat_period),
+            .map(|note| {
+                // The ingested boundaries do the folding: a note's column is
+                // how many of them sit at or below its cell.
+                let column = splits
+                    .iter()
+                    .filter(|&&boundary| note.cell >= boundary)
+                    .count();
+                Note {
+                    class_id: classes[(column + rotation) % column_count].clone(),
+                    at: TrackMilliseconds::new(note.time_ms),
+                    hold: DurationMilliseconds::new(note.hold_ms),
+                }
             })
             .collect();
 
         Beatmap::try_from(notes).map_err(|error| {
-            anyhow!(
-                "generated schedule for {track_id} violates the hold invariants: {error} \
-                 ({} slots, rest {} beats)",
-                grid.slots,
-                grid.rest_beats
-            )
+            anyhow!("the ingested map for {track_id} violates the hold invariants: {error}")
         })
     }
 }
 
-/// The usable beat grid of one track: which slots survive the lead-in and the
-/// trailing silence, and how many beats of rest separate a release from the
-/// next onset.
-#[derive(Debug, Clone, Copy)]
-struct BeatGrid {
-    first_beat: u32,
-    beat_period: u32,
-    /// Index of the first slot at or after [`LEAD_IN`].
-    first_slot: usize,
-    /// Grid slots at or before the trailing-silence cutoff (counting from the
-    /// track's own first beat).
-    slots: usize,
-    /// Beats of rest between a hold's release and the next onset, so their gap
-    /// reaches [`MINIMUM_REST_BETWEEN_NOTES`].
-    rest_beats: usize,
-}
-
-impl BeatGrid {
-    fn of(track: &TrackInfo) -> anyhow::Result<BeatGrid> {
-        let beat_period = track.beats_per_minute.beat_period().get();
-        if beat_period == 0 {
-            // Only reachable above 60000 bpm, where the integer beat period
-            // truncates to nothing; a grid of zero-length beats has no positions.
-            anyhow::bail!(
-                "track {} has an unusable beat period at {} bpm",
-                track.id,
-                track.beats_per_minute.0
-            );
-        }
-        // The last instant a hold may still occupy, then the last grid slot at or
-        // before it. Saturating: a track shorter than its own trailing silence, or
-        // whose first beat lands past the cutoff, simply has no usable slots.
-        let last_position = track.duration.get().saturating_sub(TRAILING_SILENCE.get());
-        let slots = if last_position < track.first_beat.get() {
-            0
-        } else {
-            ((last_position - track.first_beat.get()) / beat_period) as usize + 1
-        };
-        let first_slot = LEAD_IN
-            .get()
-            .saturating_sub(track.first_beat.get())
-            .div_ceil(beat_period) as usize;
-        let rest_beats = MINIMUM_REST_BETWEEN_NOTES
-            .get()
-            .div_ceil(beat_period)
-            .max(1) as usize;
-        Ok(BeatGrid {
-            first_beat: track.first_beat.get(),
-            beat_period,
-            first_slot,
-            slots,
-            rest_beats,
-        })
-    }
-
-    /// Pack holds tightly from the first usable slot: each entry is that note's
-    /// base onset slot with its hold in beats. Returns the longest prefix of
-    /// `hold_draws` whose final hold still ends inside the usable grid.
-    fn fit(&self, hold_draws: &[u32]) -> Vec<(usize, u32)> {
-        let mut placements = Vec::new();
-        let mut next_onset = self.first_slot;
-        for &hold_beats in hold_draws {
-            let release_slot = next_onset + hold_beats as usize;
-            if release_slot >= self.slots {
-                break;
-            }
-            placements.push((next_onset, hold_beats));
-            next_onset = release_slot + self.rest_beats;
-        }
-        placements
-    }
-
-    /// Slots left over after the tight packing — the room the sorted-sample
-    /// offsets may spread the schedule into.
-    fn slack_after(&self, placements: &[(usize, u32)], _hold_draws: &[u32]) -> usize {
-        match placements.last() {
-            None => 0,
-            Some(&(base_slot, hold_beats)) => {
-                let last_release = base_slot + hold_beats as usize;
-                (self.slots - 1).saturating_sub(last_release)
-            }
-        }
-    }
-
-    fn position_of(&self, slot: usize) -> TrackMilliseconds {
-        TrackMilliseconds::new(self.first_beat + slot as u32 * self.beat_period)
-    }
-}
-
-/// The class each note carries, in schedule order.
-///
-/// Dealt in rounds: every round is a freshly shuffled permutation of the offered
-/// classes, and the last round is cut short at `count`. That keeps per-class counts
-/// within one of each other for *any* note count — the property the trait promises
-/// — while which classes get the extra rep, and in what order lanes appear, both
-/// come from the seed. A count of exactly `goal_per_class × classes` deals whole
-/// rounds and lands on the goal for every class.
-fn class_deck(classes: &[ClassId], count: usize, random: &mut DeterministicRandom) -> Vec<ClassId> {
-    let mut deck = Vec::with_capacity(count);
-    while deck.len() < count {
-        let mut round = classes.to_vec();
-        shuffle(&mut round, random);
-        for class_id in round {
-            if deck.len() == count {
-                break;
-            }
-            deck.push(class_id);
-        }
-    }
-    deck
-}
-
-/// Fisher-Yates, so every permutation is equally likely and the result depends only
-/// on the seed.
-fn shuffle<T>(items: &mut [T], random: &mut DeterministicRandom) {
-    for index in (1..items.len()).rev() {
-        let swap_with = random.below(index as u64 + 1) as usize;
-        items.swap(index, swap_with);
-    }
-}
-
-/// splitmix64, inline rather than a dependency: the generator needs a handful of
-/// numbers per session, and a session's schedule must be reproducible from its
-/// seed, which rules out anything drawing on system entropy.
-#[derive(Debug, Clone, Copy)]
-struct DeterministicRandom {
-    state: u64,
-}
-
-impl DeterministicRandom {
-    fn new(seed: u64) -> DeterministicRandom {
-        DeterministicRandom { state: seed }
-    }
-
-    fn next_value(&mut self) -> u64 {
-        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut mixed = self.state;
-        mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        mixed ^ (mixed >> 31)
-    }
-
-    /// A value in `0..bound`. The modulo bias is irrelevant at these bounds (slot
-    /// counts and class counts are in the hundreds against a 64-bit range).
-    fn below(&mut self, bound: u64) -> u64 {
-        if bound == 0 {
-            0
-        } else {
-            self.next_value() % bound
-        }
-    }
+/// splitmix64, inline rather than a dependency: one number per session decides
+/// the class rotation, and it must be reproducible from the seed alone.
+fn splitmix64(seed: u64) -> u64 {
+    let mut mixed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    mixed ^ (mixed >> 31)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
-    use std::num::NonZeroU16;
+    use std::collections::BTreeSet;
 
-    /// The example catalog shipped in the repo, which the tests treat as a
-    /// fixture: if it stops loading, the dashboard's default config is broken.
-    fn example_catalog() -> TrackCatalog {
+    /// The vocabularies shipped in the repo, which the tests treat as a
+    /// fixture: if this stops parsing, the dashboard's default config is
+    /// broken. The track library is deliberately *not* read — it is personal
+    /// data that no checkout is guaranteed to have, so every test below builds
+    /// the tracks it needs.
+    fn example_config() -> CollectionConfig {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config/collection.json");
-        TrackCatalog::load(&path).expect("the example collection config must load")
+        let text = std::fs::read_to_string(&path).expect("the shipped config must be readable");
+        serde_json::from_str(&text).expect("the shipped config must parse")
     }
 
-    /// A catalog with one synthetic track appended, for capacity extremes the real
-    /// tracks don't cover.
-    fn catalog_with_track(id: &str, beats_per_minute: u16, duration_ms: u32) -> TrackCatalog {
-        let mut config = example_catalog().config;
-        config.tracks.push(TrackEntry {
+    /// A catalog holding exactly the given tracks.
+    fn catalog_of(entries: Vec<TrackEntry>) -> anyhow::Result<TrackCatalog> {
+        let tracks = entries
+            .into_iter()
+            .map(|entry| {
+                Ok(CatalogTrack {
+                    info: entry.track_info()?,
+                    beats_per_minute: entry.beats_per_minute,
+                    levels: load_levels(&entry)?,
+                    audio_path: PathBuf::from(format!("/nonexistent/{}/audio.ogg", entry.id)),
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        TrackCatalog::from_parts(example_config(), tracks)
+    }
+
+    /// One track whose schedule is the same at every difficulty level (the
+    /// levels differ only in what the ingest wrote, which tests supply).
+    fn track_entry(id: &str, map_notes: Vec<MapNote>, duration_ms: u32) -> TrackEntry {
+        let level = LevelEntry {
+            column_splits: even_splits(&map_notes),
+            map_notes,
+        };
+        TrackEntry {
             id: TrackId(id.to_string()),
             title: id.to_string(),
-            file: format!("{id}.ogg"),
-            beats_per_minute: BeatsPerMinute(NonZeroU16::new(beats_per_minute).unwrap()),
-            first_beat_ms: 240,
+            beats_per_minute: 120.0,
+            levels: DifficultyLevel::ALL
+                .into_iter()
+                .map(|difficulty| (difficulty.to_string(), level.clone()))
+                .collect(),
             duration_ms,
-        });
-        TrackCatalog::from_config(config, Path::new("/nonexistent"))
+        }
+    }
+
+    /// The ingest tool's split placement, mirrored for synthetic maps: the
+    /// boundary set whose columns deviate least from an even share.
+    fn even_splits(map_notes: &[MapNote]) -> std::collections::BTreeMap<String, Vec<u8>> {
+        let mut histogram = [0usize; 12];
+        for note in map_notes {
+            // Out-of-lattice cells only appear in the maps written to be
+            // rejected; the loader is what reports them, not this helper.
+            if let Some(bucket) = histogram.get_mut(usize::from(note.cell)) {
+                *bucket += 1;
+            }
+        }
+        let total: usize = histogram.iter().sum();
+        let mut prefix = vec![0usize];
+        for count in histogram {
+            prefix.push(prefix.last().unwrap() + count);
+        }
+        let mut splits = std::collections::BTreeMap::new();
+        for column_count in 1..=MAXIMUM_COLUMNS {
+            let target = total as f64 / column_count as f64;
+            let mut best: Vec<u8> = Vec::new();
+            let mut best_cost = f64::INFINITY;
+            // Every subset of the 11 interior boundaries, filtered to the right
+            // size: 2048 candidates, which is nothing for a test helper.
+            for mask in 0u16..(1 << 11) {
+                if mask.count_ones() as usize != column_count - 1 {
+                    continue;
+                }
+                let boundaries: Vec<u8> = (0..11u8)
+                    .filter(|bit| mask & (1 << bit) != 0)
+                    .map(|bit| bit + 1)
+                    .collect();
+                let mut edges = vec![0u8];
+                edges.extend_from_slice(&boundaries);
+                edges.push(12);
+                let cost: f64 = edges
+                    .windows(2)
+                    .map(|pair| {
+                        let count = prefix[usize::from(pair[1])] - prefix[usize::from(pair[0])];
+                        (count as f64 - target).powi(2)
+                    })
+                    .sum();
+                if cost < best_cost {
+                    best_cost = cost;
+                    best = boundaries;
+                }
+            }
+            splits.insert(column_count.to_string(), best);
+        }
+        splits
+    }
+
+    /// A catalog holding one synthetic track.
+    fn catalog_with_map(id: &str, map_notes: Vec<MapNote>, duration_ms: u32) -> TrackCatalog {
+        catalog_of(vec![track_entry(id, map_notes, duration_ms)])
             .expect("synthetic catalog must build")
+    }
+
+    /// One note per lattice cell, half a second apart.
+    fn one_note_per_cell() -> Vec<MapNote> {
+        (0u8..12)
+            .map(|cell| MapNote {
+                time_ms: 1_000 + u32::from(cell) * 500,
+                cell,
+                hold_ms: 200,
+            })
+            .collect()
     }
 
     fn notes_of(beatmap: &Beatmap) -> Vec<Note> {
         beatmap.iter().map(|(_, note)| note.clone()).collect()
     }
 
-    fn counts_of(beatmap: &Beatmap) -> BTreeMap<ClassId, usize> {
-        let mut counts = BTreeMap::new();
-        for (_, note) in beatmap.iter() {
-            *counts.entry(note.class_id.clone()).or_insert(0) += 1;
-        }
-        counts
+    /// Two synthetic tracks, the stand-in for a real library.
+    fn sample_catalog() -> TrackCatalog {
+        catalog_of(vec![
+            track_entry("first_track", one_note_per_cell(), 60_000),
+            track_entry("second_track", one_note_per_cell(), 60_000),
+        ])
+        .expect("synthetic catalog must build")
     }
 
     #[test]
-    fn example_config_loads_with_its_tracks() {
-        let catalog = example_catalog();
-        assert_eq!(catalog.goal_per_class(), 48);
-        // Lane order matches the hand, thumb side first. Rest is not a lane:
-        // the guaranteed release-to-onset gaps are the labeled rest segments.
+    fn the_shipped_config_supplies_the_vocabularies() {
+        let catalog = catalog_of(Vec::new()).expect("an empty library is a valid catalog");
         assert_eq!(
             catalog
                 .class_ids()
@@ -490,201 +636,288 @@ mod tests {
         assert_eq!(catalog.subjects().len(), 5);
         assert_eq!(catalog.activities().len(), 4);
         assert_eq!(catalog.sweat_levels().len(), 3);
-
-        let tracks = catalog.tracks();
-        assert_eq!(tracks.len(), 3);
-        // Catalog order, not sorted or otherwise reshuffled.
-        assert_eq!(
-            tracks
-                .iter()
-                .map(|track| track.id.0.as_str())
-                .collect::<Vec<_>>(),
-            ["steady_run", "powder_day", "traverse"]
-        );
+        // The library lives outside the repo, so a checkout has no tracks
+        // until something is imported — and that has to be a valid catalog.
+        assert!(catalog.tracks().is_empty());
     }
 
     #[test]
-    fn audio_path_sits_beside_the_config_file() {
-        let catalog = example_catalog();
-        let expected = Path::new(env!("CARGO_MANIFEST_DIR")).join("config/steady-run.ogg");
+    fn two_tracks_claiming_one_id_are_refused() {
+        let duplicate = catalog_of(vec![
+            track_entry("same_id", one_note_per_cell(), 60_000),
+            track_entry("same_id", one_note_per_cell(), 60_000),
+        ]);
+        assert!(duplicate.is_err());
+    }
+
+    #[test]
+    fn audio_sits_inside_the_tracks_own_directory() {
+        let catalog = sample_catalog();
+        let first = &catalog.tracks()[0];
+        let audio_path = catalog
+            .audio_path(&first.id)
+            .expect("every track has audio");
         assert_eq!(
-            catalog.audio_path(&TrackId("steady_run".into())),
-            Some(expected)
+            audio_path.file_name(),
+            Some(std::ffi::OsStr::new(TRACK_AUDIO_NAME))
         );
         assert_eq!(catalog.audio_path(&TrackId("no_such_track".into())), None);
     }
 
     #[test]
-    fn same_seed_repeats_and_a_different_seed_diverges() {
-        let catalog = example_catalog();
-        let track = TrackId("traverse".into());
-        let classes = catalog.class_ids();
+    fn every_catalog_map_projects_onto_the_offered_classes() {
+        let catalog = sample_catalog();
+        let offered = catalog.class_ids();
+        for track in catalog.tracks() {
+            let beatmap = catalog
+                .generate(&track.id, &offered, DifficultyLevel::Medium, 7)
+                .unwrap();
+            let notes = notes_of(&beatmap);
+            assert!(!notes.is_empty(), "{} produced nothing", track.id);
+            for note in &notes {
+                assert!(offered.contains(&note.class_id));
+                assert!(
+                    note.at.get() + note.hold.get() < track.duration.get(),
+                    "{}: note runs past the audio",
+                    track.id
+                );
+            }
+            for pair in notes.windows(2) {
+                assert!(
+                    pair[0].at.get() + pair[0].hold.get() < pair[1].at.get(),
+                    "{}: overlapping holds",
+                    track.id
+                );
+            }
+        }
+    }
 
-        let first = catalog.generate(&track, &classes, 48, 7).unwrap();
-        let again = catalog.generate(&track, &classes, 48, 7).unwrap();
+    #[test]
+    fn the_map_is_fixed_and_the_class_binding_rotates_with_the_seed() {
+        let catalog = sample_catalog();
+        let offered = catalog.class_ids();
+        let track = catalog.tracks()[0].id.clone();
+
+        let first = catalog
+            .generate(&track, &offered, DifficultyLevel::Medium, 7)
+            .unwrap();
+        let again = catalog
+            .generate(&track, &offered, DifficultyLevel::Medium, 7)
+            .unwrap();
         assert_eq!(notes_of(&first), notes_of(&again));
 
-        let other = catalog.generate(&track, &classes, 48, 8).unwrap();
-        assert_ne!(notes_of(&first), notes_of(&other));
-    }
-
-    #[test]
-    fn schedules_respect_rest_lead_in_silence_and_the_offered_classes() {
-        let catalog = example_catalog();
-        let offered = catalog.class_ids();
-        let allowed_holds = &catalog.config.hold_lengths_beats;
-        for track in catalog.tracks() {
-            for seed in 0..8u64 {
-                let beatmap = catalog.generate(&track.id, &offered, 48, seed).unwrap();
-                let notes = notes_of(&beatmap);
-                assert!(!notes.is_empty(), "{} produced nothing", track.id);
-
-                let beat_period = track.beats_per_minute.beat_period().get();
-                // The rest between a release and the next onset is the labeled
-                // relax segment; it must always reach the minimum.
-                for pair in notes.windows(2) {
-                    let rest = pair[1].at.get() - (pair[0].at.get() + pair[0].hold.get());
-                    assert!(
-                        rest >= MINIMUM_REST_BETWEEN_NOTES.get(),
-                        "{} seed {seed}: {rest} ms rest",
-                        track.id
-                    );
-                }
-                assert!(
-                    notes.first().unwrap().at.get() >= LEAD_IN.get(),
-                    "{} seed {seed}: first note inside the lead-in",
-                    track.id
-                );
-                for note in &notes {
-                    // On the grid...
-                    assert_eq!(
-                        (note.at.get() - track.first_beat.get()) % beat_period,
-                        0,
-                        "{} seed {seed}: note off the beat grid",
-                        track.id
-                    );
-                    // ...holding a whole number of allowed beats...
-                    let hold_beats = note.hold.get() / beat_period;
-                    assert_eq!(note.hold.get() % beat_period, 0);
-                    assert!(
-                        allowed_holds.contains(&(hold_beats as u16)),
-                        "{} seed {seed}: {hold_beats}-beat hold not offered",
-                        track.id
-                    );
-                    // ...and only ever a class that was offered.
-                    assert!(offered.contains(&note.class_id));
-                }
-                let last = notes.last().unwrap();
-                assert!(
-                    last.at.get() + last.hold.get() + TRAILING_SILENCE.get()
-                        <= track.duration.get(),
-                    "{} seed {seed}: last hold intrudes on the tail",
-                    track.id
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn class_counts_stay_within_one_of_each_other() {
-        let catalog = example_catalog();
-        let offered = catalog.class_ids();
-        for track in catalog.tracks() {
-            for seed in 0..8u64 {
-                let counts = counts_of(&catalog.generate(&track.id, &offered, 48, seed).unwrap());
-                assert_eq!(counts.len(), offered.len(), "a lane got no notes at all");
-                let lowest = *counts.values().min().unwrap();
-                let highest = *counts.values().max().unwrap();
-                assert!(
-                    highest - lowest <= 1,
-                    "{} seed {seed}: counts {counts:?} are not balanced",
-                    track.id
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn a_long_track_reaches_the_goal_for_every_class() {
-        // 12 minutes at 120 bpm: 3 beats per note leaves room for far more than
-        // 4 x 48, so the goal, not the capacity, is what binds.
-        let catalog = catalog_with_track("marathon", 120, 12 * 60_000);
-        let offered = catalog.class_ids();
-        let beatmap = catalog
-            .generate(&TrackId("marathon".into()), &offered, 48, 3)
+        // Onsets and holds never change with the seed — only the class labels.
+        let other = catalog
+            .generate(&track, &offered, DifficultyLevel::Medium, 8)
             .unwrap();
-        assert_eq!(beatmap.len(), 48 * offered.len());
-        for (class_id, count) in counts_of(&beatmap) {
-            assert_eq!(count, 48, "{class_id} missed the goal");
-        }
-    }
+        let timing = |notes: &[Note]| {
+            notes
+                .iter()
+                .map(|note| (note.at, note.hold))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(timing(&notes_of(&first)), timing(&notes_of(&other)));
 
-    #[test]
-    fn a_short_track_scales_the_goal_down_but_stays_balanced() {
-        // 40 s at 120 bpm: 500 ms beats, holds of 1-4 beats plus 2 beats of
-        // rest, 5 s of lead-in and 2 s of tail leave room for a dozen or so
-        // notes — nowhere near 5 x 48.
-        let catalog = catalog_with_track("sprint", 120, 40_000);
-        let offered = catalog.class_ids();
-        let beatmap = catalog
-            .generate(&TrackId("sprint".into()), &offered, 48, 11)
-            .unwrap();
-
-        assert!(
-            beatmap.len() < 48 * offered.len(),
-            "nothing was scaled down"
-        );
-        assert!(
-            beatmap.len() >= 10,
-            "scaled down further than the grid needs: {} notes",
-            beatmap.len()
-        );
-
-        let counts = counts_of(&beatmap);
-        assert!(*counts.values().max().unwrap() - *counts.values().min().unwrap() <= 1);
-        // Scaling down never overshoots the per-class goal either.
-        assert!(*counts.values().max().unwrap() <= 48);
-
-        let notes = notes_of(&beatmap);
-        for pair in notes.windows(2) {
-            let rest = pair[1].at.get() - (pair[0].at.get() + pair[0].hold.get());
-            assert!(rest >= MINIMUM_REST_BETWEEN_NOTES.get());
-        }
-        let last = notes.last().unwrap();
-        assert!(last.at.get() + last.hold.get() + TRAILING_SILENCE.get() <= 40_000);
-    }
-
-    #[test]
-    fn notes_spread_across_the_track_rather_than_bunching_at_the_start() {
-        // With slack to spare, the last note should sit well past the midpoint;
-        // front-loaded placement would finish in the first third.
-        let catalog = catalog_with_track("marathon", 120, 12 * 60_000);
-        let offered = catalog.class_ids();
-        for seed in 0..8u64 {
-            let beatmap = catalog
-                .generate(&TrackId("marathon".into()), &offered, 48, seed)
+        // Across seeds, every rotation offset occurs, so each class visits each
+        // column of the fixed map.
+        let mut rotations = BTreeSet::new();
+        for seed in 0..32u64 {
+            let notes = notes_of(
+                &catalog
+                    .generate(&track, &offered, DifficultyLevel::Medium, seed)
+                    .unwrap(),
+            );
+            let first_class = offered
+                .iter()
+                .position(|class| class == &notes[0].class_id)
                 .unwrap();
-            let last = notes_of(&beatmap).last().unwrap().at.get();
-            assert!(
-                last > 12 * 60_000 / 2,
-                "seed {seed}: schedule ended at {last} ms"
+            rotations.insert(first_class);
+        }
+        assert_eq!(rotations.len(), offered.len(), "some rotation never occurs");
+    }
+
+    #[test]
+    fn cells_fold_to_columns_preserving_left_to_right_order() {
+        for column_count in 1..=MAXIMUM_COLUMNS {
+            let classes: Vec<ClassId> = (0..column_count)
+                .map(|index| ClassId(format!("class_{index}")))
+                .collect();
+            let catalog = catalog_with_map("lattice", one_note_per_cell(), 60_000);
+            let beatmap = catalog
+                .generate(
+                    &TrackId("lattice".into()),
+                    &classes,
+                    DifficultyLevel::Medium,
+                    0,
+                )
+                .unwrap();
+            let notes = notes_of(&beatmap);
+            assert_eq!(notes.len(), 12);
+
+            // Monotone: walking the cells left to right never moves the column
+            // leftwards, and every column is used. With one note per cell the
+            // even-split boundaries land on the 12/N cuts.
+            let splits = &even_splits(&one_note_per_cell())[&column_count.to_string()];
+            let columns: Vec<usize> = (0u8..12)
+                .map(|cell| splits.iter().filter(|&&boundary| cell >= boundary).count())
+                .collect();
+            assert!(columns.windows(2).all(|pair| pair[0] <= pair[1]));
+            assert_eq!(
+                columns.iter().collect::<BTreeSet<_>>().len(),
+                column_count,
+                "N={column_count}: some column is unreachable"
+            );
+
+            // And the notes carry exactly that folding, modulo the rotation.
+            let rotation = notes
+                .iter()
+                .zip(&columns)
+                .map(|(note, column)| {
+                    let class_index = classes
+                        .iter()
+                        .position(|class| class == &note.class_id)
+                        .unwrap();
+                    (class_index + column_count - column) % column_count
+                })
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                rotation.len(),
+                1,
+                "N={column_count}: folding is not uniform"
             );
         }
     }
 
+    /// A catalog whose synthetic track carries `map_notes` at every level.
+    fn catalog_from_notes(id: &str, map_notes: Vec<MapNote>) -> anyhow::Result<TrackCatalog> {
+        catalog_of(vec![track_entry(id, map_notes, 60_000)])
+    }
+
     #[test]
-    fn an_unknown_track_or_an_empty_class_set_is_an_error() {
-        let catalog = example_catalog();
+    fn bad_maps_are_refused_at_load() {
+        // A hold that runs into the next onset: one hand cannot do that.
+        assert!(catalog_from_notes(
+            "overlap",
+            vec![
+                MapNote {
+                    time_ms: 1_000,
+                    cell: 0,
+                    hold_ms: 600
+                },
+                MapNote {
+                    time_ms: 1_500,
+                    cell: 3,
+                    hold_ms: 200
+                },
+            ]
+        )
+        .is_err());
+
+        // A cell outside the 4x3 lattice.
+        assert!(catalog_from_notes(
+            "bad_cell",
+            vec![
+                MapNote {
+                    time_ms: 1_000,
+                    cell: 12,
+                    hold_ms: 200
+                },
+                MapNote {
+                    time_ms: 2_000,
+                    cell: 0,
+                    hold_ms: 200
+                },
+            ]
+        )
+        .is_err());
+
+        // A cue whose hold runs past the end of the audio.
+        assert!(catalog_from_notes(
+            "overrun",
+            vec![
+                MapNote {
+                    time_ms: 1_000,
+                    cell: 0,
+                    hold_ms: 200
+                },
+                MapNote {
+                    time_ms: 59_000,
+                    cell: 3,
+                    hold_ms: 5_000
+                },
+            ]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn a_track_missing_a_level_is_refused() {
+        let map_notes = one_note_per_cell();
+        let level = LevelEntry {
+            column_splits: even_splits(&map_notes),
+            map_notes,
+        };
+        let partial = TrackEntry {
+            id: TrackId("partial".into()),
+            title: "partial".into(),
+            beats_per_minute: 120.0,
+            // Easy and medium only: the dial offers hard too.
+            levels: [
+                (DifficultyLevel::Easy.to_string(), level.clone()),
+                (DifficultyLevel::Medium.to_string(), level),
+            ]
+            .into_iter()
+            .collect(),
+            duration_ms: 60_000,
+        };
+        assert!(catalog_of(vec![partial]).is_err());
+    }
+
+    #[test]
+    fn every_level_of_every_catalog_track_is_playable() {
+        let catalog = sample_catalog();
+        let offered = catalog.class_ids();
+        for track in catalog.tracks() {
+            for difficulty in DifficultyLevel::ALL {
+                let beatmap = catalog
+                    .generate(&track.id, &offered, difficulty, 3)
+                    .unwrap_or_else(|error| panic!("{} at {difficulty}: {error}", track.id));
+                assert!(!beatmap.is_empty(), "{} at {difficulty} is empty", track.id);
+            }
+        }
+    }
+
+    #[test]
+    fn an_unknown_track_an_empty_class_set_or_too_many_classes_is_an_error() {
+        let catalog = sample_catalog();
         assert!(catalog
             .generate(
                 &TrackId("no_such_track".into()),
                 &catalog.class_ids(),
-                48,
-                1
+                DifficultyLevel::Medium,
+                1,
             )
             .is_err());
         assert!(catalog
-            .generate(&TrackId("traverse".into()), &[], 48, 1)
+            .generate(&catalog.tracks()[0].id, &[], DifficultyLevel::Medium, 1)
             .is_err());
+        let seven: Vec<ClassId> = (0..7)
+            .map(|index| ClassId(format!("class_{index}")))
+            .collect();
+        assert!(catalog
+            .generate(&catalog.tracks()[0].id, &seven, DifficultyLevel::Medium, 1)
+            .is_err());
+    }
+
+    #[test]
+    fn the_metronome_grid_runs_at_the_map_tempo() {
+        let catalog = catalog_with_map("lattice", one_note_per_cell(), 10_000);
+        let beats = catalog.beat_times(&TrackId("lattice".into())).unwrap();
+        // 120 bpm over 10 s: beats at 0, 500, …, 9500.
+        assert_eq!(beats.len(), 20);
+        assert_eq!(beats[0].get(), 0);
+        assert_eq!(beats[1].get(), 500);
+        assert!(beats.last().unwrap().get() < 10_000);
+        assert_eq!(catalog.beat_times(&TrackId("no_such_track".into())), None);
     }
 }

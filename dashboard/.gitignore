@@ -1,10 +1,12 @@
 /target
-# Runtime state (app.cbor) lives in /config; the collection catalog and its
-# placeholder tracks are shipped content, so /config's *contents* are ignored
-# rather than the directory, which is what lets the negations work.
+# Runtime state (app.cbor) lives in /config alongside collection.json, which is
+# shipped content — so /config's *contents* are ignored rather than the
+# directory, which is what lets the negation work.
 /config/*
 !/config/collection.json
-!/config/*.ogg
+# The track library: audio, converted schedules, and copied Beat Saber maps.
+# Personal music and derived map data, rebuilt by tools/ingest_track.py.
+/tracks
 # Recorded collection sessions land here at runtime.
 /sessions
 /web/node_modules

@@ -77,11 +77,16 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(device::run_serial_discovery(registry.clone()));
     }
 
-    // The collection game's backend: catalog from EMG_COLLECTION_CONFIG (default
-    // config/collection.json), sessions under EMG_SESSIONS_DIR (default sessions/),
-    // webcam at EMG_CAMERA_DEVICE (default /dev/video0).
+    // The collection game's backend: vocabularies from EMG_COLLECTION_CONFIG
+    // (default config/collection.json), the track library from EMG_TRACKS_DIR
+    // (default tracks/, one directory per track), sessions under
+    // EMG_SESSIONS_DIR (default sessions/), webcam at EMG_CAMERA_DEVICE
+    // (default /dev/video0).
     let collection_config =
         std::env::var("EMG_COLLECTION_CONFIG").unwrap_or_else(|_| "config/collection.json".into());
+    let tracks_root = std::path::PathBuf::from(
+        std::env::var("EMG_TRACKS_DIR").unwrap_or_else(|_| "tracks".into()),
+    );
     let sessions_root = std::path::PathBuf::from(
         std::env::var("EMG_SESSIONS_DIR").unwrap_or_else(|_| "sessions".into()),
     );
@@ -89,7 +94,10 @@ async fn main() -> anyhow::Result<()> {
     let camera_device = std::path::PathBuf::from(
         std::env::var("EMG_CAMERA_DEVICE").unwrap_or_else(|_| "/dev/video0".into()),
     );
-    let catalog = collect::beatmap::TrackCatalog::load(std::path::Path::new(&collection_config))?;
+    let catalog = collect::beatmap::TrackCatalog::load(
+        std::path::Path::new(&collection_config),
+        &tracks_root,
+    )?;
     let collection = collect::manager::CollectionManager::new(
         catalog,
         camera_device,

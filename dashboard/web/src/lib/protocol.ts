@@ -51,6 +51,7 @@ export const FrameType = {
   CollectionCatalog: 'collection_catalog',
   StartCollection: 'start_collection',
   TrackStarted: 'track_started',
+  FinishCollection: 'finish_collection',
   StopCollection: 'stop_collection',
   CapturePlacementPhoto: 'capture_placement_photo',
   CollectionState: 'collection_state',
@@ -201,8 +202,8 @@ export interface SweatLevel {
 export interface TrackInfo {
   readonly id: string;
   readonly title: string;
+  /** Median tempo, for display; the backend schedules notes on measured beat times. */
   readonly beats_per_minute: number;
-  readonly first_beat: TrackMilliseconds;
   readonly duration: DurationMilliseconds;
 }
 
@@ -414,13 +415,29 @@ export interface CollectionCatalogFrame {
   readonly collection_classes: readonly CollectionClass[];
   readonly activities: readonly ActivityCondition[];
   readonly sweat_levels: readonly SweatLevel[];
-  readonly goal_per_class: number;
 }
+
+/** How demanding a session's cues are; every track carries one schedule per
+ * level. Ordered easiest first. */
+export const DifficultyLevel = {
+  Easy: 'easy',
+  Medium: 'medium',
+  Hard: 'hard',
+} as const;
+
+export type DifficultyLevel = (typeof DifficultyLevel)[keyof typeof DifficultyLevel];
+
+export const DIFFICULTY_LEVELS: readonly DifficultyLevel[] = [
+  DifficultyLevel.Easy,
+  DifficultyLevel.Medium,
+  DifficultyLevel.Hard,
+];
 
 export interface StartCollectionFrame {
   readonly type: 'start_collection';
   readonly metadata: SessionMetadata;
   readonly track_id: string;
+  readonly difficulty: DifficultyLevel;
 }
 
 /** Browser → backend: audio playback actually began; anchors the beat grid. */
@@ -429,6 +446,13 @@ export interface TrackStartedFrame {
   readonly at_unix_ms: UnixMilliseconds;
 }
 
+/** Browser → backend: finalize the running session now and move to review;
+ * the keep-or-discard decision happens there, with the summary in view. */
+export interface FinishCollectionFrame {
+  readonly type: 'finish_collection';
+}
+
+/** Browser → backend: resolve a session in the reviewing phase. */
 export interface StopCollectionFrame {
   readonly type: 'stop_collection';
   readonly save: boolean;
@@ -455,6 +479,8 @@ export interface BeatmapFrame {
   readonly session_id: string;
   readonly track: TrackInfo;
   readonly notes: readonly Note[];
+  /** The measured beat grid the notes were scheduled on, for the debug metronome. */
+  readonly beat_times: readonly TrackMilliseconds[];
   readonly lead_in: DurationMilliseconds;
 }
 
@@ -475,6 +501,7 @@ export type OutgoingFrame =
   | SetServerFrame
   | StartCollectionFrame
   | TrackStartedFrame
+  | FinishCollectionFrame
   | StopCollectionFrame
   | CapturePlacementPhotoFrame;
 
@@ -760,7 +787,6 @@ function isTrackInfo(value: unknown): value is TrackInfo {
     isString(value['id']) &&
     isString(value['title']) &&
     isNumber(value['beats_per_minute']) &&
-    isNumber(value['first_beat']) &&
     isNumber(value['duration'])
   );
 }
@@ -868,8 +894,7 @@ export function isCollectionCatalogFrame(
     Array.isArray(value['activities']) &&
     value['activities'].every(isIdLabel) &&
     Array.isArray(value['sweat_levels']) &&
-    value['sweat_levels'].every(isIdLabel) &&
-    isNumber(value['goal_per_class'])
+    value['sweat_levels'].every(isIdLabel)
   );
 }
 
@@ -893,6 +918,7 @@ export function isBeatmapFrame(value: unknown): value is BeatmapFrame {
       isTrackInfo(value['track']) &&
       Array.isArray(value['notes']) &&
       value['notes'].every(isNote) &&
+      isNumberArray(value['beat_times']) &&
       isNumber(value['lead_in'])
     )
   ) {
@@ -920,6 +946,10 @@ export function isNoteResultFrame(value: unknown): value is NoteResultFrame {
   );
 }
 
+function isDifficultyLevel(value: unknown): value is DifficultyLevel {
+  return DIFFICULTY_LEVELS.includes(value as DifficultyLevel);
+}
+
 export function isOutgoingFrame(value: unknown): value is OutgoingFrame {
   if (!isObject(value)) return false;
   switch (value['type']) {
@@ -936,9 +966,15 @@ export function isOutgoingFrame(value: unknown): value is OutgoingFrame {
     case 'set_server':
       return isString(value['addr']);
     case 'start_collection':
-      return isSessionMetadata(value['metadata']) && isString(value['track_id']);
+      return (
+        isSessionMetadata(value['metadata']) &&
+        isString(value['track_id']) &&
+        isDifficultyLevel(value['difficulty'])
+      );
     case 'track_started':
       return isNumber(value['at_unix_ms']);
+    case 'finish_collection':
+      return true;
     case 'stop_collection':
       return isBoolean(value['save']);
     case 'capture_placement_photo':

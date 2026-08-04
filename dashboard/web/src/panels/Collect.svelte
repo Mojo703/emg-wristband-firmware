@@ -8,6 +8,7 @@
   // band went on, which another take does not change.
   let lastMetadata: SessionMetadata | null = null;
   let lastTrackId: string | null = null;
+  let lastDifficulty: DifficultyLevel | null = null;
 </script>
 
 <script lang="ts">
@@ -22,7 +23,7 @@
   import GameView from '../lib/collect/GameView.svelte';
   import SetupForm from './collect/SetupForm.svelte';
   import SessionSummary from './collect/SessionSummary.svelte';
-  import type { UnixMilliseconds } from '../lib/protocol';
+  import type { DifficultyLevel, UnixMilliseconds } from '../lib/protocol';
 
   const catalog = $derived(live.catalog);
   const collectionState = $derived(live.collectionState);
@@ -49,26 +50,33 @@
     inlineError = null;
   });
 
-  function start(metadata: SessionMetadata, trackId: string): void {
+  function start(
+    metadata: SessionMetadata,
+    trackId: string,
+    difficulty: DifficultyLevel,
+  ): void {
     lastMetadata = metadata;
     lastTrackId = trackId;
-    api.startCollection(metadata, trackId);
+    lastDifficulty = difficulty;
+    api.startCollection(metadata, trackId, difficulty);
   }
 
   function trackStarted(atUnixMilliseconds: UnixMilliseconds): void {
     api.trackStarted(atUnixMilliseconds);
   }
 
-  function abort(): void {
-    api.stopCollection(false);
+  // Ends a running session where it stands; the backend finalizes the
+  // recording and the review screen decides whether the partial take is kept.
+  function finish(): void {
+    api.finishCollection();
   }
 
   // Replays the previous session's tags verbatim — no re-stamping, same track.
   // Whether the session under review is kept is a separate decision the operator
   // has already made or the backend resolves; this only asks for another take.
   function againSameTags(): void {
-    if (lastMetadata === null || lastTrackId === null) return;
-    api.startCollection(lastMetadata, lastTrackId);
+    if (lastMetadata === null || lastTrackId === null || lastDifficulty === null) return;
+    api.startCollection(lastMetadata, lastTrackId, lastDifficulty);
   }
 </script>
 
@@ -108,7 +116,7 @@
        action that is still safe. -->
   <p class="muted">A session is in progress on the backend, but this page joined after
     its beatmap was sent, so the field cannot be drawn.</p>
-  <button class="btn" onclick={abort}>Abort session</button>
+  <button class="btn" onclick={finish}>Finish session</button>
 {:else}
-  <GameView {catalog} {beatmap} {phase} onTrackStarted={trackStarted} onAbort={abort} />
+  <GameView {catalog} {beatmap} {phase} onTrackStarted={trackStarted} onFinish={finish} />
 {/if}

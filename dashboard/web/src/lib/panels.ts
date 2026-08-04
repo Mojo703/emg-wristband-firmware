@@ -6,7 +6,6 @@ import EmgViewer from '../panels/EmgViewer.svelte';
 import ConfigApp from '../panels/ConfigApp.svelte';
 import LogViewer from '../panels/LogViewer.svelte';
 import PoseViewer from '../panels/PoseViewer.svelte';
-import Stub from '../panels/Stub.svelte';
 import Telemetry from '../panels/Telemetry.svelte';
 
 export interface Panel {
@@ -23,7 +22,6 @@ export const panels: readonly Panel[] = [
   { id: 'config', title: 'Config', icon: 'sliders', component: ConfigApp },
   // Training-data capture: the falling-notes game and its session bookkeeping.
   { id: 'collect', title: 'Collect', icon: 'play', component: Collect },
-  { id: 'eval', title: 'Eval', icon: 'chart', component: Stub, props: { title: 'Eval dashboard' } },
   { id: 'pose', title: 'Pose', icon: 'scan', component: PoseViewer },
   // Periodic device measurements as live values + session trend plots.
   { id: 'telemetry', title: 'Telemetry', icon: 'chart', component: Telemetry },

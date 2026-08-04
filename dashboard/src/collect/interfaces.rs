@@ -29,9 +29,9 @@
 //! backend receive time.
 
 use protocol::{
-    Beatmap, ClassId, CollectionSummary, DeviceConfig, DeviceTransport, FileReport, NoteIndex,
-    OffsetMilliseconds, SessionId, SessionMetadata, StreamProgress, TrackId, TrackInfo,
-    UnixMilliseconds,
+    Beatmap, ClassId, CollectionSummary, DeviceConfig, DeviceTransport, DifficultyLevel,
+    FileReport, NoteIndex, OffsetMilliseconds, SessionId, SessionMetadata, StreamProgress, TrackId,
+    TrackInfo, UnixMilliseconds,
 };
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -63,8 +63,10 @@ pub struct SessionManifest {
     pub metadata: SessionMetadata,
     pub hardware: HardwareIdentity,
     pub track: TrackInfo,
-    pub goal_per_class: u16,
-    /// Collection class ids in lane order; cue events refer to these.
+    /// Which of the track's schedules was played.
+    pub difficulty: DifficultyLevel,
+    /// Collection class ids in catalog order; cue events refer to these. The
+    /// session's column→class binding is a seeded rotation of this list.
     pub class_ids: Vec<ClassId>,
     pub completed: bool,
 }
@@ -208,16 +210,15 @@ pub trait VideoCapture: Send {
 
 /// Unit 3: the track catalog and note-schedule generation.
 ///
-/// `generate` places notes on the track's beat grid (from `beats_per_minute`
-/// and `first_beat`). [`Beatmap`] construction enforces strict time ordering;
-/// the remaining constraints are this trait's contract:
-/// - no two notes closer than the hand-recovery minimum (default 1500 ms),
-///   regardless of lane;
-/// - per-class counts within ±1 of each other across `classes`, targeting
-///   `goal_per_class` where the track is long enough and scaling down
-///   proportionally where it is not;
-/// - no note in the final 2 s of the track;
-/// - deterministic output for a given `seed` (replayable sessions).
+/// Each track carries one fixed cue schedule per [`DifficultyLevel`], built at
+/// ingest from a Beat Saber map. `generate` projects the chosen level's
+/// schedule onto the offered classes: the 12 lattice cells fold into
+/// `classes.len()` columns (supported up to 6) at boundaries the ingest placed
+/// to balance the columns, and the column→class binding rotates with the seed
+/// so per-class rep counts even out across sessions while the map's spatial
+/// pattern stays fixed. [`Beatmap`] construction enforces strict time
+/// ordering with non-overlapping holds; output is deterministic for a given
+/// seed.
 pub trait BeatmapGenerator: Send + Sync {
     /// The playable tracks, catalog order.
     fn tracks(&self) -> Vec<TrackInfo>;
@@ -232,7 +233,7 @@ pub trait BeatmapGenerator: Send + Sync {
         &self,
         track_id: &TrackId,
         classes: &[ClassId],
-        goal_per_class: u16,
+        difficulty: DifficultyLevel,
         seed: u64,
     ) -> anyhow::Result<Beatmap>;
 }

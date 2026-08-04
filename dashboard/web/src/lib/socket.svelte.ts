@@ -20,6 +20,7 @@ import {
   type CollectionCatalogFrame,
   type CollectionStateFrame,
   type DecodedEmg,
+  type DifficultyLevel,
   type EventFrame,
   type HelloFrame,
   type LogFrame,
@@ -388,12 +389,17 @@ export const api = {
     send({ type: 'set_wifi', ssid, psk }),
   server: (addr: string) =>
     send({ type: 'set_server', addr }),
-  startCollection: (metadata: SessionMetadata, trackId: string) =>
-    send({ type: 'start_collection', metadata, track_id: trackId }),
+  startCollection: (
+    metadata: SessionMetadata,
+    trackId: string,
+    difficulty: DifficultyLevel,
+  ) => send({ type: 'start_collection', metadata, track_id: trackId, difficulty }),
   // The moment the audio element actually began playing, which is the only
   // timestamp that can align the recorded streams with the beat grid.
   trackStarted: (atUnixMilliseconds: UnixMilliseconds) =>
     send({ type: 'track_started', at_unix_ms: atUnixMilliseconds }),
+  finishCollection: () =>
+    send({ type: 'finish_collection' }),
   stopCollection: (save: boolean) =>
     send({ type: 'stop_collection', save }),
   capturePlacementPhoto: () =>

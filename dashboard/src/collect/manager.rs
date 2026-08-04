@@ -9,10 +9,11 @@
 //! Lifecycle: `Idle` → (`StartCollection`) → `Starting` (arming in flight) →
 //! `Running` (a spawned session task owns the recorder and the device's EMG
 //! subscription; `Armed` until `TrackStarted` anchors the beat grid, then
-//! `Playing`) → `Reviewing` (track ended; files finalized on disk) →
-//! (`StopCollection { save }`) → `Idle`. A `StopCollection` while running
-//! aborts early: recording is finalized first, then the save decision applies
-//! immediately.
+//! `Playing`) → `Reviewing` (track ended, or `FinishCollection` ended it
+//! early; files finalized on disk either way) → (`StopCollection { save }`) →
+//! `Idle`. Keep-or-discard is decided only in review, with the summary in
+//! view; the sole self-resolving path is an armed session whose browser never
+//! starts the track, which times out and discards itself.
 //!
 //! Obligations honored here (from the unit reviews):
 //! - the recorder creates the session directory before video starts in it;
@@ -33,9 +34,9 @@ use crate::collect::recorder::FileSessionRecorder;
 use crate::collect::video::FfmpegVideoCapture;
 use crate::registry::Registry;
 use protocol::{
-    Beatmap, ClassId, CollectionPhase, CollectionSummary, DurationMilliseconds, FileReport, Frame,
-    LogLevel, NoteIndex, RecordingHealth, SessionId, SessionMetadata, StreamProgress, TrackId,
-    TrackInfo, TrackMilliseconds, UnixMilliseconds,
+    Beatmap, ClassId, CollectionPhase, CollectionSummary, DifficultyLevel, DurationMilliseconds,
+    FileReport, Frame, LogLevel, NoteIndex, RecordingHealth, SessionId, SessionMetadata,
+    StreamProgress, TrackId, TrackInfo, TrackMilliseconds, UnixMilliseconds,
 };
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -86,7 +87,8 @@ fn now() -> UnixMilliseconds {
 /// Control messages from browsers into a running session task.
 enum SessionControl {
     TrackStarted(UnixMilliseconds),
-    Stop { save: bool },
+    /// End the session now and move to review, mid-track or not.
+    Finish,
 }
 
 enum Phase {
@@ -189,7 +191,6 @@ impl CollectionManager {
             collection_classes: self.catalog.collection_classes().to_vec(),
             activities: self.catalog.activities().to_vec(),
             sweat_levels: self.catalog.sweat_levels().to_vec(),
-            goal_per_class: self.catalog.goal_per_class(),
         }
     }
 
@@ -238,6 +239,7 @@ impl CollectionManager {
         self: &Arc<Self>,
         metadata: SessionMetadata,
         track_id: TrackId,
+        difficulty: DifficultyLevel,
         device_id: Option<String>,
     ) {
         if let Err(reason) = self.validate_start(&metadata, &track_id) {
@@ -255,7 +257,11 @@ impl CollectionManager {
         }
         let manager = Arc::clone(self);
         tokio::spawn(async move {
-            if let Err(error) = manager.clone().arm(metadata, track_id, device_id).await {
+            if let Err(error) = manager
+                .clone()
+                .arm(metadata, track_id, difficulty, device_id)
+                .await
+            {
                 manager.publish_error(format!("session start failed: {error:#}"));
                 manager.state.lock().unwrap().phase = Phase::Idle;
                 manager.publish_idle();
@@ -353,6 +359,7 @@ impl CollectionManager {
         self: Arc<Self>,
         metadata: SessionMetadata,
         track_id: TrackId,
+        difficulty: DifficultyLevel,
         device_id: Option<String>,
     ) -> anyhow::Result<()> {
         let acquired = match device_id {
@@ -368,9 +375,9 @@ impl CollectionManager {
             .ok_or_else(|| anyhow::anyhow!("unknown track '{track_id}'"))?;
         let class_ids = self.catalog.class_ids();
         let seed = now().get();
-        let beatmap =
-            self.catalog
-                .generate(&track_id, &class_ids, self.catalog.goal_per_class(), seed)?;
+        let beatmap = self
+            .catalog
+            .generate(&track_id, &class_ids, difficulty, seed)?;
 
         let created = now();
         let practice = acquired.is_none();
@@ -392,7 +399,7 @@ impl CollectionManager {
                     metadata,
                     hardware,
                     track: track.clone(),
-                    goal_per_class: self.catalog.goal_per_class(),
+                    difficulty,
                     class_ids,
                     completed: false,
                 };
@@ -458,6 +465,7 @@ impl CollectionManager {
             session_id: session_id.clone(),
             track: track.clone(),
             notes: beatmap.clone(),
+            beat_times: self.catalog.beat_times(&track_id).unwrap_or_default(),
             lead_in: crate::collect::beatmap::LEAD_IN,
         });
 
@@ -484,22 +492,28 @@ impl CollectionManager {
         }
     }
 
-    /// Browser → `StopCollection`: aborts a running session or resolves a
-    /// reviewed one; `save: false` deletes the directory.
+    /// Browser → `FinishCollection`: end the running session now; recording is
+    /// finalized as if the track had played out and the summary screen decides
+    /// what happens to the partial take.
+    pub fn finish_collection(&self) {
+        let state = self.state.lock().unwrap();
+        if let Phase::Running { control } = &state.phase {
+            let _ = control.send(SessionControl::Finish);
+        }
+    }
+
+    /// Browser → `StopCollection`: resolves the session under review;
+    /// `save: false` deletes the directory.
     pub fn stop_collection(&self, save: bool) {
         let reviewed = {
             let mut state = self.state.lock().unwrap();
             match &state.phase {
-                Phase::Running { control } => {
-                    let _ = control.send(SessionControl::Stop { save });
-                    None
-                }
                 Phase::Reviewing { directory } => {
                     let directory = directory.clone();
                     state.phase = Phase::Idle;
                     Some(directory)
                 }
-                Phase::Idle | Phase::Starting => None,
+                Phase::Idle | Phase::Starting | Phase::Running { .. } => None,
             }
         };
         if let Some(directory) = reviewed {
@@ -655,12 +669,13 @@ struct RunningSession {
     latest_health: RecordingHealth,
 }
 
-/// How the session ends: a browser decision, or the backend's own conclusion.
+/// How the session ends: into review for a decision, or discarded outright.
 enum Ending {
-    /// Track finished (or the device died): finalize and enter review.
+    /// Track finished, the browser finished it early, or the device died:
+    /// finalize and enter review.
     Review,
-    /// Browser stop while running: finalize, then apply the decision directly.
-    Decided { save: bool },
+    /// An armed session nobody started: finalize, delete, back to idle.
+    Discard,
 }
 
 impl RunningSession {
@@ -722,7 +737,7 @@ impl RunningSession {
             tokio::select! {
                 message = self.control.recv() => match message {
                     Some(SessionControl::TrackStarted(at)) => self.anchor_track(at),
-                    Some(SessionControl::Stop { save }) => break Ending::Decided { save },
+                    Some(SessionControl::Finish) => break Ending::Review,
                     None => break Ending::Review, // manager dropped; shouldn't happen
                 },
                 frame = next_emg(&mut self.emg_receiver) => match frame {
@@ -825,7 +840,7 @@ impl RunningSession {
                 if current.since(self.armed_at).get() > ARMED_TIMEOUT.as_millis() as i64 {
                     self.manager
                         .publish_error("armed session timed out; discarding".into());
-                    return Some(Ending::Decided { save: false });
+                    return Some(Ending::Discard);
                 }
             }
             Some(anchor) => {
@@ -1029,15 +1044,13 @@ impl RunningSession {
                     placement_photo: None,
                 });
             }
-            Ending::Decided { save } => {
+            Ending::Discard => {
                 self.manager.state.lock().unwrap().phase = Phase::Idle;
-                if !save {
-                    // A practice session has nothing on disk to discard.
-                    if let Some(directory) = &self.directory {
-                        if let Err(error) = std::fs::remove_dir_all(directory) {
-                            self.manager
-                                .publish_error(format!("failed to discard session: {error}"));
-                        }
+                // A practice session has nothing on disk to discard.
+                if let Some(directory) = &self.directory {
+                    if let Err(error) = std::fs::remove_dir_all(directory) {
+                        self.manager
+                            .publish_error(format!("failed to discard session: {error}"));
                     }
                 }
                 self.manager.publish_idle();

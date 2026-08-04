@@ -320,8 +320,8 @@ mod tests {
     use super::*;
     use protocol::{
         ActivityId, Arm, BeatsPerMinute, ClassId, Degrees, DeviceConfig, DeviceTransport,
-        DurationMilliseconds, Millimeters, SessionId, SessionMetadata, SubjectId, SweatId, TrackId,
-        TrackInfo, TrackMilliseconds,
+        DifficultyLevel, DurationMilliseconds, Millimeters, SessionId, SessionMetadata, SubjectId,
+        SweatId, TrackId, TrackInfo,
     };
     use std::collections::BTreeMap;
     use std::num::NonZeroU16;
@@ -360,14 +360,13 @@ mod tests {
                     needed: 3,
                 },
             },
+            difficulty: DifficultyLevel::Medium,
             track: TrackInfo {
                 id: TrackId("metronome".to_string()),
                 title: "Metronome".to_string(),
                 beats_per_minute: BeatsPerMinute(NonZeroU16::new(120).unwrap()),
-                first_beat: TrackMilliseconds::new(250),
                 duration: DurationMilliseconds::new(60_000),
             },
-            goal_per_class: 20,
             class_ids: vec![
                 ClassId("index_pinch".to_string()),
                 ClassId("fist".to_string()),

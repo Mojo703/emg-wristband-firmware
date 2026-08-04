@@ -227,7 +227,6 @@ pub enum Frame {
         collection_classes: Vec<CollectionClass>,
         activities: Vec<ActivityCondition>,
         sweat_levels: Vec<SweatLevel>,
-        goal_per_class: u16,
     },
 
     /// Browser → backend: begin a collection session on the selected device. The
@@ -237,6 +236,7 @@ pub enum Frame {
     StartCollection {
         metadata: SessionMetadata,
         track_id: TrackId,
+        difficulty: DifficultyLevel,
     },
 
     /// Browser → backend: audio playback actually began (the browser owns the
@@ -245,9 +245,14 @@ pub enum Frame {
     /// from it.
     TrackStarted { at_unix_ms: UnixMilliseconds },
 
-    /// Browser → backend: end or resolve the session. While armed/playing it
-    /// aborts early (recording is finalized first); in the reviewing phase it
-    /// resolves the decision the summary screen offers. Either way
+    /// Browser → backend: end the running session now. Recording is finalized
+    /// exactly as if the track had played out, and the backend moves to the
+    /// reviewing phase — the summary screen decides whether the partial take is
+    /// kept. There is no mid-session discard: the decision always happens in
+    /// review, with the summary in view.
+    FinishCollection {},
+
+    /// Browser → backend: resolve a session in the reviewing phase.
     /// `save: false` deletes the session directory and `save: true` keeps it;
     /// the backend then returns to idle.
     StopCollection { save: bool },
@@ -278,6 +283,9 @@ pub enum Frame {
         session_id: SessionId,
         track: TrackInfo,
         notes: Beatmap,
+        /// The track's measured beat instants, for the browser's debug
+        /// metronome — an audible copy of the grid the notes were scheduled on.
+        beat_times: Vec<TrackMilliseconds>,
         /// Silence the browser inserts before audio t = 0 so the first notes
         /// have fall time.
         lead_in: DurationMilliseconds,
@@ -517,6 +525,36 @@ pub enum Arm {
     Right,
 }
 
+/// How demanding a session's cues are. Every track carries one ready-made
+/// schedule per level: harder levels cue more often, hold for less time, and
+/// leave less rest between gestures. Ordered easiest first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DifficultyLevel {
+    Easy,
+    Medium,
+    Hard,
+}
+
+impl DifficultyLevel {
+    /// Every level, easiest first — what the setup form offers.
+    pub const ALL: [DifficultyLevel; 3] = [
+        DifficultyLevel::Easy,
+        DifficultyLevel::Medium,
+        DifficultyLevel::Hard,
+    ];
+}
+
+impl core::fmt::Display for DifficultyLevel {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str(match self {
+            DifficultyLevel::Easy => "easy",
+            DifficultyLevel::Medium => "medium",
+            DifficultyLevel::Hard => "hard",
+        })
+    }
+}
+
 /// The session-setup form's answers, browser → backend in [`Frame::StartCollection`]
 /// and stored verbatim in the session's `session.json`. Every id refers into the
 /// [`Frame::CollectionCatalog`] vocabularies.
@@ -556,9 +594,9 @@ pub struct SweatLevel {
 pub struct TrackInfo {
     pub id: TrackId,
     pub title: String,
+    /// Median tempo across the track, for display. Notes are scheduled on the
+    /// track's measured beat times (backend-side), not on this number.
     pub beats_per_minute: BeatsPerMinute,
-    /// Where the first beat of the grid falls on the audio timeline.
-    pub first_beat: TrackMilliseconds,
     pub duration: DurationMilliseconds,
 }
 
@@ -1360,11 +1398,17 @@ mod tests {
         let frame = Frame::StartCollection {
             metadata: sample_metadata(),
             track_id: TrackId("steady-run".into()),
+            difficulty: DifficultyLevel::Hard,
         };
         match roundtrip(&frame) {
-            Frame::StartCollection { metadata, track_id } => {
+            Frame::StartCollection {
+                metadata,
+                track_id,
+                difficulty,
+            } => {
                 assert_eq!(metadata, sample_metadata());
                 assert_eq!(track_id, TrackId("steady-run".into()));
+                assert_eq!(difficulty, DifficultyLevel::Hard);
             }
             other => panic!("wrong variant: {other:?}"),
         }
@@ -1495,7 +1539,6 @@ mod tests {
             id: TrackId("steady-run".into()),
             title: "Steady Run".into(),
             beats_per_minute: BeatsPerMinute(core::num::NonZeroU16::new(120).unwrap()),
-            first_beat: TrackMilliseconds(240),
             duration: DurationMilliseconds(245_000),
         };
         let notes = Beatmap::try_from(vec![
@@ -1515,6 +1558,7 @@ mod tests {
             session_id: SessionId("2026-07-30T16-40_matthew".into()),
             track: track.clone(),
             notes,
+            beat_times: vec![TrackMilliseconds(240), TrackMilliseconds(740)],
             lead_in: DurationMilliseconds(3_000),
         };
         match roundtrip(&frame) {
@@ -1612,20 +1656,17 @@ mod tests {
                 id: SweatId("dry".into()),
                 label: "Dry".into(),
             }],
-            goal_per_class: 50,
         };
         match roundtrip(&frame) {
             Frame::CollectionCatalog {
                 subjects,
                 collection_classes,
                 activities,
-                goal_per_class,
                 ..
             } => {
                 assert_eq!(subjects[0], SubjectId("matthew".into()));
                 assert_eq!(collection_classes[0].id, ClassId("index_pinch".into()));
                 assert_eq!(activities[0].id, ActivityId("seated".into()));
-                assert_eq!(goal_per_class, 50);
             }
             other => panic!("wrong variant: {other:?}"),
         }
