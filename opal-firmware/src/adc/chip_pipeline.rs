@@ -106,6 +106,17 @@ const REFERENCE_SETTLE_AFTER_RECOVERY_US: u64 = 300_000;
 /// settling") — taken with margin.
 const COLD_START_SETTLE_US: u64 = 10_000;
 
+/// Consecutive wakes discarded for carrying no frame before the chip is
+/// warm-recovered. Discards are normal in ones and twos — the bench sees a few
+/// per thousand edges — but they return early, short of the timeout path that
+/// owns death detection, so a chip wedged into waking this thread without ever
+/// converting would keep the wait fed, deliver nothing, and hold the aligner's
+/// grid open on a source it still believes present. This bounds that. At the
+/// conversion rate the threshold is ~16 ms of silence, past
+/// [`DATA_READY_TIMEOUT_MS`], and a run this long cannot come from the measured
+/// discard rate by chance.
+const DISCARDED_WAKE_RECOVERY_THRESHOLD: u32 = 32;
+
 /// What a pipeline tells the combiner. Frames and presence transitions share one
 /// ordered channel, so "these frames, then the chip went dark" cannot reorder into
 /// its opposite.
@@ -127,6 +138,13 @@ pub(super) enum ChipEvent {
 /// producing edges slowly, and those need opposite fixes. The difference is visible
 /// in one number: how long the SPI read takes as a fraction of the wake-to-wake
 /// period.
+///
+/// A wake-to-wake period conflates two delays that need opposite fixes of their
+/// own, so the interrupt's own view of the edge is timed separately. An edge
+/// interval that stretches while the service delay stays flat is the interrupt
+/// arriving late — the chip, the shared dispatcher, or a core that cannot take
+/// the interrupt. A service delay that stretches is this thread being held off
+/// the core after the interrupt already ran, which is scheduling.
 #[derive(Default)]
 struct EdgeTiming {
     count: u32,
@@ -137,6 +155,30 @@ struct EdgeTiming {
     read_min_us: u64,
     read_sum_us: u64,
     read_max_us: u64,
+    /// The previous edge as the interrupt stamped it. 32-bit because the stamp
+    /// crosses out of interrupt context through an atomic and Xtensa has no
+    /// 64-bit atomics; the counter wraps every ~71 minutes and only differences
+    /// are ever taken, which wrapping arithmetic gets right across the wrap.
+    last_interrupt_edge_us: Option<u32>,
+    interrupt_edge_period_count: u32,
+    interrupt_edge_period_min_us: u64,
+    interrupt_edge_period_max_us: u64,
+    /// Edge intervals past 1 ms: at least one conversion went unread.
+    ///
+    /// The family reports no mean. Measured over the same serviced edges as
+    /// the wake-to-wake period beside it, both telescope to the same total and
+    /// the two means agree to a microsecond, so it would carry nothing. Making
+    /// it differ means advancing this interval across discarded wakes too, and
+    /// the bench charges ~10 serviced edges per second per chip for doing so —
+    /// too much for a metric. The minimum and the maximum still separate a
+    /// late interrupt from a late thread, which is the whole point of the pair.
+    interrupt_edge_period_over_1ms: u32,
+    service_delay_count: u32,
+    service_delay_min_us: u64,
+    service_delay_sum_us: u64,
+    service_delay_max_us: u64,
+    /// Service delays past 1 ms: the thread lost the core for two whole periods.
+    service_delay_over_1ms: u32,
 }
 
 impl EdgeTiming {
@@ -154,6 +196,43 @@ impl EdgeTiming {
             self.count += 1;
         }
         self.last_edge_us = Some(edge_us);
+    }
+
+    /// Called on every edge with the interrupt's stamp for it and this thread's
+    /// own clock reading, in that order.
+    fn record_interrupt_edge(&mut self, interrupt_edge_us: u32, thread_now_us: u32) {
+        if let Some(last) = self.last_interrupt_edge_us {
+            let period = interrupt_edge_us.wrapping_sub(last) as u64;
+            self.interrupt_edge_period_min_us = if self.interrupt_edge_period_count == 0 {
+                period
+            } else {
+                self.interrupt_edge_period_min_us.min(period)
+            };
+            self.interrupt_edge_period_max_us = self.interrupt_edge_period_max_us.max(period);
+            self.interrupt_edge_period_count += 1;
+            if period > 1_000 {
+                self.interrupt_edge_period_over_1ms += 1;
+            }
+        }
+        self.last_interrupt_edge_us = Some(interrupt_edge_us);
+        // The stamp can be newer than this thread's reading: the interrupt is
+        // re-armed before the read, so an edge arriving mid-service overwrites
+        // the stamp for the notification already pending. The difference is
+        // genuinely negative there and the delay for that edge is not
+        // measurable from here, so it counts as zero rather than wrapping to
+        // four billion and destroying the mean.
+        let delay = (thread_now_us.wrapping_sub(interrupt_edge_us) as i32).max(0) as u64;
+        self.service_delay_min_us = if self.service_delay_count == 0 {
+            delay
+        } else {
+            self.service_delay_min_us.min(delay)
+        };
+        self.service_delay_max_us = self.service_delay_max_us.max(delay);
+        self.service_delay_sum_us += delay;
+        self.service_delay_count += 1;
+        if delay > 1_000 {
+            self.service_delay_over_1ms += 1;
+        }
     }
 
     fn record_read(&mut self, elapsed_us: u64) {
@@ -179,10 +258,20 @@ impl EdgeTiming {
             read_min_us: self.read_min_us,
             read_mean_us: self.read_sum_us / self.count as u64,
             read_max_us: self.read_max_us,
+            interrupt_edge_period_min_us: self.interrupt_edge_period_min_us,
+            interrupt_edge_period_max_us: self.interrupt_edge_period_max_us,
+            interrupt_edge_period_over_1ms: self.interrupt_edge_period_over_1ms,
+            service_delay_min_us: self.service_delay_min_us,
+            service_delay_mean_us: self.service_delay_sum_us
+                / self.service_delay_count.max(1) as u64,
+            service_delay_max_us: self.service_delay_max_us,
+            service_delay_over_1ms: self.service_delay_over_1ms,
         };
         let last_edge_us = self.last_edge_us;
+        let last_interrupt_edge_us = self.last_interrupt_edge_us;
         *self = Self {
             last_edge_us,
+            last_interrupt_edge_us,
             ..Self::default()
         };
         Some(report)
@@ -197,6 +286,13 @@ struct EdgeTimingReport {
     read_min_us: u64,
     read_mean_us: u64,
     read_max_us: u64,
+    interrupt_edge_period_min_us: u64,
+    interrupt_edge_period_max_us: u64,
+    interrupt_edge_period_over_1ms: u32,
+    service_delay_min_us: u64,
+    service_delay_mean_us: u64,
+    service_delay_max_us: u64,
+    service_delay_over_1ms: u32,
 }
 
 /// The thread's whole world: its chip, its health state, and its line to the
@@ -228,6 +324,23 @@ struct Pipeline {
     /// transitions so absence is announced exactly once per outage.
     announced_present: bool,
     batch: Vec<(u64, Sample)>,
+    /// The interrupt stamp the last serviced wake carried. A wake repeating it
+    /// has no conversion behind it.
+    last_serviced_interrupt_edge_us: Option<u32>,
+    /// Wakes discarded for repeating that stamp, cumulative.
+    repeated_edge_wakes: u32,
+    /// Wakes discarded for finding DRDY unasserted, cumulative.
+    data_ready_clear_wakes: u32,
+    /// Discarded wakes since the last one that carried a frame.
+    consecutive_discarded_wakes: u32,
+    /// This chip's own frames whose status word lost its marker, cumulative.
+    /// [`HealthCounters::bad_status`] sums both chips for the device-wide
+    /// report, which cannot answer which chip is failing.
+    bad_status: u32,
+    /// The device clock as read inside the DRDY interrupt, published before the
+    /// notification that wakes this thread. Low 32 bits only: Xtensa has no
+    /// 64-bit atomics, and [`EdgeTiming`] takes nothing but differences.
+    interrupt_edge_us: Arc<std::sync::atomic::AtomicU32>,
 }
 
 /// The combiner hung up; nothing left to sample for.
@@ -292,6 +405,51 @@ impl Pipeline {
             return Ok(());
         }
 
+        // Two ways a wake arrives with no conversion behind it, both created by
+        // re-arming before the read: the notification carries a bit rather than
+        // a count, so one can be left set for an edge already serviced, and the
+        // interrupt is live during the read, where this chip's own SCLK drives
+        // DRDY and can raise an edge of its own. Reading on either clocks a
+        // frame the chip has not finished producing, which returns without a
+        // status marker and inflates the front end's integrity counter.
+        //
+        // Both tests are cheap and neither is sufficient alone. An interrupt
+        // stamp that has not advanced since the last serviced wake proves no
+        // edge has fired since, which no bus traffic can forge. DRDY, active-low
+        // and held until the frame is clocked out, catches the rest — the
+        // datasheet warns that a rising SCLK edge erases DRDY regardless of chip
+        // select (SBAS459K §9.4.1.2, and `spi-timing-audit.md` records bus
+        // traffic consuming pulses), which would make a clear line ambiguous,
+        // but reading those wakes instead of discarding them recovers no
+        // measurable frame: the bench excludes a real-frame loss above ~0.2%.
+        //
+        // What produces the discards, at a few per thousand edges, is not
+        // established; the counters exist to keep the rate visible.
+        let interrupt_edge_us = self.interrupt_edge_us.load(Ordering::Relaxed);
+        let discarded = if self.last_serviced_interrupt_edge_us == Some(interrupt_edge_us) {
+            self.repeated_edge_wakes += 1;
+            true
+        } else {
+            self.last_serviced_interrupt_edge_us = Some(interrupt_edge_us);
+            if self.chip.device.data_ready().unwrap_or(false) {
+                false
+            } else {
+                self.data_ready_clear_wakes += 1;
+                true
+            }
+        };
+        if discarded {
+            // The interrupt fired, so the interrupt family tracks it even though
+            // no frame follows; that is what separates it from the wake-to-wake
+            // period beside it.
+            self.consecutive_discarded_wakes += 1;
+            if self.consecutive_discarded_wakes >= DISCARDED_WAKE_RECOVERY_THRESHOLD {
+                return self.recover("wakes carrying no frame");
+            }
+            return Ok(());
+        }
+        self.consecutive_discarded_wakes = 0;
+
         self.edges += 1;
         // The silent-revert detector: a chip back at power-on defaults still
         // converts, but four times slower. Sustained slow periods mean its
@@ -299,6 +457,8 @@ impl Pipeline {
         let period = now.saturating_sub(self.last_edge_us);
         self.last_edge_us = now;
         self.timing.record_edge(now);
+        self.timing
+            .record_interrupt_edge(interrupt_edge_us, now as u32);
         if period > SLOW_PERIOD_US {
             self.consecutive_slow_periods += 1;
             if self.consecutive_slow_periods >= SLOW_PERIOD_RECOVERY_THRESHOLD {
@@ -336,11 +496,32 @@ impl Pipeline {
                 metric("spi_read_min_us", report.read_min_us as f64),
                 metric("spi_read_mean_us", report.read_mean_us as f64),
                 metric("spi_read_max_us", report.read_max_us as f64),
-                metric("mean_absolute_input_uv", mean_abs_microvolts as f64),
                 metric(
-                    "bad_status",
-                    self.counters.bad_status.load(Ordering::Relaxed) as f64,
+                    "interrupt_edge_period_min_us",
+                    report.interrupt_edge_period_min_us as f64,
                 ),
+                metric(
+                    "interrupt_edge_period_max_us",
+                    report.interrupt_edge_period_max_us as f64,
+                ),
+                metric(
+                    "interrupt_edge_period_over_1ms_count",
+                    report.interrupt_edge_period_over_1ms as f64,
+                ),
+                metric("repeated_edge_wake_count", self.repeated_edge_wakes as f64),
+                metric(
+                    "data_ready_clear_wake_count",
+                    self.data_ready_clear_wakes as f64,
+                ),
+                metric("service_delay_min_us", report.service_delay_min_us as f64),
+                metric("service_delay_mean_us", report.service_delay_mean_us as f64),
+                metric("service_delay_max_us", report.service_delay_max_us as f64),
+                metric(
+                    "service_delay_over_1ms_count",
+                    report.service_delay_over_1ms as f64,
+                ),
+                metric("mean_absolute_input_uv", mean_abs_microvolts as f64),
+                metric("bad_status", self.bad_status as f64),
                 metric(
                     "recoveries",
                     self.counters.recoveries.load(Ordering::Relaxed) as f64,
@@ -402,6 +583,7 @@ impl Pipeline {
         // fixed marker bits catch a bit-misaligned or corrupted read that
         // read_errors can't.
         if frame.status_word().is_none() {
+            self.bad_status += 1;
             let total = self.counters.bad_status.fetch_add(1, Ordering::Relaxed) + 1;
             if total % READ_ERROR_LOG_INTERVAL == 1 {
                 // A valid word is 0xCxxxxx; all-zero means the chip returned
@@ -459,8 +641,10 @@ impl Pipeline {
         let notification = Notification::new();
         let notifier = notification.notifier();
         let bit = NonZeroU32::new(1).expect("1 is not 0");
+        let interrupt_edge_us = Arc::clone(&self.interrupt_edge_us);
         if let Err(error) = unsafe {
             self.chip.device.subscribe_data_ready(move || {
+                interrupt_edge_us.store(now_us() as u32, Ordering::Relaxed);
                 notifier.notify_and_yield(bit);
             })
         } {
@@ -483,6 +667,19 @@ impl Pipeline {
                 return;
             }
             let woken = notification.wait(DATA_READY_TIMEOUT_TICKS).is_some();
+            // Re-armed before the read, not after it. The interrupt is disabled
+            // from the moment it fires, and a read holds the thread for ~150 µs
+            // of the ~500 µs period, so an edge landing in that stretch is lost
+            // outright unless the interrupt is already live to latch a pending
+            // notification for it. Measured on the bench with the radio quiet:
+            // whole-block gaps fell from ~0.7-1.2% per chip to ~0.1%, and the
+            // mean edge period fell to the conversion rate.
+            // A bit set for an edge already serviced then wakes this thread
+            // with nothing to read, which `service` discards on the interrupt
+            // stamp before it touches the bus.
+            if woken {
+                let _ = self.chip.device.arm_data_ready_interrupt();
+            }
             if self.service(woken).is_err() {
                 info!(
                     "combiner disconnected; chip {} pipeline stopping",
@@ -529,7 +726,15 @@ pub(super) fn spawn(
                     abs_microvolt_sum: 0.0,
                     abs_microvolt_frames: 0,
                     announced_present: false,
+                    last_serviced_interrupt_edge_us: None,
+                    repeated_edge_wakes: 0,
+                    data_ready_clear_wakes: 0,
+                    consecutive_discarded_wakes: 0,
+                    bad_status: 0,
                     batch: Vec::with_capacity(FRAMES_PER_BATCH),
+                    interrupt_edge_us: Arc::new(std::sync::atomic::AtomicU32::new(
+                        started_us as u32,
+                    )),
                 }
                 .run();
             })

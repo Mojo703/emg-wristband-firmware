@@ -296,8 +296,8 @@ impl Ads1298Device {
     }
 
     /// DRDY is active-low. It falls when a new frame is ready to be sampled.
-    /// Acquisition waits on the interrupt instead; kept for bring-up polling.
-    #[allow(dead_code)]
+    /// Acquisition waits on the interrupt to know an edge happened and reads
+    /// this to confirm a frame is actually waiting before it clocks one out.
     pub(super) fn data_ready(&self) -> Result<bool> {
         Ok(self.drdy.is_low())
     }

@@ -138,7 +138,9 @@ pub(super) struct HealthCounters {
     pub(super) dropped: AtomicU32,
     /// Frames the driver failed to read, both chips.
     pub(super) read_errors: AtomicU32,
-    /// Frames whose status word lost its fixed marker bits, both chips.
+    /// Frames whose status word lost its fixed marker bits, summed over both
+    /// chips. Each pipeline keeps its own count for its telemetry, since a
+    /// device-wide sum cannot say which chip is failing.
     pub(super) bad_status: AtomicU32,
     /// Times a chip was warm-recovered after its conversions died. The bring-up
     /// campaign (documentation/ads1298-bringup-2026-07-31/TEST-LOG.md) established
