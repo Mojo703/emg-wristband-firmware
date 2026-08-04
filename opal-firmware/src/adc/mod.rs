@@ -95,7 +95,8 @@ pub(crate) struct FrontEnds {
 fn build_front_end<SPI: SpiAnyPins + 'static>(
     spi: SPI,
     wiring: AdcChipWiring,
-    spi_config: &SpiConfig,
+    command_config: &SpiConfig,
+    frame_config: &SpiConfig,
 ) -> Result<(Ads1298FrontEnd, PinDriver<'static, Output>)> {
     let bus = Arc::new(
         SpiDriver::new(
@@ -111,9 +112,14 @@ fn build_front_end<SPI: SpiAnyPins + 'static>(
     // sequencing in `bring_up` raises both boards together.
     let mut power_down = PinDriver::output(wiring.power_down)?;
     power_down.set_low()?;
+    // Two device handles on the one bus: the command path at its clock and the
+    // frame-read hot path at its own — esp-idf serialises them on the bus lock,
+    // and CS is a GPIO either way.
     let device = Ads1298Device::new(
-        SpiDeviceDriver::new(bus, Option::<AnyOutputPin>::None, spi_config)
-            .context("SPI device")?,
+        SpiDeviceDriver::new(bus.clone(), Option::<AnyOutputPin>::None, command_config)
+            .context("SPI command device")?,
+        SpiDeviceDriver::new(bus, Option::<AnyOutputPin>::None, frame_config)
+            .context("SPI frame device")?,
         PinDriver::output(wiring.chip_select)?,
         // DRDY is actively driven by the ADS1298, so no internal pull is needed.
         PinDriver::input(wiring.data_ready, Pull::Floating)?,
@@ -131,9 +137,11 @@ fn build_front_end<SPI: SpiAnyPins + 'static>(
 /// The chips self-clock (CLKSEL at 3V3), so no external clock has to be running
 /// first: the post-RESET lockout counts cycles of each chip's own oscillator.
 ///
-/// `baud_rate_hz` is the SPI clock. One 27-byte frame per chip has to clear well
-/// inside the ~500 µs sample period; the bench validated 2 MHz (burst framing makes
-/// the register path legal at any rate the sweep passed).
+/// `command_baud_rate_hz` clocks registers and opcodes — the bench-validated rate,
+/// nothing here is latency-sensitive. `frame_baud_rate_hz` clocks the RDATAC frame
+/// reads: one 27-byte frame per chip has to clear well inside the ~500 µs sample
+/// period, and every microsecond of transfer is edge-service budget, so this one
+/// wants to be as fast as the wiring proves clean.
 /// `test_signal_channel` is `Some(channel)` to drive each chip's internal square
 /// wave into that channel instead of the electrodes. See
 /// [`ads1298::Ads1298Device::enable_test_signal`].
@@ -141,27 +149,31 @@ pub(crate) fn bring_up<SpiA: SpiAnyPins + 'static, SpiB: SpiAnyPins + 'static>(
     spi_a: SpiA,
     spi_b: SpiB,
     wiring: [AdcChipWiring; DEVICE_COUNT],
-    baud_rate_hz: u32,
+    command_baud_rate_hz: u32,
+    frame_baud_rate_hz: u32,
     test_signal_channel: Option<Channel>,
 ) -> Result<FrontEnds> {
     // The ADS1298 samples DIN on the falling edge and shifts DOUT on the rising edge:
     // SPI mode 1 (CPOL=0, CPHA=1).
     //
-    // Interrupt-driven transactions, not polling. This is load-bearing given both
-    // pipeline threads share core 1 (see `chip_pipeline::spawn`): a polled
-    // transfer spins at priority without yielding, and its equal-priority sibling
-    // waits for a FreeRTOS tick boundary (1 ms — two whole sample periods) to run
-    // at all. Measured on the bench: polling doubled the per-chip miss rate to
-    // ~13.5% and multiplied bad-status reads tenfold, while saving only ~15 µs on
-    // an uncontended read. Blocking transfers let the two chips' reads interleave
-    // within the period, and the ~100 µs ISR turnaround is absorbed by it.
-    let spi_config = SpiConfig::new()
-        .baudrate(baud_rate_hz.Hz())
+    // Interrupt-driven transactions, not polling. A polled transfer spins at
+    // priority without yielding, starving whatever shares its core — measured on
+    // the bench as the per-chip miss rate doubling and bad-status reads rising
+    // tenfold, against ~15 µs saved on an uncontended read. Blocking transfers
+    // let reads interleave with everything else, and the ~100 µs ISR turnaround
+    // is absorbed by the sample period.
+    let command_config = SpiConfig::new()
+        .baudrate(command_baud_rate_hz.Hz())
+        .data_mode(MODE_1)
+        .polling(false);
+    let frame_config = SpiConfig::new()
+        .baudrate(frame_baud_rate_hz.Hz())
         .data_mode(MODE_1)
         .polling(false);
 
     let [wiring_a, wiring_b] = wiring;
-    let (front_end_a, power_down_a) = build_front_end(spi_a, wiring_a, &spi_config)?;
+    let (front_end_a, power_down_a) =
+        build_front_end(spi_a, wiring_a, &command_config, &frame_config)?;
     // Chip B's bus is initialised from a thread pinned to core 1, for two
     // interrupt placements that follow from where code runs rather than from any
     // config: the SPI host's completion interrupt is allocated on the core that
@@ -170,7 +182,8 @@ pub(crate) fn bring_up<SpiA: SpiAnyPins + 'static, SpiB: SpiAnyPins + 'static>(
     // `crate::cores` for the whole plan — because a read-completion or DRDY wake
     // that fires on the loaded core pays that core's interrupt load as added
     // latency before the cross-core hop.
-    let spi_config_b = spi_config.clone();
+    let command_config_b = command_config.clone();
+    let frame_config_b = frame_config.clone();
     let built_b =
         crate::cores::spawn_pinned(crate::cores::GPIO_INTERRUPT_DISPATCHER_CORE, || {
             std::thread::Builder::new()
@@ -178,7 +191,7 @@ pub(crate) fn bring_up<SpiA: SpiAnyPins + 'static, SpiB: SpiAnyPins + 'static>(
                 .stack_size(8192)
                 .spawn(move || {
                     esp_idf_svc::hal::gpio::enable_isr_service()?;
-                    build_front_end(spi_b, wiring_b, &spi_config_b)
+                    build_front_end(spi_b, wiring_b, &command_config_b, &frame_config_b)
                 })
         })??
         .join();
@@ -267,7 +280,9 @@ pub(crate) fn bring_up<SpiA: SpiAnyPins + 'static, SpiB: SpiAnyPins + 'static>(
         chip.device.read_data_continuous()?;
         chip.start_conversion()?;
     }
-    info!("ADS1298 pair: streaming at {baud_rate_hz} Hz SPI");
+    info!(
+        "ADS1298 pair: streaming, frame reads at {frame_baud_rate_hz} Hz SPI, commands at {command_baud_rate_hz} Hz"
+    );
 
     Ok(FrontEnds {
         chips,

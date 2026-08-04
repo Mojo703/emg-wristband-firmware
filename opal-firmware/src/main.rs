@@ -47,12 +47,22 @@ use protocol::{Frame, WakeState};
 use std::time::Instant;
 use transport::{Control, SerialTransport};
 
-/// SPI clock for the ADS1298 bus. One 27-byte frame has to clear well inside the
-/// 500 µs sample period at 2 kSPS. The old 2/4 MHz ID-read failures were the driver
-/// violating tSDECODE on multi-byte commands, not signal integrity — with burst
-/// framing in the driver, the bring-up bench read the ID 200/200 at every rate up to
-/// 4 MHz, and streamed at 2 MHz through the whole campaign.
-const ADC_SPI_BAUD_RATE_HZ: u32 = 2_000_000;
+/// SPI clock for ADS1298 registers and opcodes: the rate the bring-up bench
+/// validated end to end. Nothing on this path is latency-sensitive, so it stays
+/// put while the frame clock below is pushed.
+const ADC_COMMAND_SPI_BAUD_RATE_HZ: u32 = 2_000_000;
+
+/// SPI clock for RDATAC frame reads, the hot path: one 27-byte frame per chip
+/// must clear well inside the ~500 µs sample period, and every microsecond of
+/// transfer is DRDY edge-service budget. Data clocking carries no tSDECODE
+/// constraint (DIN is held low; 0x00 is not an opcode), so the ceiling is signal
+/// integrity. The bench survey (2026-08-03, product harness, 90 s cells) stepped
+/// the ladder watching the per-chip miss rate, bad-status counter, and recovery
+/// counter: 2 MHz ~3.5-4.6% missing, 4 MHz ~2.35%, 8 MHz ~0.9% with bad status
+/// at its lowest and zero recoveries. 16 MHz stayed integrity-clean but bought
+/// no further miss-rate gain — the residual is interrupt-service latency, not
+/// transfer time — so 8 MHz keeps the timing margin.
+const ADC_FRAME_SPI_BAUD_RATE_HZ: u32 = 8_000_000;
 
 /// Drive the ADS1298's internal square wave into this channel instead of the
 /// electrodes, shorting every other channel's input.
@@ -296,7 +306,8 @@ fn main() -> anyhow::Result<()> {
         peripherals.spi2,
         peripherals.spi3,
         adc_wiring,
-        ADC_SPI_BAUD_RATE_HZ,
+        ADC_COMMAND_SPI_BAUD_RATE_HZ,
+        ADC_FRAME_SPI_BAUD_RATE_HZ,
         ADC_TEST_SIGNAL_CHANNEL,
     )
     .and_then(|front_ends| adc::acquisition::start(front_ends, model.input_len, input_scale));

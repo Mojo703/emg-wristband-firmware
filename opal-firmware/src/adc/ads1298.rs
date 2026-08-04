@@ -241,7 +241,13 @@ const fn test_signal_channel_settings(driven: bool) -> ChannelSettings {
 /// between transactions so the chip's command decoder gets its reset edge
 /// (SBAS459K §9.5.1.1).
 pub(super) struct Ads1298Device {
-    spi: SpiDevice,
+    /// Register and opcode traffic, at the bench-validated command clock.
+    command_spi: SpiDevice,
+    /// RDATAC frame reads only — the hot path — at its own, faster clock. Data
+    /// clocking has no tSDECODE to honour (DIN stays low for the whole read, and
+    /// 0x00 is not a live opcode), so its rate is bounded by signal integrity
+    /// alone, not the command decoder.
+    frame_spi: SpiDevice,
     chip_select: PinDriver<'static, Output>,
     drdy: PinDriver<'static, Input>,
     reset_n: PinDriver<'static, Output>,
@@ -249,7 +255,8 @@ pub(super) struct Ads1298Device {
 
 impl Ads1298Device {
     pub(super) fn new(
-        spi: SpiDevice,
+        command_spi: SpiDevice,
+        frame_spi: SpiDevice,
         mut chip_select: PinDriver<'static, Output>,
         drdy: PinDriver<'static, Input>,
         mut reset_n: PinDriver<'static, Output>,
@@ -260,7 +267,8 @@ impl Ads1298Device {
         chip_select.set_high()?;
 
         Ok(Self {
-            spi,
+            command_spi,
+            frame_spi,
             chip_select,
             drdy,
             reset_n,
@@ -344,7 +352,7 @@ impl Ads1298Device {
     /// Helper for sending SPI commands
     fn send_command(&mut self, command: u8) -> Result<()> {
         self.with_selection(|device| {
-            device.spi.write(&[command])?;
+            device.command_spi.write(&[command])?;
             Ok(())
         })
     }
@@ -399,7 +407,7 @@ impl Ads1298Device {
         // Second byte is "number of registers - 1" (0x00 = one register). CS held for
         // the whole command, decode gaps between the bytes.
         self.with_selection(|device| {
-            device.spi.transaction(&mut [
+            device.command_spi.transaction(&mut [
                 Operation::Write(&[spi_commands::WREG_BASE | reg.addr()]),
                 Operation::DelayNs(COMMAND_DECODE_GAP_NANOSECONDS),
                 Operation::Write(&[0x00]),
@@ -414,7 +422,7 @@ impl Ads1298Device {
     pub(super) fn read_register(&mut self, reg: Register) -> Result<u8> {
         self.with_selection(|device| {
             let mut rx = [0u8; 1];
-            device.spi.transaction(&mut [
+            device.command_spi.transaction(&mut [
                 Operation::Write(&[spi_commands::RREG_BASE | reg.addr()]),
                 Operation::DelayNs(COMMAND_DECODE_GAP_NANOSECONDS),
                 Operation::Write(&[0x00]),
@@ -439,7 +447,7 @@ impl Ads1298Device {
         const DIN_LOW: [u8; FRAME_BYTES] = [0u8; FRAME_BYTES];
         self.with_selection(|device| {
             let mut raw = [0u8; FRAME_BYTES];
-            device.spi.transfer(&mut raw, &DIN_LOW)?;
+            device.frame_spi.transfer(&mut raw, &DIN_LOW)?;
             Ok(parse_sample(&raw))
         })
     }
