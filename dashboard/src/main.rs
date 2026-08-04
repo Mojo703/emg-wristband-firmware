@@ -28,7 +28,7 @@ mod registry;
 use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::State;
 use axum::response::Response;
-use axum::routing::get;
+use axum::routing::{delete, get, post};
 use axum::Router;
 use registry::Registry;
 use std::net::SocketAddr;
@@ -94,15 +94,26 @@ async fn main() -> anyhow::Result<()> {
     let camera_device = std::path::PathBuf::from(
         std::env::var("EMG_CAMERA_DEVICE").unwrap_or_else(|_| "/dev/video0".into()),
     );
-    let catalog = collect::beatmap::TrackCatalog::load(
-        std::path::Path::new(&collection_config),
-        &tracks_root,
-    )?;
+    let catalog_paths = collect::beatmap::CatalogPaths {
+        config_path: std::path::PathBuf::from(collection_config),
+        tracks_root,
+    };
+    let catalog = catalog_paths.load()?;
+    // What the host remembers across sessions: which board each device is
+    // soldered to, and how many times a subject has donned the band.
+    let provenance_store = collect::provenance::ProvenanceStore::load(
+        std::env::var("EMG_PROVENANCE_STORE")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| collect::provenance::default_path()),
+    );
     let collection = collect::manager::CollectionManager::new(
         catalog,
+        catalog_paths,
         camera_device,
+        camera_settings(),
         registry.clone(),
         sessions_root,
+        provenance_store,
     );
 
     let state = AppState {
@@ -119,6 +130,21 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/ws", get(browser_ws))
         .route("/collection/audio/:track_id", get(collection_audio))
+        .route("/collection/camera/preview", get(collection_camera_preview))
+        .route(
+            "/collection/tracks/import/upload",
+            post(import_uploaded_map).layer(axum::extract::DefaultBodyLimit::max(
+                collect::import::MAXIMUM_ARCHIVE_BYTES,
+            )),
+        )
+        .route(
+            "/collection/tracks/import/beatsaver",
+            post(import_beatsaver_map),
+        )
+        .route(
+            "/collection/tracks/:track_id",
+            delete(delete_collection_track),
+        )
         .fallback_service(static_files)
         .with_state(state)
         .layer(TraceLayer::new_for_http());
@@ -133,6 +159,48 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// What to ask the webcam for, from the environment. The default is 240p30:
+/// the video exists to check a hand against a label, so it is deliberately the
+/// smallest capture that answers that, and it keeps a session's video from
+/// dwarfing its EMG. A camera that does not offer the default mode is a setting
+/// away from working, which matters because the modes a camera offers cannot be
+/// known until one is plugged in.
+///
+/// `EMG_CAMERA_SIZE` is `WIDTHxHEIGHT`; a 16:9 camera with no 4:3 mode wants
+/// `426x240` or `640x360`. `EMG_CAMERA_INPUT_FORMAT` names a v4l2 pixel format
+/// and is worth setting to `mjpeg` for anything above 240p, since raw frames
+/// cost the USB bus in proportion to their size.
+fn camera_settings() -> collect::video::CameraSettings {
+    let default = collect::video::CameraSettings::default();
+    let (width, height) = std::env::var("EMG_CAMERA_SIZE")
+        .ok()
+        .and_then(|size| {
+            let (width, height) = size.split_once(['x', 'X'])?;
+            Some((width.trim().parse().ok()?, height.trim().parse().ok()?))
+        })
+        .unwrap_or((default.width, default.height));
+    let frames_per_second = std::env::var("EMG_CAMERA_FRAMERATE")
+        .ok()
+        .and_then(|rate| rate.trim().parse().ok())
+        .unwrap_or(default.frames_per_second);
+    let settings = collect::video::CameraSettings {
+        width,
+        height,
+        frames_per_second,
+        input_format: std::env::var("EMG_CAMERA_INPUT_FORMAT")
+            .ok()
+            .filter(|format| !format.trim().is_empty()),
+    };
+    tracing::info!(
+        "webcam capture: {width}x{height} at {frames_per_second} fps{}",
+        match &settings.input_format {
+            Some(format) => format!(" ({format})"),
+            None => String::new(),
+        }
+    );
+    settings
+}
+
 async fn browser_ws(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
     ws.on_upgrade(move |socket| {
         browser::handle_browser(
@@ -145,12 +213,129 @@ async fn browser_ws(ws: WebSocketUpgrade, State(state): State<AppState>) -> Resp
     })
 }
 
+/// A refused import or delete, as the browser sees it: one message, meant to be
+/// read by whoever tried the import rather than by whoever wrote the backend.
+struct RequestFailure(anyhow::Error);
+
+impl From<anyhow::Error> for RequestFailure {
+    fn from(error: anyhow::Error) -> RequestFailure {
+        RequestFailure(error)
+    }
+}
+
+impl axum::response::IntoResponse for RequestFailure {
+    fn into_response(self) -> Response {
+        let message = format!("{:#}", self.0);
+        tracing::warn!("collection track request failed: {message}");
+        (
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({ "error": message })),
+        )
+            .into_response()
+    }
+}
+
+/// Convert one map archive into a track and refresh the catalog, so the picker
+/// shows the new track without the backend restarting.
+async fn import_map_archive(
+    state: &AppState,
+    archive_bytes: Vec<u8>,
+) -> anyhow::Result<collect::import::ImportReport> {
+    let tracks_root = state.collection.tracks_root().to_path_buf();
+    let report = tokio::task::spawn_blocking(move || {
+        collect::import::import_archive(&archive_bytes, &tracks_root)
+    })
+    .await??;
+    state.collection.reload_catalog()?;
+    Ok(report)
+}
+
+/// Import a Beat Saber map zip uploaded from the browser.
+async fn import_uploaded_map(
+    State(state): State<AppState>,
+    archive_bytes: axum::body::Bytes,
+) -> Result<axum::Json<collect::import::ImportReport>, RequestFailure> {
+    Ok(axum::Json(
+        import_map_archive(&state, archive_bytes.to_vec()).await?,
+    ))
+}
+
+/// What the browser sends to import from BeatSaver: a key or a link to one.
+#[derive(serde::Deserialize)]
+struct BeatSaverRequest {
+    reference: String,
+}
+
+/// Import a Beat Saber map the backend downloads from BeatSaver.
+async fn import_beatsaver_map(
+    State(state): State<AppState>,
+    axum::Json(request): axum::Json<BeatSaverRequest>,
+) -> Result<axum::Json<collect::import::ImportReport>, RequestFailure> {
+    let key = collect::import::BeatSaverKey::parse(&request.reference)?;
+    let archive_bytes = collect::import::download_map(&key).await?;
+    let report = import_map_archive(&state, archive_bytes)
+        .await
+        .map_err(|error| anyhow::anyhow!("BeatSaver map {key}: {error:#}"))?;
+    Ok(axum::Json(report))
+}
+
+/// Remove one track from the library.
+async fn delete_collection_track(
+    axum::extract::Path(track_id): axum::extract::Path<String>,
+    State(state): State<AppState>,
+) -> Result<axum::Json<serde_json::Value>, RequestFailure> {
+    collect::import::delete_track(&track_id, state.collection.tracks_root())?;
+    state.collection.reload_catalog()?;
+    Ok(axum::Json(serde_json::json!({ "id": track_id })))
+}
+
+/// Stream the camera to the setup form's preview as motion JPEG, which an
+/// `<img>` renders with no decoding of our own. The response body owns the
+/// preview: when the browser stops reading it, the hold drops and the camera is
+/// released.
+async fn collection_camera_preview(State(state): State<AppState>) -> Response {
+    use axum::response::IntoResponse;
+    let (hold, parts) = match state.collection.start_camera_preview().await {
+        Ok(preview) => preview,
+        Err(error) => return RequestFailure(error).into_response(),
+    };
+    // The hold rides inside the stream's state, so it is dropped exactly when
+    // the response body is — end of stream, or the browser disconnecting.
+    let body = axum::body::Body::from_stream(futures_util::stream::unfold(
+        (parts, hold),
+        |(mut parts, hold)| async move {
+            parts
+                .recv()
+                .await
+                .map(|part| (Ok::<_, std::convert::Infallible>(part), (parts, hold)))
+        },
+    ));
+    (
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                format!(
+                    "multipart/x-mixed-replace; boundary={}",
+                    collect::video::PREVIEW_BOUNDARY
+                ),
+            ),
+            (axum::http::header::CACHE_CONTROL, "no-store".to_string()),
+        ],
+        body,
+    )
+        .into_response()
+}
+
 /// Serve a catalog track's audio to the game's `<audio>` element.
+/// Served through `ServeFile` for its range support: the game seeks the audio
+/// element when a paused session resumes, and a browser will not seek a source
+/// that answers a `Range` request with the whole body.
 async fn collection_audio(
     axum::extract::Path(track_id): axum::extract::Path<String>,
     State(state): State<AppState>,
+    request: axum::extract::Request,
 ) -> Response {
-    use axum::http::{header, StatusCode};
+    use axum::http::StatusCode;
     use axum::response::IntoResponse;
     let Some(path) = state.collection.audio_path(&protocol::TrackId(track_id)) else {
         return StatusCode::NOT_FOUND.into_response();
@@ -162,8 +347,11 @@ async fn collection_audio(
         Some("wav") => "audio/wav",
         _ => "application/octet-stream",
     };
-    match tokio::fs::read(&path).await {
-        Ok(bytes) => ([(header::CONTENT_TYPE, content_type)], bytes).into_response(),
+    match ServeFile::new_with_mime(&path, &content_type.parse().expect("static mime type"))
+        .try_call(request)
+        .await
+    {
+        Ok(response) => response.into_response(),
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
 }

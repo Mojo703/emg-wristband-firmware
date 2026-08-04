@@ -42,9 +42,13 @@ async fn device_session(
     transport: DeviceTransport,
 ) {
     // A connection is anonymous until it identifies itself.
-    let (device_id, config) = loop {
+    let (device_id, config, provenance) = loop {
         match incoming.recv().await {
-            Some(Frame::DeviceHello { device_id, config }) => break (device_id, config),
+            Some(Frame::DeviceHello {
+                device_id,
+                config,
+                provenance,
+            }) => break (device_id, config, provenance),
             Some(_) => continue, // ignore data frames before identity
             None => return,      // closed before identifying
         }
@@ -58,7 +62,13 @@ async fn device_session(
         frames,
         mut control_rx,
         token,
-    } = registry.register(device_id.clone(), device_id.clone(), transport, config);
+    } = registry.register(
+        device_id.clone(),
+        device_id.clone(),
+        transport,
+        config,
+        provenance,
+    );
 
     // Forward control frames (browser → device) to the transport writer.
     let control_task = tokio::spawn(async move {
@@ -72,7 +82,9 @@ async fn device_session(
     while let Some(frame) = incoming.recv().await {
         match frame {
             // Re-announced config (e.g. after honoring a SetSensitivity).
-            Frame::DeviceHello { config, .. } => registry.update_config(&device_id, token, config),
+            Frame::DeviceHello {
+                config, provenance, ..
+            } => registry.update_config(&device_id, token, config, provenance),
             // Everything else is a data frame to fan out. `send` errs only when no
             // browser is subscribed, which is fine — drop it. Logs are additionally
             // retained so a browser opened later still sees them.

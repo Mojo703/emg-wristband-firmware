@@ -313,7 +313,10 @@ mod tests {
         let code = code_for(65_000.0);
         let out = wire_time_step(&[Some(sample_with([code; 8], STATUS_MARKER)), None]);
         let microvolts = out[0] as f32 * MICROVOLTS_PER_WIRE_COUNT;
-        assert!((microvolts - 65_000.0).abs() < 10.0, "{microvolts}");
+        assert!(
+            (microvolts - 65_000.0).abs() < MICROVOLTS_PER_WIRE_COUNT,
+            "{microvolts}"
+        );
     }
 
     #[test]

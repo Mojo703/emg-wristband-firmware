@@ -14,8 +14,8 @@
 //! | `emg.i16` | The raw stream: little-endian `i16`, channel-major per window, windows concatenated in `seq` order, exactly as received in `Frame::Emg`. Never windowed, never filtered. Raw ADC counts; [`HardwareIdentity::scale_uv`] is the µV per count they convert back with. |
 //! | `emg.missing` | The windows' `Frame::Emg::missing` bit planes, concatenated in the same window order as `emg.i16` (see the protocol crate for the plane layout). A set bit marks that source's samples at that step as aligner-gap placeholders, not measurements. Absent or short means no gap information — read as all-data. |
 //! | `events.jsonl` | One [`SessionEvent`] as JSON per line, in time order. Self-contained: a windowing tool needs nothing else to label `emg.i16`. |
-//! | `session.json` | The [`SessionManifest`]: tags, hardware identity, track, goal. |
-//! | `video.mkv` | Webcam capture, present when the camera ran. |
+//! | `session.json` | The [`SessionManifest`]: tags, hardware identity and provenance, track, goal. |
+//! | `video.mkv` | Webcam capture, present when the session asked for video ([`SessionManifest::record_video`]). |
 //! | `placement.jpg` | Webcam still of the donned band, present when captured. |
 //!
 //! A discarded session's directory is deleted whole.
@@ -27,11 +27,20 @@
 //! (device microseconds) rides along inside `emg.i16`'s source frames and is
 //! bridged by [`SessionEvent::EmgWindow`] records, which pair `seq` with the
 //! backend receive time.
+//!
+//! A session plays in one or more segments. [`SessionEvent::TrackStarted`]
+//! anchors the first; each [`SessionEvent::Paused`] ends a segment and the
+//! [`SessionEvent::Resumed`] after it anchors the next, carrying both the
+//! instant and the track position it restarted from. Cue events always carry
+//! absolute instants, so a tool that only reads [`SessionEvent::Cue`] needs none
+//! of this; the pause records are what explain the discontinuity between
+//! segments and the samples in the interval that no cue covers.
 
 use protocol::{
-    Beatmap, ClassId, CollectionSummary, DeviceConfig, DeviceTransport, DifficultyLevel,
-    FileReport, NoteIndex, OffsetMilliseconds, SessionId, SessionMetadata, StreamProgress, TrackId,
-    TrackInfo, UnixMilliseconds,
+    Beatmap, BoardRevision, ClassId, CollectionSummary, DeviceConfig, DeviceProvenance,
+    DeviceTransport, DifficultyLevel, DurationMilliseconds, FileReport, NoteIndex,
+    OffsetMilliseconds, RecordedEmg, SessionId, SessionMetadata, StreamProgress, TrackId,
+    TrackInfo, TrackMilliseconds, UnixMilliseconds,
 };
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -51,6 +60,15 @@ pub struct HardwareIdentity {
     pub scale_uv: f32,
     /// The device's full functional config at session start, verbatim.
     pub device_config: DeviceConfig,
+    /// What the device reported about itself: the firmware build that produced
+    /// this session and the front-end registers it was actually converting with,
+    /// read back off the chips. `device_config` is what the user chose;
+    /// this is what the rig was.
+    pub provenance: DeviceProvenance,
+    /// The board and harness the operator has recorded for this device id, or
+    /// `None` if nobody has said yet — an unanswered question rather than a
+    /// guess at which revision was on the bench.
+    pub board_revision: Option<BoardRevision>,
 }
 
 /// `session.json`: written when the session starts, rewritten with `completed:
@@ -68,6 +86,16 @@ pub struct SessionManifest {
     /// Collection class ids in catalog order; cue events refer to these. The
     /// session's column→class binding is a seeded rotation of this list.
     pub class_ids: Vec<ClassId>,
+    /// Which don of this subject's arm the session was recorded on: one higher
+    /// than the highest the backend has ever issued for that subject and arm, so
+    /// every session counts as its own don. The `donned` stamp in `metadata` says
+    /// when the band went on; this says how far into the run it is, which no
+    /// single session can know.
+    pub don_count: u32,
+    /// Whether the operator asked for webcam video. A session recorded without
+    /// it says so here, so a missing `video.mkv` is a decision on the record
+    /// rather than an absence to be guessed at.
+    pub record_video: bool,
     pub completed: bool,
 }
 
@@ -102,6 +130,32 @@ pub enum SessionEvent {
     },
     /// The activity detector saw muscle activity inside a cue's timing window.
     ActivityHit {
+        note_index: NoteIndex,
+        at: UnixMilliseconds,
+    },
+    /// The cue timeline froze because the device stopped sending EMG. Nothing
+    /// between here and the matching [`SessionEvent::Resumed`] was cued, so any
+    /// samples recorded in that interval carry no label.
+    Paused {
+        at: UnixMilliseconds,
+        /// Where the track stood when it froze.
+        track_position: TrackMilliseconds,
+        /// How long the device had been silent when the pause was declared.
+        silent_for: DurationMilliseconds,
+        device_id: String,
+    },
+    /// Audio resumed and the cue timeline restarted. `at` paired with
+    /// `track_position` is this play segment's anchor: every later cue's wall
+    /// clock time is `at - track_position + note position`.
+    Resumed {
+        at: UnixMilliseconds,
+        track_position: TrackMilliseconds,
+        paused_for: DurationMilliseconds,
+    },
+    /// A pause landed inside this cue's hold, so the gesture was only asked for
+    /// from the [`SessionEvent::Cue`]'s `at` until here, not until its
+    /// `release`. The cue is not re-issued after the resume.
+    CueInterrupted {
         note_index: NoteIndex,
         at: UnixMilliseconds,
     },
@@ -145,6 +199,10 @@ pub trait SessionRecorder: Send {
 
     /// Bytes of `emg.i16` on disk, and whether they grew since the last call.
     fn health(&mut self) -> StreamProgress;
+
+    /// Samples per channel the event log accounts for, with the rate they were
+    /// taken at — the operator's live proof that data is landing.
+    fn recorded_emg(&self) -> RecordedEmg;
 
     /// Windows missed so far, counted from `seq` discontinuities.
     fn emg_gap_count(&self) -> u32;

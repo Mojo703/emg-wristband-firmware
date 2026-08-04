@@ -27,7 +27,7 @@
   // anchor, taken from the element's own `playing` event — the first moment audio
   // is actually audible) and the seek that rejoins that anchor after a remount.
   import { onMount } from 'svelte';
-  import { on } from '../socket.svelte';
+  import { live, on } from '../socket.svelte';
   import { theme } from '../theme.svelte';
   import Icon from '../Icon.svelte';
   import { Button } from '$lib/components/ui/button/index.js';
@@ -50,10 +50,14 @@
     beatmap: BeatmapFrame;
     phase: PlayablePhase;
     onTrackStarted: (atUnixMilliseconds: UnixMilliseconds) => void;
+    onTrackResumed: (
+      atUnixMilliseconds: UnixMilliseconds,
+      positionMilliseconds: TrackMilliseconds,
+    ) => void;
     onFinish: () => void;
   }
 
-  let { catalog, beatmap, phase, onTrackStarted, onFinish }: Props = $props();
+  let { catalog, beatmap, phase, onTrackStarted, onTrackResumed, onFinish }: Props = $props();
 
   let canvas: HTMLCanvasElement | undefined = $state(undefined);
   let audio: HTMLAudioElement | undefined = $state(undefined);
@@ -102,14 +106,35 @@
 
   const durationMilliseconds = $derived(beatmap.track.duration);
   const recording = $derived(phase.recording);
+  // The backend froze the cue timeline. It stays frozen until this page reports
+  // audio playing again, so nothing here may quietly clear it.
+  const paused = $derived(phase.name === 'playing' ? phase.paused : null);
+  // The backend pauses; this page's audio element follows it.
+  $effect(() => {
+    if (paused !== null && audio !== undefined && !audio.paused) audio.pause();
+  });
+
+  const electrodes = $derived.by((): string | null => {
+    const quality = live.signalQuality;
+    if (quality === null) return null;
+    const limit = quality.noise_floor_limit_microvolts;
+    const railed = quality.channels.filter((channel) => channel.saturated_fraction > 0.5).length;
+    const quiet = quality.channels.filter(
+      (channel) => channel.saturated_fraction <= 0.5 && channel.noise_floor_microvolts <= limit,
+    ).length;
+    const leadOff = quality.channels.filter((channel) => channel.lead_off === true).length;
+    return `${quiet}/${quality.channels.length} under ${limit.toFixed(0)} µV · ${railed} railed · ${leadOff} lead-off`;
+  });
 
   // Which overlay the field needs, if any. Every case is a phase the operator can
   // legitimately arrive in, including arriving late:
   //
   //   start    armed, audio not yet asked for — the first user gesture.
   //   resume   playing, this session's anchor is known, audio is not running.
-  //            Also covers a deliberate pause: the backend never pauses, so
-  //            resuming has to seek forward to where the session actually is.
+  //            Either the backend froze the timeline on a stall, in which case
+  //            resuming plays from where it froze, or the operator paused local
+  //            audio while the session kept scoring, in which case resuming
+  //            seeks forward to where the session actually is.
   //   late     playing, but the anchor is gone (a page reload cleared module
   //            scope). There is no way to place the field on the real timeline, so
   //            it is not drawn at all — a wrong timeline is worse than none.
@@ -291,10 +316,14 @@
     });
   }
 
-  /** Rejoins a session already in progress. The backend kept scoring while this
-   * component was unmounted (or while audio was paused), so playback has to pick
-   * up at the elapsed position rather than at zero. A little seek drift is fine;
-   * restarting the track is not. */
+  // Set when a resume out of a backend pause is in flight, so `onPlaying` knows
+  // to report the new anchor rather than treating the event as ordinary.
+  let reportResumeAnchor = false;
+
+  /** Rejoins a session already in progress. Out of a backend pause the track
+   * resumes from where the backend froze it; otherwise the backend kept scoring
+   * while this component was unmounted, so playback picks up at the elapsed
+   * position. A little seek drift is fine; restarting the track is not. */
   function resume(): void {
     if (audio === undefined || sessionAudioStart === null) return;
     ensureClickContext();
@@ -302,13 +331,18 @@
     // it lands rather than machine-gunning everything in between.
     nextClickIndex = null;
     nextBeatIndex = null;
-    const elapsedSeconds = Math.max(0, (nowUnixMilliseconds() - sessionAudioStart) / 1000);
+    const targetSeconds =
+      paused !== null
+        ? paused.track_position / 1000
+        : Math.max(0, (nowUnixMilliseconds() - sessionAudioStart) / 1000);
     audio.currentTime = Number.isFinite(audio.duration)
-      ? Math.min(elapsedSeconds, audio.duration)
-      : elapsedSeconds;
+      ? Math.min(targetSeconds, audio.duration)
+      : targetSeconds;
+    reportResumeAnchor = paused !== null;
     // Also a click handler, so the same autoplay allowance applies. On rejection
     // `playing` stays false and the resume gate simply stays up.
     void audio.play().catch((error: unknown) => {
+      reportResumeAnchor = false;
       console.warn('audio refused to resume', error);
     });
   }
@@ -318,7 +352,19 @@
     // Fires on every resume too. The module-scope record — not a component flag —
     // decides whether this session's anchor has already been sent, so a remount
     // cannot produce a second `track_started`.
-    if (recordedAudioStart(beatmap.session_id) !== null) return;
+    if (recordedAudioStart(beatmap.session_id) !== null) {
+      if (!reportResumeAnchor) return;
+      reportResumeAnchor = false;
+      // Both halves read at the same instant: the backend re-derives the anchor
+      // from them, so wherever the seek actually landed is where the cues go.
+      // Rounded: the wire type is an integer, and cbor-x encodes a fractional
+      // JS number as a float the backend refuses.
+      onTrackResumed(
+        nowUnixMilliseconds(),
+        asTrackMilliseconds(Math.round((audio?.currentTime ?? 0) * 1000)),
+      );
+      return;
+    }
     const at = nowUnixMilliseconds();
     audioStart = { sessionId: beatmap.session_id, at };
     sessionAudioStart = at;
@@ -352,6 +398,17 @@
     return stream.advancing ? 'live' : 'stalled';
   }
 
+  /** Sample counts run to the millions, where digit-by-digit is unreadable. */
+  function samples(count: number): string {
+    if (count < 1000) return `${count}`;
+    if (count < 1_000_000) return `${(count / 1000).toFixed(1)}k`;
+    return `${(count / 1_000_000).toFixed(2)}M`;
+  }
+
+  function silence(milliseconds: number): string {
+    return `${(milliseconds / 1000).toFixed(1)} s`;
+  }
+
   /** Audio is fetched over plain HTTP, not the socket. */
   function audioSource(trackId: string): string {
     return `/collection/audio/${encodeURIComponent(trackId)}`;
@@ -373,16 +430,30 @@
 
     <span class="spacer"></span>
 
-    <!-- Recording health, straight from the phase: a dot per stream the backend
-         says it is writing. Green means advancing on disk; red means it stopped. -->
+    <!-- What is on disk, straight from the phase. The figures are the point: a
+         number that stops climbing is the failure, and a dot is not. -->
     <span class="health muted">
-      <span class="dot-label">
-        <span class="status-dot" data-state={streamState(recording.emg)}></span>rec EMG
-      </span>
+      {#if recording.recorded === null}
+        <!-- A session with no device: the game plays on the real schedule and
+             nothing reaches disk, which is exactly what must not go unnoticed. -->
+        <strong class="practice">PRACTICE — nothing is being recorded</strong>
+      {:else}
+        <span class="dot-label">
+          <span class="status-dot" data-state={streamState(recording.emg)}></span>rec EMG
+          <span class="numeric"
+            >{clock((1000 * recording.recorded.samples_per_channel) /
+              recording.recorded.sample_rate)}</span
+          >
+          <span class="numeric">{samples(recording.recorded.samples_per_channel)} samples</span>
+        </span>
+      {/if}
       {#if recording.video !== null}
         <span class="dot-label">
           <span class="status-dot" data-state={streamState(recording.video)}></span>rec video
         </span>
+      {/if}
+      {#if electrodes !== null}
+        <span class="numeric">{electrodes}</span>
       {/if}
     </span>
 
@@ -444,10 +515,24 @@
           <Icon name="play" size={18} />
           Resume
         </Button>
-        <p class="muted">
-          The session kept running. Audio picks up where it actually is, not from the
-          beginning.
-        </p>
+        {#if paused !== null}
+          <p>
+            <strong>Paused: {paused.device_id} stopped sending data</strong> after
+            {silence(paused.silent_for)} of silence, at {clock(paused.track_position)}.
+          </p>
+          <p class="muted">
+            {#if paused.device_recovered}
+              Data is arriving again. Resume picks up from {clock(paused.track_position)}.
+            {:else}
+              Still nothing arriving. Everything up to the pause is recorded.
+            {/if}
+          </p>
+        {:else}
+          <p class="muted">
+            The session kept running. Audio picks up where it actually is, not from the
+            beginning.
+          </p>
+        {/if}
       </div>
     {:else if ended}
       <!-- The backend owns the schedule and moves to review on its own; the field
@@ -500,6 +585,9 @@
     display: inline-flex;
     align-items: center;
     gap: 6px;
+  }
+  .practice {
+    color: var(--log-warn);
   }
   .confirm {
     display: inline-flex;

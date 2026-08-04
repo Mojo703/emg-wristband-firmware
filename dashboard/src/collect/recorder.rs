@@ -26,7 +26,7 @@
 
 use super::interfaces::{EmgWindow, SessionEvent, SessionManifest, SessionRecorder};
 use anyhow::Context;
-use protocol::{CollectionSummary, FileReport, StreamProgress, UnixMilliseconds};
+use protocol::{CollectionSummary, FileReport, RecordedEmg, StreamProgress, UnixMilliseconds};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -292,6 +292,14 @@ impl SessionRecorder for FileSessionRecorder {
         }
     }
 
+    fn recorded_emg(&self) -> RecordedEmg {
+        let channels = u64::from(self.manifest.hardware.channels).max(1);
+        RecordedEmg {
+            samples_per_channel: self.emg_bytes_described / 2 / channels,
+            sample_rate: self.manifest.hardware.sample_rate,
+        }
+    }
+
     fn emg_gap_count(&self) -> u32 {
         self.emg_gap_count
     }
@@ -319,8 +327,9 @@ impl SessionRecorder for FileSessionRecorder {
 mod tests {
     use super::*;
     use protocol::{
-        ActivityId, Arm, BeatsPerMinute, ClassId, Degrees, DeviceConfig, DeviceTransport,
-        DifficultyLevel, DurationMilliseconds, Millimeters, SessionId, SessionMetadata, SubjectId,
+        ActivityId, AnalogFrontEnd, Arm, BeatsPerMinute, BoardRevision, ClassId, Degrees,
+        DeviceConfig, DeviceProvenance, DeviceTransport, DifficultyLevel, DurationMilliseconds,
+        FirmwareBuild, Millimeters, RegisterReadback, SessionId, SessionMetadata, SubjectId,
         SweatId, TrackId, TrackInfo,
     };
     use std::collections::BTreeMap;
@@ -359,7 +368,28 @@ mod tests {
                     tau: 0.8,
                     needed: 3,
                 },
+                provenance: DeviceProvenance {
+                    firmware: FirmwareBuild {
+                        crate_version: "0.1.0".to_string(),
+                        git_commit: "34370e7".to_string(),
+                        working_tree_modified: false,
+                        built_at: "2026-08-04T11:22:33Z".to_string(),
+                    },
+                    analog_front_ends: vec![AnalogFrontEnd {
+                        chip: 0,
+                        registers: vec![RegisterReadback {
+                            name: "CONFIG1".to_string(),
+                            address: 0x01,
+                            value: Some(0xC4),
+                        }],
+                    }],
+                },
+                board_revision: Some(BoardRevision {
+                    board: "rev A bodged".to_string(),
+                    harness: "ribbon 2".to_string(),
+                }),
             },
+            don_count: 3,
             difficulty: DifficultyLevel::Medium,
             track: TrackInfo {
                 id: TrackId("metronome".to_string()),
@@ -367,6 +397,7 @@ mod tests {
                 beats_per_minute: BeatsPerMinute(NonZeroU16::new(120).unwrap()),
                 duration: DurationMilliseconds::new(60_000),
             },
+            record_video: true,
             class_ids: vec![
                 ClassId("index_pinch".to_string()),
                 ClassId("fist".to_string()),

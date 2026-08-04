@@ -77,8 +77,71 @@ pub(super) enum Register {
 }
 
 impl Register {
+    /// The whole map in address order — what a provenance snapshot walks.
+    pub(super) const ALL: [Register; 26] = [
+        Register::Id,
+        Register::Config1,
+        Register::Config2,
+        Register::Config3,
+        Register::Loff,
+        Register::Ch1Set,
+        Register::Ch2Set,
+        Register::Ch3Set,
+        Register::Ch4Set,
+        Register::Ch5Set,
+        Register::Ch6Set,
+        Register::Ch7Set,
+        Register::Ch8Set,
+        Register::RldSensP,
+        Register::RldSensN,
+        Register::LoffSensP,
+        Register::LoffSensN,
+        Register::LoffFlip,
+        Register::LoffStatP,
+        Register::LoffStatN,
+        Register::Gpio,
+        Register::Pace,
+        Register::Resp,
+        Register::Config4,
+        Register::Wct1,
+        Register::Wct2,
+    ];
+
     pub(super) const fn addr(self) -> u8 {
         self as u8
+    }
+
+    /// The datasheet's own name for this register (SBAS459K §9.6), so a snapshot
+    /// off the wire reads as the register map rather than as addresses.
+    pub(super) const fn name(self) -> &'static str {
+        match self {
+            Register::Id => "ID",
+            Register::Config1 => "CONFIG1",
+            Register::Config2 => "CONFIG2",
+            Register::Config3 => "CONFIG3",
+            Register::Loff => "LOFF",
+            Register::Ch1Set => "CH1SET",
+            Register::Ch2Set => "CH2SET",
+            Register::Ch3Set => "CH3SET",
+            Register::Ch4Set => "CH4SET",
+            Register::Ch5Set => "CH5SET",
+            Register::Ch6Set => "CH6SET",
+            Register::Ch7Set => "CH7SET",
+            Register::Ch8Set => "CH8SET",
+            Register::RldSensP => "RLD_SENSP",
+            Register::RldSensN => "RLD_SENSN",
+            Register::LoffSensP => "LOFF_SENSP",
+            Register::LoffSensN => "LOFF_SENSN",
+            Register::LoffFlip => "LOFF_FLIP",
+            Register::LoffStatP => "LOFF_STATP",
+            Register::LoffStatN => "LOFF_STATN",
+            Register::Gpio => "GPIO",
+            Register::Pace => "PACE",
+            Register::Resp => "RESP",
+            Register::Config4 => "CONFIG4",
+            Register::Wct1 => "WCT1",
+            Register::Wct2 => "WCT2",
+        }
     }
 
     /// The CHnSET register for a channel. CH1SET..CH8SET are eight consecutive

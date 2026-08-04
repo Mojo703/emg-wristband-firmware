@@ -11,7 +11,5 @@ dist/
 documentation/
 # JetBrains project files (RustRover).
 .idea/
-# Catalog audio is personal music ingested locally; it never gets committed.
-dashboard/config/*.ogg
-# Python virtual environments (e.g. dashboard/tools/.venv).
+# Python virtual environments (e.g. pose-service/.venv).
 .venv/

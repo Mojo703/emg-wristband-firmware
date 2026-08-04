@@ -9,6 +9,8 @@
 name = "dashboard"
 version = "0.1.0"
 edition = "2021"
+# `session_report` is the second binary; a bare `cargo run` serves the dashboard.
+default-run = "dashboard"
 
 [dependencies]
 protocol = { path = "../protocol" }
@@ -24,6 +26,9 @@ futures-util = "0.3"
 
 ciborium = "0.2"
 anyhow = "1"
+# Stopping the webcam's ffmpeg needs SIGINT, so it finalizes the container
+# rather than dying mid-write; std has no signal call.
+libc = "0.2"
 if-addrs = "0.15.0"
 
 # Collection sessions: session.json manifest and the events.jsonl label log.
@@ -31,3 +36,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Session directory names use local civil time per the interfaces.rs layout doc.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+# Track import: Beat Saber map archives are zips, and BeatSaver serves them over
+# HTTPS. rustls rather than native-tls, so a fresh clone needs no system TLS
+# headers — tokio-tungstenite already pulls rustls in.
+zip = { version = "8", default-features = false, features = ["deflate"] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls-native-roots",
+    "json",
+] }

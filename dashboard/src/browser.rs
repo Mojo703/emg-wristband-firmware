@@ -6,6 +6,7 @@ use crate::frame;
 use crate::looks;
 use crate::registry::Registry;
 use axum::extract::ws::{Message, WebSocket};
+use dashboard::signal_quality::SignalQualityMonitor;
 use futures_util::{SinkExt, StreamExt};
 use protocol::Frame;
 use std::collections::{HashMap, VecDeque};
@@ -34,6 +35,7 @@ enum LiveKind {
     Emg,
     Prediction,
     Pose,
+    SignalQuality,
     /// Keyed per emitting source: two sources' reports are different data, so
     /// one must not coalesce the other away — only a newer report from the
     /// same source may.
@@ -49,6 +51,7 @@ struct LatestLive {
     emg: Option<Message>,
     prediction: Option<Message>,
     pose: Option<Message>,
+    signal_quality: Option<Message>,
     telemetry: HashMap<String, Message>,
     other: Option<Message>,
 }
@@ -59,6 +62,7 @@ impl LatestLive {
             LiveKind::Emg => self.emg = Some(message),
             LiveKind::Prediction => self.prediction = Some(message),
             LiveKind::Pose => self.pose = Some(message),
+            LiveKind::SignalQuality => self.signal_quality = Some(message),
             LiveKind::Telemetry(source) => {
                 self.telemetry.insert(source, message);
             }
@@ -67,10 +71,16 @@ impl LatestLive {
     }
 
     fn drain(self) -> impl Iterator<Item = Message> {
-        [self.emg, self.prediction, self.pose, self.other]
-            .into_iter()
-            .flatten()
-            .chain(self.telemetry.into_values())
+        [
+            self.emg,
+            self.prediction,
+            self.pose,
+            self.signal_quality,
+            self.other,
+        ]
+        .into_iter()
+        .flatten()
+        .chain(self.telemetry.into_values())
     }
 }
 
@@ -98,7 +108,12 @@ fn send(tx: &mpsc::Sender<Out>, out: Out) -> Result<(), BrowserGone> {
 /// `Selection` carrying its config and cosmetic projection together — the wire
 /// type makes a selection-without-config unrepresentable, so this function no
 /// longer needs to keep three fields consistent by hand.
-fn view(registry: &Registry, selected: Option<&str>, device_port: u16) -> Frame {
+fn view(
+    registry: &Registry,
+    collection: &crate::collect::manager::CollectionManager,
+    selected: Option<&str>,
+    device_port: u16,
+) -> Frame {
     let selection = selected.and_then(|device_id| {
         let config = registry.config_of(device_id)?;
         let classes = looks::classes_for(&config);
@@ -106,6 +121,8 @@ fn view(registry: &Registry, selected: Option<&str>, device_port: u16) -> Frame 
             device_id: device_id.to_string(),
             config,
             classes,
+            provenance: registry.provenance_of(device_id)?,
+            board_revision: collection.board_revision(device_id),
         })
     });
     Frame::Hello {
@@ -236,6 +253,20 @@ fn reconcile(registry: &Registry, selection: &mut DeviceSelection) {
     };
 }
 
+/// Restart the signal-quality monitor when the selection moves: another device's
+/// channel 3 is not this one's, and its buffered history says nothing about it.
+fn follow_selection(
+    monitor: &mut SignalQualityMonitor,
+    viewing: &mut Option<String>,
+    selection: &DeviceSelection,
+) {
+    let selected = selection.device_id().map(str::to_string);
+    if *viewing != selected {
+        *viewing = selected;
+        monitor.reset();
+    }
+}
+
 /// Next data frame from the selected device, or pend forever when no stream is
 /// live (a `changed` notification drives reselection instead). A closed
 /// broadcast downgrades `Streaming` to `Selected` — the preference outlives
@@ -316,9 +347,13 @@ pub async fn handle_browser(
 
     let mut selection = DeviceSelection::None;
     reconcile(&registry, &mut selection);
+    let mut signal_quality = SignalQualityMonitor::new();
+    let mut viewing: Option<String> = None;
+    follow_selection(&mut signal_quality, &mut viewing, &selection);
     let mut changed = registry.watch();
     let hello = Message::Binary(frame::encode(&view(
         &registry,
+        &collection,
         selection.device_id(),
         device_port,
     )));
@@ -358,7 +393,8 @@ pub async fn handle_browser(
                         Frame::SelectDevice { device_id } => {
                             selection = DeviceSelection::Selected { device_id };
                             reconcile(&registry, &mut selection);
-                            let hello = Message::Binary(frame::encode(&view(&registry, selection.device_id(), device_port)));
+                            follow_selection(&mut signal_quality, &mut viewing, &selection);
+                            let hello = Message::Binary(frame::encode(&view(&registry, &collection, selection.device_id(), device_port)));
                             if send(&browser_tx, Out::Reliable(hello)).is_err() {
                                 break;
                             }
@@ -370,6 +406,16 @@ pub async fn handle_browser(
                             // so nothing else to do here.
                             registry.dismiss(&device_id);
                         }
+                        // The board a device is soldered to is host knowledge:
+                        // remembered here, echoed straight back so the form shows
+                        // what was stored rather than what was typed.
+                        Frame::SetBoardRevision { device_id, revision } => {
+                            collection.set_board_revision(&device_id, revision);
+                            let hello = Message::Binary(frame::encode(&view(&registry, &collection, selection.device_id(), device_port)));
+                            if send(&browser_tx, Out::Reliable(hello)).is_err() {
+                                break;
+                            }
+                        }
                         // Forward control frames to the selected device.
                         control @ (Frame::SetSensitivity { .. }
                         | Frame::SetKeymap { .. }
@@ -380,15 +426,19 @@ pub async fn handle_browser(
                             }
                         }
                         // Collection control frames go to the session manager.
-                        Frame::StartCollection { metadata, track_id, difficulty } => {
+                        Frame::StartCollection { metadata, track_id, difficulty, record_video } => {
                             collection.start_collection(
                                 metadata,
                                 track_id,
                                 difficulty,
+                                record_video,
                                 selection.device_id().map(str::to_string),
                             );
                         }
                         Frame::TrackStarted { at_unix_ms } => collection.track_started(at_unix_ms),
+                        Frame::TrackResumed { at_unix_ms, position_ms } => {
+                            collection.track_resumed(at_unix_ms, position_ms)
+                        }
                         Frame::FinishCollection {} => collection.finish_collection(),
                         Frame::StopCollection { save } => collection.stop_collection(save),
                         Frame::CapturePlacementPhoto {} => collection.capture_placement_photo(),
@@ -409,6 +459,22 @@ pub async fn handle_browser(
                     q.push_back(frame.clone());
                     drop(q);
                     notify.notify_one();
+                }
+                // The electrode check reads the same two streams the browser is
+                // shown, and emits its own frame about once a second.
+                match &frame {
+                    Frame::Emg { .. } => {
+                        if let Some(report) = signal_quality.accept_emg(&frame) {
+                            let msg = Message::Binary(frame::encode(&report));
+                            if send(&browser_tx, Out::Live(LiveKind::SignalQuality, msg)).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Frame::Telemetry { source, metrics, .. } => {
+                        signal_quality.accept_telemetry(source, metrics)
+                    }
+                    _ => {}
                 }
                 // Discrete events must not be coalesced away; the timeseries may be.
                 let msg = Message::Binary(frame::encode(&frame));
@@ -442,7 +508,8 @@ pub async fn handle_browser(
                 // A device came or went: keep a valid selection (and a fresh
                 // subscription — reconcile resubscribes) and refresh the picker.
                 reconcile(&registry, &mut selection);
-                let hello = Message::Binary(frame::encode(&view(&registry, selection.device_id(), device_port)));
+                follow_selection(&mut signal_quality, &mut viewing, &selection);
+                let hello = Message::Binary(frame::encode(&view(&registry, &collection, selection.device_id(), device_port)));
                 if send(&browser_tx, Out::Reliable(hello)).is_err() {
                     break;
                 }
@@ -462,8 +529,8 @@ pub async fn handle_browser(
 }
 
 /// Proxy EMG frames to a pose-inference service and forward `Pose` frames back to the
-/// browser, reconnecting with exponential backoff. Unchanged in spirit from before;
-/// it now rides the selected device's EMG stream.
+/// browser, reconnecting with exponential backoff. Rides the selected device's EMG
+/// stream.
 async fn run_pose_proxy(
     url: String,
     queue: PoseQueue,

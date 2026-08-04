@@ -8,7 +8,7 @@
 //! reconnects. Device ids are not guaranteed stable across power cycles, so a
 //! reconnect under the same id replaces the entry — fresh session, fresh logs.
 
-use protocol::{DeviceConfig, DeviceInfo, DeviceTransport, Frame};
+use protocol::{DeviceConfig, DeviceInfo, DeviceProvenance, DeviceTransport, Frame};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -22,6 +22,10 @@ struct DeviceEntry {
     label: String,
     transport: DeviceTransport,
     config: DeviceConfig,
+    /// What the device said it is: firmware build and front-end registers. Only
+    /// a fresh `DeviceHello` changes it, so it tracks the running build rather
+    /// than being cached from the first connection.
+    provenance: DeviceProvenance,
     frames: broadcast::Sender<Frame>,
     control: mpsc::UnboundedSender<Frame>,
     /// Recent `Frame::Log`s, retained so a browser opened after the fact still sees
@@ -88,6 +92,7 @@ impl Registry {
         label: String,
         transport: DeviceTransport,
         config: DeviceConfig,
+        provenance: DeviceProvenance,
     ) -> DeviceHandle {
         let (frames, _) = broadcast::channel(FRAME_BUFFER);
         let (control, control_rx) = mpsc::unbounded_channel();
@@ -102,6 +107,7 @@ impl Registry {
                 label,
                 transport,
                 config,
+                provenance,
                 frames: frames.clone(),
                 control,
                 logs: VecDeque::new(),
@@ -122,10 +128,17 @@ impl Registry {
     /// Update a device's config after a re-announced `DeviceHello` — but only if
     /// `token` still names the live session, so a half-open connection's late frames
     /// cannot write into a fresh reconnection's entry.
-    pub fn update_config(&self, id: &str, token: u64, config: DeviceConfig) {
+    pub fn update_config(
+        &self,
+        id: &str,
+        token: u64,
+        config: DeviceConfig,
+        provenance: DeviceProvenance,
+    ) {
         if let Some(entry) = self.devices.lock().unwrap().get_mut(id) {
             if entry.token == token {
                 entry.config = config;
+                entry.provenance = provenance;
             }
         }
         self.notify();
@@ -179,6 +192,14 @@ impl Registry {
             .unwrap()
             .get(id)
             .map(|entry| entry.config.clone())
+    }
+
+    pub fn provenance_of(&self, id: &str) -> Option<DeviceProvenance> {
+        self.devices
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|entry| entry.provenance.clone())
     }
 
     /// Subscribe a browser to a device's data-frame stream. `None` for a

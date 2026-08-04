@@ -306,6 +306,7 @@ fn announce(
         &Frame::DeviceHello {
             device_id: device_id.into(),
             config: settings.to_wire(),
+            provenance: crate::provenance::device(),
         },
         scratch,
     )

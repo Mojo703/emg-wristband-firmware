@@ -8,24 +8,29 @@
   ],
   "collection_classes": [
     {
-      "id": "key_pinch",
-      "label": "Key pinch",
-      "color": "purple"
-    },
-    {
-      "id": "index_pinch",
-      "label": "Index pinch",
+      "id": "wrist_pronation",
+      "label": "Tilt pole out",
       "color": "blue"
     },
     {
-      "id": "middle_pinch",
-      "label": "Middle pinch",
+      "id": "wrist_supination",
+      "label": "Tilt pole in",
+      "color": "amber"
+    },
+    {
+      "id": "wrist_flexion_hand_close",
+      "label": "Fist down",
       "color": "green"
     },
     {
-      "id": "pinky_pinch",
-      "label": "Pinky pinch",
-      "color": "amber"
+      "id": "wrist_extension_hand_open",
+      "label": "Open up",
+      "color": "purple"
+    },
+    {
+      "id": "three_finger_pinch",
+      "label": "Pinch",
+      "color": "pink"
     }
   ],
   "activities": [

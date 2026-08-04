@@ -1,11 +1,11 @@
 /target
-# Runtime state (app.cbor) lives in /config alongside collection.json, which is
-# shipped content — so /config's *contents* are ignored rather than the
+# Runtime state (provenance.cbor) lives in /config alongside collection.json,
+# which is shipped content — so /config's *contents* are ignored rather than the
 # directory, which is what lets the negation work.
 /config/*
 !/config/collection.json
-# The track library: audio, converted schedules, and copied Beat Saber maps.
-# Personal music and derived map data, rebuilt by tools/ingest_track.py.
+# The track library: audio, converted schedules, and the Beat Saber maps they
+# came from. Personal music, re-importable from the dashboard.
 /tracks
 # Recorded collection sessions land here at runtime.
 /sessions

@@ -465,6 +465,22 @@ impl Ads1298Device {
         }
     }
 
+    /// Every register as the chip holds it, address order, for the provenance a
+    /// session records. Same constraint as [`Self::log_configuration_readback`]:
+    /// SDATAC only, before RDATAC starts the stream. A register whose read fails
+    /// stays `None` — a snapshot that quietly reported the intended byte would
+    /// defeat the point of reading the chip at all.
+    pub(super) fn read_all_registers(&mut self) -> [Option<u8>; Register::ALL.len()] {
+        let mut values = [None; Register::ALL.len()];
+        for (slot, register) in values.iter_mut().zip(Register::ALL) {
+            match self.read_register(register) {
+                Ok(value) => *slot = Some(value),
+                Err(error) => warn!("{register:?} snapshot read failed: {error}"),
+            }
+        }
+        values
+    }
+
     // Writes this device's full register set. Must be called after
     // `stop_read_data_continuous()` (SDATAC), since registers can't be written while streaming.
     pub(super) fn configure(&mut self) -> Result<()> {

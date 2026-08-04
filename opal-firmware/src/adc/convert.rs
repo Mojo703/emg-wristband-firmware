@@ -15,15 +15,20 @@ pub(super) const MICROVOLTS_PER_VOLT: f32 = 1_000_000.0;
 /// Bits dropped from a 24-bit code to make the `i16` the wire and the recordings
 /// carry.
 ///
-/// This is the resolution-against-headroom trade, and both ends are measured. One
-/// LSB of the shifted code is [`MICROVOLTS_PER_WIRE_COUNT`] ≈ 3.05 µV, against the
-/// ADS1298's own ~1 µV RMS input-referred noise at this gain — so the quantiser sits
-/// just above the noise floor and throws nothing real away, while surface EMG at
-/// 20-500 µV RMS still spans hundreds of counts. The range is ±100 mV, which has to
-/// hold the electrode offset the signal rides on: the bench measured up to ~65 mV of
-/// it. A larger shift would clip that offset and take the signal with it; a smaller
-/// one would quantise below the noise floor for nothing.
-const WIRE_SHIFT_BITS: u32 = 6;
+/// This is the range-against-resolution trade, and both ends are measured. The
+/// shift sets the range: eight bits spread the wire's ±32768 counts over ±400 mV,
+/// which is the whole span the front end converts at gain 6, so a sample can only
+/// clip here if the analog path has already clipped it. That is what the range
+/// has to buy, because the signal rides on an electrode offset — tens of
+/// millivolts is normal — and a range that cannot hold the offset rails the
+/// channel and takes the signal with it.
+///
+/// The price is resolution. One LSB is [`MICROVOLTS_PER_WIRE_COUNT`] ≈ 12.2 µV,
+/// so quantisation contributes about 3.5 µV RMS, well above the ADS1298's own
+/// ~1 µV input-referred noise at this gain and comparable to the quietest
+/// channels measured on skin. A smaller shift buys that resolution back at a
+/// proportionally narrower range: seven bits give ±200 mV at 1.8 µV RMS.
+const WIRE_SHIFT_BITS: u32 = 8;
 
 /// Microvolts per wire count. Fixed for the life of the configuration, unlike the
 /// conditioned model input, whose scale drifts with each channel's running amplitude
@@ -71,27 +76,40 @@ mod tests {
 
     #[test]
     fn the_wire_scale_is_the_shifted_code_lsb() {
-        // 3.0518 µV/count is the number the recordings and the dashboard read; if the
+        // 12.207 µV/count is the number the recordings and the dashboard read; if the
         // reference, the gain, or the shift moves, this is what says so.
-        assert!((MICROVOLTS_PER_WIRE_COUNT - 3.0518).abs() < 1e-3);
+        assert!((MICROVOLTS_PER_WIRE_COUNT - 12.2070).abs() < 1e-3);
     }
 
     #[test]
     fn wire_counts_saturate_instead_of_wrapping() {
+        let one_count = 1 << WIRE_SHIFT_BITS;
         assert_eq!(code_to_wire_count(0), 0);
-        assert_eq!(code_to_wire_count(64), 1);
-        assert_eq!(code_to_wire_count(-64), -1);
+        assert_eq!(code_to_wire_count(one_count), 1);
+        assert_eq!(code_to_wire_count(-one_count), -1);
         assert_eq!(code_to_wire_count(8_388_607), i16::MAX);
         assert_eq!(code_to_wire_count(-8_388_608), i16::MIN);
     }
 
     #[test]
     fn a_wire_count_recovers_its_microvolts() {
-        // ±100 mV is the range the shift buys; the bench's ~65 mV electrode offset has
-        // to fit inside it.
+        // ±400 mV is the range the shift buys, so the electrode offset the signal
+        // rides on — tens of millivolts — is carried rather than clipped. Recovery is
+        // exact to one count, which is what the shift costs.
         let code = (0.065 / (2.4 / 6.0) * 8_388_608.0) as i32;
         let microvolts = code_to_wire_count(code) as f32 * MICROVOLTS_PER_WIRE_COUNT;
-        assert!((microvolts - 65_000.0).abs() < 10.0, "{microvolts}");
+        assert!(
+            (microvolts - 65_000.0).abs() < MICROVOLTS_PER_WIRE_COUNT,
+            "{microvolts}"
+        );
+    }
+
+    #[test]
+    fn the_wire_range_covers_the_front_ends_full_span() {
+        // Nothing may clip at the wire that the analog path has not already clipped:
+        // the largest code the converter can produce still lands inside i16.
+        assert_eq!(code_to_wire_count(8_388_607), 32_767);
+        assert!(8_388_607 >> WIRE_SHIFT_BITS <= i16::MAX as i32);
     }
 
     #[test]

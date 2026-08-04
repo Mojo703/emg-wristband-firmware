@@ -15,27 +15,26 @@
 //!
 //! A track is therefore added, inspected, or deleted as one directory, and the
 //! library stays out of version control — it is personal music and derived map
-//! data, regenerable by re-running the ingest.
+//! data, regenerable by importing the map again.
 //!
 //! # Where a track's notes come from
 //!
-//! `tools/ingest_track.py` writes each `track.json` from a Beat Saber map —
-//! either a hand-made one or InfernoSaber's output for a song that has none.
+//! [`super::import`] writes each `track.json` from a Beat Saber map, uploaded as
+//! a zip or fetched from BeatSaver.
 //! Timing is the map's own, verbatim, and only the right hand's notes are used
 //! (one Beat Saber hand spans the lattice the way one instrumented hand
 //! should). The 4×3 lattice flattens left-to-right dominant into cells
 //! `3·x + y`. Cues advance in whole beats, so every repeat of a sustain stays
-//! on the grid; the ingest also stores, per column count 1..=6, the split
-//! boundaries over those cells that balance the columns for that song.
+//! on the grid; the import also stores, per column count 1..=6, the column each
+//! cue is drawn in, resolved by [`assign_columns`].
 //!
 //! # What a session adds
 //!
-//! `generate` only looks things up: it picks the chosen level's schedule, and
-//! each note's column is how many of the stored boundaries sit at or below its
-//! cell (order-preserving by construction). The column→class binding then
-//! rotates by a seed-derived offset — a song's spatial pattern is identical
-//! every session while which *gesture* each column asks for rotates, evening
-//! per-class reps out across sessions. No map parsing happens here.
+//! `generate` only looks things up: it picks the chosen level's schedule and
+//! reads each cue's stored column. The column→class binding then rotates by a
+//! seed-derived offset — a song's spatial pattern is identical every session
+//! while which *gesture* each column asks for rotates, evening per-class reps
+//! out across sessions. No map parsing happens here.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -45,7 +44,7 @@ use protocol::{
     ActivityCondition, Beatmap, BeatsPerMinute, ClassId, CollectionClass, DifficultyLevel,
     DurationMilliseconds, Note, SubjectId, SweatLevel, TrackId, TrackInfo, TrackMilliseconds,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::interfaces::BeatmapGenerator;
 
@@ -59,7 +58,7 @@ pub const LEAD_IN: DurationMilliseconds = DurationMilliseconds::new(5000);
 pub const MAXIMUM_COLUMNS: usize = 6;
 
 /// How many lattice cells a map note can name: Beat Saber's 4 columns × 3 rows.
-const LATTICE_CELLS: u8 = 12;
+pub const LATTICE_CELLS: u8 = 12;
 
 /// The vocabularies the setup form offers, as they appear in
 /// `config/collection.json`. Tracks are deliberately absent: they are a
@@ -76,9 +75,9 @@ pub struct CollectionConfig {
     pub sweat_levels: Vec<SweatLevel>,
 }
 
-/// One note of a track's ingested map: the automapper's onset on the audio
-/// timeline, the lattice cell it chose, and how long the hold lasts.
-#[derive(Debug, Clone, Copy, Deserialize)]
+/// One note of a track's map: its onset on the audio timeline, the lattice cell
+/// it names, and how long the hold lasts.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 pub struct MapNote {
     pub time_ms: u32,
     /// Beat Saber lattice cell, column-major: `3·lineIndex + lineLayer`, 0..12.
@@ -87,31 +86,86 @@ pub struct MapNote {
     pub hold_ms: u32,
 }
 
-/// One track's `track.json`, as the ingest tool wrote it. The audio and the
+/// One track's `track.json`, as the importer wrote it. The audio and the
 /// source map sit beside it in the same directory, so nothing here names a
 /// file.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TrackEntry {
     pub id: TrackId,
     pub title: String,
     /// The map's tempo — the grid its note times quantize to, and the
     /// browser's display and metronome tempo.
     pub beats_per_minute: f64,
+    pub duration_ms: u32,
     /// One ready-made schedule per difficulty level, keyed by level name.
     pub levels: std::collections::BTreeMap<String, LevelEntry>,
-    pub duration_ms: u32,
 }
 
 /// One difficulty level's schedule for a track, as the ingest wrote it.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LevelEntry {
     /// The cue schedule, time-ordered.
     pub map_notes: Vec<MapNote>,
-    /// Column boundaries over the flattened cell array, keyed by column count
-    /// ("1".."6"): a note's column is how many boundaries sit at or below its
-    /// cell. Placed at ingest to balance this level's per-column cue counts;
-    /// the backend only looks them up.
-    pub column_splits: std::collections::BTreeMap<String, Vec<u8>>,
+    /// The column each cue is drawn in, keyed by column count ("1".."6") and
+    /// parallel to `map_notes`. Resolved at ingest by [`assign_columns`]; the
+    /// backend only looks them up.
+    pub column_assignments: std::collections::BTreeMap<String, Vec<u8>>,
+}
+
+/// Which column each cue of a level is drawn in, one entry per cue in schedule
+/// order.
+///
+/// Cues are ranked by lattice cell, and the cue of rank `rank` out of `total`
+/// is drawn in column `rank · column_count / total`. That is even by
+/// construction — every column holds `total / column_count` cues give or take
+/// one, whatever the song's spatial distribution looks like — and it stays
+/// order-preserving, so columns still follow the lattice left to right.
+///
+/// A cell holding more cues than one column's share therefore spans several
+/// columns. Its cues are dealt out in time order, each one going to whichever
+/// of those columns is furthest behind its share of the cell, so a heavy cell
+/// reaches every column it spans right through the song rather than filling one
+/// column with an early stretch of it and the next with a later one.
+pub fn assign_columns(map_notes: &[MapNote], column_count: usize) -> Vec<u8> {
+    let total = map_notes.len();
+    if total == 0 {
+        return Vec::new();
+    }
+
+    let mut cues_in_cell: std::collections::BTreeMap<u8, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for (index, note) in map_notes.iter().enumerate() {
+        cues_in_cell.entry(note.cell).or_default().push(index);
+    }
+
+    let mut assignments = vec![0u8; total];
+    let mut first_rank = 0usize;
+    for cues in cues_in_cell.values() {
+        let mut quotas: Vec<(u8, usize)> = Vec::new();
+        for rank in first_rank..first_rank + cues.len() {
+            let column = (rank * column_count / total) as u8;
+            match quotas.last_mut() {
+                Some((last, remaining)) if *last == column => *remaining += 1,
+                _ => quotas.push((column, 1)),
+            }
+        }
+        let mut dealt = vec![0usize; quotas.len()];
+        for &index in cues {
+            // Furthest behind by share, comparing (2·dealt + 1)/quota without
+            // leaving the integers. Equal quotas make this a plain round-robin.
+            let turn = (0..quotas.len())
+                .filter(|&column| dealt[column] < quotas[column].1)
+                .min_by(|&left, &right| {
+                    ((2 * dealt[left] + 1) * quotas[right].1)
+                        .cmp(&((2 * dealt[right] + 1) * quotas[left].1))
+                })
+                .expect("the quotas of a cell total its cue count");
+            assignments[index] = quotas[turn].0;
+            dealt[turn] += 1;
+        }
+        first_rank += cues.len();
+    }
+    assignments
 }
 
 impl TrackEntry {
@@ -152,12 +206,12 @@ struct CatalogTrack {
     audio_path: PathBuf,
 }
 
-/// One level's loaded schedule: its cues and, keyed by column count, the
-/// `count - 1` cell boundaries that fold cells into columns.
+/// One level's loaded schedule: its cues and, keyed by column count, the column
+/// each cue is drawn in.
 #[derive(Debug, Clone)]
 struct CatalogLevel {
     map_notes: Vec<MapNote>,
-    column_splits: std::collections::BTreeMap<usize, Vec<u8>>,
+    column_assignments: std::collections::BTreeMap<usize, Vec<u8>>,
 }
 
 /// The loaded catalog. Owns the config so the session manager can project it
@@ -170,10 +224,24 @@ pub struct TrackCatalog {
 }
 
 /// The file each track directory is recognized by.
-const TRACK_FILE_NAME: &str = "track.json";
+pub const TRACK_FILE_NAME: &str = "track.json";
 
 /// The audio each track directory serves, beside its `track.json`.
-const TRACK_AUDIO_NAME: &str = "audio.ogg";
+pub const TRACK_AUDIO_NAME: &str = "audio.ogg";
+
+/// Where the catalog is read from, kept so an import or a delete can rebuild it
+/// without the backend restarting.
+#[derive(Debug, Clone)]
+pub struct CatalogPaths {
+    pub config_path: PathBuf,
+    pub tracks_root: PathBuf,
+}
+
+impl CatalogPaths {
+    pub fn load(&self) -> anyhow::Result<TrackCatalog> {
+        TrackCatalog::load(&self.config_path, &self.tracks_root)
+    }
+}
 
 impl TrackCatalog {
     /// Read the vocabularies from `config_path` and the track library from
@@ -200,7 +268,7 @@ impl TrackCatalog {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 tracing::warn!(
                     path = %tracks_root.display(),
-                    "no track library yet; import one with tools/ingest_track.py"
+                    "no track library yet; import a Beat Saber map from the dashboard"
                 );
                 Vec::new()
             }
@@ -277,7 +345,7 @@ impl TrackCatalog {
             .collect()
     }
 
-    /// A uniform grid at the automapper's tempo, for the browser's debug
+    /// A uniform grid at the map's tempo, for the browser's debug
     /// metronome — the clock the map's note times quantize to.
     pub fn beat_times(&self, track_id: &TrackId) -> Option<Vec<TrackMilliseconds>> {
         let track = self.find(track_id)?;
@@ -327,8 +395,8 @@ fn load_track(directory: &Path) -> anyhow::Result<CatalogTrack> {
 /// A level's schedule must already satisfy the session invariants — cues
 /// time-ordered with non-overlapping holds, cells inside the lattice, nothing
 /// running past the audio — because the backend never edits it. Every level
-/// the game offers has to be present, with split boundaries for every column
-/// count the game supports.
+/// the game offers has to be present, with a column resolved for every cue at
+/// every column count the game supports.
 fn load_levels(
     entry: &TrackEntry,
 ) -> anyhow::Result<std::collections::BTreeMap<DifficultyLevel, CatalogLevel>> {
@@ -340,7 +408,7 @@ fn load_levels(
     for level in DifficultyLevel::ALL {
         let Some(loaded) = entry.levels.get(&level.to_string()) else {
             anyhow::bail!(
-                "track {} has no {level} schedule; re-run tools/ingest_track.py",
+                "track {} has no {level} schedule; import it again",
                 entry.id
             );
         };
@@ -380,34 +448,39 @@ fn load_levels(
             }
         }
 
-        let mut column_splits = std::collections::BTreeMap::new();
+        let mut column_assignments = std::collections::BTreeMap::new();
         for column_count in 1..=MAXIMUM_COLUMNS {
-            let Some(splits) = loaded.column_splits.get(&column_count.to_string()) else {
+            let Some(columns) = loaded.column_assignments.get(&column_count.to_string()) else {
                 anyhow::bail!(
-                    "track {} at {level} has no column splits for {column_count} columns",
+                    "track {} at {level} has no column assignment for {column_count} columns",
                     entry.id
                 );
             };
-            if splits.len() != column_count - 1 {
+            if columns.len() != loaded.map_notes.len() {
                 anyhow::bail!(
-                    "track {} at {level} has {} splits for {column_count} columns",
+                    "track {} at {level} assigns {} columns to {} cues at {column_count} columns",
                     entry.id,
-                    splits.len()
+                    columns.len(),
+                    loaded.map_notes.len()
                 );
             }
-            if !splits.windows(2).all(|pair| pair[0] <= pair[1])
-                || splits.iter().any(|&boundary| boundary > LATTICE_CELLS)
+            if columns
+                .iter()
+                .any(|&column| usize::from(column) >= column_count)
             {
-                anyhow::bail!("track {} at {level} has malformed column splits", entry.id);
+                anyhow::bail!(
+                    "track {} at {level} draws a cue outside the {column_count} columns",
+                    entry.id
+                );
             }
-            column_splits.insert(column_count, splits.clone());
+            column_assignments.insert(column_count, columns.clone());
         }
 
         levels.insert(
             level,
             CatalogLevel {
                 map_notes: loaded.map_notes.clone(),
-                column_splits,
+                column_assignments,
             },
         );
     }
@@ -449,8 +522,8 @@ impl BeatmapGenerator for TrackCatalog {
             .get(&difficulty)
             .ok_or_else(|| anyhow!("{track_id} has no {difficulty} schedule"))?;
         let column_count = classes.len();
-        let splits = level.column_splits.get(&column_count).ok_or_else(|| {
-            anyhow!("{track_id} has no ingested splits for {column_count} columns")
+        let columns = level.column_assignments.get(&column_count).ok_or_else(|| {
+            anyhow!("{track_id} has no ingested columns for {column_count} lanes")
         })?;
         // The one seeded decision: which gesture class column 0 means this
         // session. Rotation (not a shuffle) keeps neighbouring columns
@@ -460,13 +533,9 @@ impl BeatmapGenerator for TrackCatalog {
         let notes: Vec<Note> = level
             .map_notes
             .iter()
-            .map(|note| {
-                // The ingested boundaries do the folding: a note's column is
-                // how many of them sit at or below its cell.
-                let column = splits
-                    .iter()
-                    .filter(|&&boundary| note.cell >= boundary)
-                    .count();
+            .zip(columns)
+            .map(|(note, &column)| {
+                let column = usize::from(column);
                 Note {
                     class_id: classes[(column + rotation) % column_count].clone(),
                     at: TrackMilliseconds::new(note.time_ms),
@@ -526,7 +595,7 @@ mod tests {
     /// levels differ only in what the ingest wrote, which tests supply).
     fn track_entry(id: &str, map_notes: Vec<MapNote>, duration_ms: u32) -> TrackEntry {
         let level = LevelEntry {
-            column_splits: even_splits(&map_notes),
+            column_assignments: every_column_count(&map_notes),
             map_notes,
         };
         TrackEntry {
@@ -541,55 +610,17 @@ mod tests {
         }
     }
 
-    /// The ingest tool's split placement, mirrored for synthetic maps: the
-    /// boundary set whose columns deviate least from an even share.
-    fn even_splits(map_notes: &[MapNote]) -> std::collections::BTreeMap<String, Vec<u8>> {
-        let mut histogram = [0usize; 12];
-        for note in map_notes {
-            // Out-of-lattice cells only appear in the maps written to be
-            // rejected; the loader is what reports them, not this helper.
-            if let Some(bucket) = histogram.get_mut(usize::from(note.cell)) {
-                *bucket += 1;
-            }
-        }
-        let total: usize = histogram.iter().sum();
-        let mut prefix = vec![0usize];
-        for count in histogram {
-            prefix.push(prefix.last().unwrap() + count);
-        }
-        let mut splits = std::collections::BTreeMap::new();
-        for column_count in 1..=MAXIMUM_COLUMNS {
-            let target = total as f64 / column_count as f64;
-            let mut best: Vec<u8> = Vec::new();
-            let mut best_cost = f64::INFINITY;
-            // Every subset of the 11 interior boundaries, filtered to the right
-            // size: 2048 candidates, which is nothing for a test helper.
-            for mask in 0u16..(1 << 11) {
-                if mask.count_ones() as usize != column_count - 1 {
-                    continue;
-                }
-                let boundaries: Vec<u8> = (0..11u8)
-                    .filter(|bit| mask & (1 << bit) != 0)
-                    .map(|bit| bit + 1)
-                    .collect();
-                let mut edges = vec![0u8];
-                edges.extend_from_slice(&boundaries);
-                edges.push(12);
-                let cost: f64 = edges
-                    .windows(2)
-                    .map(|pair| {
-                        let count = prefix[usize::from(pair[1])] - prefix[usize::from(pair[0])];
-                        (count as f64 - target).powi(2)
-                    })
-                    .sum();
-                if cost < best_cost {
-                    best_cost = cost;
-                    best = boundaries;
-                }
-            }
-            splits.insert(column_count.to_string(), best);
-        }
-        splits
+    /// What the importer stores: the resolved column per cue at every column
+    /// count the game offers.
+    fn every_column_count(map_notes: &[MapNote]) -> std::collections::BTreeMap<String, Vec<u8>> {
+        (1..=MAXIMUM_COLUMNS)
+            .map(|column_count| {
+                (
+                    column_count.to_string(),
+                    assign_columns(map_notes, column_count),
+                )
+            })
+            .collect()
     }
 
     /// A catalog holding one synthetic track.
@@ -631,7 +662,13 @@ mod tests {
                 .iter()
                 .map(|class_id| class_id.0.as_str())
                 .collect::<Vec<_>>(),
-            ["key_pinch", "index_pinch", "middle_pinch", "pinky_pinch"]
+            [
+                "wrist_pronation",
+                "wrist_supination",
+                "wrist_flexion_hand_close",
+                "wrist_extension_hand_open",
+                "three_finger_pinch"
+            ]
         );
         assert_eq!(catalog.subjects().len(), 5);
         assert_eq!(catalog.activities().len(), 4);
@@ -755,11 +792,10 @@ mod tests {
             assert_eq!(notes.len(), 12);
 
             // Monotone: walking the cells left to right never moves the column
-            // leftwards, and every column is used. With one note per cell the
-            // even-split boundaries land on the 12/N cuts.
-            let splits = &even_splits(&one_note_per_cell())[&column_count.to_string()];
-            let columns: Vec<usize> = (0u8..12)
-                .map(|cell| splits.iter().filter(|&&boundary| cell >= boundary).count())
+            // leftwards, and every column is used.
+            let columns: Vec<usize> = assign_columns(&one_note_per_cell(), column_count)
+                .into_iter()
+                .map(usize::from)
                 .collect();
             assert!(columns.windows(2).all(|pair| pair[0] <= pair[1]));
             assert_eq!(
@@ -785,6 +821,150 @@ mod tests {
                 1,
                 "N={column_count}: folding is not uniform"
             );
+        }
+    }
+
+    /// A schedule whose cells are wildly uneven: the heaviest cell alone holds
+    /// more than half the cues, which no contiguous partition of the lattice
+    /// could ever balance.
+    fn lopsided_schedule() -> Vec<MapNote> {
+        (0..97usize)
+            .map(|index| MapNote {
+                time_ms: 1_000 + index as u32 * 400,
+                cell: match index % 8 {
+                    0 => 2,
+                    1 => 9,
+                    2 => 11,
+                    _ => 6,
+                },
+                hold_ms: 200,
+            })
+            .collect()
+    }
+
+    fn per_column_counts(columns: &[u8], column_count: usize) -> Vec<usize> {
+        let mut counts = vec![0usize; column_count];
+        for &column in columns {
+            counts[usize::from(column)] += 1;
+        }
+        counts
+    }
+
+    #[test]
+    fn every_column_count_splits_a_lopsided_map_to_within_one_cue() {
+        let map_notes = lopsided_schedule();
+        for column_count in 1..=MAXIMUM_COLUMNS {
+            let columns = assign_columns(&map_notes, column_count);
+            let counts = per_column_counts(&columns, column_count);
+            let share = map_notes.len() / column_count;
+            assert!(
+                counts
+                    .iter()
+                    .all(|&count| count == share || count == share + 1),
+                "N={column_count}: {counts:?}"
+            );
+            assert_eq!(counts.iter().sum::<usize>(), map_notes.len());
+        }
+    }
+
+    #[test]
+    fn a_cell_never_reaches_a_column_left_of_a_lighter_cell() {
+        let map_notes = lopsided_schedule();
+        for column_count in 1..=MAXIMUM_COLUMNS {
+            let columns = assign_columns(&map_notes, column_count);
+            // Order-preserving across cells: the columns a cell reaches never
+            // overlap the columns a cell to its left reaches, except where the
+            // two share the one column their boundary falls in.
+            let mut highest_so_far = 0u8;
+            let mut by_cell: std::collections::BTreeMap<u8, Vec<u8>> =
+                std::collections::BTreeMap::new();
+            for (note, &column) in map_notes.iter().zip(&columns) {
+                by_cell.entry(note.cell).or_default().push(column);
+            }
+            for (cell, reached) in by_cell {
+                let lowest = *reached.iter().min().unwrap();
+                assert!(
+                    lowest >= highest_so_far,
+                    "N={column_count}: cell {cell} reaches column {lowest} \
+                     below the previous cell's {highest_so_far}"
+                );
+                highest_so_far = *reached.iter().max().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn a_cells_smaller_share_is_interleaved_rather_than_spent_at_the_front() {
+        // Twenty cues in one cell against five elsewhere, at two columns: the
+        // heavy cell owes column 0 eight cues and column 1 twelve, and the two
+        // have to stay interleaved right through the cell.
+        let mut map_notes: Vec<MapNote> = (0..5u32)
+            .map(|index| MapNote {
+                time_ms: 1_000 + index * 500,
+                cell: 0,
+                hold_ms: 200,
+            })
+            .collect();
+        map_notes.extend((0..20u32).map(|index| MapNote {
+            time_ms: 5_000 + index * 500,
+            cell: 7,
+            hold_ms: 200,
+        }));
+
+        let columns = assign_columns(&map_notes, 2);
+        assert_eq!(per_column_counts(&columns, 2), vec![13, 12]);
+        let heavy: Vec<u8> = columns[5..].to_vec();
+        let in_column_zero: Vec<usize> = heavy
+            .iter()
+            .enumerate()
+            .filter(|(_, &column)| column == 0)
+            .map(|(position, _)| position)
+            .collect();
+        assert_eq!(in_column_zero.len(), 8);
+        // Spread across the cell rather than crowded into its opening: the
+        // eight land near evenly, so the last sits in the cell's final third.
+        assert!(
+            *in_column_zero.last().unwrap() >= 13,
+            "column 0's share of the heavy cell ends at {:?}",
+            in_column_zero
+        );
+        assert!(
+            in_column_zero.windows(2).all(|pair| pair[1] - pair[0] <= 3),
+            "column 0's share of the heavy cell clumps: {in_column_zero:?}"
+        );
+    }
+
+    #[test]
+    fn a_heavy_cells_columns_are_dealt_through_the_song_not_clumped() {
+        let map_notes = lopsided_schedule();
+        for column_count in 2..=MAXIMUM_COLUMNS {
+            let columns = assign_columns(&map_notes, column_count);
+            for column in 0..column_count as u8 {
+                let onsets: Vec<u32> = map_notes
+                    .iter()
+                    .zip(&columns)
+                    .filter(|(_, &assigned)| assigned == column)
+                    .map(|(note, _)| note.time_ms)
+                    .collect();
+                // Dealing by share bounds the gap between one column's cues: a
+                // column that owned a whole stretch of the song and nothing
+                // else would show a run far longer than this.
+                let longest_gap = onsets
+                    .windows(2)
+                    .map(|pair| pair[1] - pair[0])
+                    .max()
+                    .unwrap_or(0);
+                assert!(
+                    longest_gap <= 400 * 8 * column_count as u32,
+                    "N={column_count}, column {column}: {longest_gap} ms between cues"
+                );
+                let span = map_notes.last().unwrap().time_ms - map_notes[0].time_ms;
+                let reach = onsets.last().unwrap() - onsets[0];
+                assert!(
+                    reach * 4 >= span * 3,
+                    "N={column_count}, column {column}: cues cover {reach} of {span} ms"
+                );
+            }
         }
     }
 
@@ -854,7 +1034,7 @@ mod tests {
     fn a_track_missing_a_level_is_refused() {
         let map_notes = one_note_per_cell();
         let level = LevelEntry {
-            column_splits: even_splits(&map_notes),
+            column_assignments: every_column_count(&map_notes),
             map_notes,
         };
         let partial = TrackEntry {

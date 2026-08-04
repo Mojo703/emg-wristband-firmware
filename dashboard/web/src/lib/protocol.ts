@@ -51,6 +51,7 @@ export const FrameType = {
   CollectionCatalog: 'collection_catalog',
   StartCollection: 'start_collection',
   TrackStarted: 'track_started',
+  TrackResumed: 'track_resumed',
   FinishCollection: 'finish_collection',
   StopCollection: 'stop_collection',
   CapturePlacementPhoto: 'capture_placement_photo',
@@ -119,6 +120,45 @@ export interface DeviceConfig {
   readonly sensitivity_levels: readonly SensitivityLevel[];
   readonly tau: number;
   readonly needed: number;
+}
+
+/// What a device is, as opposed to how it is configured: the firmware build
+/// running on it and the front end it brought up. The device reports this on
+/// connect and none of it is settable — DeviceConfig is the settable half.
+export interface DeviceProvenance {
+  readonly firmware: FirmwareBuild;
+  /// One entry per converter, in the firmware's chip order. Reported separately
+  /// because the two chips are configured independently and do differ.
+  readonly analog_front_ends: readonly AnalogFrontEnd[];
+}
+
+export interface FirmwareBuild {
+  readonly crate_version: string;
+  readonly git_commit: string;
+  /// True when the build came from a working tree with uncommitted changes, so
+  /// `git_commit` names the parent commit rather than the source that was built.
+  readonly working_tree_modified: boolean;
+  readonly built_at: string;
+}
+
+/// One converter's registers as read back off the chip after configuration.
+export interface AnalogFrontEnd {
+  readonly chip: number;
+  readonly registers: readonly RegisterReadback[];
+}
+
+/// One register the chip reported. `value` is null when the read itself failed.
+export interface RegisterReadback {
+  readonly name: string;
+  readonly address: number;
+  readonly value: number | null;
+}
+
+/// Which board and harness a device is soldered to. Host-side metadata: the
+/// firmware cannot see its own board, so the operator says once per device.
+export interface BoardRevision {
+  readonly board: string;
+  readonly harness: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -229,10 +269,28 @@ export interface StreamProgress {
   readonly advancing: boolean;
 }
 
-/** Recording liveness; `video` is null when no camera is running. */
+/** How much EMG is on disk: two independent facts rather than a duration, so
+ * nothing here can disagree with anything else here. */
+export interface RecordedEmg {
+  readonly samples_per_channel: number;
+  readonly sample_rate: number;
+}
+
+/** Recording liveness; `video` is null when no camera is running, and
+ * `recorded` is null for a practice session, which records nothing. */
 export interface RecordingHealth {
   readonly emg: StreamProgress;
   readonly video: StreamProgress | null;
+  readonly recorded: RecordedEmg | null;
+}
+
+/** Why a session's cue timeline is frozen, and for how long it has been. */
+export interface CollectionPause {
+  readonly device_id: string;
+  readonly since: UnixMilliseconds;
+  readonly silent_for: DurationMilliseconds;
+  readonly track_position: TrackMilliseconds;
+  readonly device_recovered: boolean;
 }
 
 export interface FileReport {
@@ -265,6 +323,8 @@ export type CollectionPhase =
       readonly name: 'playing';
       readonly session_id: string;
       readonly recording: RecordingHealth;
+      /** Non-null while the cue timeline is frozen on a device stall. */
+      readonly paused: CollectionPause | null;
     }
   | {
       readonly name: 'reviewing';
@@ -283,6 +343,8 @@ export interface Selection {
   readonly device_id: string;
   readonly config: DeviceConfig;
   readonly classes: readonly ClassInfo[];
+  readonly provenance: DeviceProvenance;
+  readonly board_revision: BoardRevision | null;
 }
 
 export interface HelloFrame {
@@ -376,6 +438,32 @@ export interface TelemetryMetric {
   readonly value: number;
 }
 
+/**
+ * Backend → browser: what the electrodes look like right now, one entry per
+ * channel in channel order. The backend measures it from the live stream and
+ * owns the threshold; this side only paints what it is told.
+ */
+export interface SignalQualityFrame {
+  readonly type: 'signal_quality';
+  readonly mains_fundamental_hertz: number;
+  readonly noise_floor_limit_microvolts: number;
+  readonly channels: readonly ChannelQuality[];
+}
+
+/** One channel's state. Both amplitudes are microvolts RMS over 20–450 Hz: the
+ * noise floor is what a gesture has to beat, and the mains figure says whether a
+ * failing floor is a grounding problem or something else. */
+export interface ChannelQuality {
+  readonly noise_floor_microvolts: number;
+  readonly mains_microvolts: number;
+  readonly offset_millivolts: number;
+  readonly headroom_millivolts: number;
+  /** Samples at or near full scale over the last several seconds. */
+  readonly saturated_fraction: number;
+  /** The device's lead-off comparator, or null while no status word has arrived. */
+  readonly lead_off: boolean | null;
+}
+
 export interface SelectDeviceFrame {
   readonly type: 'select_device';
   readonly device_id: string;
@@ -405,6 +493,13 @@ export interface SetWifiFrame {
 export interface SetServerFrame {
   readonly type: 'set_server';
   readonly addr: string;
+}
+
+/** Browser → backend: remember which board and harness a device is soldered to. */
+export interface SetBoardRevisionFrame {
+  readonly type: 'set_board_revision';
+  readonly device_id: string;
+  readonly revision: BoardRevision;
 }
 
 /** Backend → browser: what the session-setup form offers. */
@@ -438,12 +533,23 @@ export interface StartCollectionFrame {
   readonly metadata: SessionMetadata;
   readonly track_id: string;
   readonly difficulty: DifficultyLevel;
+  /** Whether to record the webcam alongside the EMG. A session that asks for
+   * video and cannot get it fails to start rather than recording EMG alone. */
+  readonly record_video: boolean;
 }
 
 /** Browser → backend: audio playback actually began; anchors the beat grid. */
 export interface TrackStartedFrame {
   readonly type: 'track_started';
   readonly at_unix_ms: UnixMilliseconds;
+}
+
+/** Browser → backend: audio resumed after a pause, with the position the audio
+ * element was at. The pair re-anchors the beat grid outright. */
+export interface TrackResumedFrame {
+  readonly type: 'track_resumed';
+  readonly at_unix_ms: UnixMilliseconds;
+  readonly position_ms: TrackMilliseconds;
 }
 
 /** Browser → backend: finalize the running session now and move to review;
@@ -499,8 +605,10 @@ export type OutgoingFrame =
   | SetKeymapFrame
   | SetWifiFrame
   | SetServerFrame
+  | SetBoardRevisionFrame
   | StartCollectionFrame
   | TrackStartedFrame
+  | TrackResumedFrame
   | FinishCollectionFrame
   | StopCollectionFrame
   | CapturePlacementPhotoFrame;
@@ -513,6 +621,7 @@ export type IncomingFrame =
   | PoseFrame
   | LogFrame
   | TelemetryFrame
+  | SignalQualityFrame
   | CollectionCatalogFrame
   | CollectionStateFrame
   | BeatmapFrame
@@ -650,12 +759,50 @@ function isDeviceConfig(value: unknown): value is DeviceConfig {
   );
 }
 
+function isRegisterReadback(value: unknown): value is RegisterReadback {
+  return (
+    isObject(value) &&
+    isString(value['name']) &&
+    isNumber(value['address']) &&
+    (value['value'] === null || isNumber(value['value']))
+  );
+}
+
+function isAnalogFrontEnd(value: unknown): value is AnalogFrontEnd {
+  return (
+    isObject(value) &&
+    isNumber(value['chip']) &&
+    Array.isArray(value['registers']) &&
+    value['registers'].every(isRegisterReadback)
+  );
+}
+
+function isDeviceProvenance(value: unknown): value is DeviceProvenance {
+  if (!isObject(value)) return false;
+  const firmware = value['firmware'];
+  return (
+    isObject(firmware) &&
+    isString(firmware['crate_version']) &&
+    isString(firmware['git_commit']) &&
+    isBoolean(firmware['working_tree_modified']) &&
+    isString(firmware['built_at']) &&
+    Array.isArray(value['analog_front_ends']) &&
+    value['analog_front_ends'].every(isAnalogFrontEnd)
+  );
+}
+
+function isBoardRevision(value: unknown): value is BoardRevision {
+  return isObject(value) && isString(value['board']) && isString(value['harness']);
+}
+
 function isSelection(value: unknown): value is Selection {
   return (
     isObject(value) &&
     isString(value['device_id']) &&
     isDeviceConfig(value['config']) &&
-    isClassInfoArray(value['classes'])
+    isClassInfoArray(value['classes']) &&
+    isDeviceProvenance(value['provenance']) &&
+    (value['board_revision'] === null || isBoardRevision(value['board_revision']))
   );
 }
 
@@ -761,6 +908,29 @@ export function isTelemetryFrame(value: unknown): value is TelemetryFrame {
   );
 }
 
+function isChannelQuality(value: unknown): value is ChannelQuality {
+  return (
+    isObject(value) &&
+    isNumber(value['noise_floor_microvolts']) &&
+    isNumber(value['mains_microvolts']) &&
+    isNumber(value['offset_millivolts']) &&
+    isNumber(value['headroom_millivolts']) &&
+    isNumber(value['saturated_fraction']) &&
+    (value['lead_off'] === null || isBoolean(value['lead_off']))
+  );
+}
+
+export function isSignalQualityFrame(value: unknown): value is SignalQualityFrame {
+  return (
+    hasType(value, 'signal_quality') &&
+    isObject(value) &&
+    isNumber(value['mains_fundamental_hertz']) &&
+    isNumber(value['noise_floor_limit_microvolts']) &&
+    Array.isArray(value['channels']) &&
+    value['channels'].every(isChannelQuality)
+  );
+}
+
 export function isArm(value: unknown): value is Arm {
   return value === Arm.Left || value === Arm.Right;
 }
@@ -825,11 +995,31 @@ function isStreamProgress(value: unknown): value is StreamProgress {
   );
 }
 
+function isRecordedEmg(value: unknown): value is RecordedEmg {
+  return (
+    isObject(value) &&
+    isNumber(value['samples_per_channel']) &&
+    isNumber(value['sample_rate'])
+  );
+}
+
 function isRecordingHealth(value: unknown): value is RecordingHealth {
   return (
     isObject(value) &&
     isStreamProgress(value['emg']) &&
-    (value['video'] === null || isStreamProgress(value['video']))
+    (value['video'] === null || isStreamProgress(value['video'])) &&
+    (value['recorded'] === null || isRecordedEmg(value['recorded']))
+  );
+}
+
+function isCollectionPause(value: unknown): value is CollectionPause {
+  return (
+    isObject(value) &&
+    isString(value['device_id']) &&
+    isNumber(value['since']) &&
+    isNumber(value['silent_for']) &&
+    isNumber(value['track_position']) &&
+    isBoolean(value['device_recovered'])
   );
 }
 
@@ -868,9 +1058,14 @@ export function isCollectionPhase(value: unknown): value is CollectionPhase {
     case 'idle':
       return true;
     case 'armed':
-    case 'playing':
       return (
         isString(value['session_id']) && isRecordingHealth(value['recording'])
+      );
+    case 'playing':
+      return (
+        isString(value['session_id']) &&
+        isRecordingHealth(value['recording']) &&
+        (value['paused'] === null || isCollectionPause(value['paused']))
       );
     case 'reviewing':
       return (
@@ -965,14 +1160,19 @@ export function isOutgoingFrame(value: unknown): value is OutgoingFrame {
       return isString(value['ssid']) && isString(value['psk']);
     case 'set_server':
       return isString(value['addr']);
+    case 'set_board_revision':
+      return isString(value['device_id']) && isBoardRevision(value['revision']);
     case 'start_collection':
       return (
         isSessionMetadata(value['metadata']) &&
         isString(value['track_id']) &&
-        isDifficultyLevel(value['difficulty'])
+        isDifficultyLevel(value['difficulty']) &&
+        isBoolean(value['record_video'])
       );
     case 'track_started':
       return isNumber(value['at_unix_ms']);
+    case 'track_resumed':
+      return isNumber(value['at_unix_ms']) && isNumber(value['position_ms']);
     case 'finish_collection':
       return true;
     case 'stop_collection':
@@ -992,6 +1192,7 @@ export function asIncomingFrame(value: unknown): IncomingFrame | null {
   if (isPoseFrame(value)) return value;
   if (isLogFrame(value)) return value;
   if (isTelemetryFrame(value)) return value;
+  if (isSignalQualityFrame(value)) return value;
   if (isCollectionCatalogFrame(value)) return value;
   if (isCollectionStateFrame(value)) return value;
   if (isBeatmapFrame(value)) return value;

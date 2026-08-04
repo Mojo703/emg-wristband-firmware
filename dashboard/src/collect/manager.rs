@@ -25,18 +25,20 @@
 //! - a second `TrackStarted` for an anchored session is ignored;
 //! - `StartCollection` ids are validated against the live catalog.
 
-use crate::collect::beatmap::TrackCatalog;
+use crate::collect::beatmap::{CatalogPaths, TrackCatalog};
 use crate::collect::interfaces::{
     BeatmapGenerator, EmgWindow, HardwareIdentity, RecordingHandle, SessionEvent, SessionManifest,
     SessionRecorder, VideoCapture, VideoReport,
 };
+use crate::collect::provenance::ProvenanceStore;
 use crate::collect::recorder::FileSessionRecorder;
-use crate::collect::video::FfmpegVideoCapture;
+use crate::collect::video::{CameraSettings, FfmpegVideoCapture};
 use crate::registry::Registry;
 use protocol::{
-    Beatmap, ClassId, CollectionPhase, CollectionSummary, DifficultyLevel, DurationMilliseconds,
-    FileReport, Frame, LogLevel, NoteIndex, RecordingHealth, SessionId, SessionMetadata,
-    StreamProgress, TrackId, TrackInfo, TrackMilliseconds, UnixMilliseconds,
+    Beatmap, BoardRevision, ClassId, CollectionPause, CollectionPhase, CollectionSummary,
+    DifficultyLevel, DurationMilliseconds, FileReport, Frame, LogLevel, NoteIndex, RecordingHealth,
+    SessionId, SessionMetadata, StreamProgress, TrackId, TrackInfo, TrackMilliseconds,
+    UnixMilliseconds,
 };
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -70,6 +72,13 @@ const ACTIVITY_WINDOW_AFTER_MILLISECONDS: u64 = 400;
 /// streak and counts `activity_hits`.
 const ACTIVITY_HIT_FACTOR: f32 = 1.6;
 
+/// Silence from the device that freezes the cue timeline. Windows arrive every
+/// 250 ms; across the two sessions on disk the worst gap between consecutive
+/// arrivals is 339 ms and the 95th percentile is 272 ms, so this is six
+/// consecutive windows lost — a link that is down rather than one that stutters.
+/// Checked on the tick, so a pause lands within 1.75 s of the last sample.
+const STALL_THRESHOLD: Duration = Duration::from_millis(1_500);
+
 /// Extra time after the track's end before the session finalizes itself.
 const TRACK_END_SLACK: Duration = Duration::from_secs(1);
 
@@ -87,6 +96,8 @@ fn now() -> UnixMilliseconds {
 /// Control messages from browsers into a running session task.
 enum SessionControl {
     TrackStarted(UnixMilliseconds),
+    /// Audio resumed after a pause, at this instant and this track position.
+    TrackResumed(UnixMilliseconds, TrackMilliseconds),
     /// End the session now and move to review, mid-track or not.
     Finish,
 }
@@ -130,28 +141,42 @@ struct ManagerState {
 }
 
 pub struct CollectionManager {
-    catalog: TrackCatalog,
+    /// Behind a lock because importing or deleting a track rebuilds it while
+    /// the backend runs; every read here is short and uncontended.
+    catalog: std::sync::RwLock<TrackCatalog>,
+    catalog_paths: CatalogPaths,
     video: Arc<Mutex<FfmpegVideoCapture>>,
     registry: Arc<Registry>,
     sessions_root: PathBuf,
     outbound: broadcast::Sender<Frame>,
+    /// What the host remembers between sessions: board revisions per device,
+    /// don counts per subject and arm.
+    provenance: ProvenanceStore,
     state: Mutex<ManagerState>,
 }
 
 impl CollectionManager {
     pub fn new(
         catalog: TrackCatalog,
+        catalog_paths: CatalogPaths,
         camera_device: PathBuf,
+        camera_settings: CameraSettings,
         registry: Arc<Registry>,
         sessions_root: PathBuf,
+        provenance: ProvenanceStore,
     ) -> Arc<Self> {
         let (outbound, _) = broadcast::channel(OUTBOUND_CAPACITY);
         Arc::new(Self {
-            catalog,
-            video: Arc::new(Mutex::new(FfmpegVideoCapture::new(camera_device))),
+            catalog: std::sync::RwLock::new(catalog),
+            catalog_paths,
+            video: Arc::new(Mutex::new(FfmpegVideoCapture::new(
+                camera_device,
+                camera_settings,
+            ))),
             registry,
             sessions_root,
             outbound,
+            provenance,
             state: Mutex::new(ManagerState {
                 phase: Phase::Idle,
                 placement_photo: None,
@@ -159,6 +184,16 @@ impl CollectionManager {
                 latest_beatmap: None,
             }),
         })
+    }
+
+    /// The board and harness remembered for a device, for the browser's view.
+    pub fn board_revision(&self, device_id: &str) -> Option<BoardRevision> {
+        self.provenance.board_revision(device_id)
+    }
+
+    /// Remember a device's board and harness until someone says otherwise.
+    pub fn set_board_revision(&self, device_id: &str, revision: BoardRevision) {
+        self.provenance.set_board_revision(device_id, revision);
     }
 
     /// Subscribe a browser session to collection frames.
@@ -185,18 +220,33 @@ impl CollectionManager {
     }
 
     fn catalog_frame(&self) -> Frame {
+        let catalog = self.catalog.read().unwrap();
         Frame::CollectionCatalog {
-            subjects: self.catalog.subjects().to_vec(),
-            tracks: self.catalog.tracks(),
-            collection_classes: self.catalog.collection_classes().to_vec(),
-            activities: self.catalog.activities().to_vec(),
-            sweat_levels: self.catalog.sweat_levels().to_vec(),
+            subjects: catalog.subjects().to_vec(),
+            tracks: catalog.tracks(),
+            collection_classes: catalog.collection_classes().to_vec(),
+            activities: catalog.activities().to_vec(),
+            sweat_levels: catalog.sweat_levels().to_vec(),
         }
+    }
+
+    /// The track library's root, for the import and delete routes.
+    pub fn tracks_root(&self) -> &std::path::Path {
+        &self.catalog_paths.tracks_root
+    }
+
+    /// Re-read the library from disk and tell every browser what it now holds.
+    /// An import or a delete is only finished once this has run.
+    pub fn reload_catalog(&self) -> anyhow::Result<()> {
+        let reloaded = self.catalog_paths.load()?;
+        *self.catalog.write().unwrap() = reloaded;
+        self.publish(self.catalog_frame());
+        Ok(())
     }
 
     /// Filesystem path of a track's audio, for the HTTP audio route.
     pub fn audio_path(&self, track_id: &TrackId) -> Option<PathBuf> {
-        self.catalog.audio_path(track_id)
+        self.catalog.read().unwrap().audio_path(track_id)
     }
 
     /// Broadcast a frame, caching state/beatmap frames for later connectors.
@@ -240,6 +290,7 @@ impl CollectionManager {
         metadata: SessionMetadata,
         track_id: TrackId,
         difficulty: DifficultyLevel,
+        record_video: bool,
         device_id: Option<String>,
     ) {
         if let Err(reason) = self.validate_start(&metadata, &track_id) {
@@ -259,7 +310,7 @@ impl CollectionManager {
         tokio::spawn(async move {
             if let Err(error) = manager
                 .clone()
-                .arm(metadata, track_id, difficulty, device_id)
+                .arm(metadata, track_id, difficulty, record_video, device_id)
                 .await
             {
                 manager.publish_error(format!("session start failed: {error:#}"));
@@ -277,23 +328,22 @@ impl CollectionManager {
         if metadata.subject.0.trim().is_empty() {
             return Err("empty subject".into());
         }
-        if !self
-            .catalog
+        let catalog = self.catalog.read().unwrap();
+        if !catalog
             .activities()
             .iter()
             .any(|activity| activity.id == metadata.activity)
         {
             return Err(format!("unknown activity '{}'", metadata.activity));
         }
-        if !self
-            .catalog
+        if !catalog
             .sweat_levels()
             .iter()
             .any(|sweat| sweat.id == metadata.sweat)
         {
             return Err(format!("unknown sweat level '{}'", metadata.sweat));
         }
-        if self.catalog.audio_path(track_id).is_none() {
+        if catalog.audio_path(track_id).is_none() {
             return Err(format!("unknown track '{track_id}'"));
         }
         Ok(())
@@ -337,6 +387,10 @@ impl CollectionManager {
             .registry
             .config_of(device_id)
             .ok_or_else(|| anyhow::anyhow!("device '{device_id}' has no config"))?;
+        let provenance = self
+            .registry
+            .provenance_of(device_id)
+            .ok_or_else(|| anyhow::anyhow!("device '{device_id}' reported no provenance"))?;
         Ok(AcquiredDevice {
             emg_receiver,
             hardware: HardwareIdentity {
@@ -346,6 +400,8 @@ impl CollectionManager {
                 sample_rate,
                 scale_uv,
                 device_config,
+                provenance,
+                board_revision: self.provenance.board_revision(device_id),
             },
         })
     }
@@ -360,6 +416,7 @@ impl CollectionManager {
         metadata: SessionMetadata,
         track_id: TrackId,
         difficulty: DifficultyLevel,
+        record_video: bool,
         device_id: Option<String>,
     ) -> anyhow::Result<()> {
         let acquired = match device_id {
@@ -367,20 +424,25 @@ impl CollectionManager {
             None => None,
         };
 
-        let track = self
-            .catalog
-            .tracks()
-            .into_iter()
-            .find(|track| track.id == track_id)
-            .ok_or_else(|| anyhow::anyhow!("unknown track '{track_id}'"))?;
-        let class_ids = self.catalog.class_ids();
-        let seed = now().get();
-        let beatmap = self
-            .catalog
-            .generate(&track_id, &class_ids, difficulty, seed)?;
+        let (track, class_ids, beatmap, beat_times) = {
+            let catalog = self.catalog.read().unwrap();
+            let track = catalog
+                .tracks()
+                .into_iter()
+                .find(|track| track.id == track_id)
+                .ok_or_else(|| anyhow::anyhow!("unknown track '{track_id}'"))?;
+            let class_ids = catalog.class_ids();
+            let seed = now().get();
+            let beatmap = catalog.generate(&track_id, &class_ids, difficulty, seed)?;
+            let beat_times = catalog.beat_times(&track_id).unwrap_or_default();
+            (track, class_ids, beatmap, beat_times)
+        };
 
         let created = now();
         let practice = acquired.is_none();
+        let session_device_id = acquired
+            .as_ref()
+            .map(|device| device.hardware.device_id.clone());
         let session_id = SessionId(format!(
             "{}_{}{}",
             chrono::Local::now().format("%Y-%m-%dT%H-%M-%S"),
@@ -393,14 +455,19 @@ impl CollectionManager {
                 emg_receiver,
                 hardware,
             }) => {
+                let don_count = self
+                    .provenance
+                    .next_don_count(&metadata.subject, metadata.arm);
                 let manifest = SessionManifest {
                     session_id: session_id.clone(),
                     created,
                     metadata,
                     hardware,
+                    don_count,
                     track: track.clone(),
                     difficulty,
                     class_ids,
+                    record_video,
                     completed: false,
                 };
 
@@ -429,26 +496,33 @@ impl CollectionManager {
             None => (None, None, None),
         };
 
-        // Video is optional: a missing camera degrades to an EMG-only session.
-        // Practice sessions have no directory to record into, so no video either.
-        let recording_handle: Option<RecordingHandle> = match &directory {
-            Some(directory) => {
+        // The operator asked for video or they did not. A camera that cannot
+        // deliver it aborts the start — a session that silently records EMG
+        // alone is the failure this whole path exists to prevent. Practice
+        // sessions have no directory to record into, so no video either.
+        let recording_handle: Option<RecordingHandle> = match (record_video, &directory) {
+            (true, Some(directory)) => {
                 let video = Arc::clone(&self.video);
                 let video_output = directory.join("video.mkv");
                 let requested_start = now();
-                tokio::task::spawn_blocking(move || {
+                let started = tokio::task::spawn_blocking(move || {
                     video
                         .lock()
                         .unwrap()
                         .start_recording(&video_output, requested_start)
                 })
-                .await?
-                .map_err(|error| {
-                    tracing::warn!("video capture unavailable, continuing without: {error:#}");
-                })
-                .ok()
+                .await?;
+                match started {
+                    Ok(handle) => Some(handle),
+                    Err(error) => {
+                        // Nothing has been recorded yet, so the directory holds
+                        // only the manifest; leaving it would look like a take.
+                        let _ = std::fs::remove_dir_all(directory);
+                        return Err(error.context("this session asked for video"));
+                    }
+                }
             }
-            None => None,
+            (false, _) | (true, None) => None,
         };
 
         let (control, control_receiver) = mpsc::unbounded_channel();
@@ -465,7 +539,7 @@ impl CollectionManager {
             session_id: session_id.clone(),
             track: track.clone(),
             notes: beatmap.clone(),
-            beat_times: self.catalog.beat_times(&track_id).unwrap_or_default(),
+            beat_times,
             lead_in: crate::collect::beatmap::LEAD_IN,
         });
 
@@ -475,6 +549,7 @@ impl CollectionManager {
             directory,
             recorder,
             emg_receiver,
+            session_device_id,
             control_receiver,
             recording_handle,
             beatmap,
@@ -489,6 +564,14 @@ impl CollectionManager {
         let state = self.state.lock().unwrap();
         if let Phase::Running { control } = &state.phase {
             let _ = control.send(SessionControl::TrackStarted(at));
+        }
+    }
+
+    /// Browser → `TrackResumed`.
+    pub fn track_resumed(&self, at: UnixMilliseconds, position: TrackMilliseconds) {
+        let state = self.state.lock().unwrap();
+        if let Phase::Running { control } = &state.phase {
+            let _ = control.send(SessionControl::TrackResumed(at, position));
         }
     }
 
@@ -529,6 +612,26 @@ impl CollectionManager {
         }
     }
 
+    /// Browser → `GET /collection/camera/preview`. Starts the setup preview and
+    /// hands back its JPEG parts plus the hold that keeps it alive; the camera
+    /// is released the moment the hold is dropped.
+    pub async fn start_camera_preview(
+        self: &Arc<Self>,
+    ) -> anyhow::Result<(CameraPreviewHold, mpsc::Receiver<Vec<u8>>)> {
+        let video = Arc::clone(&self.video);
+        // start_preview waits for the first frame, so it must not run on a
+        // runtime worker.
+        let session =
+            tokio::task::spawn_blocking(move || video.lock().unwrap().start_preview()).await??;
+        Ok((
+            CameraPreviewHold {
+                video: Arc::clone(&self.video),
+                token: session.token,
+            },
+            session.parts,
+        ))
+    }
+
     /// Browser → `CapturePlacementPhoto`. Idle only: the camera cannot be
     /// opened twice, and setup is the only place the photo makes sense.
     pub fn capture_placement_photo(self: &Arc<Self>) {
@@ -561,6 +664,20 @@ impl CollectionManager {
                 }
             }
         });
+    }
+}
+
+/// One browser's claim on the setup preview, alive for as long as the HTTP
+/// response streams. Dropping it releases the camera, so a browser that closes
+/// its tab cannot leave the device held against the next session.
+pub struct CameraPreviewHold {
+    video: Arc<Mutex<FfmpegVideoCapture>>,
+    token: crate::collect::video::PreviewToken,
+}
+
+impl Drop for CameraPreviewHold {
+    fn drop(&mut self) {
+        self.video.lock().unwrap().stop_preview(self.token);
     }
 }
 
@@ -649,19 +766,27 @@ impl ActivityBaseline {
     }
 }
 
-/// A live session. The three `Option`s below are all `None` together for a
-/// practice session (no device): nothing records, and every cue misses.
+/// A live session. The four device-shaped `Option`s below are all `None`
+/// together for a practice session: nothing records, nothing can stall, and
+/// every cue misses.
 struct RunningSession {
     manager: Arc<CollectionManager>,
     session_id: SessionId,
     directory: Option<PathBuf>,
     recorder: Option<FileSessionRecorder>,
     emg_receiver: Option<broadcast::Receiver<Frame>>,
+    device_id: Option<String>,
     control: mpsc::UnboundedReceiver<SessionControl>,
     recording_handle: Option<RecordingHandle>,
     cues: Vec<CueState>,
     track: TrackInfo,
+    /// The instant audio t = 0 was, for the segment now playing. `TrackStarted`
+    /// sets it and every `TrackResumed` re-derives it, so a cue's wall-clock
+    /// time is always `anchor + note position` for the segment it falls in.
     anchor: Option<UnixMilliseconds>,
+    /// When the most recent EMG window landed, the stall detector's baseline.
+    last_window_at: Option<UnixMilliseconds>,
+    paused: Option<CollectionPause>,
     armed_at: UnixMilliseconds,
     baseline: ActivityBaseline,
     activity_hits: u32,
@@ -686,6 +811,7 @@ impl RunningSession {
         directory: Option<PathBuf>,
         recorder: Option<FileSessionRecorder>,
         emg_receiver: Option<broadcast::Receiver<Frame>>,
+        device_id: Option<String>,
         control: mpsc::UnboundedReceiver<SessionControl>,
         recording_handle: Option<RecordingHandle>,
         beatmap: Beatmap,
@@ -711,11 +837,14 @@ impl RunningSession {
             directory,
             recorder,
             emg_receiver,
+            device_id,
             control,
             recording_handle,
             cues,
             track,
             anchor: None,
+            last_window_at: None,
+            paused: None,
             armed_at: now(),
             baseline: ActivityBaseline { value: None },
             activity_hits: 0,
@@ -726,6 +855,7 @@ impl RunningSession {
                     advancing: false,
                 },
                 video: None,
+                recorded: None,
             },
         }
     }
@@ -737,6 +867,7 @@ impl RunningSession {
             tokio::select! {
                 message = self.control.recv() => match message {
                     Some(SessionControl::TrackStarted(at)) => self.anchor_track(at),
+                    Some(SessionControl::TrackResumed(at, position)) => self.resume_track(at, position),
                     Some(SessionControl::Finish) => break Ending::Review,
                     None => break Ending::Review, // manager dropped; shouldn't happen
                 },
@@ -776,13 +907,132 @@ impl RunningSession {
             return;
         }
         self.anchor = Some(at);
-        for cue in &mut self.cues {
-            cue.at_wall = Some(at.at_track_position(cue.at_track));
-            cue.release_wall = Some(at.at_track_position(cue.at_track.plus(cue.hold)));
-        }
+        self.place_unlogged_cues(at);
+        // Silence is measured from here rather than from arming, so a session
+        // armed early does not start out looking stalled.
+        self.last_window_at = Some(at);
         if let Some(recorder) = &mut self.recorder {
             if let Err(error) = recorder.append_event(&SessionEvent::TrackStarted { at }) {
                 tracing::warn!("failed to log track start: {error:#}");
+            }
+        }
+        self.publish_state();
+    }
+
+    /// Every cue that has not been logged yet takes its wall-clock transitions
+    /// from this anchor. Logged cues keep the times they were logged with: those
+    /// are what the subject was actually shown.
+    fn place_unlogged_cues(&mut self, anchor: UnixMilliseconds) {
+        for cue in self.cues.iter_mut().filter(|cue| !cue.logged) {
+            cue.at_wall = Some(anchor.at_track_position(cue.at_track));
+            cue.release_wall = Some(anchor.at_track_position(cue.at_track.plus(cue.hold)));
+        }
+    }
+
+    fn track_position(&self, at: UnixMilliseconds) -> TrackMilliseconds {
+        let elapsed = match self.anchor {
+            Some(anchor) => at.since(anchor).get().max(0) as u64,
+            None => 0,
+        };
+        TrackMilliseconds::new(elapsed.min(u32::MAX as u64) as u32)
+    }
+
+    /// Freeze the cue timeline: the device has gone quiet, so anything cued from
+    /// here on would be asked of a subject nothing is being recorded from.
+    fn pause_for_silence(&mut self, at: UnixMilliseconds, silent_for: DurationMilliseconds) {
+        let track_position = self.track_position(at);
+        let device_id = self.device_id.clone().unwrap_or_default();
+        self.interrupt_cues_in_progress(at);
+        let event = SessionEvent::Paused {
+            at,
+            track_position,
+            silent_for,
+            device_id: device_id.clone(),
+        };
+        if let Some(recorder) = &mut self.recorder {
+            if let Err(error) = recorder.append_event(&event) {
+                tracing::warn!("failed to log the pause: {error:#}");
+            }
+        }
+        self.paused = Some(CollectionPause {
+            device_id,
+            since: at,
+            silent_for,
+            track_position,
+            device_recovered: false,
+        });
+        self.publish_state();
+    }
+
+    /// A cue whose hold straddles the pause is cut short here and never
+    /// re-issued: the subject let go when the music stopped, so replaying the
+    /// rest of the hold would label rest as a gesture.
+    fn interrupt_cues_in_progress(&mut self, at: UnixMilliseconds) {
+        for position in 0..self.cues.len() {
+            let cue = &self.cues[position];
+            if !cue.logged || cue.resolved {
+                continue;
+            }
+            // A cue whose hold already ran out was shown in full; it is only
+            // waiting on its activity window, so it resolves as usual.
+            let held_through = cue.release_wall.is_some_and(|release| release > at);
+            let index = cue.index;
+            self.cues[position].resolved = true;
+            let hit = self.cue_hit(position);
+            if hit {
+                self.activity_hits += 1;
+            }
+            if held_through {
+                let event = SessionEvent::CueInterrupted {
+                    note_index: index,
+                    at,
+                };
+                if let Some(recorder) = &mut self.recorder {
+                    if let Err(error) = recorder.append_event(&event) {
+                        tracing::warn!("failed to log the interrupted cue: {error:#}");
+                    }
+                }
+            }
+            self.manager.publish(Frame::NoteResult {
+                session_id: self.session_id.clone(),
+                index,
+                hit,
+            });
+        }
+    }
+
+    /// Re-anchor on the browser's report of where audio actually restarted, and
+    /// place every cue still ahead of the playhead against it.
+    fn resume_track(&mut self, at: UnixMilliseconds, position: TrackMilliseconds) {
+        let Some(pause) = self.paused.take() else {
+            tracing::warn!("ignoring track_resumed for a session that is not paused");
+            return;
+        };
+        let anchor = at.before_track_position(position);
+        self.anchor = Some(anchor);
+        // A cue whose onset is already behind the resumed playhead was never
+        // shown — the pause froze the timeline just short of it. Retire it
+        // silently rather than logging a gesture nobody was asked for.
+        for cue in self.cues.iter_mut().filter(|cue| !cue.logged) {
+            if cue.at_track < position {
+                cue.logged = true;
+                cue.resolved = true;
+            }
+        }
+        self.place_unlogged_cues(anchor);
+        // The stall clock restarts here, so resuming onto a device that is still
+        // quiet takes the full threshold again rather than re-pausing at once.
+        self.last_window_at = Some(at);
+        let paused_for = DurationMilliseconds::new(
+            at.since(pause.since).get().max(0).min(u32::MAX as i64) as u32,
+        );
+        if let Some(recorder) = &mut self.recorder {
+            if let Err(error) = recorder.append_event(&SessionEvent::Resumed {
+                at,
+                track_position: position,
+                paused_for,
+            }) {
+                tracing::warn!("failed to log the resume: {error:#}");
             }
         }
         self.publish_state();
@@ -796,6 +1046,18 @@ impl RunningSession {
         samples: &[u8],
         missing: &[u8],
     ) {
+        let arrival = now();
+        self.last_window_at = Some(arrival);
+        let recovering = self
+            .paused
+            .as_ref()
+            .is_some_and(|pause| !pause.device_recovered);
+        if recovering {
+            if let Some(pause) = &mut self.paused {
+                pause.device_recovered = true;
+            }
+            self.publish_state();
+        }
         if let Some(recorder) = &mut self.recorder {
             if let Err(error) = recorder.append_emg(EmgWindow {
                 seq,
@@ -809,7 +1071,7 @@ impl RunningSession {
         let Some(mean_absolute) = mean_absolute_deviation(channels, samples) else {
             return;
         };
-        let arrival = now().get();
+        let arrival = arrival.get();
         let mut near_cue = false;
         for cue in &mut self.cues {
             let (Some(at_wall), Some(release_wall)) = (cue.at_wall, cue.release_wall) else {
@@ -844,6 +1106,15 @@ impl RunningSession {
                 }
             }
             Some(anchor) => {
+                // A frozen timeline resolves nothing and cannot reach the
+                // track's end; only the browser's resume restarts it.
+                if self.paused.is_some() {
+                    return None;
+                }
+                if let Some(silent_for) = self.silence_past_threshold(current) {
+                    self.pause_for_silence(current, silent_for);
+                    return None;
+                }
                 self.resolve_cues(current);
                 let track_end = anchor
                     .at_track_position(TrackMilliseconds::new(self.track.duration.get()))
@@ -855,6 +1126,27 @@ impl RunningSession {
             }
         }
         None
+    }
+
+    /// How long the device has been silent, once that exceeds
+    /// [`STALL_THRESHOLD`]. Always `None` for a practice session, which has no
+    /// device to fall silent.
+    fn silence_past_threshold(&self, current: UnixMilliseconds) -> Option<DurationMilliseconds> {
+        let last = self.last_window_at?;
+        self.emg_receiver.as_ref()?;
+        let silent = current.since(last).get().max(0);
+        (silent > STALL_THRESHOLD.as_millis() as i64)
+            .then(|| DurationMilliseconds::new(silent.min(u32::MAX as i64) as u32))
+    }
+
+    /// Whether a cue's peak activity beat the rolling baseline.
+    fn cue_hit(&self, position: usize) -> bool {
+        match self.baseline.value {
+            Some(baseline) if baseline > 0.0 => {
+                self.cues[position].peak_activity > baseline * ACTIVITY_HIT_FACTOR
+            }
+            _ => false,
+        }
     }
 
     fn resolve_cues(&mut self, current: UnixMilliseconds) {
@@ -878,21 +1170,17 @@ impl RunningSession {
                     }
                 }
             }
+            let index = cue.index;
             if cue.logged
                 && !cue.resolved
                 && current.get() > release_wall.get() + ACTIVITY_WINDOW_AFTER_MILLISECONDS
             {
                 cue.resolved = true;
-                let hit = match self.baseline.value {
-                    Some(baseline) if baseline > 0.0 => {
-                        cue.peak_activity > baseline * ACTIVITY_HIT_FACTOR
-                    }
-                    _ => false,
-                };
+                let hit = self.cue_hit(position);
                 if hit {
                     self.activity_hits += 1;
                     let event = SessionEvent::ActivityHit {
-                        note_index: cue.index,
+                        note_index: index,
                         at: current,
                     };
                     if let Some(recorder) = &mut self.recorder {
@@ -901,7 +1189,6 @@ impl RunningSession {
                         }
                     }
                 }
-                let index = cue.index;
                 self.manager.publish(Frame::NoteResult {
                     session_id: self.session_id.clone(),
                     index,
@@ -925,7 +1212,11 @@ impl RunningSession {
             .recording_handle
             .as_ref()
             .map(|handle| self.manager.video.lock().unwrap().health(handle));
-        self.latest_health = RecordingHealth { emg, video };
+        self.latest_health = RecordingHealth {
+            emg,
+            video,
+            recorded: self.recorder.as_ref().map(SessionRecorder::recorded_emg),
+        };
     }
 
     fn publish_state(&self) {
@@ -933,6 +1224,7 @@ impl RunningSession {
             CollectionPhase::Playing {
                 session_id: self.session_id.clone(),
                 recording: self.latest_health,
+                paused: self.paused.clone(),
             }
         } else {
             CollectionPhase::Armed {

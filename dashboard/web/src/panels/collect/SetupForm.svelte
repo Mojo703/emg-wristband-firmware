@@ -13,6 +13,7 @@
     DifficultyLevel,
     DIFFICULTY_LEVELS,
     nowUnixMilliseconds,
+    type BoardRevision,
     type CollectionCatalogFrame,
     type SessionMetadata,
     type UnixMilliseconds,
@@ -31,15 +32,37 @@
     catalog: CollectionCatalogFrame;
     placementPhoto: UnixMilliseconds | null;
     disabled: boolean;
+    /** What the backend remembers this device is soldered to, if anything. */
+    boardRevision: BoardRevision | null;
+    /** Null when no device is selected, since there is nothing to remember it against. */
+    onSetBoardRevision: ((revision: BoardRevision) => void) | null;
+    /** The track whose deletion is in flight, if one is. */
+    deletingTrackId: string | null;
+    /** No device is selected, so this run would be practice: the game plays on
+     * the real schedule and not one sample reaches disk. */
+    recordsNothing: boolean;
     onStart: (
       metadata: SessionMetadata,
       trackId: string,
       difficulty: DifficultyLevel,
+      recordVideo: boolean,
     ) => void;
     onCapturePlacementPhoto: () => void;
+    onDeleteTrack: (trackId: string) => void;
   }
 
-  let { catalog, placementPhoto, disabled, onStart, onCapturePlacementPhoto }: Props = $props();
+  let {
+    catalog,
+    placementPhoto,
+    disabled,
+    boardRevision,
+    onSetBoardRevision,
+    deletingTrackId,
+    recordsNothing,
+    onStart,
+    onCapturePlacementPhoto,
+    onDeleteTrack,
+  }: Props = $props();
 
   // Band geometry. The band wears like a wristwatch, so the offset is measured
   // up the forearm from the ulnar styloid — the bony bump on the wrist's pinky
@@ -73,6 +96,34 @@
   // How demanding the cues are. Every track ships a schedule per level, so this
   // picks one of the backend's rather than shaping anything here.
   let selectedDifficulty = $state<DifficultyLevel>(DifficultyLevel.Medium);
+
+  // Webcam video is opt-in per session, and the camera only opens once the
+  // operator asks for it. The preview streams from the backend's own ffmpeg
+  // rather than from getUserMedia, so what it shows is the device the recording
+  // will use. Taking a placement photo takes the camera off the preview for a
+  // moment, so the stream is re-attached once the photo lands.
+  let recordVideo = $state(false);
+  const CAMERA_PREVIEW_URL = '/collection/camera/preview';
+
+  // The board and harness are remembered per device by the backend, so these
+  // fields start at whatever it holds and are only written when the operator
+  // leaves one having changed it.
+  let boardText = $state('');
+  let harnessText = $state('');
+  $effect(() => {
+    boardText = boardRevision?.board ?? '';
+    harnessText = boardRevision?.harness ?? '';
+  });
+
+  function commitBoardRevision(): void {
+    if (onSetBoardRevision === null) return;
+    const revision = { board: boardText.trim(), harness: harnessText.trim() };
+    if (revision.board === (boardRevision?.board ?? '') &&
+        revision.harness === (boardRevision?.harness ?? '')) {
+      return;
+    }
+    onSetBoardRevision(revision);
+  }
 
   // A coarse clock, only fine enough to keep the "n min ago" beside the donned
   // stamp honest. Nothing else re-renders on it.
@@ -126,6 +177,34 @@
   });
   const startable = $derived(!disabled && subject !== null && trackId !== '');
 
+  // Deleting a track takes the audio and the chart with it, so it is a two-tap
+  // action, and an armed confirm button disarms itself rather than sitting there
+  // waiting for a stray tap.
+  const DELETE_ARMED_MILLISECONDS = 5000;
+  let deleteArmedTrackId = $state<string | null>(null);
+  let disarmTimer: number | null = null;
+
+  function armDelete(candidateTrackId: string): void {
+    deleteArmedTrackId = candidateTrackId;
+    if (disarmTimer !== null) window.clearTimeout(disarmTimer);
+    disarmTimer = window.setTimeout(() => {
+      disarmTimer = null;
+      deleteArmedTrackId = null;
+    }, DELETE_ARMED_MILLISECONDS);
+  }
+
+  function disarmDelete(): void {
+    if (disarmTimer !== null) {
+      window.clearTimeout(disarmTimer);
+      disarmTimer = null;
+    }
+    deleteArmedTrackId = null;
+  }
+
+  $effect(() => () => {
+    if (disarmTimer !== null) window.clearTimeout(disarmTimer);
+  });
+
   function clamp(value: number, minimum: number, maximum: number): number {
     return Math.min(maximum, Math.max(minimum, value));
   }
@@ -161,7 +240,7 @@
       sweat,
       note: trimmedNote === '' ? null : trimmedNote,
     };
-    onStart(metadata, trackId, selectedDifficulty);
+    onStart(metadata, trackId, selectedDifficulty, recordVideo);
   }
 </script>
 
@@ -248,6 +327,30 @@
       >
     </div>
 
+    <span class="field-label">Board</span>
+    <div class="chips">
+      <input
+        type="text"
+        class="chip"
+        data-filled={boardText.trim() !== '' ? 'true' : 'false'}
+        placeholder="board rev"
+        aria-label="board revision"
+        disabled={disabled || onSetBoardRevision === null}
+        bind:value={boardText}
+        onchange={commitBoardRevision}
+      />
+      <input
+        type="text"
+        class="chip"
+        data-filled={harnessText.trim() !== '' ? 'true' : 'false'}
+        placeholder="harness"
+        aria-label="harness revision"
+        disabled={disabled || onSetBoardRevision === null}
+        bind:value={harnessText}
+        onchange={commitBoardRevision}
+      />
+    </div>
+
     <span class="field-label">Activity</span>
     <div class="chips">
       {#each catalog.activities as condition (condition.id)}
@@ -264,6 +367,16 @@
       {#each catalog.sweat_levels as level (level.id)}
         {@render chip(level.label, sweat === level.id, () => (selectedSweat = level.id))}
       {/each}
+    </div>
+
+    <span class="field-label">Video</span>
+    <div class="video">
+      {@render yesNo(recordVideo, (next) => (recordVideo = next))}
+      {#if recordVideo}
+        {#key placementPhoto}
+          <img class="preview" src={CAMERA_PREVIEW_URL} alt="camera preview" />
+        {/key}
+      {/if}
     </div>
 
     <span class="field-label">Photo</span>
@@ -285,18 +398,42 @@
     <span class="field-label tall">Track</span>
     <div class="tracks">
       {#each catalog.tracks as candidate (candidate.id)}
-        <button
-          type="button"
-          class="chip track"
-          aria-pressed={trackId === candidate.id}
-          {disabled}
-          onclick={() => (selectedTrack = candidate.id)}
-        >
-          <strong>{candidate.title}</strong>
-          <span class="muted">
-            {Math.round(candidate.beats_per_minute)} bpm · {formatWholeMinutes(candidate.duration)} min
-          </span>
-        </button>
+        <div class="track-row">
+          <button
+            type="button"
+            class="chip track"
+            aria-pressed={trackId === candidate.id}
+            {disabled}
+            onclick={() => (selectedTrack = candidate.id)}
+          >
+            <strong>{candidate.title}</strong>
+            <span class="muted">
+              {Math.round(candidate.beats_per_minute)} bpm · {formatWholeMinutes(candidate.duration)}
+              min
+            </span>
+          </button>
+          {#if deletingTrackId === candidate.id}
+            <span class="muted">deleting…</span>
+          {:else if deleteArmedTrackId === candidate.id}
+            <Button
+              variant="destructive"
+              size="sm"
+              onclick={() => {
+                disarmDelete();
+                onDeleteTrack(candidate.id);
+              }}>Confirm delete</Button
+            >
+            <Button variant="ghost" size="sm" onclick={disarmDelete}>Keep</Button>
+          {:else}
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={disabled || deletingTrackId !== null}
+              aria-label={`delete ${candidate.title}`}
+              onclick={() => armDelete(candidate.id)}>Delete</Button
+            >
+          {/if}
+        </div>
       {/each}
       {#if catalog.tracks.length === 0}
         <span class="muted">No tracks in the catalog.</span>
@@ -319,10 +456,12 @@
   <div class="actions">
     <Button size="lg" disabled={!startable} onclick={start}>
       <Icon name="play" size={14} />
-      Start session
+      {recordsNothing ? 'Start practice run' : 'Start session'}
     </Button>
     {#if subject === null}
       <span class="muted">Pick a subject first.</span>
+    {:else if recordsNothing}
+      <strong class="warn">No device selected — this run records nothing.</strong>
     {/if}
   </div>
 </div>
@@ -358,6 +497,20 @@
     flex-wrap: wrap;
   }
 
+  .video {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+  }
+  .preview {
+    width: 320px;
+    max-width: 100%;
+    aspect-ratio: 16 / 9;
+    object-fit: cover;
+    border-radius: 6px;
+  }
+
   .stepper-value {
     min-width: 64px;
     text-align: center;
@@ -368,7 +521,13 @@
     flex-direction: column;
     gap: 6px;
   }
+  .track-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
   .track {
+    flex: 1;
     display: flex;
     justify-content: space-between;
     align-items: baseline;

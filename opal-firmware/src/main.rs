@@ -29,6 +29,7 @@ mod links;
 mod logger;
 #[cfg(test)]
 mod model_checks;
+mod provenance;
 mod telemetry;
 mod transport;
 mod wifi;
@@ -532,6 +533,7 @@ fn main() -> anyhow::Result<()> {
         let hello = config_changed.then(|| Frame::DeviceHello {
             device_id: device_id.clone(),
             config: settings.to_wire(),
+            provenance: provenance::device(),
         });
         links.send_window(hello.as_ref(), &decision_frames);
         performance.record(

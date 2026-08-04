@@ -17,6 +17,7 @@ import {
   decodeEmg,
   type BeatmapFrame,
   type Binding,
+  type BoardRevision,
   type CollectionCatalogFrame,
   type CollectionStateFrame,
   type DecodedEmg,
@@ -29,7 +30,9 @@ import {
   type PoseFrame,
   type PredictionFrame,
   type SessionMetadata,
+  type SignalQualityFrame,
   type TelemetryFrame,
+  type TrackMilliseconds,
   type UnixMilliseconds,
 } from './protocol';
 
@@ -74,6 +77,9 @@ class LiveStateManager {
   // series) or the connection resets.
   telemetry = $state<Record<string, Record<string, TelemetrySample[]>>>({});
   #telemetryDevice: string | null = null;
+  // The pre-collection electrode check, recomputed by the backend about once a
+  // second from the selected device's stream.
+  #signalQuality = $state<SignalQualityFrame | null>(null);
   // Collection (the falling-notes capture game). The catalog is a descriptor the
   // backend sends once per connection, like hello; the state frame is the
   // backend's authoritative session phase, and the beatmap arrives once per
@@ -99,6 +105,10 @@ class LiveStateManager {
     return this.status === 'online' ? this.#beatmap : null;
   }
 
+  get signalQuality(): SignalQualityFrame | null {
+    return this.status === 'online' ? this.#signalQuality : null;
+  }
+
   get emg(): DecodedEmg | null {
     return this.status === 'online' ? this.#emg : null;
   }
@@ -118,6 +128,7 @@ class LiveStateManager {
     if (device !== this.#telemetryDevice) {
       this.#telemetryDevice = device;
       this.telemetry = {};
+      this.#signalQuality = null;
     }
     if (this.status === 'handshake') {
       this.status = 'online';
@@ -172,6 +183,10 @@ class LiveStateManager {
     this.#pose = value;
   }
 
+  setSignalQuality(value: SignalQualityFrame): void {
+    this.#signalQuality = value;
+  }
+
   setCatalog(value: CollectionCatalogFrame): void {
     this.#catalog = value;
   }
@@ -197,6 +212,7 @@ class LiveStateManager {
     this.#emg = null;
     this.#prediction = null;
     this.#pose = null;
+    this.#signalQuality = null;
     this.#catalog = null;
     this.#collectionState = null;
     this.#beatmap = null;
@@ -211,6 +227,7 @@ class LiveStateManager {
     this.#emg = null;
     this.#prediction = null;
     this.#pose = null;
+    this.#signalQuality = null;
     this.#catalog = null;
     this.#collectionState = null;
     this.#beatmap = null;
@@ -355,6 +372,8 @@ export function connect(): void {
       for (const cb of listeners.log) cb(frame);
     } else if (frame.type === 'telemetry') {
       live.appendTelemetry(frame);
+    } else if (frame.type === 'signal_quality') {
+      live.setSignalQuality(frame);
     } else if (frame.type === 'collection_catalog') {
       live.setCatalog(frame);
     } else if (frame.type === 'collection_state') {
@@ -389,15 +408,33 @@ export const api = {
     send({ type: 'set_wifi', ssid, psk }),
   server: (addr: string) =>
     send({ type: 'set_server', addr }),
+  boardRevision: (deviceId: string, revision: BoardRevision) =>
+    send({ type: 'set_board_revision', device_id: deviceId, revision }),
   startCollection: (
     metadata: SessionMetadata,
     trackId: string,
     difficulty: DifficultyLevel,
-  ) => send({ type: 'start_collection', metadata, track_id: trackId, difficulty }),
+    recordVideo: boolean,
+  ) =>
+    send({
+      type: 'start_collection',
+      metadata,
+      track_id: trackId,
+      difficulty,
+      record_video: recordVideo,
+    }),
   // The moment the audio element actually began playing, which is the only
   // timestamp that can align the recorded streams with the beat grid.
   trackStarted: (atUnixMilliseconds: UnixMilliseconds) =>
     send({ type: 'track_started', at_unix_ms: atUnixMilliseconds }),
+  // Both halves of the resumed session's anchor: when audio restarted and where
+  // in the track it restarted from.
+  trackResumed: (atUnixMilliseconds: UnixMilliseconds, positionMilliseconds: TrackMilliseconds) =>
+    send({
+      type: 'track_resumed',
+      at_unix_ms: atUnixMilliseconds,
+      position_ms: positionMilliseconds,
+    }),
   finishCollection: () =>
     send({ type: 'finish_collection' }),
   stopCollection: (save: boolean) =>
@@ -410,8 +447,11 @@ export const api = {
 export type { Binding, DecodedEmg, EventFrame, HelloFrame, LogFrame, PoseFrame, PredictionFrame } from './protocol';
 export type {
   BeatmapFrame,
+  BoardRevision,
+  ChannelQuality,
   CollectionCatalogFrame,
   CollectionStateFrame,
   NoteResultFrame,
+  SignalQualityFrame,
   SessionMetadata,
 } from './protocol';

@@ -9,6 +9,7 @@
   let lastMetadata: SessionMetadata | null = null;
   let lastTrackId: string | null = null;
   let lastDifficulty: DifficultyLevel | null = null;
+  let lastRecordVideo = false;
 </script>
 
 <script lang="ts">
@@ -23,9 +24,15 @@
   import GameView from '../lib/collect/GameView.svelte';
   import SetupForm from './collect/SetupForm.svelte';
   import SessionSummary from './collect/SessionSummary.svelte';
-  import type { DifficultyLevel, UnixMilliseconds } from '../lib/protocol';
+  import SignalQuality from './collect/SignalQuality.svelte';
+  import TrackImport from './collect/TrackImport.svelte';
+  import { deleteTrack, failureText } from './collect/trackLibrary';
+  import type { DifficultyLevel, TrackMilliseconds, UnixMilliseconds } from '../lib/protocol';
 
   const catalog = $derived(live.catalog);
+  // The board revision is remembered against the selected device, so the setup
+  // form can only offer it while one is selected.
+  const selection = $derived(live.hello?.selection ?? null);
   const collectionState = $derived(live.collectionState);
   const phase = $derived(collectionState?.phase ?? null);
   const beatmap = $derived(live.beatmap);
@@ -44,25 +51,56 @@
     }),
   );
   // A phase change means the world moved on; whatever the error described is
-  // stale against the new state.
+  // stale against the new state. The comparison is on the phase's name, not the
+  // frame: a refused start publishes its reason and then re-publishes the same
+  // idle phase, and a fresh frame object carrying the same phase must not wipe
+  // the reason the operator has not read yet.
+  let clearedForPhase = $state<string | null>(null);
   $effect(() => {
-    void phase?.name;
-    inlineError = null;
+    const name = phase?.name ?? null;
+    if (name !== clearedForPhase) {
+      clearedForPhase = name;
+      inlineError = null;
+    }
   });
+
+  // Removing a track is HTTP, not a socket frame, so its refusal lands in the
+  // same inline strip the backend's collection errors use.
+  let deletingTrackId = $state<string | null>(null);
+  async function removeTrack(trackId: string): Promise<void> {
+    deletingTrackId = trackId;
+    try {
+      await deleteTrack(trackId);
+      inlineError = null;
+    } catch (error) {
+      inlineError = failureText(error);
+    } finally {
+      deletingTrackId = null;
+    }
+  }
 
   function start(
     metadata: SessionMetadata,
     trackId: string,
     difficulty: DifficultyLevel,
+    recordVideo: boolean,
   ): void {
     lastMetadata = metadata;
     lastTrackId = trackId;
     lastDifficulty = difficulty;
-    api.startCollection(metadata, trackId, difficulty);
+    lastRecordVideo = recordVideo;
+    api.startCollection(metadata, trackId, difficulty, recordVideo);
   }
 
   function trackStarted(atUnixMilliseconds: UnixMilliseconds): void {
     api.trackStarted(atUnixMilliseconds);
+  }
+
+  function trackResumed(
+    atUnixMilliseconds: UnixMilliseconds,
+    positionMilliseconds: TrackMilliseconds,
+  ): void {
+    api.trackResumed(atUnixMilliseconds, positionMilliseconds);
   }
 
   // Ends a running session where it stands; the backend finalizes the
@@ -76,7 +114,7 @@
   // has already made or the backend resolves; this only asks for another take.
   function againSameTags(): void {
     if (lastMetadata === null || lastTrackId === null || lastDifficulty === null) return;
-    api.startCollection(lastMetadata, lastTrackId, lastDifficulty);
+    api.startCollection(lastMetadata, lastTrackId, lastDifficulty, lastRecordVideo);
   }
 </script>
 
@@ -92,15 +130,24 @@
 {#if collectionState === null || phase === null || catalog === null}
   <p class="muted">Collection not available.</p>
 {:else if phase.name === 'idle'}
+  <SignalQuality />
   <!-- The held placement photo is a property of the connection, not of the phase,
        so it comes off the state frame. -->
   <SetupForm
     {catalog}
     placementPhoto={collectionState.placement_photo}
     disabled={false}
+    boardRevision={selection?.board_revision ?? null}
+    onSetBoardRevision={selection === null
+      ? null
+      : (revision) => api.boardRevision(selection.device_id, revision)}
+    {deletingTrackId}
+    recordsNothing={selection === null}
     onStart={start}
     onCapturePlacementPhoto={api.capturePlacementPhoto}
+    onDeleteTrack={removeTrack}
   />
+  <TrackImport />
 {:else if phase.name === 'reviewing'}
   <SessionSummary
     summary={phase.summary}
@@ -118,5 +165,12 @@
     its beatmap was sent, so the field cannot be drawn.</p>
   <button class="btn" onclick={finish}>Finish session</button>
 {:else}
-  <GameView {catalog} {beatmap} {phase} onTrackStarted={trackStarted} onFinish={finish} />
+  <GameView
+    {catalog}
+    {beatmap}
+    {phase}
+    onTrackStarted={trackStarted}
+    onTrackResumed={trackResumed}
+    onFinish={finish}
+  />
 {/if}

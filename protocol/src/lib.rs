@@ -57,6 +57,11 @@ pub enum Frame {
         /// Stable, MAC-derived id, e.g. "opal-1a2b3c".
         device_id: String,
         config: DeviceConfig,
+        /// What this device *is*, as opposed to how it is set up. Sits beside
+        /// `config` rather than inside it because nothing here is settable from
+        /// the browser: it is the build that is running and the front end it
+        /// brought up, recorded so a session can be compared against another.
+        provenance: DeviceProvenance,
     },
 
     /// Bulk EMG window. `samples` is little-endian `i16`, channel-major:
@@ -90,7 +95,7 @@ pub enum Frame {
         missing: Vec<u8>,
     },
 
-    /// Classifier output for one window (backend → browser).
+    /// Classifier output for one window (device → backend → browser).
     Prediction {
         seq: u32,
         logits: Vec<f32>,
@@ -108,7 +113,7 @@ pub enum Frame {
         tau: f32,
     },
 
-    /// A discrete decision event (backend → browser). Deliberately generic: the
+    /// A discrete decision event (device → backend → browser). Deliberately generic: the
     /// frontend draws each as a labelled vertical line at `t_us` in `color`, with
     /// no knowledge of what `kind` means — new event kinds need no frontend change.
     /// `t_us` shares the EMG `t0_us` timeline.
@@ -154,6 +159,15 @@ pub enum Frame {
     /// Persist a gesture→action keymap (browser → backend).
     SetKeymap { bindings: Vec<Binding> },
 
+    /// Record which board and harness a device is soldered to (browser → backend).
+    /// The firmware cannot know this, so the backend remembers it per device id and
+    /// stamps it into every later session's manifest; the browser only sets it when
+    /// the hardware actually changes.
+    SetBoardRevision {
+        device_id: String,
+        revision: BoardRevision,
+    },
+
     /// Set WiFi credentials (browser → backend → device). The device persists them
     /// and uses them to reach the backend over wifi on the next boot.
     SetWifi { ssid: String, psk: String },
@@ -194,6 +208,19 @@ pub enum Frame {
         /// schedules.
         source: String,
         metrics: Vec<TelemetryMetric>,
+    },
+
+    /// Backend → browser: what the electrodes look like right now, one entry per
+    /// channel in channel order. The backend measures this from the live stream
+    /// so the offline session-quality report can share the estimator; the browser
+    /// only paints it.
+    SignalQuality {
+        /// The mains fundamental as measured, not assumed. Harmonics are integer
+        /// multiples of it, and the noise floor is what survives their removal.
+        mains_fundamental_hertz: f32,
+        /// The floor a channel has to stay under for a gesture to stand out of it.
+        noise_floor_limit_microvolts: f32,
+        channels: Vec<ChannelQuality>,
     },
 
     /// Backend → device over a freshly opened serial port: "a dashboard is now on
@@ -237,6 +264,10 @@ pub enum Frame {
         metadata: SessionMetadata,
         track_id: TrackId,
         difficulty: DifficultyLevel,
+        /// Whether to record the webcam alongside the EMG. The operator chooses
+        /// per session; a session that asked for video and cannot get it fails
+        /// to start rather than quietly recording EMG alone.
+        record_video: bool,
     },
 
     /// Browser → backend: audio playback actually began (the browser owns the
@@ -244,6 +275,16 @@ pub enum Frame {
     /// note's track position to the shared clock; the backend logs cue events
     /// from it.
     TrackStarted { at_unix_ms: UnixMilliseconds },
+
+    /// Browser → backend: audio playback resumed after a pause, carrying both
+    /// the instant it resumed and the position the audio element was at. The
+    /// pair re-anchors the beat grid outright rather than adjusting the old
+    /// anchor by an assumed pause length, so a seek that lands somewhere other
+    /// than the frozen position still labels correctly.
+    TrackResumed {
+        at_unix_ms: UnixMilliseconds,
+        position_ms: TrackMilliseconds,
+    },
 
     /// Browser → backend: end the running session now. Recording is finalized
     /// exactly as if the track had played out, and the backend moves to the
@@ -308,8 +349,6 @@ pub enum Frame {
 // instant and a class id cannot be swapped with a subject id.
 // ------------------------------------------------------------------
 
-/// An instant on the wall clock browser and backend share (unix epoch
-/// milliseconds; both run on the same laptop, so `Date.now()` and the backend
 /// One named measurement inside [`Frame::Telemetry`]. `f64` covers every
 /// counter and duration the firmware reports; the unit rides in the name's
 /// suffix so the pair is self-contained.
@@ -319,6 +358,31 @@ pub struct TelemetryMetric {
     pub value: f64,
 }
 
+/// One channel's state in [`Frame::SignalQuality`].
+///
+/// Two amplitudes rather than one: the broadband floor is what a gesture has to
+/// beat, and the mains figure is what says whether a failing floor is a grounding
+/// problem or something else. Both are microvolts RMS over 20–450 Hz.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChannelQuality {
+    /// Band power away from every mains harmonic, carried across the whole band.
+    pub noise_floor_microvolts: f32,
+    /// Band power in the discarded bins around the mains harmonics.
+    pub mains_microvolts: f32,
+    /// The channel's DC level, which is mostly the electrode's own offset.
+    pub offset_millivolts: f32,
+    /// How far that offset leaves the input from the nearer rail.
+    pub headroom_millivolts: f32,
+    /// Samples at or near full scale over the last several seconds. A railed
+    /// channel reads 1.0; one that wanders on and off reads in between.
+    pub saturated_fraction: f32,
+    /// The device's own lead-off comparator for this channel, or `None` while no
+    /// usable status word has arrived.
+    pub lead_off: Option<bool>,
+}
+
+/// An instant on the wall clock browser and backend share (unix epoch
+/// milliseconds; both run on the same laptop, so `Date.now()` and the backend
 /// clock agree). The value is private so all arithmetic goes through the named
 /// operations below — adding two instants, say, does not exist.
 ///
@@ -383,6 +447,12 @@ impl UnixMilliseconds {
     /// t = 0 happened — the anchoring every cue label rests on.
     pub const fn at_track_position(self, position: TrackMilliseconds) -> UnixMilliseconds {
         UnixMilliseconds(self.0 + position.get() as u64)
+    }
+
+    /// The instant audio t = 0 must have been, for `self` to be the moment the
+    /// track reached `position` — the anchor a resumed session re-derives.
+    pub const fn before_track_position(self, position: TrackMilliseconds) -> UnixMilliseconds {
+        UnixMilliseconds(self.0.saturating_sub(position.get() as u64))
     }
 
     /// Signed distance from `earlier` to `self`.
@@ -708,10 +778,14 @@ pub enum CollectionPhase {
         session_id: SessionId,
         recording: RecordingHealth,
     },
-    /// Audio playing, notes falling.
+    /// Audio playing, notes falling. `paused` is `Some` while the cue timeline
+    /// is frozen: the session is still open and still writes whatever EMG
+    /// arrives, but no cue resolves and the track's end cannot arrive until the
+    /// browser reports playback resumed.
     Playing {
         session_id: SessionId,
         recording: RecordingHealth,
+        paused: Option<CollectionPause>,
     },
     /// The track ended (or the session was stopped): recording is finalized,
     /// the files are on disk, and the summary screen is asking the user to
@@ -722,6 +796,23 @@ pub enum CollectionPhase {
     },
 }
 
+/// Why a session's cue timeline is frozen, and for how long it has been.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollectionPause {
+    /// The device that stopped sending, named so the operator knows which one
+    /// to go and look at.
+    pub device_id: String,
+    pub since: UnixMilliseconds,
+    /// Silence at the moment the pause was declared, measured from the last
+    /// EMG window that landed.
+    pub silent_for: DurationMilliseconds,
+    /// Where the track froze. Resuming plays from here.
+    pub track_position: TrackMilliseconds,
+    /// Whether EMG has started arriving again since — the operator can resume
+    /// as soon as this turns true.
+    pub device_recovered: bool,
+}
+
 /// Disk-level progress of one recording stream. `advancing` means the bytes
 /// grew since the previous health check — the tripwire signal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -730,13 +821,24 @@ pub struct StreamProgress {
     pub advancing: bool,
 }
 
+/// How much EMG the session has written, in the units the operator can check
+/// against a clock on the wall. Two independent facts rather than a duration,
+/// so nothing here can disagree with anything else here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordedEmg {
+    pub samples_per_channel: u64,
+    pub sample_rate: u32,
+}
+
 /// Liveness of the session's recording streams, measured at the disk, not the
 /// intent. `video` is `None` when no camera is running — a session without
-/// video is legitimate, a session without EMG is not.
+/// video is legitimate, a session without EMG is not. `recorded` is `None` for
+/// a practice session, which has no recorder at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordingHealth {
     pub emg: StreamProgress,
     pub video: Option<StreamProgress>,
+    pub recorded: Option<RecordedEmg>,
 }
 
 /// One file the session wrote, for the summary screen's files card.
@@ -800,6 +902,11 @@ pub struct Selection {
     /// Render hints per softmax class (label/colour/role) so the frontend needs
     /// no built-in palette or command/reject knowledge.
     pub classes: Vec<ClassInfo>,
+    /// What the device reported about itself on connect, verbatim.
+    pub provenance: DeviceProvenance,
+    /// The board and harness the backend has remembered for this device, or
+    /// `None` until someone says.
+    pub board_revision: Option<BoardRevision>,
 }
 
 /// A connected device, as shown in the browser's device picker.
@@ -848,6 +955,70 @@ pub struct DeviceConfig {
     pub tau: f32,
     /// Consecutive above-τ windows a command needs to latch (the streak goal).
     pub needed: u8,
+}
+
+/// What a device is, rather than how it is configured: the firmware build that is
+/// running and the analog front end it brought up. Sent device → backend in
+/// [`Frame::DeviceHello`] and written into every session manifest, so two sessions
+/// can be told apart by the build and the acquisition setup that produced them.
+/// Nothing here is settable — [`DeviceConfig`] is the settable half.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeviceProvenance {
+    pub firmware: FirmwareBuild,
+    /// One entry per analog-to-digital converter, in the order the firmware
+    /// brought them up. The two chips are reported separately: they are
+    /// configured independently and are known to differ, so a merged view would
+    /// hide the asymmetry this field exists to record.
+    pub analog_front_ends: Vec<AnalogFrontEnd>,
+}
+
+/// Which firmware build is running, resolved at compile time.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FirmwareBuild {
+    /// The firmware crate's own version, e.g. "0.1.0".
+    pub crate_version: String,
+    /// Abbreviated git commit the build came from, or an empty string when the
+    /// build machine had no git information to offer.
+    pub git_commit: String,
+    /// True when the working tree carried uncommitted changes at build time, in
+    /// which case `git_commit` names the parent commit and not the source that
+    /// was compiled.
+    pub working_tree_modified: bool,
+    /// When the build ran, ISO 8601 UTC.
+    pub built_at: String,
+}
+
+/// One analog-to-digital converter's register set, read back off the chip after
+/// configuration rather than copied from what the firmware meant to write — a
+/// register that did not take is exactly what this is here to catch.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AnalogFrontEnd {
+    /// Position in the firmware's chip order, matching the channel blocks in
+    /// [`Frame::Emg`]: chip 0 carries channels `0..8`, chip 1 carries `8..16`.
+    pub chip: u8,
+    pub registers: Vec<RegisterReadback>,
+}
+
+/// One register as the chip reported it. Self-describing like
+/// [`TelemetryMetric`]: the name rides along, so a consumer needs no copy of the
+/// register map to display or compare a snapshot.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RegisterReadback {
+    pub name: String,
+    pub address: u8,
+    /// The byte the chip returned, or `None` when the read itself failed. An
+    /// absent value is a fact about the chip; substituting the intended byte
+    /// would not be.
+    pub value: Option<u8>,
+}
+
+/// Which board and harness a device is soldered to. Host-side metadata: the
+/// firmware cannot see its own board, so the operator enters this once per device
+/// and the backend reuses it until the hardware changes.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct BoardRevision {
+    pub board: String,
+    pub harness: String,
 }
 
 /// One sensitivity preset the user can pick. `id` is echoed back in
@@ -1249,6 +1420,46 @@ mod tests {
     }
 
     #[test]
+    fn signal_quality_frame_roundtrips_with_an_absent_lead_off_reading() {
+        let frame = Frame::SignalQuality {
+            mains_fundamental_hertz: 59.977,
+            noise_floor_limit_microvolts: 10.0,
+            channels: alloc::vec![
+                ChannelQuality {
+                    noise_floor_microvolts: 7.6,
+                    mains_microvolts: 212.2,
+                    offset_millivolts: -18.4,
+                    headroom_millivolts: 81.6,
+                    saturated_fraction: 0.0,
+                    lead_off: Some(false),
+                },
+                ChannelQuality {
+                    noise_floor_microvolts: 0.0,
+                    mains_microvolts: 0.0,
+                    offset_millivolts: -100.0,
+                    headroom_millivolts: 0.0,
+                    saturated_fraction: 1.0,
+                    lead_off: None,
+                },
+            ],
+        };
+        match roundtrip(&frame) {
+            Frame::SignalQuality {
+                mains_fundamental_hertz,
+                channels,
+                ..
+            } => {
+                assert_eq!(mains_fundamental_hertz, 59.977);
+                assert_eq!(channels.len(), 2);
+                assert_eq!(channels[0].lead_off, Some(false));
+                assert_eq!(channels[1].lead_off, None);
+                assert_eq!(channels[1].saturated_fraction, 1.0);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
     fn missing_bits_index_by_source_plane_then_step() {
         // Two sources, 10 steps: stride is 2 bytes, source 1's plane starts at
         // byte 2. Source 0 gaps at steps 0 and 9; source 1 at step 3.
@@ -1362,17 +1573,71 @@ mod tests {
             tau: 0.5,
             needed: 3,
         };
+        let provenance = DeviceProvenance {
+            firmware: FirmwareBuild {
+                crate_version: "0.1.0".into(),
+                git_commit: "34370e7".into(),
+                working_tree_modified: true,
+                built_at: "2026-08-04T11:22:33Z".into(),
+            },
+            analog_front_ends: vec![
+                AnalogFrontEnd {
+                    chip: 0,
+                    registers: vec![RegisterReadback {
+                        name: "CONFIG1".into(),
+                        address: 0x01,
+                        value: Some(0xC4),
+                    }],
+                },
+                AnalogFrontEnd {
+                    chip: 1,
+                    registers: vec![RegisterReadback {
+                        name: "CONFIG1".into(),
+                        address: 0x01,
+                        // A register the chip refused to report stays absent
+                        // rather than borrowing the byte the firmware intended.
+                        value: None,
+                    }],
+                },
+            ],
+        };
         let frame = Frame::DeviceHello {
             device_id: "opal-1a2b3c".into(),
             config: config.clone(),
+            provenance: provenance.clone(),
         };
         match roundtrip(&frame) {
             Frame::DeviceHello {
                 device_id,
                 config: out,
+                provenance: reported,
             } => {
                 assert_eq!(device_id, "opal-1a2b3c");
                 assert_eq!(out, config);
+                assert_eq!(reported, provenance);
+                assert_eq!(reported.analog_front_ends[1].registers[0].value, None);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_board_revision_roundtrips() {
+        let frame = Frame::SetBoardRevision {
+            device_id: "opal-1a2b3c".into(),
+            revision: BoardRevision {
+                board: "rev A bodged".into(),
+                harness: "ribbon 2".into(),
+            },
+        };
+        match roundtrip(&frame) {
+            Frame::SetBoardRevision {
+                device_id,
+                revision,
+            } => {
+                assert_eq!(device_id, "opal-1a2b3c");
+                assert_eq!(revision.board, "rev A bodged");
+                assert_eq!(revision.harness, "ribbon 2");
             }
             other => panic!("wrong variant: {other:?}"),
         }
@@ -1399,16 +1664,19 @@ mod tests {
             metadata: sample_metadata(),
             track_id: TrackId("steady-run".into()),
             difficulty: DifficultyLevel::Hard,
+            record_video: true,
         };
         match roundtrip(&frame) {
             Frame::StartCollection {
                 metadata,
                 track_id,
                 difficulty,
+                record_video,
             } => {
                 assert_eq!(metadata, sample_metadata());
                 assert_eq!(track_id, TrackId("steady-run".into()));
                 assert_eq!(difficulty, DifficultyLevel::Hard);
+                assert!(record_video);
             }
             other => panic!("wrong variant: {other:?}"),
         }
@@ -1462,6 +1730,10 @@ mod tests {
         );
         let tempo = BeatsPerMinute(core::num::NonZeroU16::new(120).unwrap());
         assert_eq!(tempo.beat_period(), DurationMilliseconds(500));
+        assert_eq!(
+            UnixMilliseconds(1_784_000_007_240).before_track_position(TrackMilliseconds(7_240)),
+            UnixMilliseconds(1_784_000_000_000)
+        );
         assert!(TrackMilliseconds(999).is_within(DurationMilliseconds(1_000)));
         assert!(!TrackMilliseconds(1_000).is_within(DurationMilliseconds(1_000)));
     }
@@ -1480,18 +1752,64 @@ mod tests {
                         bytes_on_disk: 81_000_000,
                         advancing: false,
                     }),
+                    recorded: Some(RecordedEmg {
+                        samples_per_channel: 490_625,
+                        sample_rate: 2_000,
+                    }),
                 },
+                paused: None,
             },
             placement_photo: Some(UnixMilliseconds(1_784_000_000_000)),
         };
         match roundtrip(&playing) {
             Frame::CollectionState {
-                phase: CollectionPhase::Playing { recording, .. },
+                phase:
+                    CollectionPhase::Playing {
+                        recording, paused, ..
+                    },
                 placement_photo,
             } => {
                 assert!(recording.emg.advancing);
                 assert!(!recording.video.unwrap().advancing);
+                assert_eq!(recording.recorded.unwrap().samples_per_channel, 490_625);
+                assert_eq!(paused, None);
                 assert_eq!(placement_photo, Some(UnixMilliseconds(1_784_000_000_000)));
+            }
+            other => panic!("wrong shape: {other:?}"),
+        }
+
+        let stalled = Frame::CollectionState {
+            phase: CollectionPhase::Playing {
+                session_id: SessionId("2026-07-30T16-40_matthew".into()),
+                recording: RecordingHealth {
+                    emg: StreamProgress {
+                        bytes_on_disk: 15_700_000,
+                        advancing: false,
+                    },
+                    video: None,
+                    recorded: None,
+                },
+                paused: Some(CollectionPause {
+                    device_id: "opal-01".into(),
+                    since: UnixMilliseconds(1_784_000_007_000),
+                    silent_for: DurationMilliseconds(1_600),
+                    track_position: TrackMilliseconds(7_240),
+                    device_recovered: false,
+                }),
+            },
+            placement_photo: None,
+        };
+        match roundtrip(&stalled) {
+            Frame::CollectionState {
+                phase:
+                    CollectionPhase::Playing {
+                        paused: Some(pause),
+                        ..
+                    },
+                ..
+            } => {
+                assert_eq!(pause.device_id, "opal-01");
+                assert_eq!(pause.track_position, TrackMilliseconds(7_240));
             }
             other => panic!("wrong shape: {other:?}"),
         }
