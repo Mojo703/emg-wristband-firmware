@@ -100,9 +100,14 @@ pub(crate) fn apply(
         let num_knots = basis.dim(0)?;
         // knots ~ N(0,1) per (sample, channel); envelope = knots @ basis.
         let knot_values = Tensor::randn(0f32, 1f32, (batch_size * channels, num_knots), device)?;
-        let envelope = knot_values.matmul(basis)?.reshape((batch_size, 1, channels, time))?;
-        let gain =
-            (envelope * config.warp_sigma)?.broadcast_add(&Tensor::ones((1,), DType::F32, device)?)?;
+        let envelope = knot_values
+            .matmul(basis)?
+            .reshape((batch_size, 1, channels, time))?;
+        let gain = (envelope * config.warp_sigma)?.broadcast_add(&Tensor::ones(
+            (1,),
+            DType::F32,
+            device,
+        )?)?;
         output = output.mul(&gain)?;
     }
 
@@ -112,7 +117,9 @@ pub(crate) fn apply(
         let keep_threshold = Tensor::full(keep_probability as f32, (1, 1, 1, 1), device)?;
         let mask = random.broadcast_lt(&keep_threshold)?.to_dtype(DType::F32)?;
         // inverted dropout: scale kept channels by 1/keep so the expected scale holds
-        output = output.broadcast_mul(&mask)?.affine(1.0 / keep_probability, 0.0)?;
+        output = output
+            .broadcast_mul(&mask)?
+            .affine(1.0 / keep_probability, 0.0)?;
     }
 
     Ok(output.contiguous()?)

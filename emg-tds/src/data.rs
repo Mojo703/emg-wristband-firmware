@@ -71,8 +71,12 @@ impl Dataset {
         let mut unique_subjects: Vec<i64> = self.subjects.clone();
         unique_subjects.sort_unstable();
         unique_subjects.dedup();
-        let validation_subjects: std::collections::HashSet<i64> =
-            unique_subjects.iter().rev().take(holdout).copied().collect();
+        let validation_subjects: std::collections::HashSet<i64> = unique_subjects
+            .iter()
+            .rev()
+            .take(holdout)
+            .copied()
+            .collect();
         all_indices
             .into_iter()
             .partition(|&index| !validation_subjects.contains(&self.subjects[index as usize]))
@@ -110,7 +114,11 @@ impl PoseSequenceDataset {
             .0;
         Ok(Self {
             inputs: Tensor::from_vec(inputs_data, (num_windows, 1, channels, time), device)?,
-            pose_sequence: Tensor::from_vec(sequence_data, (num_windows, frames, pose_dimension), device)?,
+            pose_sequence: Tensor::from_vec(
+                sequence_data,
+                (num_windows, frames, pose_dimension),
+                device,
+            )?,
             num_windows,
             channels,
             time,
@@ -129,7 +137,9 @@ impl PoseSequenceDataset {
 
     /// Per-dimension z-score stats over all windows and frames → (mean, std_dev) [pose_dimension].
     pub(crate) fn zscore_stats(&self, device: &Device) -> Result<(Tensor, Tensor)> {
-        let flattened = self.pose_sequence.reshape((self.num_windows * self.frames, self.pose_dimension))?;
+        let flattened = self
+            .pose_sequence
+            .reshape((self.num_windows * self.frames, self.pose_dimension))?;
         let mean = flattened.mean(0)?;
         let variance = flattened.broadcast_sub(&mean)?.sqr()?.mean(0)?;
         let std_dev = (variance + 1e-6)?.sqrt()?;

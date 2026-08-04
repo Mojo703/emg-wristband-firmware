@@ -1,12 +1,9 @@
 //! The EMG gesture classifier: a 4-block depthwise-separable 1D CNN (emg-tds).
 //!
-//! Two constructors:
-//! - `Model::synthetic()` — random weights for timing benchmarks (deterministic)
-//! - `Model::load(blob)` — loads int8 weights from the binary blob exported by
-//!   `emg-tds export-int8` (BN-folded, ReLU, k=25, channels 16→32→64→128→128).
-//!
-//! The blob is supplied by the caller (`include_bytes!` in the firmware/benchmark),
-//! so this crate carries no model data of its own.
+//! `Model::load(blob)` reads int8 weights from the blob exported by `emg-tds
+//! export-int8` (BN-folded, ReLU, k=25, channels 16→32→64→128→128). The blob is
+//! supplied by the caller (`include_bytes!` in the firmware), so this crate carries
+//! no model data of its own.
 //!
 //! `Model::load` borrows the weight tensors and biases straight out of the blob
 //! rather than copying them: on the ESP32-S3 the blob lives in memory-mapped flash,
@@ -16,8 +13,7 @@
 //! and the exporter pads each section to the alignment asserted here.
 
 use crate::layers::{self, Requantize};
-use crate::tensor::{AlignedI8, I8Activation};
-use alloc::borrow::Cow;
+use crate::tensor::I8Activation;
 use alloc::vec::Vec;
 
 /// Per-stage labels, in `forward_profiled` order, for a [`StageTimer`].
@@ -42,7 +38,7 @@ const BLOCKS: [(usize, usize); 4] = [(16, 32), (32, 64), (64, 128), (128, 128)];
 const FEATURE_DIM: usize = 128;
 
 const MAGIC: u32 = 0x454D4739;
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
 
 /// Hook for per-stage timing in [`Model::forward_profiled`]. Implemented by the
 /// benchmark; keeps this crate free of any clock so it stays `no_std`/portable.
@@ -51,41 +47,24 @@ pub trait StageTimer {
     fn stage<R>(&mut self, index: usize, f: impl FnOnce() -> R) -> R;
 }
 
-/// An int8 weight tensor: borrowed from the model blob, or owned when the weights are
-/// generated at runtime ([`Model::synthetic`]). Either way `as_slice` hands the kernels
-/// a 16-byte-aligned slice whose length is a multiple of 16, which is what
-/// `mac::dot_i8_simd` and `layers::depthwise_simd` require.
-enum WeightTensor<'a> {
-    Borrowed(&'a [i8]),
-    Owned(AlignedI8),
-}
-
-impl WeightTensor<'_> {
-    #[inline]
-    fn as_slice(&self) -> &[i8] {
-        match self {
-            WeightTensor::Borrowed(s) => s,
-            WeightTensor::Owned(a) => a.as_slice(),
-        }
-    }
-}
-
 struct Block<'a> {
     out_ch: usize,
-    dw: WeightTensor<'a>,
-    dw_bias: Cow<'a, [i32]>,
+    dw: &'a [i8],
+    dw_bias: &'a [i32],
     dw_rq: Requantize,
-    pw: WeightTensor<'a>,
-    pw_bias: Cow<'a, [i32]>,
+    pw: &'a [i8],
+    pw_bias: &'a [i32],
     pw_rq: Requantize,
 }
 
 pub struct Model<'a> {
     blocks: Vec<Block<'a>>,
-    head: (WeightTensor<'a>, Cow<'a, [i32]>),
+    head: (&'a [i8], &'a [i32]),
     pub input_len: usize,
     pub kernel: usize,
     pub logit_scale: f32,
+    /// Normalised units per int8 count: what the caller must quantize its window at.
+    pub input_scale: f32,
     scratch: ForwardScratch,
 }
 
@@ -139,7 +118,6 @@ pub struct VerifyWindow {
 /// so the full batch does not consume the limited ESP32-S3 heap.
 pub struct VerifyBatch<'a> {
     cursor: ModelFileCursor<'a>,
-    pub input_scale: f32,
     pub total: usize,
     remaining: usize,
     input_len: usize,
@@ -224,48 +202,6 @@ impl<'a> ModelFileCursor<'a> {
     }
 }
 
-impl Model<'static> {
-    pub fn synthetic() -> Self {
-        let mut rng = crate::tensor::Rng::new(0x5eed_1234);
-        let rq = Requantize {
-            mult: 1,
-            shift: 12,
-            relu: true,
-        };
-        let kernel = 25;
-        let blocks: Vec<Block<'static>> = BLOCKS
-            .iter()
-            .map(|&(in_ch, out_ch)| Block {
-                out_ch,
-                dw: WeightTensor::Owned(AlignedI8::from_slice(&rng.fill_i8(in_ch * kernel))),
-                dw_bias: Cow::Owned(rng.fill_i32_small(in_ch)),
-                dw_rq: Requantize {
-                    mult: 1,
-                    shift: 12,
-                    relu: false,
-                },
-                pw: WeightTensor::Owned(AlignedI8::from_slice(&rng.fill_i8(out_ch * in_ch))),
-                pw_bias: Cow::Owned(rng.fill_i32_small(out_ch)),
-                pw_rq: rq,
-            })
-            .collect();
-        let scratch = ForwardScratch::sized_for(500, kernel, &blocks);
-        Model {
-            blocks,
-            head: (
-                WeightTensor::Owned(AlignedI8::from_slice(
-                    &rng.fill_i8(NUM_CLASSES * FEATURE_DIM),
-                )),
-                Cow::Owned(rng.fill_i32_small(NUM_CLASSES)),
-            ),
-            input_len: 500,
-            kernel,
-            logit_scale: 1.0,
-            scratch,
-        }
-    }
-}
-
 impl<'a> Model<'a> {
     /// Load BN-folded int8 weights from an `emg-tds export-int8` blob, borrowing the
     /// tensors in place (see the module docs). `blob` must be 16-byte aligned.
@@ -289,6 +225,7 @@ impl<'a> Model<'a> {
         assert_eq!(n_blocks, BLOCKS.len());
         let num_classes = c.u32() as usize;
         assert_eq!(num_classes, NUM_CLASSES);
+        let input_scale = c.f32();
 
         let mut blocks = Vec::new();
         for _ in 0..n_blocks {
@@ -309,15 +246,15 @@ impl<'a> Model<'a> {
 
             blocks.push(Block {
                 out_ch,
-                dw: WeightTensor::Borrowed(dw_w),
-                dw_bias: Cow::Borrowed(dw_b),
+                dw: dw_w,
+                dw_bias: dw_b,
                 dw_rq: Requantize {
                     mult: dw_mult,
                     shift: dw_shift,
                     relu: false,
                 },
-                pw: WeightTensor::Borrowed(pw_w),
-                pw_bias: Cow::Borrowed(pw_b),
+                pw: pw_w,
+                pw_bias: pw_b,
                 pw_rq: Requantize {
                     mult: pw_mult,
                     shift: pw_shift,
@@ -334,10 +271,11 @@ impl<'a> Model<'a> {
         let scratch = ForwardScratch::sized_for(input_len, kernel, &blocks);
         Model {
             blocks,
-            head: (WeightTensor::Borrowed(head_w), Cow::Borrowed(head_b)),
+            head: (head_w, head_b),
             input_len,
             kernel,
             logit_scale,
+            input_scale,
             scratch,
         }
     }
@@ -361,8 +299,8 @@ impl<'a> Model<'a> {
             let xin: &I8Activation = if index == 0 { input } else { pointwise_out };
             layers::depthwise(
                 xin,
-                blk.dw.as_slice(),
-                &blk.dw_bias,
+                blk.dw,
+                blk.dw_bias,
                 *kernel,
                 STRIDE,
                 blk.dw_rq,
@@ -371,8 +309,8 @@ impl<'a> Model<'a> {
             );
             layers::pointwise(
                 depthwise_out,
-                blk.pw.as_slice(),
-                &blk.pw_bias,
+                blk.pw,
+                blk.pw_bias,
                 blk.out_ch,
                 blk.pw_rq,
                 pointwise_out,
@@ -380,7 +318,7 @@ impl<'a> Model<'a> {
         }
         let pooled = layers::global_avg_pool(pointwise_out);
         let (hw, hb) = head;
-        let logits = layers::linear_i32(pooled.as_slice(), hw.as_slice(), hb, NUM_CLASSES);
+        let logits = layers::linear_i32(pooled.as_slice(), hw, hb, NUM_CLASSES);
         ForwardResult::Logits(logits)
     }
 
@@ -408,8 +346,8 @@ impl<'a> Model<'a> {
                 let xin: &I8Activation = if index == 0 { input } else { pointwise_out };
                 layers::depthwise(
                     xin,
-                    blk.dw.as_slice(),
-                    &blk.dw_bias,
+                    blk.dw,
+                    blk.dw_bias,
                     *kernel,
                     STRIDE,
                     blk.dw_rq,
@@ -420,8 +358,8 @@ impl<'a> Model<'a> {
             timer.stage(index * 2 + 1, || {
                 layers::pointwise(
                     depthwise_out,
-                    blk.pw.as_slice(),
-                    &blk.pw_bias,
+                    blk.pw,
+                    blk.pw_bias,
                     blk.out_ch,
                     blk.pw_rq,
                     pointwise_out,
@@ -431,12 +369,7 @@ impl<'a> Model<'a> {
         let pooled = timer.stage(8, || layers::global_avg_pool(pointwise_out));
         timer.stage(9, || {
             let (hw, hb) = head;
-            ForwardResult::Logits(layers::linear_i32(
-                pooled.as_slice(),
-                hw.as_slice(),
-                hb,
-                NUM_CLASSES,
-            ))
+            ForwardResult::Logits(layers::linear_i32(pooled.as_slice(), hw, hb, NUM_CLASSES))
         })
     }
 }
@@ -447,22 +380,21 @@ pub enum ForwardResult {
 
 impl<'a> VerifyBatch<'a> {
     /// Position a streaming reader at the verification batch inside `blob`.
+    ///
+    /// The skip below has to match both the exporter's padding and `Model::load`'s
+    /// walk, or it lands mid-tensor.
     pub fn new(blob: &'a [u8]) -> Self {
-        let mut header = ModelFileCursor::new(blob);
-        header.u32(); // magic
-        header.u32(); // version
-        let input_len = header.u32() as usize;
-        header.u32(); // input_ch
-        let kernel = header.u32() as usize;
-        header.u32(); // stride
-        let n_blocks = header.u32() as usize;
-        header.u32(); // num_classes
-
         let mut c = ModelFileCursor::new(blob);
-        // Skip the 32-byte header and the block/head weights to reach the verify batch.
-        // The alignment steps have to match both the exporter's padding and
-        // `Model::load`'s walk, or this lands mid-tensor.
-        c.pos = 32;
+        c.u32(); // magic
+        c.u32(); // version
+        let input_len = c.u32() as usize;
+        c.u32(); // input_ch
+        let kernel = c.u32() as usize;
+        c.u32(); // stride
+        let n_blocks = c.u32() as usize;
+        c.u32(); // num_classes
+        c.f32(); // input_scale
+
         for _ in 0..n_blocks {
             let in_ch = c.u32() as usize;
             let out_ch = c.u32() as usize;
@@ -483,12 +415,10 @@ impl<'a> VerifyBatch<'a> {
         c.pos += NUM_CLASSES * 4; // head bias
         c.pos += 4; // logit_scale
 
-        let input_scale = c.f32();
         let num_verify = c.u32() as usize;
 
         VerifyBatch {
             cursor: c,
-            input_scale,
             total: num_verify,
             remaining: num_verify,
             input_len,

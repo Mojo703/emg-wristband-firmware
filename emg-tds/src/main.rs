@@ -52,6 +52,10 @@ enum Command {
         /// Output path for the device-ready int8 blob.
         #[arg(long, default_value = "../emg-runtime/data/model_int8.bin")]
         out: PathBuf,
+        /// Output path for the fixture blob: the same weights plus the verification
+        /// windows, which opal-firmware's device tests read.
+        #[arg(long, default_value = "../emg-runtime/data/model_int8_verify.bin")]
+        verify_out: PathBuf,
         /// Number of training windows used for activation calibration.
         #[arg(long, default_value_t = 256)]
         calib_windows: usize,
@@ -581,6 +585,7 @@ fn main() -> Result<()> {
             checkpoint,
             data_dir,
             out,
+            verify_out,
             calib_windows,
             num_verify,
             channels,
@@ -590,6 +595,7 @@ fn main() -> Result<()> {
             checkpoint,
             data_dir,
             out,
+            verify_out,
             calib_windows,
             num_verify,
             channels,

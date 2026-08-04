@@ -17,8 +17,9 @@ use emg_runtime::{layers, mac};
 #[repr(align(16))]
 struct AlignedBlob<Bytes: ?Sized>(Bytes);
 
-static FIXTURE_BLOB: &AlignedBlob<[u8]> =
-    &AlignedBlob(*include_bytes!("../../emg-runtime/data/model_int8.bin"));
+static FIXTURE_BLOB: &AlignedBlob<[u8]> = &AlignedBlob(*include_bytes!(
+    "../../emg-runtime/data/model_int8_verify.bin"
+));
 
 /// Integer ratios, so the comparison never materialises a float constant: the Xtensa
 /// backend mishandles float constant pools in the test profile.

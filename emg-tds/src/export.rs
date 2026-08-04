@@ -24,6 +24,7 @@ pub(crate) struct ExportArgs {
     pub(crate) checkpoint: std::path::PathBuf,
     pub(crate) data_dir: std::path::PathBuf,
     pub(crate) out: std::path::PathBuf,
+    pub(crate) verify_out: std::path::PathBuf,
     pub(crate) calib_windows: usize,
     pub(crate) num_verify: usize,
     pub(crate) channels: usize,
@@ -37,6 +38,7 @@ impl Default for ExportArgs {
             checkpoint: std::path::PathBuf::from("models/gesture-classifier-v1.safetensors"),
             data_dir: std::path::PathBuf::from("data"),
             out: std::path::PathBuf::from("../emg-runtime/data/model_int8.bin"),
+            verify_out: std::path::PathBuf::from("../emg-runtime/data/model_int8_verify.bin"),
             calib_windows: 256,
             num_verify: 32,
             channels: 16,
@@ -80,20 +82,16 @@ struct VerifyWindow {
     float_logits: Vec<f32>,
 }
 
-struct VerifyBatch {
-    windows: Vec<VerifyWindow>,
-    input_scale: f32,
-}
-
 struct QuantizedModel {
     input_len: usize,
     input_ch: usize,
     kernel: usize,
     stride: usize,
     num_classes: usize,
+    input_scale: f32,
     blocks: Vec<QuantizedBlock>,
     head: QuantizedHead,
-    verify: VerifyBatch,
+    verify_windows: Vec<VerifyWindow>,
 }
 
 /// Run the full export pipeline: load, fold, calibrate, quantize, simulate, serialize.
@@ -153,8 +151,9 @@ pub(crate) fn run(args: ExportArgs) -> Result<()> {
     let (verify_inputs, verify_labels) = test_set.batch(&verify_indices, &device)?;
     let float_logits = model.forward(&verify_inputs, false)?.to_vec2::<f32>()?;
     let labels = verify_labels.to_vec1::<u32>()?;
-    qmodel.verify = prepare_verify_batch(&verify_inputs, &float_logits, &labels, scales.input)?;
-    qmodel.input_len = qmodel.verify.windows[0].input.len() / qmodel.input_ch;
+    qmodel.verify_windows =
+        prepare_verify_windows(&verify_inputs, &float_logits, &labels, scales.input)?;
+    qmodel.input_len = qmodel.verify_windows[0].input.len() / qmodel.input_ch;
 
     // Host int8 sanity simulation.
     let sim_logits = host_int8_sim(&qmodel)?;
@@ -163,7 +162,7 @@ pub(crate) fn run(args: ExportArgs) -> Result<()> {
     let mut float_top1_correct = 0usize;
     let mut top1_correct = 0usize;
     let mut agreement = 0usize;
-    for (i, window) in qmodel.verify.windows.iter().enumerate() {
+    for (i, window) in qmodel.verify_windows.iter().enumerate() {
         let fa = argmax_f32(&window.float_logits);
         let sa = argmax_i32(&sim_logits[i]);
         float_argmax.push(fa);
@@ -178,9 +177,9 @@ pub(crate) fn run(args: ExportArgs) -> Result<()> {
             agreement += 1;
         }
     }
-    let float_top1 = float_top1_correct as f32 / qmodel.verify.windows.len() as f32;
-    let top1 = top1_correct as f32 / qmodel.verify.windows.len() as f32;
-    let agree = agreement as f32 / qmodel.verify.windows.len() as f32;
+    let float_top1 = float_top1_correct as f32 / qmodel.verify_windows.len() as f32;
+    let top1 = top1_correct as f32 / qmodel.verify_windows.len() as f32;
+    let agree = agreement as f32 / qmodel.verify_windows.len() as f32;
     println!(
         "float top-1: {:.3}  host int8 top-1: {:.3}  agreement: {:.3}",
         float_top1, top1, agree
@@ -190,8 +189,18 @@ pub(crate) fn run(args: ExportArgs) -> Result<()> {
     if let Some(parent) = args.out.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    serialize(&qmodel, &args.out)?;
+    serialize(&qmodel, &args.out, false)?;
     println!("wrote int8 model → {}", args.out.display());
+
+    if let Some(parent) = args.verify_out.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    serialize(&qmodel, &args.verify_out, true)?;
+    println!(
+        "wrote fixture blob ({} windows) → {}",
+        qmodel.verify_windows.len(),
+        args.verify_out.display()
+    );
 
     Ok(())
 }
@@ -353,10 +362,8 @@ fn quantize_model(
             feature_dim,
             num_classes: config.num_classes,
         },
-        verify: VerifyBatch {
-            windows: Vec::new(),
-            input_scale: scales.input,
-        },
+        input_scale: scales.input,
+        verify_windows: Vec::new(),
     })
 }
 
@@ -445,12 +452,12 @@ fn requant_params(m: f64) -> (i32, u32) {
     (mult, shift)
 }
 
-fn prepare_verify_batch(
+fn prepare_verify_windows(
     inputs: &Tensor,
     float_logits: &[Vec<f32>],
     labels: &[u32],
     input_scale: f32,
-) -> Result<VerifyBatch> {
+) -> Result<Vec<VerifyWindow>> {
     let data = inputs.squeeze(1)?.to_vec3::<f32>()?;
     let num = data.len();
     let channels = data[0].len();
@@ -470,15 +477,12 @@ fn prepare_verify_batch(
             float_logits: float_logits[i].clone(),
         });
     }
-    Ok(VerifyBatch {
-        windows,
-        input_scale,
-    })
+    Ok(windows)
 }
 
 fn host_int8_sim(q: &QuantizedModel) -> Result<Vec<Vec<i32>>> {
-    let mut all_logits = Vec::with_capacity(q.verify.windows.len());
-    for window in &q.verify.windows {
+    let mut all_logits = Vec::with_capacity(q.verify_windows.len());
+    for window in &q.verify_windows {
         let mut act = I8Tensor {
             data: window.input.clone(),
             t: q.input_len,
@@ -638,12 +642,14 @@ impl AlignedWriter {
     }
 }
 
-fn serialize(q: &QuantizedModel, path: &Path) -> Result<()> {
+/// Write the blob. `include_verify` controls whether the held-out windows are
+/// appended: the device blob omits them, only the fixture blob carries them.
+fn serialize(q: &QuantizedModel, path: &Path, include_verify: bool) -> Result<()> {
     let file = File::create(path)?;
     let mut w = AlignedWriter::new(file);
 
     const MAGIC: u32 = 0x454D4739;
-    const VERSION: u32 = 3;
+    const VERSION: u32 = 4;
     write_u32(&mut w, MAGIC)?;
     write_u32(&mut w, VERSION)?;
     write_u32(&mut w, q.input_len as u32)?;
@@ -652,6 +658,7 @@ fn serialize(q: &QuantizedModel, path: &Path) -> Result<()> {
     write_u32(&mut w, q.stride as u32)?;
     write_u32(&mut w, q.blocks.len() as u32)?;
     write_u32(&mut w, q.num_classes as u32)?;
+    write_f32(&mut w, q.input_scale)?;
 
     for block in &q.blocks {
         write_u32(&mut w, block.in_channels as u32)?;
@@ -676,9 +683,13 @@ fn serialize(q: &QuantizedModel, path: &Path) -> Result<()> {
     write_i32s(&mut w, &q.head.bias)?;
     write_f32(&mut w, q.head.logit_scale)?;
 
-    write_f32(&mut w, q.verify.input_scale)?;
-    write_u32(&mut w, q.verify.windows.len() as u32)?;
-    for window in &q.verify.windows {
+    let windows: &[VerifyWindow] = if include_verify {
+        &q.verify_windows
+    } else {
+        &[]
+    };
+    write_u32(&mut w, windows.len() as u32)?;
+    for window in windows {
         // The verification windows are copied into an aligned activation buffer one at
         // a time on the device, so their int8 samples only have to keep the following
         // label and float logits on a 4-byte boundary.

@@ -96,7 +96,50 @@ const STALL_WARNING_MS: u128 = 1000;
 /// Batches between inference-performance telemetry reports (~4 s at the 244 ms
 /// window period, since a batch is normally one window). Telemetry never touches
 /// log retention, so the rate is set by trend resolution alone.
-const PERF_REPORT_INTERVAL: u32 = 16;
+const PERFORMANCE_REPORT_INTERVAL: u32 = 16;
+
+/// Latency samples held for percentiles. Sixteen batches is too few to place a p95,
+/// so the ring spans several reporting intervals and the percentiles slide.
+const LATENCY_SAMPLE_COUNT: usize = 64;
+
+/// Fixed ring of recent latencies. Sized at construction and never resized: the
+/// inference path must not allocate.
+struct LatencyRing {
+    samples: [u32; LATENCY_SAMPLE_COUNT],
+    written: usize,
+}
+
+impl Default for LatencyRing {
+    fn default() -> Self {
+        Self {
+            samples: [0; LATENCY_SAMPLE_COUNT],
+            written: 0,
+        }
+    }
+}
+
+impl LatencyRing {
+    fn record(&mut self, microseconds: u64) {
+        self.samples[self.written % LATENCY_SAMPLE_COUNT] = microseconds as u32;
+        self.written += 1;
+    }
+
+    /// Median and 95th percentile, sorted on the stack.
+    fn percentiles(&self) -> (u32, u32) {
+        let filled = self.written.min(LATENCY_SAMPLE_COUNT);
+        if filled == 0 {
+            return (0, 0);
+        }
+        let mut sorted = [0u32; LATENCY_SAMPLE_COUNT];
+        sorted[..filled].copy_from_slice(&self.samples[..filled]);
+        let sorted = &mut sorted[..filled];
+        sorted.sort_unstable();
+        (
+            sorted[(filled - 1) * 50 / 100],
+            sorted[(filled - 1) * 95 / 100],
+        )
+    }
+}
 
 /// Running inference-latency, total-processing-latency, and loop-throughput stats
 /// between periodic log lines. "Total" is inference plus the reject-pipeline
@@ -104,7 +147,7 @@ const PERF_REPORT_INTERVAL: u32 = 16;
 /// contributes to onset-to-output latency, short of acquisition (which runs on its
 /// own threads) and BLE dispatch (not wired into this firmware yet).
 #[derive(Default)]
-struct PerfStats {
+struct InferencePerformance {
     interval_start: Option<Instant>,
     /// Batches recorded, which is also the number of inferences: one per batch,
     /// whatever the backlog was.
@@ -112,33 +155,37 @@ struct PerfStats {
     /// Windows sent across those batches. Equal to `count` except while catching up
     /// after a link stall, and the difference is exactly how much catching up happened.
     windows: u32,
-    infer_sum_us: u64,
-    infer_max_us: u64,
+    inference_sum_us: u64,
+    inference_max_us: u64,
     total_sum_us: u64,
     total_max_us: u64,
+    inference_latency: LatencyRing,
+    total_latency: LatencyRing,
     /// Cumulative dropped-window count at the start of the interval, so the log can
     /// report drops per interval rather than an ever-growing total.
     dropped_at_interval_start: u32,
 }
 
-impl PerfStats {
+impl InferencePerformance {
     /// Record one batch: its inference time (the newest window only), its total
     /// processing time (inference through frame send, excluding the intentional
     /// real-time pacing sleep), and how many windows it carried. Logs and resets every
-    /// [`PERF_REPORT_INTERVAL`] batches.
-    fn record(&mut self, infer_us: u64, total_us: u64, windows: usize, dropped_total: u32) {
+    /// [`PERFORMANCE_REPORT_INTERVAL`] batches.
+    fn record(&mut self, inference_us: u64, total_us: u64, windows: usize, dropped_total: u32) {
         let start = *self.interval_start.get_or_insert_with(Instant::now);
         if self.count == 0 {
             self.dropped_at_interval_start = dropped_total;
         }
         self.count += 1;
         self.windows += windows as u32;
-        self.infer_sum_us += infer_us;
-        self.infer_max_us = self.infer_max_us.max(infer_us);
+        self.inference_sum_us += inference_us;
+        self.inference_max_us = self.inference_max_us.max(inference_us);
         self.total_sum_us += total_us;
         self.total_max_us = self.total_max_us.max(total_us);
+        self.inference_latency.record(inference_us);
+        self.total_latency.record(total_us);
 
-        if self.count >= PERF_REPORT_INTERVAL {
+        if self.count >= PERFORMANCE_REPORT_INTERVAL {
             let throughput_hz = self.windows as f64 / start.elapsed().as_secs_f64();
             let dropped = dropped_total.saturating_sub(self.dropped_at_interval_start);
             // Free heap rides along because the window buffers are now the biggest
@@ -146,19 +193,25 @@ impl PerfStats {
             // `acquisition::WINDOW_QUEUE_DEPTH`), and
             // an out-of-memory abort here would otherwise arrive with no warning.
             let free_heap_kilobytes = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() / 1024 };
+            let (inference_p50, inference_p95) = self.inference_latency.percentiles();
+            let (total_p50, total_p95) = self.total_latency.percentiles();
             let metric = telemetry::metric;
             telemetry::report(
                 "inference",
                 vec![
                     metric(
                         "inference_mean_us",
-                        (self.infer_sum_us / self.count as u64) as f64,
+                        (self.inference_sum_us / self.count as u64) as f64,
                     ),
-                    metric("inference_max_us", self.infer_max_us as f64),
+                    metric("inference_p50_us", inference_p50 as f64),
+                    metric("inference_p95_us", inference_p95 as f64),
+                    metric("inference_max_us", self.inference_max_us as f64),
                     metric(
                         "total_processing_mean_us",
                         (self.total_sum_us / self.count as u64) as f64,
                     ),
+                    metric("total_processing_p50_us", total_p50 as f64),
+                    metric("total_processing_p95_us", total_p95 as f64),
                     metric("total_processing_max_us", self.total_max_us as f64),
                     metric("throughput_windows_per_second", throughput_hz),
                     metric("windows", self.windows as f64),
@@ -167,7 +220,13 @@ impl PerfStats {
                     metric("free_heap_kilobytes", free_heap_kilobytes as f64),
                 ],
             );
-            *self = PerfStats::default();
+            self.interval_start = None;
+            self.count = 0;
+            self.windows = 0;
+            self.inference_sum_us = 0;
+            self.inference_max_us = 0;
+            self.total_sum_us = 0;
+            self.total_max_us = 0;
         }
     }
 }
@@ -298,11 +357,10 @@ fn main() -> anyhow::Result<()> {
         },
     ];
 
-    // The model's own quantisation scale, read straight off the blob header so the ADC
-    // path produces int8 on the same footing training used. These are normalised units
-    // per count, not microvolts per count; `adc::conditioning` documents the difference
-    // and the acquisition path is what puts the signal on that footing.
-    let input_scale = emg_runtime::VerifyBatch::new(&MODEL_BIN.0).input_scale;
+    // Normalised units per count, not microvolts per count; `adc::conditioning`
+    // documents the difference and the acquisition path is what puts the signal on
+    // that footing.
+    let input_scale = model.input_scale;
 
     // Bring-up blocks ~2.5 s on the ADS1298's mandated settling delays, so it must run
     // before the code below registers the task watchdog.
@@ -351,7 +409,7 @@ fn main() -> anyhow::Result<()> {
     let mut model_input = I8Activation::zeros(model.input_len, INPUT_CH);
     let mut seq: u32 = 0;
     let mut prev_wake = WakeState::Idle;
-    let mut perf = PerfStats::default();
+    let mut performance = InferencePerformance::default();
     let mut last_window_at = Instant::now();
     let mut stall_reported = false;
 
@@ -476,7 +534,7 @@ fn main() -> anyhow::Result<()> {
             config: settings.to_wire(),
         });
         links.send_window(hello.as_ref(), &decision_frames);
-        perf.record(
+        performance.record(
             infer_us,
             infer_start.elapsed().as_micros() as u64,
             batch_size,
