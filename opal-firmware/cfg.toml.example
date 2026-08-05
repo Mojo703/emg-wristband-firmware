@@ -1,0 +1,15 @@
+# Copy to cfg.toml and fill in. The real file is gitignored, because it holds the
+# wifi password in plaintext once you set one.
+#
+# Everything here is a first-boot fallback. Once the device is provisioned over
+# the serial link, the live values persist to NVS and override these.
+#
+# For recording sessions you can skip this file entirely. Leaving wifi_ssid empty
+# boots the device into the USB serial link, which is what the dashboard uses.
+
+[opal-firmware]
+# A 2.4 GHz network. The ESP32-S3 has no 5 GHz radio.
+wifi_ssid = ""
+wifi_psk = ""
+# host:port of the dashboard's device listener (EMG_DEVICE_ADDR), a LAN IP.
+server_addr = "192.168.1.90:9000"

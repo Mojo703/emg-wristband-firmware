@@ -93,22 +93,27 @@ const fn device_config1() -> Config1 {
 ///
 /// TODO(bias drive): the subject bias / right-leg drive is OFF. On-skin sessions run
 /// without common-mode rejection, so expect visibly more 50/60 Hz mains pickup in
-/// collected data. Before enabling it: (1) fix the board — the compensation network
-/// (1 MΩ ∥ 1 nF) must move from RLDIN to RLDINV per SBAS459K figure 94; (2) validate
-/// the powered loop on the bench with the survival harness, since RLD load was never
-/// exonerated in the conversion-death campaign; (3) pick Internal vs External
-/// reference against the schematic (RLDREF is grounded, which only suits internal).
+/// collected data. Before enabling it: (1) fix the board, which needs one wire from
+/// J4 pin 1 to the BIAS_DRV node so the compensation network closes the loop into
+/// RLDINV rather than padding the output; (2) validate the powered loop on the bench
+/// with a scope on BIAS_DRV and the survival harness, since RLD load was never
+/// exonerated in the conversion-death campaign.
+///
+/// Either reference mode suits this board. AVDD is +2.5 V and AVSS is -2.5 V, so
+/// mid-supply is 0 V, and the grounded RLDREF pin presents exactly the reference the
+/// internal option would generate.
 ///
 /// `Disabled` is the only bench-validated setting: the entire bring-up campaign ran
-/// with the amplifier off, and the PCB review found the drive's compensation network
-/// on the wrong pin (RLDIN, the monitor mux, instead of RLDINV, the feedback node —
-/// SBAS459K figure 94), so the loop's stability when powered is unverified. Enabling
-/// it is its own future experiment; expect worse mains rejection until then.
+/// with the amplifier off, and the netlist puts the compensation network between
+/// RLDOUT and the electrode while RLDINV, the feedback node, reaches nothing but a
+/// header pin (SBAS459K figure 94). An amplifier whose inverting input floats has no
+/// closed loop, so powering this one before the board is fixed drives its output to a
+/// rail. Engineering log 0019 carries the trace and the one-wire fix.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum RightLegDriveMode {
-    /// Amplifier powered, reference taken from the RLDREF pin (`0xC6`). RLDREF is
-    /// grounded on this board, which is only correct with the internal reference
-    /// selected — do not use this mode without re-reading the schematic.
+    /// Amplifier powered, reference taken from the RLDREF pin (`0xC6`). The pin is
+    /// grounded, which is mid-supply on this board's bipolar rails, so this mode is
+    /// correct here.
     #[allow(dead_code)]
     ExternalReference,
     /// Amplifier powered, reference generated internally at mid-supply (`0xCE`).

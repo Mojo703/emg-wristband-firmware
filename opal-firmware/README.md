@@ -100,8 +100,9 @@ cargo run    # builds, flashes over USB-Serial-JTAG, opens the serial monitor
 ```
 
 Compile-time defaults (wifi credentials, server address) come from `cfg.toml`,
-which stays out of version control. Values persisted to NVS by the dashboard
-override it.
+which stays out of version control; copy `cfg.toml.example` and fill it in.
+Values the dashboard persists to NVS override it. The file is optional for
+recording, since an empty `wifi_ssid` boots the device into the USB serial link.
 
 ## On-device tests
 
