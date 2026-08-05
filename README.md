@@ -75,6 +75,10 @@ a custom board later stays contained.
 
 ## Where to start
 
+New to the project? [`ONBOARDING.md`](ONBOARDING.md) is the ordered path: the
+dashboard, a track, the firmware toolchain, and how to run and check a recording
+session. The rest of this section is the reference material it links to.
+
 For firmware bring-up and OTA, read [`ota-client/README.md`](ota-client/README.md).
 It has the one-time Xtensa toolchain setup that every firmware project shares,
 including the Arch `libxml2` workaround, plus the end-to-end OTA verification.
