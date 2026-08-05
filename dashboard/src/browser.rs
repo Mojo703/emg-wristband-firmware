@@ -298,6 +298,9 @@ pub async fn handle_browser(
     collection: Arc<crate::collect::manager::CollectionManager>,
 ) {
     tracing::info!("browser connected");
+    // Held for the whole handler: dropping it is what tells a running session
+    // that nobody is watching it any more.
+    let _attachment = collection.attach_browser();
     let (browser_sink, mut browser_stream) = socket.split();
 
     // All outbound browser traffic funnels through this channel so the pose proxy doesn't
@@ -348,6 +351,9 @@ pub async fn handle_browser(
     let mut selection = DeviceSelection::None;
     reconcile(&registry, &mut selection);
     let mut signal_quality = SignalQualityMonitor::new();
+    // Until the page says which panel it is on, it gets the stream: a browser
+    // that opens on a waveform panel must not miss the first windows.
+    let mut emg_stream = true;
     let mut viewing: Option<String> = None;
     follow_selection(&mut signal_quality, &mut viewing, &selection);
     let mut changed = registry.watch();
@@ -435,13 +441,17 @@ pub async fn handle_browser(
                                 selection.device_id().map(str::to_string),
                             );
                         }
-                        Frame::TrackStarted { at_unix_ms } => collection.track_started(at_unix_ms),
-                        Frame::TrackResumed { at_unix_ms, position_ms } => {
-                            collection.track_resumed(at_unix_ms, position_ms)
-                        }
+                        Frame::StartTrack {} => collection.start_track(),
+                        Frame::PauseTrack {} => collection.pause_track(),
+                        Frame::ResumeTrack {} => collection.resume_track(),
                         Frame::FinishCollection {} => collection.finish_collection(),
                         Frame::StopCollection { save } => collection.stop_collection(save),
                         Frame::CapturePlacementPhoto {} => collection.capture_placement_photo(),
+                        Frame::SetAudioVolume { volume_permille } => {
+                            collection.set_audio_volume(volume_permille)
+                        }
+                        Frame::SetAudioOutput { output } => collection.set_audio_output(output),
+                        Frame::SetEmgStream { enabled } => emg_stream = enabled,
                         _ => {} // device/backend-origin frames are ignored if echoed
                     }
                 }
@@ -475,6 +485,12 @@ pub async fn handle_browser(
                         signal_quality.accept_telemetry(source, metrics)
                     }
                     _ => {}
+                }
+                // A browser that draws no waveforms has already been served by
+                // the electrode check above; encoding the window for it would be
+                // work at both ends for something nothing renders.
+                if matches!(frame, Frame::Emg { .. }) && !emg_stream {
+                    continue;
                 }
                 // Discrete events must not be coalesced away; the timeseries may be.
                 let msg = Message::Binary(frame::encode(&frame));

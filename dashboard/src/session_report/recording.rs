@@ -23,6 +23,14 @@ pub struct Manifest {
     pub completed: bool,
     #[serde(default)]
     pub metadata: SessionMetadata,
+    /// Absent in sessions recorded before the backend played the audio itself.
+    pub audio: Option<AudioPlayback>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AudioPlayback {
+    pub output: String,
+    pub sample_rate: u32,
 }
 
 #[derive(Debug, Deserialize)]

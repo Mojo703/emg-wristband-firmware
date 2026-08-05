@@ -93,8 +93,10 @@ ports while flashing firmware.
 
 A collection session records raw EMG and a label log while the subject follows
 falling notes in the browser, plus a webcam video when the operator asks for one.
-The backend writes everything that carries a timestamp; the browser renders, and
-reports the moment audio actually started.
+The backend writes everything that carries a timestamp, and it plays the audio,
+so the playhead the cues are logged against is the mixer's own sample cursor. The
+browser sends the operator's playback intents and draws the positions it is
+sent.
 
 ### Getting a song in
 
@@ -118,9 +120,9 @@ the right hand's notes, and turns them into one cue schedule per difficulty leve
 of this game's own dial. A map is far denser than a hand forming gestures can
 follow, so a level's schedule keeps a subset of the notes as cue roots rather
 than all of them; the times it keeps are the map's own, verbatim. The audio is
-copied without being decoded, since the browser's `<audio>` element is the only
-thing that plays it. A map's audio therefore has to be the Ogg Vorbis that Beat
-Saber maps ship.
+copied without being decoded. A map's audio therefore has to be the Ogg Vorbis
+that Beat Saber maps ship, which is what the backend's mixer decodes at session
+start.
 
 An import that fails leaves nothing behind: the track is built in a temporary
 directory beside the library and renamed into place. The importer refuses a track
@@ -144,12 +146,34 @@ a `User-Agent`; nothing about that needs configuring.
 ### Running a session
 
 The vocabularies the setup form offers (subjects, gesture classes, activities,
-sweat levels) come from `config/collection.json`. Edit that file to add a
-teammate or a condition; the gesture classes are the game's lanes, in the order
-listed.
+sweat levels) come from `config/collection.json`, which is read once at startup —
+changing it needs a backend restart. Edit that file to add a teammate or a
+condition; the gesture classes are the game's lanes, in the order listed.
 
-Above the setup form, while no session is running, the Collect panel shows the
-electrode check: per channel, the broadband noise floor, the mains figure, the
+The classes are Hyser 10, 11, 16, 17 and 1: forearm rotation both ways, wrist
+deviation both ways, and lifting the thumb. All five are performable with a fist
+closed on a pole and none of them takes the hand off the grip. The first four
+swing the pole tip along two axes — rotation moves it sideways, deviation moves
+it fore and aft — and each carries a `motion` in the config: an arrow and a line
+of explanation, drawn by one component wherever the class is shown. The arrows
+are a **plan view of the pole tip seen from above**, with up the screen meaning
+down-track, and the lateral pair is written for the right arm. Lifting the thumb
+moves no pole, so it has no `motion` and draws no arrow.
+
+They are **larger than the gestures this product wants**, chosen to clear the
+current analog front end's noise floor rather than to sit apart from ordinary
+skiing motion; the `note` at the top of `collection.json` says so, and they
+should be replaced with subtler ones once the front end is fixed. Trained on
+held-out Hyser subjects this set reaches 57.4%, against 61.5% for the same four
+without the thumb: the fifth command costs four points, and almost all of it
+comes out of radial deviation, which falls to 18%. Expect that lane to look
+worst in the data. Thumb extension was the best of six candidate fifth classes
+measured, and the only one where the hand never leaves the pole.
+
+While no session is running, the Collect panel is four cards over two columns:
+subject and session tags, the band and its signal, the track library with the
+audio controls, and track import. A ready bar along the bottom holds Start and
+says what is blocking it. The band card carries the electrode check: per channel, the broadband noise floor, the mains figure, the
 DC offset and the headroom it leaves, how much of the last ten seconds sat at
 the rail, and the device's own lead-off comparator. The floor is the number that
 decides whether a take is worth making, and it has to stay under 10 µV RMS;
@@ -174,9 +198,16 @@ the session directory.
 If the device stops sending EMG for more than a second and a half, the backend
 pauses the session: the audio stops, the cue timeline freezes, and the field says
 which device went quiet and for how long. Press play to carry on once it is back;
-the track resumes from where it froze and the cues follow it, so what the log says
-you were asked to do still lines up with the samples. A cue the pause landed
-inside is cut short at the pause and not re-issued. The top bar carries the
+the track resumes from exactly where it froze and the cues follow it, so what the
+log says you were asked to do still lines up with the samples. A cue the pause
+landed inside is cut short at the pause and not re-issued. The pause button does
+the same thing on request, and the log records which of the two it was.
+
+An armed session nobody starts is not thrown away. It keeps recording, and after
+ten minutes it finalizes itself and goes to review like any other take; the
+stretch before the track began is marked in the event log as an `armed_prefix`,
+so the samples nothing was cued in are labelled as such rather than left to be
+inferred. The top bar carries the
 recorded seconds and the sample count throughout, which is what stops moving when
 something goes wrong.
 
@@ -192,7 +223,7 @@ local time it was created and the subject:
 | `emg.i16` | the raw sample blobs, verbatim, little-endian `i16`, channel-major within each window and concatenated in `seq` order |
 | `emg.missing` | the windows' gap bit planes, in the same window order, so a placeholder zero is never mistaken for a measurement |
 | `events.jsonl` | one JSON event per line: every cue, every window, every phase change, and every pause with the resume that ended it |
-| `session.json` | the manifest: the metadata, the hardware identity and device provenance, the track, the don count, and `completed` |
+| `session.json` | the manifest: the metadata, the hardware identity and device provenance, the track, the don count, the audio output and its measured latency, and `completed` |
 | `video.mkv` | the webcam recording, when the session asked for video |
 | `placement.jpg` | the placement photo, if one was taken at setup |
 
@@ -251,6 +282,7 @@ than the one beside `sessions/`.
 | `EMG_CAMERA_SIZE` | `320x240` | capture size, `WIDTHxHEIGHT` |
 | `EMG_CAMERA_FRAMERATE` | `30` | capture frame rate |
 | `EMG_CAMERA_INPUT_FORMAT` | (driver's choice) | v4l2 pixel format, e.g. `mjpeg` |
+| `EMG_AUDIO_OUTPUT` | (default output device) | game audio sink: part of a device name, or `silent` to run the mixer against no device |
 
 Without a pose URL the Pose panel renders but receives no frames.
 

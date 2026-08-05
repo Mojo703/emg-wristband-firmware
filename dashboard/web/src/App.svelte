@@ -3,7 +3,7 @@
   import { Tabs, ToggleGroup } from 'bits-ui';
   import * as Tooltip from '$lib/components/ui/tooltip/index.js';
   import { panels } from './lib/panels';
-  import { connect, live } from './lib/socket.svelte';
+  import { api, connect, live } from './lib/socket.svelte';
   import { theme, type ThemeChoice } from './lib/theme.svelte';
   import Icon from './lib/Icon.svelte';
   import DeviceList from './lib/DeviceList.svelte';
@@ -28,6 +28,16 @@
   }
 
   onMount(connect);
+
+  // Only the panels that draw waveforms ask for the EMG stream. Sent on every
+  // switch (and re-sent on reconnect, because a fresh socket starts subscribed
+  // and would otherwise stream the whole of a collection session at a page
+  // drawing none of it).
+  const drawsEmg = $derived(panels.find((panel) => panel.id === active)?.drawsEmg ?? false);
+  $effect(() => {
+    if (live.status !== 'online') return;
+    api.setEmgStream(drawsEmg);
+  });
 </script>
 
 <Tooltip.Provider delayDuration={200}>

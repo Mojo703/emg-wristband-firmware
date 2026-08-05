@@ -119,11 +119,24 @@
   }
 </script>
 
-<div class="stream-monitor" title="EMG frames/s — dashed line is the real-time target, fill is what the browser receives">
+<div
+  class="stream-monitor"
+  title={live.emgStream
+    ? 'EMG frames/s — dashed line is the real-time target, fill is what the browser receives'
+    : 'This panel draws no waveforms, so the backend is not sending it EMG. Recording is unaffected.'}
+>
   <div class="stream-head">
     <span>{transport === null ? 'pipe' : `pipe via ${transport}`}</span>
     <span class="stream-rate" class:on={live.streaming}>
-      {deviceOffline ? 'device offline' : target > 0 ? `${live.fps} / ${Math.round(target)} fps` : 'no stream'}
+      {#if !live.emgStream}
+        not subscribed
+      {:else if deviceOffline}
+        device offline
+      {:else if target > 0}
+        {live.fps} / {Math.round(target)} fps
+      {:else}
+        no stream
+      {/if}
     </span>
   </div>
   <canvas bind:this={canvas}></canvas>

@@ -1,35 +1,16 @@
-<script module lang="ts">
-  import type { UnixMilliseconds } from '../protocol';
-
-  // The wall-clock instant audio began, per session, at module scope: only the
-  // active panel is mounted, so switching away from Collect and back destroys and
-  // rebuilds this component mid-session, and component state cannot be trusted to
-  // remember whether `track_started` already went out.
-  //
-  // The backend anchors the whole beat grid on the first `track_started` it
-  // receives for a session. A second one would silently re-anchor it and mislabel
-  // every cue in the recorded data, so this record — not a component flag — is
-  // what gates the send, which makes a repeat structurally impossible.
-  let audioStart: { readonly sessionId: string; readonly at: UnixMilliseconds } | null = null;
-
-  function recordedAudioStart(sessionId: string): UnixMilliseconds | null {
-    return audioStart !== null && audioStart.sessionId === sessionId ? audioStart.at : null;
-  }
-</script>
-
 <script lang="ts">
-  // The game itself: an audio element, a canvas playfield, and a top bar.
+  // The game: a canvas playfield and a top bar.
   //
-  // The audio element is the clock. Every drawn frame reads `currentTime` and
-  // positions notes from it, so a stall, a seek, or a pause moves the field with
-  // the sound instead of drifting away from it. The only wall-clock readings in
-  // the whole panel are the `track_started` stamp (the backend's alignment
-  // anchor, taken from the element's own `playing` event — the first moment audio
-  // is actually audible) and the seek that rejoins that anchor after a remount.
+  // The backend plays the audio, owns the playhead, and logs the cues. This
+  // component sends the operator's three playback intents and draws what it is
+  // told. The only local arithmetic on time is extrapolating the backend's most
+  // recent `(position, instant)` pair to the current frame, which is smoothing
+  // for the eye, not a timeline of its own.
   import { onMount } from 'svelte';
   import { live, on } from '../socket.svelte';
   import { theme } from '../theme.svelte';
   import Icon from '../Icon.svelte';
+  import GestureArrow from './GestureArrow.svelte';
   import { Button } from '$lib/components/ui/button/index.js';
   import {
     asTrackMilliseconds,
@@ -49,27 +30,25 @@
     catalog: CollectionCatalogFrame;
     beatmap: BeatmapFrame;
     phase: PlayablePhase;
-    onTrackStarted: (atUnixMilliseconds: UnixMilliseconds) => void;
-    onTrackResumed: (
-      atUnixMilliseconds: UnixMilliseconds,
-      positionMilliseconds: TrackMilliseconds,
-    ) => void;
+    onStartTrack: () => void;
+    onPauseTrack: () => void;
+    onResumeTrack: () => void;
     onFinish: () => void;
   }
 
-  let { catalog, beatmap, phase, onTrackStarted, onTrackResumed, onFinish }: Props = $props();
+  let {
+    catalog,
+    beatmap,
+    phase,
+    onStartTrack,
+    onPauseTrack,
+    onResumeTrack,
+    onFinish,
+  }: Props = $props();
 
   let canvas: HTMLCanvasElement | undefined = $state(undefined);
-  let audio: HTMLAudioElement | undefined = $state(undefined);
   // Local view flags only — none of these is game state the backend also holds.
-  let startRequested = $state(false);
-  // Whether audio is running right now, from the element's own events.
-  let playing = $state(false);
-  let ended = $state(false);
   let confirmingFinish = $state(false);
-  // A reactive mirror of this session's module-scope record, so the gate below can
-  // depend on it. The module variable stays the authority for the send guard.
-  let sessionAudioStart = $state<UnixMilliseconds | null>(null);
   let positionMilliseconds = $state<TrackMilliseconds>(asTrackMilliseconds(0));
   // Consecutive hits, folded from note results in arrival order. Not
   // authoritative and not persisted: it is a cosmetic reward, and the summary the
@@ -106,12 +85,23 @@
 
   const durationMilliseconds = $derived(beatmap.track.duration);
   const recording = $derived(phase.recording);
-  // The backend froze the cue timeline. It stays frozen until this page reports
-  // audio playing again, so nothing here may quietly clear it.
+  // The backend froze the cue timeline, either because the device went quiet or
+  // because the operator asked. It stays frozen until the backend unfreezes it.
   const paused = $derived(phase.name === 'playing' ? phase.paused : null);
-  // The backend pauses; this page's audio element follows it.
-  $effect(() => {
-    if (paused !== null && audio !== undefined && !audio.paused) audio.pause();
+  const playing = $derived(phase.name === 'playing' && paused === null);
+  // Only this session's readings; a frame left over from the previous session
+  // would place the field on the wrong track entirely.
+  const playhead = $derived.by(() => {
+    const reading = live.playbackPosition;
+    return reading !== null && reading.session_id === beatmap.session_id ? reading : null;
+  });
+
+  // How much EMG is already on disk, read off the recorder's own count rather
+  // than a clock here. Null for a practice run, which records nothing.
+  const armedSeconds = $derived.by((): number | null => {
+    const recorded = recording.recorded;
+    if (recorded === null || recorded.sample_rate === 0) return null;
+    return recorded.samples_per_channel / recorded.sample_rate;
   });
 
   const electrodes = $derived.by((): string | null => {
@@ -126,122 +116,27 @@
     return `${quiet}/${quality.channels.length} under ${limit.toFixed(0)} µV · ${railed} railed · ${leadOff} lead-off`;
   });
 
-  // Which overlay the field needs, if any. Every case is a phase the operator can
-  // legitimately arrive in, including arriving late:
+  // Which overlay the field needs, if any. Both cases come straight off the
+  // backend's phase, so a reload mid-session lands in the right one.
   //
-  //   start    armed, audio not yet asked for — the first user gesture.
-  //   resume   playing, this session's anchor is known, audio is not running.
-  //            Either the backend froze the timeline on a stall, in which case
-  //            resuming plays from where it froze, or the operator paused local
-  //            audio while the session kept scoring, in which case resuming
-  //            seeks forward to where the session actually is.
-  //   late     playing, but the anchor is gone (a page reload cleared module
-  //            scope). There is no way to place the field on the real timeline, so
-  //            it is not drawn at all — a wrong timeline is worse than none.
-  type Gate = 'start' | 'resume' | 'late' | null;
+  //   start    armed: the track has not begun. The operator's tap starts it.
+  //   resume   playing but frozen: a stall the operator has to look at, or a
+  //            pause they asked for.
+  type Gate = 'start' | 'resume' | null;
   const gate = $derived.by((): Gate => {
-    if (phase.name === 'armed') return startRequested ? null : 'start';
-    if (sessionAudioStart === null) return 'late';
-    if (ended || playing) return null;
-    return 'resume';
+    if (phase.name === 'armed') return 'start';
+    return paused !== null ? 'resume' : null;
   });
 
-  // A new session resets the cosmetic counters and re-reads the module-scope
-  // anchor; nothing else needs clearing because everything else is read from the
-  // beatmap or the audio element.
+  // A new session resets the cosmetic counters; everything else is read from
+  // the beatmap or the backend's playhead.
   $effect(() => {
-    const sessionId = beatmap.session_id;
+    beatmap.session_id;
     streak = 0;
     laneHits = {};
     laneMisses = {};
-    startRequested = false;
-    playing = false;
-    ended = false;
     confirmingFinish = false;
-    nextClickIndex = null;
-    nextBeatIndex = null;
-    sessionAudioStart = recordedAudioStart(sessionId);
   });
-
-  // A click the moment each cue's onset crosses the hit line, from the same
-  // clock the field is drawn from (the audio element's position). Audible truth
-  // for the schedule: if the falling blocks look offset from where the clicks
-  // land in the music, the *rendering* is off; if the clicks themselves sit off
-  // the beat, the measured beat times are off.
-  let clickContext: AudioContext | null = null;
-  // Index of the next note that has not clicked yet, or null when it must be
-  // re-derived from the current position (fresh session, remount mid-track).
-  let nextClickIndex: number | null = null;
-
-  /** Created/resumed inside the Start and Resume click handlers, where the
-   * browser's autoplay policy allows audio output. */
-  function ensureClickContext(): void {
-    clickContext ??= new AudioContext();
-    if (clickContext.state === 'suspended') void clickContext.resume();
-  }
-
-  function playTone(frequency: number, gain: number, seconds: number): void {
-    if (clickContext === null || clickContext.state !== 'running') return;
-    const oscillator = clickContext.createOscillator();
-    const envelope = clickContext.createGain();
-    const at = clickContext.currentTime;
-    oscillator.type = 'square';
-    oscillator.frequency.value = frequency;
-    envelope.gain.setValueAtTime(gain, at);
-    envelope.gain.exponentialRampToValueAtTime(0.001, at + seconds);
-    oscillator.connect(envelope);
-    envelope.connect(clickContext.destination);
-    oscillator.start(at);
-    oscillator.stop(at + seconds + 0.01);
-  }
-
-  /** The cue click: loud and high, when a note's onset crosses the hit line. */
-  function playClick(): void {
-    playTone(1100, 0.25, 0.04);
-  }
-
-  /** The debug metronome tick: soft and low, on every measured beat, so the
-   * grid itself is audible under the cue clicks. */
-  function playMetronomeTick(): void {
-    playTone(700, 0.1, 0.025);
-  }
-
-  /** Fire clicks for every onset the playhead passed since the previous frame.
-   * Notes arrive time-ordered, so a single advancing index suffices; seeded
-   * from the current position so a mid-track remount does not replay the past. */
-  function clickPassedOnsets(position: TrackMilliseconds): void {
-    if (!playing) return;
-    if (nextClickIndex === null) {
-      const upcoming = beatmap.notes.findIndex((note) => note.at > position);
-      nextClickIndex = upcoming === -1 ? beatmap.notes.length : upcoming;
-      return;
-    }
-    for (;;) {
-      const note = beatmap.notes[nextClickIndex];
-      if (note === undefined || note.at > position) break;
-      playClick();
-      nextClickIndex += 1;
-    }
-  }
-
-  // The metronome walks the measured beat list the same way the cue clicks
-  // walk the schedule.
-  let nextBeatIndex: number | null = null;
-
-  function tickPassedBeats(position: TrackMilliseconds): void {
-    if (!playing) return;
-    if (nextBeatIndex === null) {
-      const upcoming = beatmap.beat_times.findIndex((beat) => beat > position);
-      nextBeatIndex = upcoming === -1 ? beatmap.beat_times.length : upcoming;
-      return;
-    }
-    for (;;) {
-      const beat = beatmap.beat_times[nextBeatIndex];
-      if (beat === undefined || beat > position) break;
-      playMetronomeTick();
-      nextBeatIndex += 1;
-    }
-  }
 
   onMount(() => {
     const offNoteResult = on('noteResult', (result) => {
@@ -261,8 +156,6 @@
     return () => {
       offNoteResult();
       cancelAnimationFrame(animationFrame);
-      void clickContext?.close();
-      clickContext = null;
     };
 
     function frame(): void {
@@ -270,6 +163,19 @@
       render();
     }
   });
+
+  /** Where the backend's playhead is right now. Between readings the local
+   * clock carries it forward, which is presentation: the reading itself already
+   * says when its position is heard, so extrapolating it is exact rather than a
+   * guess, and a fresh reading lands within a millisecond of the extrapolation
+   * instead of snapping. A frozen playhead is drawn where it froze. */
+  function currentPosition(): TrackMilliseconds {
+    const reading = playhead;
+    if (reading === null) return asTrackMilliseconds(0);
+    if (!reading.playing) return reading.position_ms;
+    const ahead = nowUnixMilliseconds() - reading.at_unix_ms;
+    return asTrackMilliseconds(Math.max(0, reading.position_ms + ahead));
+  }
 
   function render(): void {
     if (canvas === undefined) return;
@@ -287,12 +193,14 @@
     if (context === null) return;
     context.setTransform(ratio, 0, 0, ratio, 0, 0); // draw in CSS pixels
 
-    // The audio element is the clock: seconds of playback become the track
-    // position, with no wall-clock arithmetic anywhere in the loop.
-    const position = asTrackMilliseconds((audio?.currentTime ?? 0) * 1000);
-    positionMilliseconds = position;
-    clickPassedOnsets(position);
-    tickPassedBeats(position);
+    const position = currentPosition();
+    // The canvas redraws every frame; the clock beside it reads in seconds, so
+    // it is only assigned when its displayed value would change. Writing it
+    // every frame would put a reactive update — and the DOM work behind it —
+    // on the same 60 Hz loop as the drawing, for text that moves once a second.
+    if (Math.floor(position / 1000) !== Math.floor(positionMilliseconds / 1000)) {
+      positionMilliseconds = position;
+    }
     renderField(context, {
       playfield,
       laneColors,
@@ -304,86 +212,17 @@
     });
   }
 
-  function start(): void {
-    if (audio === undefined) return;
-    startRequested = true;
-    ensureClickContext();
-    // Autoplay policy: this call is inside the click handler, which is what makes
-    // it allowed. A rejection puts the gate back so the operator can retry.
-    void audio.play().catch((error: unknown) => {
-      console.warn('audio refused to start', error);
-      startRequested = false;
-    });
-  }
-
-  // Set when a resume out of a backend pause is in flight, so `onPlaying` knows
-  // to report the new anchor rather than treating the event as ordinary.
-  let reportResumeAnchor = false;
-
-  /** Rejoins a session already in progress. Out of a backend pause the track
-   * resumes from where the backend froze it; otherwise the backend kept scoring
-   * while this component was unmounted, so playback picks up at the elapsed
-   * position. A little seek drift is fine; restarting the track is not. */
-  function resume(): void {
-    if (audio === undefined || sessionAudioStart === null) return;
-    ensureClickContext();
-    // The playhead is about to jump; the click indexes re-derive from wherever
-    // it lands rather than machine-gunning everything in between.
-    nextClickIndex = null;
-    nextBeatIndex = null;
-    const targetSeconds =
-      paused !== null
-        ? paused.track_position / 1000
-        : Math.max(0, (nowUnixMilliseconds() - sessionAudioStart) / 1000);
-    audio.currentTime = Number.isFinite(audio.duration)
-      ? Math.min(targetSeconds, audio.duration)
-      : targetSeconds;
-    reportResumeAnchor = paused !== null;
-    // Also a click handler, so the same autoplay allowance applies. On rejection
-    // `playing` stays false and the resume gate simply stays up.
-    void audio.play().catch((error: unknown) => {
-      reportResumeAnchor = false;
-      console.warn('audio refused to resume', error);
-    });
-  }
-
-  function onPlaying(): void {
-    playing = true;
-    // Fires on every resume too. The module-scope record — not a component flag —
-    // decides whether this session's anchor has already been sent, so a remount
-    // cannot produce a second `track_started`.
-    if (recordedAudioStart(beatmap.session_id) !== null) {
-      if (!reportResumeAnchor) return;
-      reportResumeAnchor = false;
-      // Both halves read at the same instant: the backend re-derives the anchor
-      // from them, so wherever the seek actually landed is where the cues go.
-      // Rounded: the wire type is an integer, and cbor-x encodes a fractional
-      // JS number as a float the backend refuses.
-      onTrackResumed(
-        nowUnixMilliseconds(),
-        asTrackMilliseconds(Math.round((audio?.currentTime ?? 0) * 1000)),
-      );
-      return;
-    }
-    const at = nowUnixMilliseconds();
-    audioStart = { sessionId: beatmap.session_id, at };
-    sessionAudioStart = at;
-    onTrackStarted(at);
-  }
-
   function togglePause(): void {
-    if (audio === undefined) return;
-    if (audio.paused) {
-      resume();
+    if (paused === null) {
+      onPauseTrack();
     } else {
-      audio.pause();
+      onResumeTrack();
     }
   }
 
   /** Ends the session where it stands. The backend finalizes the recording and
    * moves to review; keep-or-discard is decided there, summary in view. */
   function finish(): void {
-    audio?.pause();
     onFinish();
   }
 
@@ -408,11 +247,6 @@
   function silence(milliseconds: number): string {
     return `${(milliseconds / 1000).toFixed(1)} s`;
   }
-
-  /** Audio is fetched over plain HTTP, not the socket. */
-  function audioSource(trackId: string): string {
-    return `/collection/audio/${encodeURIComponent(trackId)}`;
-  }
 </script>
 
 <div class="game">
@@ -423,8 +257,7 @@
     </div>
 
     <span class="numeric">
-      <!-- With no anchor there is no honest elapsed figure to show. -->
-      {gate === 'late' ? '—:—' : clock(positionMilliseconds)}
+      {clock(positionMilliseconds)}
       <span class="muted">/ {clock(durationMilliseconds)}</span>
     </span>
 
@@ -466,10 +299,9 @@
         </Button>
       </span>
     {:else}
-      <!-- Pause/resume only exists once this page has started the session's
-           audio: before the Start gate is tapped there is nothing to pause, and
-           a page that never held the anchor has nothing honest to resume. -->
-      {#if gate !== 'late' && sessionAudioStart !== null && !ended}
+      <!-- Pause/resume only exists once the track is running: before the Start
+           gate is tapped there is nothing to pause. -->
+      {#if phase.name === 'playing'}
         <button class="btn" onclick={togglePause} title={playing ? 'Pause' : 'Resume'}>
           <Icon name={playing ? 'pause' : 'play'} size={16} />
         </button>
@@ -478,18 +310,15 @@
     {/if}
   </div>
 
-  {#if gate === 'late'}
-    <p class="muted">This session is playing on the backend, but the page reloaded after
-      audio began, so the moment the track started is gone. The field would be drawn on
-      the wrong timeline, so it is left out; the recording itself is unaffected. Finish
-      above to end the session and review it.</p>
-  {:else}
   <div class="field">
     <canvas bind:this={canvas}></canvas>
 
     <div class="lane-labels">
       {#each collectionClasses as collectionClass, index (collectionClass.id)}
         <span class="lane-label" style:color={laneColors[index]}>
+          {#if collectionClass.motion !== null}
+            <GestureArrow motion={collectionClass.motion} size={15} />
+          {/if}
           {collectionClass.label}
           <span class="tally muted">
             {laneHits[collectionClass.id] ?? 0}/{(laneHits[collectionClass.id] ?? 0) +
@@ -501,21 +330,31 @@
 
     {#if gate === 'start'}
       <div class="gate">
-        <Button size="lg" onclick={start}>
+        <Button size="lg" onclick={onStartTrack}>
           <Icon name="play" size={18} />
           Start
         </Button>
         <p class="muted">
           The track begins on tap. Lead-in is {clock(beatmap.lead_in)} before the first cue.
         </p>
+        <!-- Recording began when the session armed, not here. Said outright,
+             because a recorder that is already running is not what a Start
+             button implies, and the stretch is kept on purpose: it is the
+             baseline nothing was cued in. -->
+        {#if armedSeconds !== null}
+          <p class="muted">
+            <strong>Already recording</strong> — {armedSeconds.toFixed(0)} s of baseline
+            written since the session armed.
+          </p>
+        {/if}
       </div>
-    {:else if gate === 'resume'}
+    {:else if gate === 'resume' && paused !== null}
       <div class="gate">
-        <Button size="lg" onclick={resume}>
+        <Button size="lg" onclick={onResumeTrack}>
           <Icon name="play" size={18} />
           Resume
         </Button>
-        {#if paused !== null}
+        {#if paused.cause === 'device_silent'}
           <p>
             <strong>Paused: {paused.device_id} stopped sending data</strong> after
             {silence(paused.silent_for)} of silence, at {clock(paused.track_position)}.
@@ -527,35 +366,21 @@
               Still nothing arriving. Everything up to the pause is recorded.
             {/if}
           </p>
+        {:else if paused.cause === 'browser_gone'}
+          <p>
+            <strong>Paused: this page closed at {clock(paused.track_position)}</strong>,
+            so the cues stopped rather than run at nobody.
+          </p>
+          <p class="muted">Resume picks up from there; the recording never stopped.</p>
         {:else}
           <p class="muted">
-            The session kept running. Audio picks up where it actually is, not from the
-            beginning.
+            Paused at {clock(paused.track_position)}. Resume picks up from there; the
+            recording never stopped.
           </p>
         {/if}
       </div>
-    {:else if ended}
-      <!-- The backend owns the schedule and moves to review on its own; the field
-           stays up until that phase change arrives. -->
-      <div class="notice">Track finished — waiting for the backend to score it.</div>
     {/if}
   </div>
-
-  <!-- Not `autoplay`: playback has to originate in the operator's tap for the
-       browser to allow it, and for `track_started` to mean anything. Absent in the
-       joined-late case, so there is no element to accidentally play from zero. -->
-  <audio
-    bind:this={audio}
-    src={audioSource(beatmap.track.id)}
-    preload="auto"
-    onplaying={onPlaying}
-    onpause={() => (playing = false)}
-    onended={() => {
-      playing = false;
-      ended = true;
-    }}
-  ></audio>
-  {/if}
 </div>
 
 <style>
@@ -623,8 +448,7 @@
     margin-left: 4px;
     font-variant-numeric: tabular-nums;
   }
-  .gate,
-  .notice {
+  .gate {
     position: absolute;
     inset: 0;
     display: flex;

@@ -298,6 +298,18 @@ fn render_session(report: &Report, out: &mut String) {
         manifest.hardware.sample_rate,
         manifest.hardware.scale_uv,
     );
+    match &manifest.audio {
+        Some(audio) => {
+            let _ = writeln!(
+                out,
+                "  audio   {} at {} Hz (cue instants are heard time)",
+                audio.output, audio.sample_rate,
+            );
+        }
+        None => {
+            let _ = writeln!(out, "  audio   not recorded for this session");
+        }
+    }
     let _ = writeln!(
         out,
         "  track   {}   difficulty {}",

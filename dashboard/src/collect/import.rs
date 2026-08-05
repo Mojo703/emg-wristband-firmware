@@ -8,9 +8,9 @@
 //! name alone and nothing is ever written to a path the archive chose, so a
 //! crafted entry name cannot escape the track directory.
 //!
-//! The audio is copied verbatim. Nothing decodes it — the browser's `<audio>`
-//! element is the only consumer — so the only thing read out of it is the
+//! The audio is copied verbatim; the only thing read out of it here is the
 //! duration, which an Ogg container states in its last page's granule position.
+//! Decoding happens later, in the mixer that plays the track.
 //!
 //! A track is built in a temporary directory beside the library and renamed into
 //! place, so an import that fails partway leaves nothing for

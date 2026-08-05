@@ -9,7 +9,7 @@
 //! ```text
 //! tracks/lisa-crossing-field/
 //!   track.json     identity, tempo, and one cue schedule per difficulty
-//!   audio.ogg      what the dashboard serves over /collection/audio/{id}
+//!   audio.ogg      what the backend's mixer decodes and plays
 //!   source/        the Beat Saber map it was converted from
 //! ```
 //!
@@ -656,19 +656,34 @@ mod tests {
     #[test]
     fn the_shipped_config_supplies_the_vocabularies() {
         let catalog = catalog_of(Vec::new()).expect("an empty library is a valid catalog");
+        // The class set itself is expected to change — it is chosen around the
+        // hardware, not settled — so this pins what every class must carry
+        // rather than which classes there are.
+        let classes = catalog.collection_classes();
+        assert!(!classes.is_empty(), "the config offers nothing to collect");
+        let mut seen = std::collections::BTreeSet::new();
+        for class in classes {
+            assert!(
+                seen.insert(class.id.clone()),
+                "two classes share the id {}",
+                class.id
+            );
+            assert!(!class.label.is_empty(), "{} has no lane label", class.id);
+            assert!(!class.color.is_empty(), "{} has no colour", class.id);
+            // A motion is optional, but an empty one is a lane that draws an
+            // arrow with nothing to say about it.
+            if let Some(motion) = &class.motion {
+                assert!(
+                    !motion.hint.is_empty(),
+                    "{} draws an arrow with no explanation",
+                    class.id
+                );
+            }
+        }
         assert_eq!(
-            catalog
-                .class_ids()
-                .iter()
-                .map(|class_id| class_id.0.as_str())
-                .collect::<Vec<_>>(),
-            [
-                "wrist_pronation",
-                "wrist_supination",
-                "wrist_flexion_hand_close",
-                "wrist_extension_hand_open",
-                "three_finger_pinch"
-            ]
+            catalog.class_ids().len(),
+            classes.len(),
+            "the lane order and the class list disagree"
         );
         assert_eq!(catalog.subjects().len(), 5);
         assert_eq!(catalog.activities().len(), 4);

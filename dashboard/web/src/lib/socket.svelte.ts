@@ -27,13 +27,13 @@ import {
   type LogFrame,
   type NoteResultFrame,
   type OutgoingFrame,
+  type AudioSettingsFrame,
+  type PlaybackPositionFrame,
   type PoseFrame,
   type PredictionFrame,
   type SessionMetadata,
   type SignalQualityFrame,
   type TelemetryFrame,
-  type TrackMilliseconds,
-  type UnixMilliseconds,
 } from './protocol';
 
 /** One point of a telemetry metric's session history, on the device clock. */
@@ -88,6 +88,14 @@ class LiveStateManager {
   #catalog = $state<CollectionCatalogFrame | null>(null);
   #collectionState = $state<CollectionStateFrame | null>(null);
   #beatmap = $state<BeatmapFrame | null>(null);
+  // The backend's playhead, republished a few times a second. The playfield
+  // extrapolates between these readings with the local clock; it is the only
+  // thing here the browser is allowed to do with time.
+  #playbackPosition = $state<PlaybackPositionFrame | null>(null);
+  /** Whether this browser asked for the raw EMG stream. The header's pipe
+   * monitor reads it so an unsubscribed panel does not look like a dead link. */
+  emgStream = $state(true);
+  #audioSettings = $state<AudioSettingsFrame | null>(null);
 
   get hello(): HelloFrame | null {
     return this.status === 'online' ? this.#hello : null;
@@ -103,6 +111,14 @@ class LiveStateManager {
 
   get beatmap(): BeatmapFrame | null {
     return this.status === 'online' ? this.#beatmap : null;
+  }
+
+  get playbackPosition(): PlaybackPositionFrame | null {
+    return this.status === 'online' ? this.#playbackPosition : null;
+  }
+
+  get audioSettings(): AudioSettingsFrame | null {
+    return this.status === 'online' ? this.#audioSettings : null;
   }
 
   get signalQuality(): SignalQualityFrame | null {
@@ -199,11 +215,20 @@ class LiveStateManager {
     const phase = value.phase.name;
     if (phase === 'idle' || phase === 'reviewing') {
       this.#beatmap = null;
+      this.#playbackPosition = null;
     }
   }
 
   setBeatmap(value: BeatmapFrame): void {
     this.#beatmap = value;
+  }
+
+  setPlaybackPosition(value: PlaybackPositionFrame): void {
+    this.#playbackPosition = value;
+  }
+
+  setAudioSettings(value: AudioSettingsFrame): void {
+    this.#audioSettings = value;
   }
 
   setHandshake(): void {
@@ -216,6 +241,7 @@ class LiveStateManager {
     this.#catalog = null;
     this.#collectionState = null;
     this.#beatmap = null;
+    this.#playbackPosition = null;
     this.logs = [];
     this.fps = 0;
     this.#emgSinceTick = 0;
@@ -231,6 +257,7 @@ class LiveStateManager {
     this.#catalog = null;
     this.#collectionState = null;
     this.#beatmap = null;
+    this.#playbackPosition = null;
     this.logs = [];
     this.fps = 0;
     this.#emgSinceTick = 0;
@@ -380,6 +407,10 @@ export function connect(): void {
       live.setCollectionState(frame);
     } else if (frame.type === 'beatmap') {
       live.setBeatmap(frame);
+    } else if (frame.type === 'playback_position') {
+      live.setPlaybackPosition(frame);
+    } else if (frame.type === 'audio_settings') {
+      live.setAudioSettings(frame);
     } else if (frame.type === 'note_result') {
       for (const cb of listeners.noteResult) cb(frame);
     }
@@ -423,18 +454,25 @@ export const api = {
       difficulty,
       record_video: recordVideo,
     }),
-  // The moment the audio element actually began playing, which is the only
-  // timestamp that can align the recorded streams with the beat grid.
-  trackStarted: (atUnixMilliseconds: UnixMilliseconds) =>
-    send({ type: 'track_started', at_unix_ms: atUnixMilliseconds }),
-  // Both halves of the resumed session's anchor: when audio restarted and where
-  // in the track it restarted from.
-  trackResumed: (atUnixMilliseconds: UnixMilliseconds, positionMilliseconds: TrackMilliseconds) =>
-    send({
-      type: 'track_resumed',
-      at_unix_ms: atUnixMilliseconds,
-      position_ms: positionMilliseconds,
-    }),
+  // The three playback intents. The backend plays the audio and owns the
+  // timeline, so each of these is a command with nothing to report back.
+  startTrack: () =>
+    send({ type: 'start_track' }),
+  pauseTrack: () =>
+    send({ type: 'pause_track' }),
+  resumeTrack: () =>
+    send({ type: 'resume_track' }),
+  // Whether this browser needs the raw EMG stream. Sent whenever the visible
+  // panel changes, so a session spends its length not shipping sixteen
+  // channels to a page that draws none of them.
+  setEmgStream: (enabled: boolean) => {
+    live.emgStream = enabled;
+    send({ type: 'set_emg_stream', enabled });
+  },
+  // Both take effect on a running session, not just the next one.
+  setAudioVolume: (volumePermille: number) =>
+    send({ type: 'set_audio_volume', volume_permille: Math.round(volumePermille) }),
+  setAudioOutput: (output: string | null) => send({ type: 'set_audio_output', output }),
   finishCollection: () =>
     send({ type: 'finish_collection' }),
   stopCollection: (save: boolean) =>
@@ -452,6 +490,7 @@ export type {
   CollectionCatalogFrame,
   CollectionStateFrame,
   NoteResultFrame,
+  PlaybackPositionFrame,
   SignalQualityFrame,
   SessionMetadata,
 } from './protocol';

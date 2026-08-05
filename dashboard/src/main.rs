@@ -81,7 +81,9 @@ async fn main() -> anyhow::Result<()> {
     // (default config/collection.json), the track library from EMG_TRACKS_DIR
     // (default tracks/, one directory per track), sessions under
     // EMG_SESSIONS_DIR (default sessions/), webcam at EMG_CAMERA_DEVICE
-    // (default /dev/video0).
+    // (default /dev/video0), and the game's audio out of EMG_AUDIO_OUTPUT
+    // (default the host's default device; `silent` for a run that must not be
+    // audible).
     let collection_config =
         std::env::var("EMG_COLLECTION_CONFIG").unwrap_or_else(|_| "config/collection.json".into());
     let tracks_root = std::path::PathBuf::from(
@@ -114,6 +116,7 @@ async fn main() -> anyhow::Result<()> {
         registry.clone(),
         sessions_root,
         provenance_store,
+        collect::audio::output_from_environment(),
     );
 
     let state = AppState {
@@ -129,7 +132,6 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/ws", get(browser_ws))
-        .route("/collection/audio/:track_id", get(collection_audio))
         .route("/collection/camera/preview", get(collection_camera_preview))
         .route(
             "/collection/tracks/import/upload",
@@ -324,34 +326,4 @@ async fn collection_camera_preview(State(state): State<AppState>) -> Response {
         body,
     )
         .into_response()
-}
-
-/// Serve a catalog track's audio to the game's `<audio>` element.
-/// Served through `ServeFile` for its range support: the game seeks the audio
-/// element when a paused session resumes, and a browser will not seek a source
-/// that answers a `Range` request with the whole body.
-async fn collection_audio(
-    axum::extract::Path(track_id): axum::extract::Path<String>,
-    State(state): State<AppState>,
-    request: axum::extract::Request,
-) -> Response {
-    use axum::http::StatusCode;
-    use axum::response::IntoResponse;
-    let Some(path) = state.collection.audio_path(&protocol::TrackId(track_id)) else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    let content_type = match path.extension().and_then(|extension| extension.to_str()) {
-        Some("ogg") => "audio/ogg",
-        Some("mp3") => "audio/mpeg",
-        Some("flac") => "audio/flac",
-        Some("wav") => "audio/wav",
-        _ => "application/octet-stream",
-    };
-    match ServeFile::new_with_mime(&path, &content_type.parse().expect("static mime type"))
-        .try_call(request)
-        .await
-    {
-        Ok(response) => response.into_response(),
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
-    }
 }

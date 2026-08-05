@@ -35,12 +35,22 @@
 //! absolute instants, so a tool that only reads [`SessionEvent::Cue`] needs none
 //! of this; the pause records are what explain the discontinuity between
 //! segments and the samples in the interval that no cue covers.
+//!
+//! Recording begins when the session arms, which is before the operator starts
+//! the track, so a session's `emg.i16` opens with a stretch nothing was cued in.
+//! [`SessionEvent::ArmedPrefix`] marks that stretch outright rather than leaving
+//! it to be inferred from the distance between two other events.
+//!
+//! Cue instants are in *heard* time: what the subject's ears received, which is
+//! the backend's playhead plus the output device's latency. The offset is
+//! applied when the cue is logged and is not recorded anywhere, because a
+//! recorded copy is something a later tool can subtract a second time.
 
 use protocol::{
     Beatmap, BoardRevision, ClassId, CollectionSummary, DeviceConfig, DeviceProvenance,
     DeviceTransport, DifficultyLevel, DurationMilliseconds, FileReport, NoteIndex,
-    OffsetMilliseconds, RecordedEmg, SessionId, SessionMetadata, StreamProgress, TrackId,
-    TrackInfo, TrackMilliseconds, UnixMilliseconds,
+    OffsetMilliseconds, PauseCause, RecordedEmg, SessionId, SessionMetadata, StreamProgress,
+    TrackId, TrackInfo, TrackMilliseconds, UnixMilliseconds,
 };
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -96,7 +106,16 @@ pub struct SessionManifest {
     /// it says so here, so a missing `video.mkv` is a decision on the record
     /// rather than an absence to be guessed at.
     pub record_video: bool,
+    pub audio: AudioPlayback,
     pub completed: bool,
+}
+
+/// How the track reached the subject's ears.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AudioPlayback {
+    /// The output device the backend played through.
+    pub output: String,
+    pub sample_rate: u32,
 }
 
 /// One line of `events.jsonl`. Instants are [`UnixMilliseconds`] on the shared
@@ -116,8 +135,15 @@ pub enum SessionEvent {
         t0_us: u64,
         at: UnixMilliseconds,
     },
-    /// Audio playback began in the browser (anchor for the beat grid).
+    /// The instant the subject heard audio t = 0 — the anchor for the beat grid.
     TrackStarted { at: UnixMilliseconds },
+    /// The recorded stretch between arming and the track starting, which no cue
+    /// covers. Written when the track starts, or at the end of a session whose
+    /// track never did, in which case it spans the whole recording.
+    ArmedPrefix {
+        from: UnixMilliseconds,
+        to: UnixMilliseconds,
+    },
     /// One cue's hold block: the note in the beatmap, its class id
     /// (self-contained for the windowing tool), and both transitions on the
     /// shared clock — the gesture begins at `at` and releases at `release`.
@@ -133,16 +159,18 @@ pub enum SessionEvent {
         note_index: NoteIndex,
         at: UnixMilliseconds,
     },
-    /// The cue timeline froze because the device stopped sending EMG. Nothing
-    /// between here and the matching [`SessionEvent::Resumed`] was cued, so any
-    /// samples recorded in that interval carry no label.
+    /// The cue timeline froze: the device stopped sending EMG, or the operator
+    /// asked. Nothing between here and the matching [`SessionEvent::Resumed`]
+    /// was cued, so any samples recorded in that interval carry no label.
     Paused {
         at: UnixMilliseconds,
         /// Where the track stood when it froze.
         track_position: TrackMilliseconds,
-        /// How long the device had been silent when the pause was declared.
+        /// How long the device had been silent when the pause was declared, and
+        /// zero for an operator pause.
         silent_for: DurationMilliseconds,
         device_id: String,
+        cause: PauseCause,
     },
     /// Audio resumed and the cue timeline restarted. `at` paired with
     /// `track_position` is this play segment's anchor: every later cue's wall
@@ -281,7 +309,7 @@ pub trait BeatmapGenerator: Send + Sync {
     /// The playable tracks, catalog order.
     fn tracks(&self) -> Vec<TrackInfo>;
 
-    /// Filesystem path of a track's audio, for the HTTP audio route.
+    /// Filesystem path of a track's audio, for the mixer to decode.
     fn audio_path(&self, track_id: &TrackId) -> Option<PathBuf>;
 
     /// Generate the schedule for one session. `classes` are the lane

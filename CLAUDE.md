@@ -64,6 +64,12 @@ temporal voting as a crutch, so fix the model instead. The reject pipeline's
 3-of-3 smoothing is a deliberate, documented decision spine and not an accuracy
 patch, so keep that distinction.
 
+The collected gesture set is a hardware workaround, not a design. The five
+classes in `dashboard/config/collection.json` are large motions picked to clear
+the current analog front end's noise floor. The product wants subtler gestures —
+ones that separate from ordinary skiing motion, which these do not. When the
+front end is fixed, revisit the set; do not treat the current one as settled.
+
 ## Where the reasoning lives
 
 `engineering-logs/` records why the ML and on-device kernels turned out the way

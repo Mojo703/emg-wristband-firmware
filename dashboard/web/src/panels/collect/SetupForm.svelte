@@ -8,11 +8,13 @@
   //
   // Layout is one label-and-control grid row per independent answer; a set of
   // mutually exclusive chips (a radio set) is one row.
+  import type { Snippet } from 'svelte';
   import {
     Arm,
     DifficultyLevel,
     DIFFICULTY_LEVELS,
     nowUnixMilliseconds,
+    type AudioSettingsFrame,
     type BoardRevision,
     type CollectionCatalogFrame,
     type SessionMetadata,
@@ -20,6 +22,7 @@
   } from '../../lib/protocol';
   import { Button } from '$lib/components/ui/button/index.js';
   import ChipEntry from './ChipEntry.svelte';
+  import GestureArrow from '../../lib/collect/GestureArrow.svelte';
   import Icon from '../../lib/Icon.svelte';
   import {
     formatClockTime,
@@ -32,6 +35,16 @@
     catalog: CollectionCatalogFrame;
     placementPhoto: UnixMilliseconds | null;
     disabled: boolean;
+    /** The electrode check, rendered inside the band card rather than above the
+     * form: it answers a question about the band, so it belongs beside the
+     * board and the placement photo. */
+    signalQuality: Snippet;
+    /** Track import, in the card beside the library it adds to. */
+    trackImport: Snippet;
+    /** Host audio settings, or null before the backend has said. */
+    audio: AudioSettingsFrame | null;
+    onSetVolume: (volumePermille: number) => void;
+    onSetOutput: (output: string | null) => void;
     /** What the backend remembers this device is soldered to, if anything. */
     boardRevision: BoardRevision | null;
     /** Null when no device is selected, since there is nothing to remember it against. */
@@ -55,6 +68,11 @@
     catalog,
     placementPhoto,
     disabled,
+    signalQuality,
+    trackImport,
+    audio,
+    onSetVolume,
+    onSetOutput,
     boardRevision,
     onSetBoardRevision,
     deletingTrackId,
@@ -163,7 +181,6 @@
   const activity = $derived(selectedActivity ?? catalog.activities[0]?.id ?? '');
   const sweat = $derived(selectedSweat ?? catalog.sweat_levels[0]?.id ?? '');
   const trackId = $derived(selectedTrack ?? catalog.tracks[0]?.id ?? '');
-  const track = $derived(catalog.tracks.find((entry) => entry.id === trackId) ?? null);
 
   // Roster picks are gated on membership (the effect above normally clears a
   // vanished pick, but this is the gate on what reaches the wire, so it checks
@@ -278,201 +295,359 @@
 {/snippet}
 
 <div class="setup">
-  <div class="grid">
-    <span class="field-label">Subject</span>
-    <div class="chips">
-      {#each catalog.subjects as candidate (candidate)}
-        {@render chip(candidate, subject === candidate, () => {
-          selectedSubject = candidate;
-          customSubject = '';
-        })}
-      {/each}
-      <ChipEntry label="+ other" bind:value={customSubject} {disabled} ariaLabel="subject name" />
-    </div>
+  <div class="columns">
+    <div class="column">
+      <section class="card">
+        <h3>Subject &amp; session</h3>
+        <div class="grid">
+          <span class="field-label">Subject</span>
+          <div class="chips">
+            {#each catalog.subjects as candidate (candidate)}
+              {@render chip(candidate, subject === candidate, () => {
+                selectedSubject = candidate;
+                customSubject = '';
+              })}
+            {/each}
+            <ChipEntry label="+ other" bind:value={customSubject} {disabled} ariaLabel="subject name" />
+          </div>
 
-    <span class="field-label">Arm</span>
-    <div class="chips">
-      {@render chip('left', selectedArm === Arm.Left, () => (selectedArm = Arm.Left))}
-      {@render chip('right', selectedArm === Arm.Right, () => (selectedArm = Arm.Right))}
-    </div>
+          <span class="field-label">Arm</span>
+          <div class="chips">
+            {@render chip('left', selectedArm === Arm.Left, () => (selectedArm = Arm.Left))}
+            {@render chip('right', selectedArm === Arm.Right, () => (selectedArm = Arm.Right))}
+          </div>
 
-    <span class="field-label">Gloves</span>
-    {@render yesNo(gloves, (next) => (gloves = next))}
+          <span class="field-label">Gloves</span>
+          {@render yesNo(gloves, (next) => (gloves = next))}
 
-    <span class="field-label">Skin prep</span>
-    {@render yesNo(skinPrep, (next) => (skinPrep = next))}
+          <span class="field-label">Skin prep</span>
+          {@render yesNo(skinPrep, (next) => (skinPrep = next))}
 
-    <span class="field-label">From ulna bump</span>
-    {@render stepper(
-      formatMillimetresAsCentimetres(bandOffsetMillimetres),
-      stepBandOffset,
-      'distance from the ulna bump',
-    )}
+          <span class="field-label">Activity</span>
+          <div class="chips">
+            {#each catalog.activities as condition (condition.id)}
+              {@render chip(
+                condition.label,
+                activity === condition.id,
+                () => (selectedActivity = condition.id),
+              )}
+            {/each}
+          </div>
 
-    <span class="field-label">Rotation</span>
-    {@render stepper(`${bandRotationDegrees}°`, stepBandRotation, 'band rotation')}
+          <span class="field-label">Sweat</span>
+          <div class="chips">
+            {#each catalog.sweat_levels as level (level.id)}
+              {@render chip(level.label, sweat === level.id, () => (selectedSweat = level.id))}
+            {/each}
+          </div>
 
-    <span class="field-label">Donned</span>
-    <div class="chips">
-      <strong class="numeric">{formatClockTime(donned)}</strong>
-      <span class="muted">{formatMinutesAgo(donned, now)}</span>
-      <Button
-        variant="outline"
-        size="sm"
-        {disabled}
-        onclick={() => {
-          donned = nowUnixMilliseconds();
-          now = donned;
-        }}>re-donned now</Button
-      >
-    </div>
-
-    <span class="field-label">Board</span>
-    <div class="chips">
-      <input
-        type="text"
-        class="chip"
-        data-filled={boardText.trim() !== '' ? 'true' : 'false'}
-        placeholder="board rev"
-        aria-label="board revision"
-        disabled={disabled || onSetBoardRevision === null}
-        bind:value={boardText}
-        onchange={commitBoardRevision}
-      />
-      <input
-        type="text"
-        class="chip"
-        data-filled={harnessText.trim() !== '' ? 'true' : 'false'}
-        placeholder="harness"
-        aria-label="harness revision"
-        disabled={disabled || onSetBoardRevision === null}
-        bind:value={harnessText}
-        onchange={commitBoardRevision}
-      />
-    </div>
-
-    <span class="field-label">Activity</span>
-    <div class="chips">
-      {#each catalog.activities as condition (condition.id)}
-        {@render chip(
-          condition.label,
-          activity === condition.id,
-          () => (selectedActivity = condition.id),
-        )}
-      {/each}
-    </div>
-
-    <span class="field-label">Sweat</span>
-    <div class="chips">
-      {#each catalog.sweat_levels as level (level.id)}
-        {@render chip(level.label, sweat === level.id, () => (selectedSweat = level.id))}
-      {/each}
-    </div>
-
-    <span class="field-label">Video</span>
-    <div class="video">
-      {@render yesNo(recordVideo, (next) => (recordVideo = next))}
-      {#if recordVideo}
-        {#key placementPhoto}
-          <img class="preview" src={CAMERA_PREVIEW_URL} alt="camera preview" />
-        {/key}
-      {/if}
-    </div>
-
-    <span class="field-label">Photo</span>
-    <div class="chips">
-      <Button variant="outline" size="sm" {disabled} onclick={onCapturePlacementPhoto}>
-        <Icon name="scan" size={14} />
-        capture placement photo
-      </Button>
-      {#if placementPhoto !== null}
-        <span class="muted">captured {formatClockTime(placementPhoto)} ✓</span>
-      {/if}
-    </div>
-
-    <span class="field-label">Note</span>
-    <div class="chips">
-      <ChipEntry label="+ note" bind:value={noteText} {disabled} ariaLabel="session note" />
-    </div>
-
-    <span class="field-label tall">Track</span>
-    <div class="tracks">
-      {#each catalog.tracks as candidate (candidate.id)}
-        <div class="track-row">
-          <button
-            type="button"
-            class="chip track"
-            aria-pressed={trackId === candidate.id}
-            {disabled}
-            onclick={() => (selectedTrack = candidate.id)}
-          >
-            <strong>{candidate.title}</strong>
-            <span class="muted">
-              {Math.round(candidate.beats_per_minute)} bpm · {formatWholeMinutes(candidate.duration)}
-              min
-            </span>
-          </button>
-          {#if deletingTrackId === candidate.id}
-            <span class="muted">deleting…</span>
-          {:else if deleteArmedTrackId === candidate.id}
-            <Button
-              variant="destructive"
-              size="sm"
-              onclick={() => {
-                disarmDelete();
-                onDeleteTrack(candidate.id);
-              }}>Confirm delete</Button
-            >
-            <Button variant="ghost" size="sm" onclick={disarmDelete}>Keep</Button>
-          {:else}
-            <Button
-              variant="ghost"
-              size="sm"
-              disabled={disabled || deletingTrackId !== null}
-              aria-label={`delete ${candidate.title}`}
-              onclick={() => armDelete(candidate.id)}>Delete</Button
-            >
-          {/if}
+          <span class="field-label">Note</span>
+          <div class="chips">
+            <ChipEntry label="+ note" bind:value={noteText} {disabled} ariaLabel="session note" />
+          </div>
         </div>
-      {/each}
-      {#if catalog.tracks.length === 0}
-        <span class="muted">No tracks in the catalog.</span>
-      {/if}
-      {#if track !== null}
-        <span class="muted">
-          ~{formatWholeMinutes(track.duration)} min
-        </span>
-      {/if}
+      </section>
+
+      <!-- The lanes the session will cue, in lane order, with the arrow and
+           the line the backend supplies for each. This is what a subject is
+           walked through before the track starts, and it is the same
+           descriptor the playfield's lane labels draw. -->
+      <section class="card">
+        <h3>Gestures</h3>
+        <ul class="gestures">
+          {#each catalog.collection_classes as collectionClass (collectionClass.id)}
+            <li>
+              <span class="gesture-arrow">
+                {#if collectionClass.motion !== null}
+                  <GestureArrow motion={collectionClass.motion} size={18} />
+                {/if}
+              </span>
+              <strong>{collectionClass.label}</strong>
+              <span class="muted">{collectionClass.motion?.hint ?? 'nothing moves'}</span>
+            </li>
+          {/each}
+        </ul>
+      </section>
+
+      <section class="card">
+        <h3>Track &amp; sound</h3>
+        <div class="grid">
+          <span class="field-label tall">Track</span>
+          <div class="tracks">
+            {#each catalog.tracks as candidate (candidate.id)}
+              <div class="track-row">
+                <button
+                  type="button"
+                  class="chip track"
+                  aria-pressed={trackId === candidate.id}
+                  {disabled}
+                  onclick={() => (selectedTrack = candidate.id)}
+                >
+                  <strong>{candidate.title}</strong>
+                  <span class="muted">
+                    {Math.round(candidate.beats_per_minute)} bpm · {formatWholeMinutes(candidate.duration)}
+                    min
+                  </span>
+                </button>
+                {#if deletingTrackId === candidate.id}
+                  <span class="muted">deleting…</span>
+                {:else if deleteArmedTrackId === candidate.id}
+                  <Button
+                    variant="destructive"
+                    size="sm"
+                    onclick={() => {
+                      disarmDelete();
+                      onDeleteTrack(candidate.id);
+                    }}>Confirm delete</Button
+                  >
+                  <Button variant="ghost" size="sm" onclick={disarmDelete}>Keep</Button>
+                {:else}
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    disabled={disabled || deletingTrackId !== null}
+                    aria-label={`delete ${candidate.title}`}
+                    onclick={() => armDelete(candidate.id)}>Delete</Button
+                  >
+                {/if}
+              </div>
+            {/each}
+            {#if catalog.tracks.length === 0}
+              <span class="muted">No tracks in the catalog.</span>
+            {/if}
+          </div>
+
+          <span class="field-label">Difficulty</span>
+          <div class="chips">
+            {#each DIFFICULTY_LEVELS as level (level)}
+              {@render chip(level, selectedDifficulty === level, () => (selectedDifficulty = level))}
+            {/each}
+          </div>
+
+          <!-- The backend plays the audio, so these are host settings rather
+               than page settings: they persist, and they move a running
+               session as readily as the next one. -->
+          <span class="field-label">Music</span>
+          <div class="chips">
+            <input
+              type="range"
+              min="0"
+              max="1000"
+              step="25"
+              disabled={audio === null}
+              aria-label="music volume"
+              value={audio?.volume_permille ?? 0}
+              oninput={(event) => onSetVolume(Number(event.currentTarget.value))}
+            />
+            <span class="muted numeric">
+              {Math.round((audio?.volume_permille ?? 0) / 10)}%
+            </span>
+            <span class="muted">cue clicks keep their own level</span>
+          </div>
+
+          <span class="field-label">Output</span>
+          <div class="chips">
+            <select
+              class="chip"
+              disabled={audio === null}
+              aria-label="audio output device"
+              value={audio?.output ?? ''}
+              onchange={(event) =>
+                onSetOutput(event.currentTarget.value === '' ? null : event.currentTarget.value)}
+            >
+              <option value="">System default</option>
+              {#each audio?.devices ?? [] as device (device)}
+                <option value={device}>{device}</option>
+              {/each}
+            </select>
+          </div>
+        </div>
+      </section>
     </div>
 
-    <span class="field-label">Difficulty</span>
-    <div class="chips">
-      {#each DIFFICULTY_LEVELS as level (level)}
-        {@render chip(level, selectedDifficulty === level, () => (selectedDifficulty = level))}
-      {/each}
+    <div class="column">
+      <section class="card">
+        <h3>Band &amp; signal</h3>
+        <div class="grid">
+          <span class="field-label">From ulna bump</span>
+          {@render stepper(
+            formatMillimetresAsCentimetres(bandOffsetMillimetres),
+            stepBandOffset,
+            'distance from the ulna bump',
+          )}
+
+          <span class="field-label">Rotation</span>
+          {@render stepper(`${bandRotationDegrees}°`, stepBandRotation, 'band rotation')}
+
+          <span class="field-label">Donned</span>
+          <div class="chips">
+            <strong class="numeric">{formatClockTime(donned)}</strong>
+            <span class="muted">{formatMinutesAgo(donned, now)}</span>
+            <Button
+              variant="outline"
+              size="sm"
+              {disabled}
+              onclick={() => {
+                donned = nowUnixMilliseconds();
+                now = donned;
+              }}>re-donned now</Button
+            >
+          </div>
+
+          <span class="field-label">Board</span>
+          <div class="chips">
+            <input
+              type="text"
+              class="chip"
+              data-filled={boardText.trim() !== '' ? 'true' : 'false'}
+              placeholder="board rev"
+              aria-label="board revision"
+              disabled={disabled || onSetBoardRevision === null}
+              bind:value={boardText}
+              onchange={commitBoardRevision}
+            />
+            <input
+              type="text"
+              class="chip"
+              data-filled={harnessText.trim() !== '' ? 'true' : 'false'}
+              placeholder="harness"
+              aria-label="harness revision"
+              disabled={disabled || onSetBoardRevision === null}
+              bind:value={harnessText}
+              onchange={commitBoardRevision}
+            />
+          </div>
+
+          <span class="field-label">Video</span>
+          <div class="video">
+            {@render yesNo(recordVideo, (next) => (recordVideo = next))}
+            {#if recordVideo}
+              {#key placementPhoto}
+                <img class="preview" src={CAMERA_PREVIEW_URL} alt="camera preview" />
+              {/key}
+            {/if}
+          </div>
+
+          <span class="field-label">Photo</span>
+          <div class="chips">
+            <Button variant="outline" size="sm" {disabled} onclick={onCapturePlacementPhoto}>
+              <Icon name="scan" size={14} />
+              capture placement photo
+            </Button>
+            {#if placementPhoto !== null}
+              <span class="muted">captured {formatClockTime(placementPhoto)} ✓</span>
+            {/if}
+          </div>
+        </div>
+
+        {@render signalQuality()}
+      </section>
+
+      <section class="card">
+        <h3>Import</h3>
+        {@render trackImport()}
+      </section>
     </div>
   </div>
 
-  <div class="actions">
+  <!-- Sticky, because the answer to "can I start, and if not why not" has to be
+       readable from wherever the operator is in the form. -->
+  <div class="ready-bar">
+    <span class="ready-state">
+      {#if subject === null}
+        <span class="muted">Pick a subject to start.</span>
+      {:else if trackId === ''}
+        <span class="muted">No track in the catalog to play.</span>
+      {:else if recordsNothing}
+        <strong class="warn">No device selected — this run records nothing.</strong>
+      {:else}
+        <span class="muted">
+          Ready. Recording starts the moment you start the session, before the track.
+        </span>
+      {/if}
+    </span>
     <Button size="lg" disabled={!startable} onclick={start}>
       <Icon name="play" size={14} />
       {recordsNothing ? 'Start practice run' : 'Start session'}
     </Button>
-    {#if subject === null}
-      <span class="muted">Pick a subject first.</span>
-    {:else if recordsNothing}
-      <strong class="warn">No device selected — this run records nothing.</strong>
-    {/if}
   </div>
 </div>
 
 <style>
+
   /* Layout only; chips, labels and text colours come from the global styles. */
   .setup {
     display: flex;
     flex-direction: column;
-    gap: 18px;
-    max-width: 720px;
+    gap: 16px;
+  }
+
+  /* Two columns while there is room for two; one below, in source order, so
+     the setup answers still come before the track and the import. */
+  .columns {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
+    align-items: start;
+    gap: 16px;
+  }
+  .column {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    min-width: 0;
+  }
+  .card {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    padding: 14px 16px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    min-width: 0;
+  }
+  .card h3 {
+    margin: 0;
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--muted-foreground);
+  }
+
+  .gestures {
+    display: grid;
+    grid-template-columns: max-content max-content 1fr;
+    align-items: center;
+    column-gap: 12px;
+    row-gap: 8px;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  .gestures li {
+    display: contents;
+  }
+  .gesture-arrow {
+    display: inline-flex;
+    width: 18px;
+    justify-content: center;
+  }
+
+  .ready-bar {
+    position: sticky;
+    bottom: 0;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+    padding: 12px 16px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--background);
+  }
+  .ready-state {
+    min-width: 0;
   }
 
   /* One label-and-control row per independent answer, columns aligned across
@@ -535,9 +710,4 @@
     text-align: left;
   }
 
-  .actions {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
 </style>

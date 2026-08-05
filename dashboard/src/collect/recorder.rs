@@ -398,6 +398,10 @@ mod tests {
                 duration: DurationMilliseconds::new(60_000),
             },
             record_video: true,
+            audio: crate::collect::interfaces::AudioPlayback {
+                output: "silent".to_string(),
+                sample_rate: 44_100,
+            },
             class_ids: vec![
                 ClassId("index_pinch".to_string()),
                 ClassId("fist".to_string()),

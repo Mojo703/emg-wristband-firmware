@@ -270,21 +270,20 @@ pub enum Frame {
         record_video: bool,
     },
 
-    /// Browser → backend: audio playback actually began (the browser owns the
-    /// audio element, so only it knows the true start moment). Anchors every
-    /// note's track position to the shared clock; the backend logs cue events
-    /// from it.
-    TrackStarted { at_unix_ms: UnixMilliseconds },
+    /// Browser → backend: the operator tapped Start. The backend begins audio
+    /// playback and the cue timeline together, so there is nothing for the
+    /// browser to report back about when the track began.
+    StartTrack {},
 
-    /// Browser → backend: audio playback resumed after a pause, carrying both
-    /// the instant it resumed and the position the audio element was at. The
-    /// pair re-anchors the beat grid outright rather than adjusting the old
-    /// anchor by an assumed pause length, so a seek that lands somewhere other
-    /// than the frozen position still labels correctly.
-    TrackResumed {
-        at_unix_ms: UnixMilliseconds,
-        position_ms: TrackMilliseconds,
-    },
+    /// Browser → backend: freeze playback and the cue timeline where they
+    /// stand. The session stays open and keeps recording whatever EMG arrives;
+    /// no cue resolves while frozen.
+    PauseTrack {},
+
+    /// Browser → backend: unfreeze playback and the cue timeline from the
+    /// position they froze at. Answers both an operator pause and one the
+    /// backend declared because the device fell silent.
+    ResumeTrack {},
 
     /// Browser → backend: end the running session now. Recording is finalized
     /// exactly as if the track had played out, and the backend moves to the
@@ -302,6 +301,37 @@ pub enum Frame {
     /// before `StartCollection`; the backend holds the most recent photo and
     /// writes it into the next session's directory.
     CapturePlacementPhoto {},
+
+    /// Browser → backend: whether this browser needs the raw EMG stream.
+    ///
+    /// Only the panels that draw waveforms do. A page showing the collection
+    /// game draws none of it, and a browser that says so spends the whole
+    /// session not decoding sixteen channels it will throw away. The backend
+    /// keeps consuming the stream either way — the electrode check is computed
+    /// from it — so this changes what crosses the socket, not what is measured.
+    /// A browser that never sends this gets the stream.
+    SetEmgStream { enabled: bool },
+
+    /// Browser → backend: how loud the music is, in thousandths. Applies to the
+    /// next buffer the mixer renders, so it is safe mid-song, and it moves only
+    /// the track — the cue clicks keep their own level so turning the music
+    /// down makes them clearer rather than quieter.
+    SetAudioVolume { volume_permille: u32 },
+
+    /// Browser → backend: which output device the game plays through. `None`
+    /// asks for the host's default. A running session switches sinks in place
+    /// and re-anchors its cue timeline on the new device.
+    SetAudioOutput { output: Option<String> },
+
+    /// Backend → browser: the audio settings and the devices to choose from.
+    /// Sent on connect and after any change.
+    AudioSettings {
+        /// Every output device the host offers, in the order it lists them.
+        devices: Vec<String>,
+        /// The chosen device, or `None` for the host's default.
+        output: Option<String>,
+        volume_permille: u32,
+    },
 
     /// Backend → browser: the authoritative collection state. Sent on every
     /// phase change and periodically while recording, so the browser's rec
@@ -330,6 +360,20 @@ pub enum Frame {
         /// Silence the browser inserts before audio t = 0 so the first notes
         /// have fall time.
         lead_in: DurationMilliseconds,
+    },
+
+    /// Backend → browser: where the backend's audio output stands. `position_ms`
+    /// is what the subject hears at `at_unix_ms`, which is a little ahead of the
+    /// send because it accounts for the output device's latency. The browser
+    /// extrapolates between these for a smooth playfield and never derives the
+    /// timeline itself; the pair is also the anchor every cue is logged against.
+    PlaybackPosition {
+        session_id: SessionId,
+        position_ms: TrackMilliseconds,
+        at_unix_ms: UnixMilliseconds,
+        /// False while the timeline is frozen, when extrapolating would run the
+        /// playfield past a playhead that is not moving.
+        playing: bool,
     },
 
     /// Backend → browser: verdict for one cued note from the activity detector
@@ -671,12 +715,43 @@ pub struct TrackInfo {
 }
 
 /// One gesture class being collected — a lane in the game. `color` is a named
-/// palette colour, backend-owned like every other cosmetic.
+/// palette colour and `motion` an optional arrow, both backend-owned like every
+/// other cosmetic: the config file decides, and every place a class is shown
+/// paints the same thing.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CollectionClass {
     pub id: ClassId,
     pub label: String,
     pub color: String,
+    /// How to draw this gesture's direction, or `None` for a gesture that has
+    /// no direction to draw (a squeeze moves nothing).
+    #[serde(default)]
+    pub motion: Option<GestureMotion>,
+}
+
+/// The direction a gesture moves something, as an arrow to draw and a line to
+/// read. Deliberately a small closed vocabulary rather than an angle: the
+/// backend says which arrow, the frontend owns what an arrow looks like.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GestureMotion {
+    pub arrow: MotionArrow,
+    /// One line naming what moves and where, for a tooltip and for the class
+    /// list a subject is walked through before a session.
+    pub hint: String,
+}
+
+/// Which arrow a gesture draws. The curved pair is for a rotation — a motion
+/// whose direction is a turn rather than a line — and reads differently at a
+/// glance from the straight four, which is the whole point of having both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MotionArrow {
+    Left,
+    Right,
+    Up,
+    Down,
+    Clockwise,
+    CounterClockwise,
 }
 
 /// One cue in the beatmap: a *hold block*. The gesture begins when `at`
@@ -773,15 +848,15 @@ impl Beatmap {
 pub enum CollectionPhase {
     /// No session; the setup form is live.
     Idle,
-    /// Session started, recorder and camera rolling, waiting for `TrackStarted`.
+    /// Session started, recorder and camera rolling, waiting for `StartTrack`.
     Armed {
         session_id: SessionId,
         recording: RecordingHealth,
     },
     /// Audio playing, notes falling. `paused` is `Some` while the cue timeline
     /// is frozen: the session is still open and still writes whatever EMG
-    /// arrives, but no cue resolves and the track's end cannot arrive until the
-    /// browser reports playback resumed.
+    /// arrives, but no cue resolves and the track's end cannot arrive until
+    /// `ResumeTrack`.
     Playing {
         session_id: SessionId,
         recording: RecordingHealth,
@@ -799,18 +874,35 @@ pub enum CollectionPhase {
 /// Why a session's cue timeline is frozen, and for how long it has been.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CollectionPause {
-    /// The device that stopped sending, named so the operator knows which one
-    /// to go and look at.
+    pub cause: PauseCause,
+    /// The device the session is recording from, named so the operator knows
+    /// which one to go and look at.
     pub device_id: String,
     pub since: UnixMilliseconds,
-    /// Silence at the moment the pause was declared, measured from the last
-    /// EMG window that landed.
+    /// Silence at the moment the pause was declared, measured from the last EMG
+    /// window that landed. Zero when the operator asked for the pause.
     pub silent_for: DurationMilliseconds,
     /// Where the track froze. Resuming plays from here.
     pub track_position: TrackMilliseconds,
     /// Whether EMG has started arriving again since — the operator can resume
     /// as soon as this turns true.
     pub device_recovered: bool,
+}
+
+/// What froze a session's cue timeline. The three read very differently to the
+/// operator: a rig fault to go and fix, a decision they just made, and a page
+/// that went away while the track was still running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PauseCause {
+    /// The device stopped sending EMG, so the backend froze the timeline rather
+    /// than cue gestures nothing is being recorded from.
+    DeviceSilent,
+    /// The operator sent `PauseTrack`.
+    Operator,
+    /// The last browser watching the session disconnected. Nobody could see the
+    /// cues, so continuing would label gestures that were never asked for.
+    BrowserGone,
 }
 
 /// Disk-level progress of one recording stream. `advancing` means the bytes
@@ -1790,6 +1882,7 @@ mod tests {
                     recorded: None,
                 },
                 paused: Some(CollectionPause {
+                    cause: PauseCause::DeviceSilent,
                     device_id: "opal-01".into(),
                     since: UnixMilliseconds(1_784_000_007_000),
                     silent_for: DurationMilliseconds(1_600),
@@ -1811,6 +1904,40 @@ mod tests {
                 assert_eq!(pause.device_id, "opal-01");
                 assert_eq!(pause.track_position, TrackMilliseconds(7_240));
             }
+            other => panic!("wrong shape: {other:?}"),
+        }
+
+        let operator_paused = Frame::CollectionState {
+            phase: CollectionPhase::Playing {
+                session_id: SessionId("2026-07-30T16-40_matthew".into()),
+                recording: RecordingHealth {
+                    emg: StreamProgress {
+                        bytes_on_disk: 15_700_000,
+                        advancing: true,
+                    },
+                    video: None,
+                    recorded: None,
+                },
+                paused: Some(CollectionPause {
+                    cause: PauseCause::Operator,
+                    device_id: "opal-01".into(),
+                    since: UnixMilliseconds(1_784_000_007_000),
+                    silent_for: DurationMilliseconds(0),
+                    track_position: TrackMilliseconds(7_240),
+                    device_recovered: true,
+                }),
+            },
+            placement_photo: None,
+        };
+        match roundtrip(&operator_paused) {
+            Frame::CollectionState {
+                phase:
+                    CollectionPhase::Playing {
+                        paused: Some(pause),
+                        ..
+                    },
+                ..
+            } => assert_eq!(pause.cause, PauseCause::Operator),
             other => panic!("wrong shape: {other:?}"),
         }
 
@@ -1847,6 +1974,45 @@ mod tests {
                 phase: CollectionPhase::Reviewing { summary, .. },
                 ..
             } => assert_eq!(summary.cues_per_class, cues_per_class),
+            other => panic!("wrong shape: {other:?}"),
+        }
+    }
+
+    /// The playback commands carry no payload, so what matters is that each one
+    /// still decodes as its own variant rather than collapsing into a sibling.
+    #[test]
+    fn playback_commands_and_position_roundtrip() {
+        assert!(matches!(
+            roundtrip(&Frame::StartTrack {}),
+            Frame::StartTrack {}
+        ));
+        assert!(matches!(
+            roundtrip(&Frame::PauseTrack {}),
+            Frame::PauseTrack {}
+        ));
+        assert!(matches!(
+            roundtrip(&Frame::ResumeTrack {}),
+            Frame::ResumeTrack {}
+        ));
+        match roundtrip(&Frame::PlaybackPosition {
+            session_id: SessionId("2026-07-30T16-40_matthew".into()),
+            position_ms: TrackMilliseconds(7_240),
+            at_unix_ms: UnixMilliseconds(1_784_000_007_240),
+            playing: true,
+        }) {
+            Frame::PlaybackPosition {
+                position_ms,
+                at_unix_ms,
+                playing,
+                ..
+            } => {
+                // The pair is an anchor: audio t = 0 was at `at - position`.
+                assert_eq!(
+                    at_unix_ms.before_track_position(position_ms),
+                    UnixMilliseconds(1_784_000_000_000)
+                );
+                assert!(playing);
+            }
             other => panic!("wrong shape: {other:?}"),
         }
     }
@@ -1965,6 +2131,10 @@ mod tests {
                 id: ClassId("index_pinch".into()),
                 label: "Index pinch".into(),
                 color: "emerald".into(),
+                motion: Some(GestureMotion {
+                    arrow: MotionArrow::Clockwise,
+                    hint: "pole tip swings back".into(),
+                }),
             }],
             activities: vec![ActivityCondition {
                 id: ActivityId("seated".into()),
@@ -1984,10 +2154,68 @@ mod tests {
             } => {
                 assert_eq!(subjects[0], SubjectId("matthew".into()));
                 assert_eq!(collection_classes[0].id, ClassId("index_pinch".into()));
+                // The arrow and its line survive the trip: everything a class
+                // is drawn with is the backend's to say, motion included.
+                let motion = collection_classes[0]
+                    .motion
+                    .as_ref()
+                    .expect("the class carried a motion");
+                assert_eq!(motion.arrow, MotionArrow::Clockwise);
+                assert_eq!(motion.hint, "pole tip swings back");
                 assert_eq!(activities[0].id, ActivityId("seated".into()));
             }
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    /// The audio controls cross the wire as whole numbers and an optional
+    /// name, because `None` has to stay distinguishable from a device called
+    /// nothing: it means the host's default, not "unchanged".
+    #[test]
+    fn the_audio_frames_roundtrip_with_a_defaulted_device() {
+        match roundtrip(&Frame::SetAudioVolume {
+            volume_permille: 625,
+        }) {
+            Frame::SetAudioVolume { volume_permille } => assert_eq!(volume_permille, 625),
+            other => panic!("wrong variant: {other:?}"),
+        }
+        match roundtrip(&Frame::SetAudioOutput { output: None }) {
+            Frame::SetAudioOutput { output } => assert_eq!(output, None),
+            other => panic!("wrong variant: {other:?}"),
+        }
+        let settings = Frame::AudioSettings {
+            devices: vec!["pipewire".into(), "hdmi".into()],
+            output: Some("pipewire".into()),
+            volume_permille: 625,
+        };
+        match roundtrip(&settings) {
+            Frame::AudioSettings {
+                devices,
+                output,
+                volume_permille,
+            } => {
+                assert_eq!(devices.len(), 2);
+                assert_eq!(output.as_deref(), Some("pipewire"));
+                assert_eq!(volume_permille, 625);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// A browser that closes mid-track is its own pause cause, so the page that
+    /// comes back can say what happened rather than blaming the device.
+    #[test]
+    fn a_browser_gone_pause_roundtrips_as_its_own_cause() {
+        let frame = Frame::SetEmgStream { enabled: false };
+        match roundtrip(&frame) {
+            Frame::SetEmgStream { enabled } => assert!(!enabled),
+            other => panic!("wrong variant: {other:?}"),
+        }
+        let mut encoded = Vec::new();
+        ciborium::into_writer(&PauseCause::BrowserGone, &mut encoded).unwrap();
+        let decoded: PauseCause = ciborium::from_reader(encoded.as_slice()).unwrap();
+        assert_eq!(decoded, PauseCause::BrowserGone);
+        assert_ne!(decoded, PauseCause::Operator);
     }
 
     #[test]

@@ -62,15 +62,21 @@ positions inside a track as `TrackMilliseconds`.
 
 | Frame | Direction | What it carries |
 |-------|-----------|-----------------|
-| `CollectionCatalog` | backend → browser | Everything the session-setup form offers: the `subjects` roster, the playable `tracks`, the `collection_classes` being collected with their lane colours, and the `activities` and `sweat_levels` vocabularies. The collection classes are the target set and are unrelated to the device's trained model classes in `DeviceConfig`. |
+| `CollectionCatalog` | backend → browser | Everything the session-setup form offers: the `subjects` roster, the playable `tracks`, the `collection_classes` being collected with their lane colours and their optional `motion` (an arrow to draw and a line to read, `null` for a gesture that moves nothing), and the `activities` and `sweat_levels` vocabularies. The collection classes are the target set and are unrelated to the device's trained model classes in `DeviceConfig`. |
 | `StartCollection` | browser → backend | `metadata`, `track_id`, `difficulty`, and `record_video`. The operator chooses video per session; a session that asked for it and cannot get it fails to start rather than quietly recording EMG alone. |
-| `TrackStarted` | browser → backend | The instant audio playback actually began. The browser owns the audio element, so only it knows this; it anchors every note's track position to the shared clock. |
-| `TrackResumed` | browser → backend | The instant playback resumed and the `position_ms` the audio element was at. The pair re-anchors the beat grid outright, so a seek that lands somewhere other than the frozen position still labels correctly. |
+| `StartTrack` | browser → backend | The operator tapped Start. The backend plays the audio, so it begins playback and the cue timeline together and the browser has nothing to report back about when the track began. |
+| `PauseTrack` | browser → backend | Freeze playback and the cue timeline where they stand. The session stays open and keeps recording whatever EMG arrives. |
+| `ResumeTrack` | browser → backend | Unfreeze from the frozen position. Answers both an operator pause and one the backend declared because the device fell silent. |
 | `FinishCollection` | browser → backend | End the running session now. Recording is finalized as if the track had played out. |
 | `StopCollection` | browser → backend | Resolve a session in the reviewing phase: `save: true` keeps the directory, `save: false` deletes it. |
 | `CapturePlacementPhoto` | browser → backend | Capture a webcam still of the donned band. The backend holds the most recent photo and writes it into the next session's directory. |
+| `SetEmgStream` | browser → backend | Whether this browser needs the raw EMG stream. Only the panels that draw waveforms do; a page showing the collection game draws none of it. The backend keeps consuming the stream either way, so the electrode check is unaffected. A browser that never sends this gets the stream. |
+| `SetAudioVolume` | browser → backend | The music's level in thousandths. Applies to the next buffer the mixer renders, so it moves a running session, and it moves only the track — the cue clicks keep their own level. |
+| `SetAudioOutput` | browser → backend | Which output device the game plays through; `null` asks for the host's default. A running session switches sinks in place and re-anchors its cue timeline on the new device. A backend started with `EMG_AUDIO_OUTPUT=silent` ignores it. |
+| `AudioSettings` | backend → browser | The devices the host offers, the chosen `output` (`null` for the default) and the current `volume_permille`. Sent on connect and after every change. |
 | `CollectionState` | backend → browser | The authoritative `phase` (`CollectionPhase`) plus the capture instant of any held `placement_photo`. Sent on every phase change and periodically while recording, so the browser's recording tripwire reflects bytes reaching disk. |
 | `Beatmap` | backend → browser | The armed session's complete note schedule: `session_id`, `track`, `notes`, the track's measured `beat_times` for the debug metronome, and the `lead_in` silence before audio t = 0. The browser renders it and never invents notes; the backend logs the same schedule as cue events, so labels never depend on the browser. |
+| `PlaybackPosition` | backend → browser | Where the backend's audio output stands: `position_ms` is what the subject hears at `at_unix_ms`, which sits a little ahead of the send because it accounts for the output device's latency. The browser extrapolates between these and never derives the timeline itself; the same pair is the anchor every cue is logged against. |
 | `NoteResult` | backend → browser | One cued note's verdict from the activity detector: `session_id`, `index`, `hit`. It says muscle activity landed inside the note's window and makes no claim about which gesture was made. |
 
 ## The EMG window

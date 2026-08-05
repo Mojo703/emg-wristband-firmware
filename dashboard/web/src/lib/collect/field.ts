@@ -9,10 +9,10 @@
 // hold-time countdown.
 //
 // Nothing in here holds game state. Every frame is a function of the beatmap
-// (fixed for the session), the audio element's position, and the streak the
+// (fixed for the session), the position the caller passes in, and the streak the
 // backend's note results imply — so the panel can be unmounted, refreshed, or
 // re-rendered at any moment and it paints the same thing. Position is always a
-// TrackMilliseconds read from the audio element; the wall clock never enters the
+// TrackMilliseconds off the backend's playhead; the wall clock never enters the
 // drawing.
 //
 // Future: model evaluation will render *predicted* gesture segments as a second

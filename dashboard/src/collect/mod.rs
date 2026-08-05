@@ -8,6 +8,7 @@
 //!
 //! Module layout (one implementation unit per file, built against
 //! [`interfaces`]):
+//! - `audio`     — track decode, cue clicks and metronome, and the exact playhead
 //! - `recorder`  — raw `emg.i16` + `events.jsonl` + `session.json` writing
 //! - `video`     — ffmpeg child process: session video, placement photos, stall detection
 //! - `beatmap`   — track catalog and note-schedule generation
@@ -18,6 +19,7 @@
 //!
 //! [`provenance`]: crate::collect::provenance
 
+pub mod audio;
 pub mod beatmap;
 pub mod beatsaber;
 pub mod import;

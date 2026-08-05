@@ -1,4 +1,5 @@
 {
+  "note": "The collection classes are chosen around the current analog front end, not around the product. They are large, unsubtle motions picked so they clear the noise floor; a shipping command set wants gestures that separate from ordinary skiing motion, which these do not. Revisit the set once the front end is fixed. Every class here is performable with a fist closed on a pole. Arrows are a plan view of the pole tip seen from above, with forward meaning down-track; the lateral pair is written for the right arm. This file is read only at startup, so a change here needs a backend restart.",
   "subjects": [
     "Matthew",
     "Zachary",
@@ -9,28 +10,45 @@
   "collection_classes": [
     {
       "id": "wrist_pronation",
-      "label": "Tilt pole out",
-      "color": "blue"
+      "label": "Tip out",
+      "color": "blue",
+      "motion": {
+        "arrow": "right",
+        "hint": "forearm rotates out; the pole tip swings away from you"
+      }
     },
     {
       "id": "wrist_supination",
-      "label": "Tilt pole in",
-      "color": "amber"
+      "label": "Tip in",
+      "color": "amber",
+      "motion": {
+        "arrow": "left",
+        "hint": "forearm rotates in; the pole tip swings toward you"
+      }
     },
     {
-      "id": "wrist_flexion_hand_close",
-      "label": "Fist down",
-      "color": "green"
+      "id": "wrist_radial_deviation",
+      "label": "Tip forward",
+      "color": "green",
+      "motion": {
+        "arrow": "up",
+        "hint": "wrist cocks toward the thumb; the pole tip swings down-track"
+      }
     },
     {
-      "id": "wrist_extension_hand_open",
-      "label": "Open up",
-      "color": "purple"
+      "id": "wrist_ulnar_deviation",
+      "label": "Tip back",
+      "color": "purple",
+      "motion": {
+        "arrow": "down",
+        "hint": "wrist drops toward the pinky; the pole tip swings behind you"
+      }
     },
     {
-      "id": "three_finger_pinch",
-      "label": "Pinch",
-      "color": "pink"
+      "id": "thumb_extension",
+      "label": "Lift thumb",
+      "color": "pink",
+      "motion": null
     }
   ],
   "activities": [

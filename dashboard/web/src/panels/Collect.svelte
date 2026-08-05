@@ -15,11 +15,11 @@
 <script lang="ts">
   // Collect: the phase shell for training-data capture.
   //
-  // The backend owns the session state machine; this component only picks the
-  // view that matches the phase it was told about, and forwards the four
-  // operator decisions (start, stop-and-save, discard, capture a photo) back. It
-  // keeps no game state of its own: everything the game draws comes from the
-  // beatmap and the audio element's position.
+  // The backend owns the session state machine and the playback; this component
+  // only picks the view that matches the phase it was told about and forwards
+  // the operator's decisions back. It keeps no game state of its own:
+  // everything the game draws comes from the beatmap and the backend's
+  // published playhead.
   import { api, live, on } from '../lib/socket.svelte';
   import GameView from '../lib/collect/GameView.svelte';
   import SetupForm from './collect/SetupForm.svelte';
@@ -27,7 +27,7 @@
   import SignalQuality from './collect/SignalQuality.svelte';
   import TrackImport from './collect/TrackImport.svelte';
   import { deleteTrack, failureText } from './collect/trackLibrary';
-  import type { DifficultyLevel, TrackMilliseconds, UnixMilliseconds } from '../lib/protocol';
+  import type { DifficultyLevel } from '../lib/protocol';
 
   const catalog = $derived(live.catalog);
   // The board revision is remembered against the selected device, so the setup
@@ -92,17 +92,6 @@
     api.startCollection(metadata, trackId, difficulty, recordVideo);
   }
 
-  function trackStarted(atUnixMilliseconds: UnixMilliseconds): void {
-    api.trackStarted(atUnixMilliseconds);
-  }
-
-  function trackResumed(
-    atUnixMilliseconds: UnixMilliseconds,
-    positionMilliseconds: TrackMilliseconds,
-  ): void {
-    api.trackResumed(atUnixMilliseconds, positionMilliseconds);
-  }
-
   // Ends a running session where it stands; the backend finalizes the
   // recording and the review screen decides whether the partial take is kept.
   function finish(): void {
@@ -130,9 +119,10 @@
 {#if collectionState === null || phase === null || catalog === null}
   <p class="muted">Collection not available.</p>
 {:else if phase.name === 'idle'}
-  <SignalQuality />
   <!-- The held placement photo is a property of the connection, not of the phase,
-       so it comes off the state frame. -->
+       so it comes off the state frame. The electrode check and the importer are
+       passed in rather than stacked above the form, so each sits in the card it
+       belongs to. -->
   <SetupForm
     {catalog}
     placementPhoto={collectionState.placement_photo}
@@ -143,11 +133,20 @@
       : (revision) => api.boardRevision(selection.device_id, revision)}
     {deletingTrackId}
     recordsNothing={selection === null}
+    audio={live.audioSettings}
+    onSetVolume={api.setAudioVolume}
+    onSetOutput={api.setAudioOutput}
     onStart={start}
     onCapturePlacementPhoto={api.capturePlacementPhoto}
     onDeleteTrack={removeTrack}
-  />
-  <TrackImport />
+  >
+    {#snippet signalQuality()}
+      <SignalQuality />
+    {/snippet}
+    {#snippet trackImport()}
+      <TrackImport />
+    {/snippet}
+  </SetupForm>
 {:else if phase.name === 'reviewing'}
   <SessionSummary
     summary={phase.summary}
@@ -169,8 +168,9 @@
     {catalog}
     {beatmap}
     {phase}
-    onTrackStarted={trackStarted}
-    onTrackResumed={trackResumed}
+    onStartTrack={api.startTrack}
+    onPauseTrack={api.pauseTrack}
+    onResumeTrack={api.resumeTrack}
     onFinish={finish}
   />
 {/if}

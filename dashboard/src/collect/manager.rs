@@ -7,13 +7,21 @@
 //! The manager is the *only* writer of collection truth — the browser renders.
 //!
 //! Lifecycle: `Idle` → (`StartCollection`) → `Starting` (arming in flight) →
-//! `Running` (a spawned session task owns the recorder and the device's EMG
-//! subscription; `Armed` until `TrackStarted` anchors the beat grid, then
-//! `Playing`) → `Reviewing` (track ended, or `FinishCollection` ended it
-//! early; files finalized on disk either way) → (`StopCollection { save }`) →
-//! `Idle`. Keep-or-discard is decided only in review, with the summary in
-//! view; the sole self-resolving path is an armed session whose browser never
-//! starts the track, which times out and discards itself.
+//! `Running` (a spawned session task owns the recorder, the device's EMG
+//! subscription, and the audio playback; `Armed` until `StartTrack` begins the
+//! track, then `Playing`) → `Reviewing` (track ended, or `FinishCollection`
+//! ended it early; files finalized on disk either way) → (`StopCollection {
+//! save }`) → `Idle`. Every ending goes through review: a take that reached
+//! disk is never thrown away without the operator seeing its summary.
+//!
+//! # The clock
+//!
+//! The backend plays the audio, so the playhead is the one in
+//! [`crate::collect::audio`] and nothing here reads a browser timestamp. A
+//! session's `anchor` is the instant the subject heard audio t = 0, taken from
+//! the mixer's own cursor, and a cue's wall-clock time is `anchor + note
+//! position`. `PlaybackPosition` frames publish the same playhead to browsers,
+//! which extrapolate it for a smooth playfield and own none of it.
 //!
 //! Obligations honored here (from the unit reviews):
 //! - the recorder creates the session directory before video starts in it;
@@ -22,26 +30,29 @@
 //!   resolution);
 //! - recorder and video file reports merge into one `CollectionSummary.files`;
 //! - `generate` receives classes in catalog order (the lane order browsers see);
-//! - a second `TrackStarted` for an anchored session is ignored;
+//! - a second `StartTrack` for a started session is ignored;
 //! - `StartCollection` ids are validated against the live catalog.
 
+use crate::collect::audio::{self, AudioOutput, Playback, Timeline};
 use crate::collect::beatmap::{CatalogPaths, TrackCatalog};
 use crate::collect::interfaces::{
-    BeatmapGenerator, EmgWindow, HardwareIdentity, RecordingHandle, SessionEvent, SessionManifest,
-    SessionRecorder, VideoCapture, VideoReport,
+    AudioPlayback, BeatmapGenerator, EmgWindow, HardwareIdentity, RecordingHandle, SessionEvent,
+    SessionManifest, SessionRecorder, VideoCapture, VideoReport,
 };
-use crate::collect::provenance::ProvenanceStore;
+use crate::collect::provenance::{ProvenanceStore, StoredAudio};
 use crate::collect::recorder::FileSessionRecorder;
 use crate::collect::video::{CameraSettings, FfmpegVideoCapture};
 use crate::registry::Registry;
+use anyhow::Context;
 use protocol::{
     Beatmap, BoardRevision, ClassId, CollectionPause, CollectionPhase, CollectionSummary,
-    DifficultyLevel, DurationMilliseconds, FileReport, Frame, LogLevel, NoteIndex, RecordingHealth,
-    SessionId, SessionMetadata, StreamProgress, TrackId, TrackInfo, TrackMilliseconds,
-    UnixMilliseconds,
+    DifficultyLevel, DurationMilliseconds, FileReport, Frame, LogLevel, NoteIndex, PauseCause,
+    RecordingHealth, SessionId, SessionMetadata, StreamProgress, TrackId, TrackInfo,
+    TrackMilliseconds, UnixMilliseconds,
 };
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
@@ -54,9 +65,14 @@ const OUTBOUND_CAPACITY: usize = 64;
 /// hardware identity) before giving up.
 const FIRST_WINDOW_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// An armed session that never receives `TrackStarted` (browser closed mid
-/// countdown) is aborted and discarded after this long.
-const ARMED_TIMEOUT: Duration = Duration::from_secs(90);
+/// An armed session nobody ever starts finalizes itself after this long and
+/// goes to review like any other take. Generous, because the EMG it has been
+/// recording since arming is real data and the operator decides its fate.
+const ARMED_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// How long `StartTrack` and `ResumeTrack` wait for the mixer to publish the
+/// playhead they just commanded. A device period is a couple of milliseconds.
+const PLAYHEAD_TIMEOUT: Duration = Duration::from_millis(1_000);
 
 /// Session-task cadence. Cue events resolve on this grid; health is published
 /// every other tick (~500 ms), which is also the video start-offset resolution.
@@ -95,11 +111,21 @@ fn now() -> UnixMilliseconds {
 
 /// Control messages from browsers into a running session task.
 enum SessionControl {
-    TrackStarted(UnixMilliseconds),
-    /// Audio resumed after a pause, at this instant and this track position.
-    TrackResumed(UnixMilliseconds, TrackMilliseconds),
+    /// Begin the track: audio playback and the cue timeline together.
+    StartTrack,
+    /// Freeze both where they stand.
+    PauseTrack,
+    /// The last browser disconnected: freeze for a reason the operator did not
+    /// choose, and say so when they come back.
+    BrowserGone,
+    /// Unfreeze both from where they froze.
+    ResumeTrack,
     /// End the session now and move to review, mid-track or not.
     Finish,
+    /// Turn the music up or down under the cues.
+    SetMusicGain(f32),
+    /// Move playback to another device without losing the track's place.
+    SetOutput(AudioOutput),
 }
 
 enum Phase {
@@ -115,6 +141,45 @@ enum Phase {
     Reviewing {
         directory: Option<PathBuf>,
     },
+}
+
+/// How the game sounds. The volume is in thousandths because that is what
+/// crosses the wire — a whole number survives the browser's CBOR encoder, where
+/// a fraction would arrive as a float the backend refuses.
+struct AudioSettings {
+    output: AudioOutput,
+    volume_permille: u32,
+    /// The backend was started with `EMG_AUDIO_OUTPUT=silent`, so it stays
+    /// silent whatever a browser asks for. Automated runs rely on this: a
+    /// stored preference must not make a test audible to whoever is sitting at
+    /// the machine.
+    forced_silent: bool,
+}
+
+impl AudioSettings {
+    fn gain(&self) -> f32 {
+        self.volume_permille as f32 / 1000.0
+    }
+
+    /// The device name a browser should show as chosen, or `None` for the
+    /// host's default.
+    fn output_name(&self) -> Option<String> {
+        match &self.output {
+            AudioOutput::Named(name) => Some(name.clone()),
+            AudioOutput::Default | AudioOutput::Silent => None,
+        }
+    }
+}
+
+/// One browser's presence, held for the life of its socket.
+pub struct BrowserAttachment {
+    manager: Arc<CollectionManager>,
+}
+
+impl Drop for BrowserAttachment {
+    fn drop(&mut self) {
+        self.manager.browser_detached();
+    }
 }
 
 /// A device stream claimed for a session, with the identity read off its first
@@ -150,12 +215,20 @@ pub struct CollectionManager {
     sessions_root: PathBuf,
     outbound: broadcast::Sender<Frame>,
     /// What the host remembers between sessions: board revisions per device,
-    /// don counts per subject and arm.
+    /// don counts per subject and arm, and how the game sounds.
     provenance: ProvenanceStore,
+    /// How the game sounds: which sink, and how loud the music is under the
+    /// cues. Both are live — a running session is told about a change rather
+    /// than waiting for the next one.
+    audio_settings: Mutex<AudioSettings>,
+    /// Browsers currently holding a socket. A cue nobody can see is a cue the
+    /// subject was never given, so the last one leaving freezes the session.
+    browsers: AtomicUsize,
     state: Mutex<ManagerState>,
 }
 
 impl CollectionManager {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         catalog: TrackCatalog,
         catalog_paths: CatalogPaths,
@@ -164,8 +237,23 @@ impl CollectionManager {
         registry: Arc<Registry>,
         sessions_root: PathBuf,
         provenance: ProvenanceStore,
+        audio_output: AudioOutput,
     ) -> Arc<Self> {
         let (outbound, _) = broadcast::channel(OUTBOUND_CAPACITY);
+        // The environment names the sink this run starts on; the stored
+        // preference supplies one only when it does not. `silent` is the
+        // exception in both directions — it is a promise that this backend
+        // makes no sound, so nothing remembered or asked for can undo it.
+        let forced_silent = audio_output == AudioOutput::Silent;
+        let stored = provenance.audio();
+        let audio_settings = AudioSettings {
+            output: match (&audio_output, &stored.output) {
+                (AudioOutput::Default, Some(name)) => AudioOutput::Named(name.clone()),
+                _ => audio_output,
+            },
+            volume_permille: stored.volume_permille,
+            forced_silent,
+        };
         Arc::new(Self {
             catalog: std::sync::RwLock::new(catalog),
             catalog_paths,
@@ -177,6 +265,8 @@ impl CollectionManager {
             sessions_root,
             outbound,
             provenance,
+            audio_settings: Mutex::new(audio_settings),
+            browsers: AtomicUsize::new(0),
             state: Mutex::new(ManagerState {
                 phase: Phase::Idle,
                 placement_photo: None,
@@ -201,12 +291,26 @@ impl CollectionManager {
         self.outbound.subscribe()
     }
 
+    /// Register a browser for as long as it holds the returned guard. A running
+    /// session freezes when the last guard drops: the playfield is how the
+    /// subject is told what to do, so a session with no page watching it has
+    /// stopped asking for anything.
+    pub fn attach_browser(self: &Arc<Self>) -> BrowserAttachment {
+        self.browsers.fetch_add(1, Ordering::AcqRel);
+        BrowserAttachment {
+            manager: Arc::clone(self),
+        }
+    }
+
     /// The frames a freshly connected browser needs to render the current
     /// collection reality: catalog, current state, and the running session's
     /// beatmap if one exists.
     pub fn connect_frames(&self) -> Vec<Frame> {
+        // Enumerating devices talks to the sound server, so it happens before
+        // the state lock rather than under it.
+        let audio = self.audio_settings_frame();
         let state = self.state.lock().unwrap();
-        let mut frames = vec![self.catalog_frame()];
+        let mut frames = vec![self.catalog_frame(), audio];
         frames.push(
             state
                 .latest_state
@@ -242,11 +346,6 @@ impl CollectionManager {
         *self.catalog.write().unwrap() = reloaded;
         self.publish(self.catalog_frame());
         Ok(())
-    }
-
-    /// Filesystem path of a track's audio, for the HTTP audio route.
-    pub fn audio_path(&self, track_id: &TrackId) -> Option<PathBuf> {
-        self.catalog.read().unwrap().audio_path(track_id)
     }
 
     /// Broadcast a frame, caching state/beatmap frames for later connectors.
@@ -424,7 +523,7 @@ impl CollectionManager {
             None => None,
         };
 
-        let (track, class_ids, beatmap, beat_times) = {
+        let (track, class_ids, beatmap, beat_times, audio_path) = {
             let catalog = self.catalog.read().unwrap();
             let track = catalog
                 .tracks()
@@ -435,8 +534,37 @@ impl CollectionManager {
             let seed = now().get();
             let beatmap = catalog.generate(&track_id, &class_ids, difficulty, seed)?;
             let beat_times = catalog.beat_times(&track_id).unwrap_or_default();
-            (track, class_ids, beatmap, beat_times)
+            let audio_path = catalog
+                .audio_path(&track_id)
+                .ok_or_else(|| anyhow::anyhow!("track '{track_id}' has no audio"))?;
+            (track, class_ids, beatmap, beat_times, audio_path)
         };
+
+        // Decoding a whole track and opening a device both block, so this runs
+        // off the runtime's threads. The stream is playing silence by the time
+        // it returns, which is what makes the first cue's placement a
+        // measurement of this device rather than a guess.
+        let note_onsets: Vec<TrackMilliseconds> = beatmap.iter().map(|(_, note)| note.at).collect();
+        let click_beats = beat_times.clone();
+        let (output, gain) = {
+            let settings = self.audio_settings.lock().unwrap();
+            (settings.output.clone(), settings.gain())
+        };
+        let playback = tokio::task::spawn_blocking(move || {
+            Playback::open(&audio_path, &note_onsets, &click_beats, &output, gain)
+        })
+        .await?
+        .context("opening the session's audio output")?;
+        let audio = AudioPlayback {
+            output: playback.output_name().to_string(),
+            sample_rate: playback.output_sample_rate(),
+        };
+        tracing::info!(
+            "collection audio on '{}' at {} Hz, output latency {} ms (already applied to every cue)",
+            audio.output,
+            audio.sample_rate,
+            playback.output_latency().get()
+        );
 
         let created = now();
         let practice = acquired.is_none();
@@ -468,6 +596,7 @@ impl CollectionManager {
                     difficulty,
                     class_ids,
                     record_video,
+                    audio,
                     completed: false,
                 };
 
@@ -554,24 +683,88 @@ impl CollectionManager {
             recording_handle,
             beatmap,
             track,
+            playback,
         );
         tokio::spawn(session.run());
         Ok(())
     }
 
-    /// Browser → `TrackStarted`.
-    pub fn track_started(&self, at: UnixMilliseconds) {
-        let state = self.state.lock().unwrap();
-        if let Phase::Running { control } = &state.phase {
-            let _ = control.send(SessionControl::TrackStarted(at));
+    /// The audio settings frame browsers render the controls from.
+    pub fn audio_settings_frame(&self) -> Frame {
+        let settings = self.audio_settings.lock().unwrap();
+        Frame::AudioSettings {
+            devices: audio::output_devices(),
+            output: settings.output_name(),
+            volume_permille: settings.volume_permille,
         }
     }
 
-    /// Browser → `TrackResumed`.
-    pub fn track_resumed(&self, at: UnixMilliseconds, position: TrackMilliseconds) {
+    /// Browser → `SetAudioVolume`. A running session hears about it at once.
+    pub fn set_audio_volume(&self, volume_permille: u32) {
+        let gain = {
+            let mut settings = self.audio_settings.lock().unwrap();
+            settings.volume_permille = volume_permille.min(1000);
+            settings.gain()
+        };
+        self.remember_audio();
+        self.command(SessionControl::SetMusicGain(gain));
+        self.publish(self.audio_settings_frame());
+    }
+
+    /// Browser → `SetAudioOutput`. A running session moves to the new device
+    /// mid-track; anything else takes effect when the next one arms.
+    pub fn set_audio_output(&self, output: Option<String>) {
+        let chosen = {
+            let mut settings = self.audio_settings.lock().unwrap();
+            if settings.forced_silent {
+                tracing::info!("ignoring an output-device change: this backend runs silent");
+                return;
+            }
+            settings.output = match output {
+                Some(name) if !name.is_empty() => AudioOutput::Named(name),
+                _ => AudioOutput::Default,
+            };
+            settings.output.clone()
+        };
+        self.remember_audio();
+        self.command(SessionControl::SetOutput(chosen));
+        self.publish(self.audio_settings_frame());
+    }
+
+    fn remember_audio(&self) {
+        let settings = self.audio_settings.lock().unwrap();
+        self.provenance.set_audio(StoredAudio {
+            output: settings.output_name(),
+            volume_permille: settings.volume_permille,
+        });
+    }
+
+    /// Browser → `StartTrack`.
+    pub fn start_track(&self) {
+        self.command(SessionControl::StartTrack);
+    }
+
+    /// Browser → `PauseTrack`.
+    pub fn pause_track(&self) {
+        self.command(SessionControl::PauseTrack);
+    }
+
+    /// Browser → `ResumeTrack`.
+    pub fn resume_track(&self) {
+        self.command(SessionControl::ResumeTrack);
+    }
+
+    fn command(&self, control: SessionControl) {
         let state = self.state.lock().unwrap();
-        if let Phase::Running { control } = &state.phase {
-            let _ = control.send(SessionControl::TrackResumed(at, position));
+        if let Phase::Running { control: sender } = &state.phase {
+            let _ = sender.send(control);
+        }
+    }
+
+    /// The last browser let go of its socket.
+    fn browser_detached(&self) {
+        if self.browsers.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.command(SessionControl::BrowserGone);
         }
     }
 
@@ -579,10 +772,7 @@ impl CollectionManager {
     /// finalized as if the track had played out and the summary screen decides
     /// what happens to the partial take.
     pub fn finish_collection(&self) {
-        let state = self.state.lock().unwrap();
-        if let Phase::Running { control } = &state.phase {
-            let _ = control.send(SessionControl::Finish);
-        }
+        self.command(SessionControl::Finish);
     }
 
     /// Browser → `StopCollection`: resolves the session under review;
@@ -780,9 +970,11 @@ struct RunningSession {
     recording_handle: Option<RecordingHandle>,
     cues: Vec<CueState>,
     track: TrackInfo,
-    /// The instant audio t = 0 was, for the segment now playing. `TrackStarted`
-    /// sets it and every `TrackResumed` re-derives it, so a cue's wall-clock
-    /// time is always `anchor + note position` for the segment it falls in.
+    playback: Playback,
+    /// The instant the subject heard audio t = 0, for the segment now playing.
+    /// Read off the mixer's cursor when the track starts and re-derived on every
+    /// resume, so a cue's wall-clock time is always `anchor + note position` for
+    /// the segment it falls in.
     anchor: Option<UnixMilliseconds>,
     /// When the most recent EMG window landed, the stall detector's baseline.
     last_window_at: Option<UnixMilliseconds>,
@@ -792,15 +984,6 @@ struct RunningSession {
     activity_hits: u32,
     cues_per_class: BTreeMap<ClassId, u16>,
     latest_health: RecordingHealth,
-}
-
-/// How the session ends: into review for a decision, or discarded outright.
-enum Ending {
-    /// Track finished, the browser finished it early, or the device died:
-    /// finalize and enter review.
-    Review,
-    /// An armed session nobody started: finalize, delete, back to idle.
-    Discard,
 }
 
 impl RunningSession {
@@ -816,6 +999,7 @@ impl RunningSession {
         recording_handle: Option<RecordingHandle>,
         beatmap: Beatmap,
         track: TrackInfo,
+        playback: Playback,
     ) -> Self {
         let cues = beatmap
             .iter()
@@ -842,6 +1026,7 @@ impl RunningSession {
             recording_handle,
             cues,
             track,
+            playback,
             anchor: None,
             last_window_at: None,
             paused: None,
@@ -863,13 +1048,17 @@ impl RunningSession {
     async fn run(mut self) {
         let mut ticker = tokio::time::interval(TICK);
         let mut publish_health = false;
-        let ending = loop {
+        loop {
             tokio::select! {
                 message = self.control.recv() => match message {
-                    Some(SessionControl::TrackStarted(at)) => self.anchor_track(at),
-                    Some(SessionControl::TrackResumed(at, position)) => self.resume_track(at, position),
-                    Some(SessionControl::Finish) => break Ending::Review,
-                    None => break Ending::Review, // manager dropped; shouldn't happen
+                    Some(SessionControl::StartTrack) => self.start_track().await,
+                    Some(SessionControl::PauseTrack) => self.pause_track().await,
+                    Some(SessionControl::BrowserGone) => self.browser_gone().await,
+                    Some(SessionControl::SetMusicGain(gain)) => self.playback.set_music_gain(gain),
+                    Some(SessionControl::SetOutput(output)) => self.set_output(&output).await,
+                    Some(SessionControl::ResumeTrack) => self.resume_track().await,
+                    Some(SessionControl::Finish) => break,
+                    None => break, // manager dropped; shouldn't happen
                 },
                 frame = next_emg(&mut self.emg_receiver) => match frame {
                     Ok(Frame::Emg { seq, t0_us, channels, samples, missing, .. }) => {
@@ -881,13 +1070,14 @@ impl RunningSession {
                         self.manager.publish_error(
                             "device stream ended mid-session; finalizing".into(),
                         );
-                        break Ending::Review;
+                        break;
                     }
                 },
                 _ = ticker.tick() => {
-                    if let Some(ending) = self.tick() {
-                        break ending;
+                    if self.tick().await {
+                        break;
                     }
+                    self.publish_playback_position();
                     publish_health = !publish_health;
                     if publish_health {
                         self.poll_health();
@@ -895,28 +1085,59 @@ impl RunningSession {
                     }
                 }
             }
-        };
-        self.finalize(ending).await;
+        }
+        self.finalize().await;
     }
 
-    fn anchor_track(&mut self, at: UnixMilliseconds) {
-        // Defense in depth: a second anchor for an anchored session is ignored
-        // (a browser bug here would silently corrupt every later cue label).
+    /// The operator tapped Start: play the track, then take the anchor off the
+    /// mixer's own cursor. Nothing here trusts a clock but the one the samples
+    /// are leaving through.
+    async fn start_track(&mut self) {
+        // Defense in depth: a second start for a started session is ignored (it
+        // would silently re-anchor and mislabel every later cue).
         if self.anchor.is_some() {
-            tracing::warn!("ignoring duplicate track_started for {}", self.session_id);
+            tracing::warn!("ignoring a second start_track for {}", self.session_id);
             return;
         }
+        self.playback.play();
+        let Some(timeline) = self.playhead_after_command(true).await else {
+            self.playback.pause();
+            self.manager
+                .publish_error("audio output did not start; the track has not begun".into());
+            return;
+        };
+        let at = timeline.heard_at.before_track_position(timeline.position);
         self.anchor = Some(at);
         self.place_unlogged_cues(at);
         // Silence is measured from here rather than from arming, so a session
         // armed early does not start out looking stalled.
         self.last_window_at = Some(at);
-        if let Some(recorder) = &mut self.recorder {
-            if let Err(error) = recorder.append_event(&SessionEvent::TrackStarted { at }) {
-                tracing::warn!("failed to log track start: {error:#}");
-            }
-        }
+        let armed_at = self.armed_at;
+        self.log_event(&SessionEvent::ArmedPrefix {
+            from: armed_at,
+            to: at,
+        });
+        self.log_event(&SessionEvent::TrackStarted { at });
         self.publish_state();
+        self.publish_playback_position();
+    }
+
+    /// Wait for the mixer to publish a playhead taken after playback was
+    /// commanded, so the reading describes the command's effect rather than
+    /// what came before it.
+    async fn playhead_after_command(&self, playing: bool) -> Option<Timeline> {
+        let commanded = now();
+        let deadline = tokio::time::Instant::now() + PLAYHEAD_TIMEOUT;
+        loop {
+            let timeline = self.playback.timeline();
+            if timeline.playing == playing && timeline.heard_at >= commanded {
+                return Some(timeline);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
     }
 
     /// Every cue that has not been logged yet takes its wall-clock transitions
@@ -937,31 +1158,97 @@ impl RunningSession {
         TrackMilliseconds::new(elapsed.min(u32::MAX as u64) as u32)
     }
 
-    /// Freeze the cue timeline: the device has gone quiet, so anything cued from
-    /// here on would be asked of a subject nothing is being recorded from.
-    fn pause_for_silence(&mut self, at: UnixMilliseconds, silent_for: DurationMilliseconds) {
-        let track_position = self.track_position(at);
+    /// Move to another output device mid-session.
+    ///
+    /// The new device has its own latency, so every cue still ahead has to be
+    /// re-placed against a fresh anchor — the same re-derivation a resume does,
+    /// for the same reason. Cues already logged keep the instants they were
+    /// logged with: those are when the subject actually heard them.
+    async fn set_output(&mut self, output: &AudioOutput) {
+        if let Err(error) = self.playback.switch_output(output) {
+            self.manager.publish_error(format!(
+                "could not switch audio output: {error:#}; still on {}",
+                self.playback.output_name()
+            ));
+            return;
+        }
+        tracing::info!(
+            "collection audio moved to '{}' at {} Hz",
+            self.playback.output_name(),
+            self.playback.output_sample_rate()
+        );
+        if self.anchor.is_none() || self.paused.is_some() {
+            // Nothing is running against the anchor: a track that has not
+            // started takes its anchor at the start, and a frozen one takes a
+            // fresh one when it resumes.
+            self.publish_playback_position();
+            return;
+        }
+        if let Some(timeline) = self.playhead_after_command(true).await {
+            let anchor = timeline.heard_at.before_track_position(timeline.position);
+            self.anchor = Some(anchor);
+            self.place_unlogged_cues(anchor);
+        }
+        self.publish_playback_position();
+    }
+
+    /// Browser → `PauseTrack`: the operator asked, so audio and the cue timeline
+    /// stop together and the device is not implicated.
+    async fn pause_track(&mut self) {
+        if self.anchor.is_none() || self.paused.is_some() {
+            return;
+        }
+        self.freeze(PauseCause::Operator, DurationMilliseconds::new(0))
+            .await;
+    }
+
+    /// The last browser closed. An armed session has nothing to freeze — the
+    /// track never began — and it is left alone to time out on its own.
+    async fn browser_gone(&mut self) {
+        if self.anchor.is_none() || self.paused.is_some() {
+            return;
+        }
+        self.freeze(PauseCause::BrowserGone, DurationMilliseconds::new(0))
+            .await;
+    }
+
+    /// Freeze audio and the cue timeline where they stand. Anything cued past
+    /// here would be asked of a subject the music has stopped for, and — when
+    /// the device is the reason — one nothing is being recorded from.
+    ///
+    /// The pause is stamped at the instant the *cursor* stopped, not at the
+    /// instant the decision was taken. That is what makes the pause length the
+    /// log records equal to the shift the resume puts into the beat grid, which
+    /// is what a windowing tool subtracts to get back onto the track's timeline.
+    async fn freeze(&mut self, cause: PauseCause, silent_for: DurationMilliseconds) {
+        self.playback.pause();
+        let track_position = match self.playhead_after_command(false).await {
+            Some(timeline) => timeline.position,
+            None => self.track_position(now()),
+        };
+        let Some(anchor) = self.anchor else { return };
+        let at = anchor.at_track_position(track_position);
         let device_id = self.device_id.clone().unwrap_or_default();
         self.interrupt_cues_in_progress(at);
-        let event = SessionEvent::Paused {
+        self.log_event(&SessionEvent::Paused {
             at,
             track_position,
             silent_for,
             device_id: device_id.clone(),
-        };
-        if let Some(recorder) = &mut self.recorder {
-            if let Err(error) = recorder.append_event(&event) {
-                tracing::warn!("failed to log the pause: {error:#}");
-            }
-        }
+            cause,
+        });
         self.paused = Some(CollectionPause {
+            cause,
             device_id,
             since: at,
             silent_for,
             track_position,
-            device_recovered: false,
+            // Only a silent device leaves anything to wait for; the other two
+            // causes say nothing about the device.
+            device_recovered: cause != PauseCause::DeviceSilent,
         });
         self.publish_state();
+        self.publish_playback_position();
     }
 
     /// A cue whose hold straddles the pause is cut short here and never
@@ -1001,13 +1288,23 @@ impl RunningSession {
         }
     }
 
-    /// Re-anchor on the browser's report of where audio actually restarted, and
-    /// place every cue still ahead of the playhead against it.
-    fn resume_track(&mut self, at: UnixMilliseconds, position: TrackMilliseconds) {
-        let Some(pause) = self.paused.take() else {
-            tracing::warn!("ignoring track_resumed for a session that is not paused");
+    /// Unfreeze: play from where the pause left the cursor, then re-anchor on
+    /// where the mixer says it actually restarted and place every cue still
+    /// ahead of the playhead against that.
+    async fn resume_track(&mut self) {
+        if self.paused.is_none() {
+            tracing::warn!("ignoring resume_track for a session that is not paused");
+            return;
+        }
+        self.playback.play();
+        let Some(timeline) = self.playhead_after_command(true).await else {
+            self.playback.pause();
+            self.manager
+                .publish_error("audio output did not resume; the timeline is still frozen".into());
             return;
         };
+        let pause = self.paused.take().expect("checked above");
+        let (at, position) = (timeline.heard_at, timeline.position);
         let anchor = at.before_track_position(position);
         self.anchor = Some(anchor);
         // A cue whose onset is already behind the resumed playhead was never
@@ -1026,16 +1323,32 @@ impl RunningSession {
         let paused_for = DurationMilliseconds::new(
             at.since(pause.since).get().max(0).min(u32::MAX as i64) as u32,
         );
+        self.log_event(&SessionEvent::Resumed {
+            at,
+            track_position: position,
+            paused_for,
+        });
+        self.publish_state();
+        self.publish_playback_position();
+    }
+
+    fn log_event(&mut self, event: &SessionEvent) {
         if let Some(recorder) = &mut self.recorder {
-            if let Err(error) = recorder.append_event(&SessionEvent::Resumed {
-                at,
-                track_position: position,
-                paused_for,
-            }) {
-                tracing::warn!("failed to log the resume: {error:#}");
+            if let Err(error) = recorder.append_event(event) {
+                tracing::warn!("failed to log {event:?}: {error:#}");
             }
         }
-        self.publish_state();
+    }
+
+    /// Where the mixer's cursor stands, for the browsers drawing the playfield.
+    fn publish_playback_position(&self) {
+        let timeline = self.playback.timeline();
+        self.manager.publish(Frame::PlaybackPosition {
+            session_id: self.session_id.clone(),
+            position_ms: timeline.position,
+            at_unix_ms: timeline.heard_at,
+            playing: timeline.playing && self.anchor.is_some(),
+        });
     }
 
     fn ingest_window(
@@ -1094,26 +1407,26 @@ impl RunningSession {
         }
     }
 
-    /// Periodic work; returns an ending when the session concludes on its own.
-    fn tick(&mut self) -> Option<Ending> {
+    /// Periodic work; true when the session has reached its own end.
+    async fn tick(&mut self) -> bool {
         let current = now();
         match self.anchor {
             None => {
                 if current.since(self.armed_at).get() > ARMED_TIMEOUT.as_millis() as i64 {
                     self.manager
-                        .publish_error("armed session timed out; discarding".into());
-                    return Some(Ending::Discard);
+                        .publish_error("armed session timed out; sending it to review".into());
+                    return true;
                 }
             }
             Some(anchor) => {
                 // A frozen timeline resolves nothing and cannot reach the
-                // track's end; only the browser's resume restarts it.
+                // track's end; only a resume restarts it.
                 if self.paused.is_some() {
-                    return None;
+                    return false;
                 }
                 if let Some(silent_for) = self.silence_past_threshold(current) {
-                    self.pause_for_silence(current, silent_for);
-                    return None;
+                    self.freeze(PauseCause::DeviceSilent, silent_for).await;
+                    return false;
                 }
                 self.resolve_cues(current);
                 let track_end = anchor
@@ -1121,11 +1434,11 @@ impl RunningSession {
                     .get()
                     + TRACK_END_SLACK.as_millis() as u64;
                 if current.get() >= track_end {
-                    return Some(Ending::Review);
+                    return true;
                 }
             }
         }
-        None
+        false
     }
 
     /// How long the device has been silent, once that exceeds
@@ -1243,7 +1556,21 @@ impl RunningSession {
         });
     }
 
-    async fn finalize(mut self, ending: Ending) {
+    /// Stop everything, write the files, and hand the take to review. Every
+    /// ending arrives here: a take that reached disk is the operator's to keep
+    /// or discard, never this function's.
+    async fn finalize(mut self) {
+        self.playback.pause();
+        // A session whose track never started still recorded EMG from arming;
+        // that whole stretch is the unlabelled prefix.
+        if self.anchor.is_none() {
+            let armed_at = self.armed_at;
+            self.log_event(&SessionEvent::ArmedPrefix {
+                from: armed_at,
+                to: now(),
+            });
+        }
+
         // Video first, off the runtime: stop_recording can block up to 5 s.
         let video_report: Option<VideoReport> = match self.recording_handle.take() {
             Some(handle) => {
@@ -1320,40 +1647,107 @@ impl RunningSession {
             }
         }
 
-        match ending {
-            Ending::Review => {
-                {
-                    let mut state = self.manager.state.lock().unwrap();
-                    state.phase = Phase::Reviewing {
-                        directory: self.directory.clone(),
-                    };
-                }
-                self.manager.publish(Frame::CollectionState {
-                    phase: CollectionPhase::Reviewing {
-                        session_id: self.session_id,
-                        summary,
-                    },
-                    placement_photo: None,
-                });
-            }
-            Ending::Discard => {
-                self.manager.state.lock().unwrap().phase = Phase::Idle;
-                // A practice session has nothing on disk to discard.
-                if let Some(directory) = &self.directory {
-                    if let Err(error) = std::fs::remove_dir_all(directory) {
-                        self.manager
-                            .publish_error(format!("failed to discard session: {error}"));
-                    }
-                }
-                self.manager.publish_idle();
-            }
+        {
+            let mut state = self.manager.state.lock().unwrap();
+            state.phase = Phase::Reviewing {
+                directory: self.directory.clone(),
+            };
         }
+        self.manager.publish(Frame::CollectionState {
+            phase: CollectionPhase::Reviewing {
+                session_id: self.session_id,
+                summary,
+            },
+            placement_photo: None,
+        });
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::mean_absolute_deviation;
+    use super::*;
+
+    /// A manager with nothing behind it but the pieces the attachment count
+    /// touches. It never arms a session, so the catalog and the camera are
+    /// never read.
+    fn bare_manager(name: &str) -> Arc<CollectionManager> {
+        // Its own directory per test: these run in parallel, and a shared
+        // config file is one test reading what another is still writing.
+        let directory = std::env::temp_dir().join(format!("collection-attachment-{name}"));
+        let paths = CatalogPaths {
+            config_path: directory.join("collection.json"),
+            tracks_root: directory.join("tracks"),
+        };
+        std::fs::create_dir_all(&paths.tracks_root).expect("the temp directory is writable");
+        std::fs::write(
+            &paths.config_path,
+            r#"{"subjects":["subject"],
+                "collection_classes":[{"id":"a","label":"A","color":"blue"}],
+                "activities":[{"id":"seated","label":"Seated"}],
+                "sweat_levels":[{"id":"dry","label":"Dry"}]}"#,
+        )
+        .expect("the temp directory is writable");
+        let catalog = paths.load().expect("a track-less catalog loads");
+        CollectionManager::new(
+            catalog,
+            paths,
+            PathBuf::from("/dev/null"),
+            CameraSettings::default(),
+            Arc::new(Registry::new()),
+            directory.clone(),
+            ProvenanceStore::load(directory.join("provenance.cbor")),
+            AudioOutput::Silent,
+        )
+    }
+
+    /// Pretend a session is running, and hand back the end of the control
+    /// channel a real session task would be reading.
+    fn pretend_running(manager: &CollectionManager) -> mpsc::UnboundedReceiver<SessionControl> {
+        let (control, receiver) = mpsc::unbounded_channel();
+        manager.state.lock().unwrap().phase = Phase::Running { control };
+        receiver
+    }
+
+    /// The point of the count: one page closing while another still watches
+    /// changes nothing, because someone can still see the cues.
+    #[test]
+    fn a_session_freezes_only_when_the_last_browser_leaves() {
+        let manager = bare_manager("last-leaves");
+        let mut control = pretend_running(&manager);
+
+        let first = manager.attach_browser();
+        let second = manager.attach_browser();
+        drop(first);
+        assert!(
+            control.try_recv().is_err(),
+            "a session with a browser still attached was told nobody is watching"
+        );
+
+        drop(second);
+        assert!(
+            matches!(control.try_recv(), Ok(SessionControl::BrowserGone)),
+            "the last browser leaving did not freeze the session"
+        );
+    }
+
+    /// Reconnecting arms the count again, so a second round of closures freezes
+    /// the session a second time rather than going quiet forever.
+    #[test]
+    fn a_reconnecting_browser_can_freeze_the_session_again() {
+        let manager = bare_manager("reconnecting");
+        let mut control = pretend_running(&manager);
+
+        drop(manager.attach_browser());
+        assert!(matches!(
+            control.try_recv(),
+            Ok(SessionControl::BrowserGone)
+        ));
+        drop(manager.attach_browser());
+        assert!(matches!(
+            control.try_recv(),
+            Ok(SessionControl::BrowserGone)
+        ));
+    }
 
     /// Channel-major blob from per-channel sample runs.
     fn blob(channels: &[&[i16]]) -> Vec<u8> {

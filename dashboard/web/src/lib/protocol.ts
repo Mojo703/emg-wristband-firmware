@@ -50,13 +50,19 @@ export const FrameType = {
   SetServer: 'set_server',
   CollectionCatalog: 'collection_catalog',
   StartCollection: 'start_collection',
-  TrackStarted: 'track_started',
-  TrackResumed: 'track_resumed',
+  StartTrack: 'start_track',
+  PauseTrack: 'pause_track',
+  ResumeTrack: 'resume_track',
   FinishCollection: 'finish_collection',
   StopCollection: 'stop_collection',
   CapturePlacementPhoto: 'capture_placement_photo',
+  SetEmgStream: 'set_emg_stream',
+  SetAudioVolume: 'set_audio_volume',
+  SetAudioOutput: 'set_audio_output',
+  AudioSettings: 'audio_settings',
   CollectionState: 'collection_state',
   Beatmap: 'beatmap',
+  PlaybackPosition: 'playback_position',
   NoteResult: 'note_result',
 } as const;
 
@@ -238,7 +244,7 @@ export interface SweatLevel {
   readonly label: string;
 }
 
-/** One playable track; audio is fetched over HTTP at `/collection/audio/{id}`. */
+/** One playable track. The backend plays its audio; nothing here fetches it. */
 export interface TrackInfo {
   readonly id: string;
   readonly title: string;
@@ -247,11 +253,37 @@ export interface TrackInfo {
   readonly duration: DurationMilliseconds;
 }
 
-/** One gesture class being collected — a lane. `color` is a named palette colour. */
+/** Which arrow a gesture draws. The curved pair is for a rotation — a motion
+ * whose direction is a turn rather than a line — and reads differently at a
+ * glance from the straight four, which is the point of having both. */
+export const MotionArrow = {
+  Left: 'left',
+  Right: 'right',
+  Up: 'up',
+  Down: 'down',
+  Clockwise: 'clockwise',
+  CounterClockwise: 'counter_clockwise',
+} as const;
+
+export type MotionArrow = (typeof MotionArrow)[keyof typeof MotionArrow];
+
+/** The direction a gesture moves something: an arrow to draw and a line to
+ * read. The backend says which arrow; what an arrow looks like is the
+ * frontend's business. */
+export interface GestureMotion {
+  readonly arrow: MotionArrow;
+  readonly hint: string;
+}
+
+/** One gesture class being collected — a lane. `color` is a named palette
+ * colour and `motion` an optional arrow; both are backend-owned, so every
+ * place a class is shown paints the same thing. `motion` is null for a gesture
+ * with no direction to draw. */
 export interface CollectionClass {
   readonly id: string;
   readonly label: string;
   readonly color: string;
+  readonly motion: GestureMotion | null;
 }
 
 /** One cue: a hold block. The gesture begins when `at` reaches the hit line,
@@ -284,8 +316,19 @@ export interface RecordingHealth {
   readonly recorded: RecordedEmg | null;
 }
 
+/** What froze a session's cue timeline: a rig fault to go and fix, a decision
+ * the operator just made, or a page that went away mid-track. */
+export const PauseCause = {
+  DeviceSilent: 'device_silent',
+  Operator: 'operator',
+  BrowserGone: 'browser_gone',
+} as const;
+
+export type PauseCause = (typeof PauseCause)[keyof typeof PauseCause];
+
 /** Why a session's cue timeline is frozen, and for how long it has been. */
 export interface CollectionPause {
+  readonly cause: PauseCause;
   readonly device_id: string;
   readonly since: UnixMilliseconds;
   readonly silent_for: DurationMilliseconds;
@@ -323,7 +366,8 @@ export type CollectionPhase =
       readonly name: 'playing';
       readonly session_id: string;
       readonly recording: RecordingHealth;
-      /** Non-null while the cue timeline is frozen on a device stall. */
+      /** Non-null while the cue timeline is frozen, by a device stall or by
+       * the operator. */
       readonly paused: CollectionPause | null;
     }
   | {
@@ -538,18 +582,21 @@ export interface StartCollectionFrame {
   readonly record_video: boolean;
 }
 
-/** Browser → backend: audio playback actually began; anchors the beat grid. */
-export interface TrackStartedFrame {
-  readonly type: 'track_started';
-  readonly at_unix_ms: UnixMilliseconds;
+/** Browser → backend: the operator tapped Start. The backend plays the audio,
+ * so it begins playback and the cue timeline together. */
+export interface StartTrackFrame {
+  readonly type: 'start_track';
 }
 
-/** Browser → backend: audio resumed after a pause, with the position the audio
- * element was at. The pair re-anchors the beat grid outright. */
-export interface TrackResumedFrame {
-  readonly type: 'track_resumed';
-  readonly at_unix_ms: UnixMilliseconds;
-  readonly position_ms: TrackMilliseconds;
+/** Browser → backend: freeze playback and the cue timeline where they stand. */
+export interface PauseTrackFrame {
+  readonly type: 'pause_track';
+}
+
+/** Browser → backend: unfreeze from the position they froze at. Answers both an
+ * operator pause and one the backend declared on a device stall. */
+export interface ResumeTrackFrame {
+  readonly type: 'resume_track';
 }
 
 /** Browser → backend: finalize the running session now and move to review;
@@ -566,6 +613,37 @@ export interface StopCollectionFrame {
 
 export interface CapturePlacementPhotoFrame {
   readonly type: 'capture_placement_photo';
+}
+
+/** Browser → backend: whether this browser needs the raw EMG stream. Only the
+ * panels that draw waveforms do; a page showing the collection game spends the
+ * whole session not decoding sixteen channels it would throw away. The backend
+ * keeps consuming the stream either way, so the electrode check is unaffected. */
+export interface SetEmgStreamFrame {
+  readonly type: 'set_emg_stream';
+  readonly enabled: boolean;
+}
+
+/** Browser → backend: how loud the music is, in thousandths. Applies mid-song
+ * and moves only the track — the cue clicks keep their own level. */
+export interface SetAudioVolumeFrame {
+  readonly type: 'set_audio_volume';
+  readonly volume_permille: number;
+}
+
+/** Browser → backend: which output device the game plays through; `null` asks
+ * for the host's default. A running session switches sinks in place. */
+export interface SetAudioOutputFrame {
+  readonly type: 'set_audio_output';
+  readonly output: string | null;
+}
+
+/** Backend → browser: the audio settings and the devices to choose from. */
+export interface AudioSettingsFrame {
+  readonly type: 'audio_settings';
+  readonly devices: readonly string[];
+  readonly output: string | null;
+  readonly volume_permille: number;
 }
 
 /** Backend → browser: authoritative session state; drives the rec tripwire.
@@ -590,6 +668,20 @@ export interface BeatmapFrame {
   readonly lead_in: DurationMilliseconds;
 }
 
+/** Backend → browser: where the backend's audio output stands. `position_ms` is
+ * what the subject hears at `at_unix_ms`, which sits a little ahead of the send
+ * because it includes the output device's latency. The renderer extrapolates
+ * between these with the local clock; it never derives the timeline itself. */
+export interface PlaybackPositionFrame {
+  readonly type: 'playback_position';
+  readonly session_id: string;
+  readonly position_ms: TrackMilliseconds;
+  readonly at_unix_ms: UnixMilliseconds;
+  /** False while the timeline is frozen, when extrapolating would run the
+   * playfield past a playhead that is not moving. */
+  readonly playing: boolean;
+}
+
 /** Backend → browser: activity-detector verdict for one cued note. */
 export interface NoteResultFrame {
   readonly type: 'note_result';
@@ -607,11 +699,15 @@ export type OutgoingFrame =
   | SetServerFrame
   | SetBoardRevisionFrame
   | StartCollectionFrame
-  | TrackStartedFrame
-  | TrackResumedFrame
+  | StartTrackFrame
+  | PauseTrackFrame
+  | ResumeTrackFrame
   | FinishCollectionFrame
   | StopCollectionFrame
-  | CapturePlacementPhotoFrame;
+  | CapturePlacementPhotoFrame
+  | SetEmgStreamFrame
+  | SetAudioVolumeFrame
+  | SetAudioOutputFrame;
 
 export type IncomingFrame =
   | HelloFrame
@@ -625,6 +721,8 @@ export type IncomingFrame =
   | CollectionCatalogFrame
   | CollectionStateFrame
   | BeatmapFrame
+  | PlaybackPositionFrame
+  | AudioSettingsFrame
   | NoteResultFrame;
 
 export type Frame = IncomingFrame | OutgoingFrame;
@@ -969,12 +1067,25 @@ function isTrackInfoArray(value: unknown): value is readonly TrackInfo[] {
   return Array.isArray(value) && value.every(isTrackInfo);
 }
 
+function isMotionArrow(value: unknown): value is MotionArrow {
+  return Object.values(MotionArrow).includes(value as MotionArrow);
+}
+
+function isGestureMotion(value: unknown): value is GestureMotion {
+  return isObject(value) && isMotionArrow(value['arrow']) && isString(value['hint']);
+}
+
 function isCollectionClass(value: unknown): value is CollectionClass {
   return (
     isObject(value) &&
     isString(value['id']) &&
     isString(value['label']) &&
-    isString(value['color'])
+    isString(value['color']) &&
+    // Absent and null both mean "no arrow": ciborium omits nothing, but a
+    // config written before motions existed has no key at all.
+    (value['motion'] === null ||
+      value['motion'] === undefined ||
+      isGestureMotion(value['motion']))
   );
 }
 
@@ -1012,9 +1123,14 @@ function isRecordingHealth(value: unknown): value is RecordingHealth {
   );
 }
 
+function isPauseCause(value: unknown): value is PauseCause {
+  return Object.values(PauseCause).includes(value as PauseCause);
+}
+
 function isCollectionPause(value: unknown): value is CollectionPause {
   return (
     isObject(value) &&
+    isPauseCause(value['cause']) &&
     isString(value['device_id']) &&
     isNumber(value['since']) &&
     isNumber(value['silent_for']) &&
@@ -1131,6 +1247,30 @@ export function isBeatmapFrame(value: unknown): value is BeatmapFrame {
   return true;
 }
 
+export function isAudioSettingsFrame(value: unknown): value is AudioSettingsFrame {
+  return (
+    hasType(value, 'audio_settings') &&
+    isObject(value) &&
+    Array.isArray(value['devices']) &&
+    value['devices'].every(isString) &&
+    (value['output'] === null || isString(value['output'])) &&
+    isNumber(value['volume_permille'])
+  );
+}
+
+export function isPlaybackPositionFrame(
+  value: unknown,
+): value is PlaybackPositionFrame {
+  return (
+    hasType(value, 'playback_position') &&
+    isObject(value) &&
+    isString(value['session_id']) &&
+    isNumber(value['position_ms']) &&
+    isNumber(value['at_unix_ms']) &&
+    isBoolean(value['playing'])
+  );
+}
+
 export function isNoteResultFrame(value: unknown): value is NoteResultFrame {
   return (
     hasType(value, 'note_result') &&
@@ -1169,16 +1309,24 @@ export function isOutgoingFrame(value: unknown): value is OutgoingFrame {
         isDifficultyLevel(value['difficulty']) &&
         isBoolean(value['record_video'])
       );
-    case 'track_started':
-      return isNumber(value['at_unix_ms']);
-    case 'track_resumed':
-      return isNumber(value['at_unix_ms']) && isNumber(value['position_ms']);
+    case 'start_track':
+      return true;
+    case 'pause_track':
+      return true;
+    case 'resume_track':
+      return true;
     case 'finish_collection':
       return true;
     case 'stop_collection':
       return isBoolean(value['save']);
     case 'capture_placement_photo':
       return true;
+    case 'set_emg_stream':
+      return isBoolean(value['enabled']);
+    case 'set_audio_volume':
+      return isNumber(value['volume_permille']);
+    case 'set_audio_output':
+      return value['output'] === null || isString(value['output']);
     default:
       return false;
   }
@@ -1196,6 +1344,8 @@ export function asIncomingFrame(value: unknown): IncomingFrame | null {
   if (isCollectionCatalogFrame(value)) return value;
   if (isCollectionStateFrame(value)) return value;
   if (isBeatmapFrame(value)) return value;
+  if (isPlaybackPositionFrame(value)) return value;
+  if (isAudioSettingsFrame(value)) return value;
   if (isNoteResultFrame(value)) return value;
   // A tagged frame that fails its own guard is a bug on one side of the wire
   // mirror; dropping it silently is how such bugs stay hidden for hours.
