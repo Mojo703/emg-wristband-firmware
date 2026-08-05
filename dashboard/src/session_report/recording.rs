@@ -592,33 +592,92 @@ fn sequence_backwards(events: &Events) -> (usize, usize) {
 }
 
 /// How far the backend receive times have walked away from the device's own
-/// timeline, after removing the constant offset at the first window.
+/// timeline, after removing the constant offset at the anchor window.
+///
+/// The parts-per-million figure is the slope of that walk, and it has to survive
+/// two things the receive times carry besides the device's clock. Windows the
+/// recorder drained from a subscription backlog arrive far faster than the
+/// device produced them, so they time the queue and not the host; the anchor
+/// steps past them. Transport latency only adds, so the slope is fitted to the
+/// quarter of arrivals that were delayed least, where what remains is the two
+/// clocks and not the scheduler.
 fn drift(events: &Events) -> Option<Drift> {
-    let first = events.windows.first()?;
     if events.windows.len() < 2 {
         return None;
     }
-    let residuals: Vec<f64> = events
+    let backlog = backlog_windows(events);
+    let anchor = &events.windows[backlog];
+    let residuals: Vec<(f64, f64)> = events
         .windows
         .iter()
         .map(|window| {
-            let device = (window.device_microseconds - first.device_microseconds) as f64 / 1000.0;
-            (window.backend_milliseconds - first.backend_milliseconds) - device
+            let device =
+                (window.device_microseconds as f64 - anchor.device_microseconds as f64) / 1000.0;
+            (
+                device,
+                (window.backend_milliseconds - anchor.backend_milliseconds) - device,
+            )
         })
         .collect();
-    let span =
-        (events.windows.last()?.device_microseconds - first.device_microseconds) as f64 / 1000.0;
-    let final_value = *residuals.last()?;
     Some(Drift {
-        minimum: residuals.iter().copied().fold(f64::INFINITY, f64::min),
-        maximum: residuals.iter().copied().fold(f64::NEG_INFINITY, f64::max),
-        final_value,
-        parts_per_million: if span > 0.0 {
-            final_value / span * 1e6
-        } else {
-            0.0
-        },
+        minimum: residuals
+            .iter()
+            .map(|(_, residual)| *residual)
+            .fold(f64::INFINITY, f64::min),
+        maximum: residuals
+            .iter()
+            .map(|(_, residual)| *residual)
+            .fold(f64::NEG_INFINITY, f64::max),
+        final_value: residuals.last()?.1,
+        parts_per_million: least_delayed_slope(&residuals[backlog..]) * 1e6,
     })
+}
+
+/// Leading windows the recorder drained from a backlog rather than received as
+/// the device sent them: they land within a fraction of a device step of each
+/// other, where a live stream is one step apart.
+fn backlog_windows(events: &Events) -> usize {
+    let nominal = device_step(events).nominal as f64 / 1000.0;
+    let mut anchor = 0;
+    while anchor + 1 < events.windows.len()
+        && events.windows[anchor + 1].backend_milliseconds
+            - events.windows[anchor].backend_milliseconds
+            < nominal / 2.0
+    {
+        anchor += 1;
+    }
+    anchor
+}
+
+/// Least-squares slope of the residuals over the quarter of windows that were
+/// delayed least, in milliseconds per millisecond.
+fn least_delayed_slope(residuals: &[(f64, f64)]) -> f64 {
+    let mut least_delayed = residuals.to_vec();
+    least_delayed.sort_by(|left, right| left.1.partial_cmp(&right.1).expect("finite times"));
+    least_delayed.truncate((residuals.len() / 4).max(4));
+    if least_delayed.len() < 2 {
+        return 0.0;
+    }
+    let count = least_delayed.len() as f64;
+    let mean_device = least_delayed.iter().map(|(device, _)| device).sum::<f64>() / count;
+    let mean_residual = least_delayed
+        .iter()
+        .map(|(_, residual)| residual)
+        .sum::<f64>()
+        / count;
+    let covariance: f64 = least_delayed
+        .iter()
+        .map(|(device, residual)| (device - mean_device) * (residual - mean_residual))
+        .sum();
+    let variance: f64 = least_delayed
+        .iter()
+        .map(|(device, _)| (device - mean_device).powi(2))
+        .sum();
+    if variance > 0.0 {
+        covariance / variance
+    } else {
+        0.0
+    }
 }
 
 /// Wall-clock milliseconds at sample zero. Each window's receive time is an
@@ -772,6 +831,60 @@ mod tests {
         // An instant inside the hole has no samples of its own; it extrapolates
         // off the last window before it.
         assert_eq!(sample(1_500.0), Some(1_000.0));
+    }
+
+    /// One window every 250 ms at `parts_per_million` of device-clock error,
+    /// with `jitter` milliseconds of scheduling delay added to every other
+    /// arrival and `backlog` windows drained a millisecond apart at the front.
+    fn stream(count: usize, parts_per_million: f64, jitter: f64, backlog: usize) -> Events {
+        let windows = (0..count)
+            .map(|index| {
+                let device = index as u64 * 250_000;
+                let real = device as f64 / 1000.0 * (1.0 + parts_per_million / 1e6);
+                let delay = if index.is_multiple_of(2) { 0.0 } else { jitter };
+                EmgWindowRecord {
+                    sequence: index as u32,
+                    device_microseconds: device,
+                    backend_milliseconds: if index < backlog {
+                        // The backlog drains at the instant the recorder starts.
+                        backlog as f64 * 250.0 + index as f64
+                    } else {
+                        real + delay
+                    },
+                }
+            })
+            .collect();
+        Events {
+            windows,
+            ..Events::default()
+        }
+    }
+
+    #[test]
+    fn drift_reads_the_device_clock_through_scheduling_jitter() {
+        let measured = drift(&stream(400, 40.0, 20.0, 0)).expect("enough windows");
+        assert!(
+            (measured.parts_per_million - 40.0).abs() < 10.0,
+            "{} ppm is not the 40 ppm the stream drifts by",
+            measured.parts_per_million
+        );
+    }
+
+    /// Windows drained from a subscription backlog arrive hundreds of times
+    /// faster than the device produced them. Timing the host against them reads
+    /// the queue, so the measurement starts after them.
+    #[test]
+    fn a_drained_backlog_does_not_become_device_clock_error() {
+        let measured = drift(&stream(400, 40.0, 20.0, 8)).expect("enough windows");
+        assert!(
+            (measured.parts_per_million - 40.0).abs() < 10.0,
+            "{} ppm is the backlog, not the device clock",
+            measured.parts_per_million
+        );
+        // The backlog is still visible: those windows sit two seconds off the
+        // timeline the rest of the recording keeps.
+        assert!(measured.maximum > 1_500.0);
+        assert!(measured.final_value.abs() < 50.0);
     }
 
     #[test]

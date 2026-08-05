@@ -518,11 +518,10 @@ impl CollectionManager {
         record_video: bool,
         device_id: Option<String>,
     ) -> anyhow::Result<()> {
-        let acquired = match device_id {
-            Some(device_id) => Some(self.acquire_device(&device_id).await?),
-            None => None,
-        };
-
+        // Everything device-independent happens first, and the order is
+        // load-bearing: subscribing to the device starts buffering EMG, and
+        // decoding a track takes seconds, so a subscription taken any earlier
+        // hands the recorder seconds of windows that predate `session_start`.
         let (track, class_ids, beatmap, beat_times, audio_path) = {
             let catalog = self.catalog.read().unwrap();
             let track = catalog
@@ -565,6 +564,11 @@ impl CollectionManager {
             audio.sample_rate,
             playback.output_latency().get()
         );
+
+        let acquired = match device_id {
+            Some(device_id) => Some(self.acquire_device(&device_id).await?),
+            None => None,
+        };
 
         let created = now();
         let practice = acquired.is_none();
