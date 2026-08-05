@@ -4,6 +4,10 @@
 **Crates:** `dashboard` (`signal_quality`, `session_report`), `opal-firmware` (`adc::convert`, `adc::ads1298`).
 **Hardware:** rev A bodged board, ribbon 2 harness, both ADS1298s, subject bias drive OFF.
 
+**Superseded in part by [0020](0020-why-nine-sessions-recorded-nothing.md):** the
+channel 9 hard-fault call in Next steps does not survive six more sessions, and the
+bias-drive errata is traced there to the exact node rather than named.
+
 ## Purpose
 
 Three collection sessions were recorded on the product band for the first time.

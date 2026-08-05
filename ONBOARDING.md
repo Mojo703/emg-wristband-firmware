@@ -207,11 +207,17 @@ under stale labels this way.
 
 Read this before your first session so you know what you are looking at.
 
-No session has yet produced usable data. Across nine recordings the noise floor
-has run 20–190 µV against a 10 µV limit, four or five of sixteen channels rail
-outright, and the mains figure reaches 2.7 mV differential. In the one correctly
-labelled session we analysed in full, no gesture produced a response we could
-tell apart from rest.
+All nine recordings so far come back NOT USABLE, and the noise floor is usually
+why. Chip medians run from 5.6 to 219 µV against a 10 µV limit, and only two of
+the nine put any channel under it. Mains pickup spans 6 µV on the quietest
+session to 5.9 mV on the worst. Between none and seven of the sixteen channels
+rail, and which ones move each time the band goes back on.
+
+Gestures do sometimes show through. One session produced seven channel-by-gesture
+cells above the significance threshold for forearm rotation, and six of those
+peaked at the cue's real time rather than beside it, so the rig is not blind. The two sessions with clean contact
+are also the two that were cut short with almost no cues, which is the pattern to
+break: nobody has yet recorded a full track on well-prepared skin.
 
 We are working through three causes, in this order.
 
