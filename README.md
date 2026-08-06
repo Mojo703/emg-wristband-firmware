@@ -20,7 +20,7 @@ Firmware (ESP32-S3, Xtensa toolchain):
 
 | Path | What it is |
 |------|------------|
-| [`opal-firmware/`](opal-firmware) | The device. Two ADS1298s sample 16 channels on their own thread, the int8 model classifies each window, and the result streams to the dashboard over wifi or USB serial. `BRINGUP.md` is the bench procedure for new hardware. |
+| [`opal-firmware/`](opal-firmware) | The device. Two ADS1298s sample 16 channels, each chip's frame clocked out inside its own data-ready interrupt, the int8 model classifies each window, and the result streams to the dashboard over wifi or USB serial. `BRINGUP.md` is the bench procedure for new hardware. |
 | [`drv2605l/`](drv2605l) | TI DRV2605L haptic driver over I2C, plus a bench binary that plays candidate wristband feedback patterns. The library is `embedded-hal` generic, so the firmware can take it without the bench setup. |
 | [`ota-client/`](ota-client) | OTA update client. Pulls a firmware image over HTTP and reboots into it. Not yet folded into `opal-firmware`, which still boots from a single app partition. |
 | [`ota-server/`](ota-server) | Dev-machine HTTP server that hosts firmware `.bin` images for the client. Plain host Rust, no ESP toolchain. |
@@ -33,7 +33,7 @@ Machine learning and tooling (host, plain Rust or Python):
 | [`emg-tds/`](emg-tds) | The current gesture model: a depthwise-separable (TDS) conv encoder in Rust/candle, with swappable classifier and pose heads. Trains, evaluates, and exports. The `.npy` training/eval/pose windows live in its `data/` directory. |
 | [`dashboard/`](dashboard) | Web dashboard. An axum backend relays CBOR frames between the wristband and a Svelte frontend, and runs the training-data collection game: import a Beat Saber map, play the falling-notes track, record labelled EMG. |
 | [`pose-service/`](pose-service) | Python WebSocket service that turns EMG windows into 3-D hand pose. Runs a mock estimator or Meta's `emg2pose` model. |
-| [`emg-runtime/`](emg-runtime) | The on-device inference path: int8 kernels with hand-written ESP32-S3 SIMD and a scalar fallback off target, plus the reject pipeline. Builds on the host too. `data/` holds the exported model blobs. |
+| [`emg-runtime/`](emg-runtime) | The on-device inference path: int8 kernels with hand-written ESP32-S3 SIMD and a scalar fallback off target, the reject pipeline, and the grid aligner that puts the two chips' independently clocked streams on one time base. `no_std`, and it builds on the host for verification. `data/` holds the exported model blobs. |
 | [`protocol/`](protocol) | A `no_std` crate of the CBOR frame types shared by the dashboard backend, the browser, and the firmware. |
 | [`engineering-logs/`](engineering-logs) | Dated log of the ML and on-device optimisation work, one goal, method, measurement, and analysis per entry. Read it first to learn why the model is what it is. |
 
@@ -58,20 +58,22 @@ acronyms or abbreviations. Cross-process messages are CBOR frames defined once i
 | Tool | Version |
 |------|---------|
 | OS | EndeavourOS (Arch Linux) |
-| Kernel | 7.0.12-arch1-1 |
+| Kernel | 7.1.4-arch1-1 |
 | CPU | AMD Ryzen 9 7900X |
 | GCC / G++ | 16.1.1 |
-| Clang | 22.1.6 |
-| CMake | 4.3.3 |
+| Clang | 22.1.8 |
+| CMake | 4.4.2 |
 | GNU Make | 4.4.1 |
-| Rust (`rustc`) | 1.95.0-nightly |
-| Cargo | 1.95.0-nightly |
+| Rust (`rustc`) | 1.96.0 stable, 1.96.0-nightly |
+| Cargo | 1.96.0 stable, 1.96.0-nightly |
 
 ## Target hardware
 
 ESP32-S3-Zero (Waveshare): 4 MB flash, no PSRAM, native USB (USB-Serial-JTAG over
-USB-C). Nothing here is board-pinned beyond the 4 MB partition tables, so a move to
-a custom board later stays contained.
+USB-C). What ties the tree to this board is the 4 MB partition tables and, in
+`opal-firmware`, the pin map in `src/main.rs` together with the two-board
+`Board` enum the thread and interrupt placements in `src/cores.rs` are exhaustive
+over. A move to a custom board goes through those and nothing else.
 
 ## Where to start
 

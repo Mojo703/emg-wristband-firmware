@@ -5,6 +5,14 @@
 the remaining latency is structural and lives in the model's channel/width/window
 choices, which need a retrain in `emg-gesture-class`.
 
+**Never run, and the ground under it has moved twice.**
+[0005](0005-sota-review-and-waveformer.md) turned the effort from latency to
+accuracy, `emg-gesture-class` is retired, and the shipping model is now `emg-tds`
+([0008](0008-waveformer-dead-end-emg2pose-and-tds.md),
+[0015](0015-emg-tds-int8-on-device.md)). The `ml-bench` crate named in the
+procedure below was deleted on 2026-08-04 (9a0d5ac); its runtime is now
+`emg-runtime`. Kept for the latency budget it works out, not the steps.
+
 ## Goal
 
 Cut real-model latency well below the current 17.0 ms floor by shrinking the

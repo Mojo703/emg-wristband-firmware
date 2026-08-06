@@ -3,6 +3,14 @@
 **Date:** 2026-06-23
 **Crates:** `emg-tds` (`export-int8` subcommand), `ml-bench` (runtime + blob format).
 
+**`ml-bench` no longer exists (deleted 2026-08-04, 9a0d5ac).** Read every mention
+of it below as `emg-runtime`, which now holds the kernels and the blob format.
+`emg-tds export-int8` writes to `emg-runtime/data/model_int8.bin`, the kernel
+self-tests and the forward-pass verification run as `opal-firmware` device tests
+(`cargo test-device`, `src/model_checks.rs`), and the latency numbers this entry
+reports live come from the firmware's `inference` telemetry source instead. The
+measurements below stand as recorded.
+
 ## Purpose
 
 The int8 model that previously ran on-device (`ml-bench/data/model_int8.bin`) was

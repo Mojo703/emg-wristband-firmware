@@ -209,7 +209,7 @@ Read this before your first session so you know what you are looking at.
 
 All nine recordings so far come back NOT USABLE, and the noise floor is usually
 why. Chip medians run from 5.6 to 219 µV against a 10 µV limit, and only two of
-the nine put any channel under it. Mains pickup spans 6 µV on the quietest
+the nine put a chip median under it. Mains pickup spans 6 µV on the quietest
 session to 5.9 mV on the worst. Between none and seven of the sixteen channels
 rail, and which ones move each time the band goes back on.
 
@@ -228,10 +228,12 @@ electrode on one of those pins changes nothing else about the rig.
 
 Nobody has prepared the skin, ever. Section 4 says what to do about it.
 
-The bias drive is switched off, and the board wires its compensation network to
-the wrong pin, so turning the drive on is not enough by itself. One jumper wire
-fixes the board, and the firmware change is separate. Engineering log 0019 has
-the detail.
+The bias drive is switched off, and the board leaves the amplifier's inverting
+input, RLDINV, terminating on a header pin with the compensation network wired
+between the output and the electrode instead. An amplifier whose inverting input
+floats has no closed loop, so switching the drive on by itself would only drive
+its output to a rail. One jumper wire fixes the board, and the firmware change is
+separate. Engineering log 0020 traced it and names the wire.
 
 Expect early sessions to fail the electrode check, and treat a passing floor as
 the news it is. Neither the model nor the software is the limiting factor right

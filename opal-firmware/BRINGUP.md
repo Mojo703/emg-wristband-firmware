@@ -7,18 +7,22 @@ on it, and a fault carried forward is much harder to find.
 ## Before you plug anything in
 
 Check the pin map. It is the block marked `ADS1298 wiring` in `src/main.rs`, and it
-still holds the numbers from the bring-up sketch, which were written as placeholders.
-If the board disagrees, nothing else will work and the symptom will look like a dead
-bus. GPIO 19 and 20 belong to USB-Serial-JTAG and cannot be used.
+is the authoritative wiring table for the harness in hand. If the board disagrees,
+nothing else will work and the symptom will look like a dead bus. GPIO 19 and 20
+belong to USB-Serial-JTAG and cannot be used.
 
-Two constants at the top of `src/main.rs` control the rest:
+Three constants in `src/main.rs` control the rest:
 
 ```rust
-const ADC_SPI_BAUD_RATE_HZ: u32 = 1_000_000;
-const ADC_TEST_SIGNAL_CHANNEL: Option<usize> = None;
+const ADC_COMMAND_SPI_BAUD_RATE_HZ: u32 = 2_000_000;
+const ADC_FRAME_SPI_BAUD_RATE_HZ: u32 = 8_000_000;
+const ADC_TEST_SIGNAL_CHANNEL: Option<Channel> = None;
 ```
 
-A channel outside 0..8 fails the build rather than the bench. Then:
+Switch the test signal on with `Some(Channel::checked(3))`, not `Channel::new`: the
+checked constructor refuses an out-of-range channel at compile time, while `new`
+would hand back a `None` that reads as "no test signal" and cost a bench session.
+Then:
 
 ```sh
 . ~/export-esp.sh
@@ -33,29 +37,36 @@ so read the boot log before anything else.
 Watch for these lines:
 
 ```
-ADS1298: powering up chip A
-ADS1298: powering up chip B
-ADS1298: both chips streaming at 1000000 Hz SPI
-ADC acquisition thread running
+ADS1298 pair: powering up
+ADS1298 chip 0: ID 0x92 as expected
+ADS1298 chip 1: ID 0x92 as expected
+ADS1298 chip 0 configuration readback:
+ADS1298 pair: streaming, frame reads at 8000000 Hz SPI, commands at 2000000 Hz
 ```
 
-Power-up takes about 4.4 seconds. Both chips must report an ID of `0x92`. A mismatch
-names what it read and guesses at the cause:
+Power sequencing and reference settling take about 2.5 seconds. Both chips are
+probed and reported before any mismatch is fatal, because with two boards on
+independent buses the comparison between them is the diagnosis: both chips failing
+the same way points at something genuinely common, one chip disagreeing points at
+that board's own wiring. A mismatch names what it read and guesses at the cause:
 
 - Reads `0x00` or `0xFF`: the bus is stuck at one level. Look at wiring, power, and CS
   before anything else. The chip is probably not talking at all.
-- Reads something else: the bus works and the chip answers, so suspect SPI mode or the
-  part number. The driver uses mode 1, which the datasheet requires.
+- Reads something else: the bus works and the chip answers, so suspect SPI mode, a
+  shifted or reversed ribbon, or a CLKSEL strap not actually at 3V3. The driver uses
+  mode 1, which the datasheet requires, and an unclocked chip cannot decode commands
+  at all.
 
-Bring-up failure stops the boot. The error names which chip and which step failed, which
-is the whole diagnostic: `chip A power-up` points somewhere different from `SPI bus
-init`.
+Bring-up failure stops the boot. The error names which chip and which step failed, and
+that is the whole diagnostic: `ADS1298 chip 0 identity probe` points somewhere
+different from `ADS1298 chip 1 initialise`. The chips are numbered 0 and 1 in the log
+and called A and B in the wiring; chip 0 is board A.
 
 ## 2. Is the read path right?
 
-Set `ADC_TEST_SIGNAL_CHANNEL` to `Some(0)` and flash again. This drives the chip's own
-square wave into channel 0 and shorts the rest, so the electrodes and everything in
-front of the ADC drop out of the picture.
+Set `ADC_TEST_SIGNAL_CHANNEL` to `Some(Channel::checked(0))` and flash again. This
+drives the chip's own square wave into channel 0 and shorts the rest, so the
+electrodes and everything in front of the ADC drop out of the picture.
 
 On the scope panel you should see one channel carrying a square wave and fifteen sitting
 near zero. Check the amplitude against the datasheet's test signal, roughly 1 mV at
@@ -73,40 +84,41 @@ Two failures worth naming:
 
 ## 3. Is the bus fast enough?
 
-This is the constraint most likely to bite. Each chip returns 27 bytes per sample, the
-driver reads them one chip after the other, and at 2 kSPS the whole pair has 500
-microseconds. At 1 MHz, 54 bytes take about 432 microseconds. That leaves under 70
-microseconds for chip select, driver overhead and jitter, which is not much.
+Each chip returns 27 bytes per sample on its own bus, clocked out inside that chip's
+own DRDY interrupt, and the chip has no buffer: a conversion not read within one
+~487 microsecond period is gone. Two clocks are configured separately in
+`src/main.rs`. `ADC_COMMAND_SPI_BAUD_RATE_HZ` is 2 MHz and carries register and
+opcode traffic, where nothing is latency-sensitive. `ADC_FRAME_SPI_BAUD_RATE_HZ` is
+8 MHz and carries the frame reads only; a 27-byte read at that clock measures 32
+microseconds, so the deadline has an order of magnitude of margin. Engineering logs
+[0017](../engineering-logs/0017-missed-edges-and-honest-gaps.md) and
+[0018](../engineering-logs/0018-the-frame-read-moved-into-the-interrupt.md) are the
+measurements behind both settings; read them before changing either.
 
-The log tells you whether it is coping. Every 128 windows:
+What tells you whether a new harness is coping is the dashboard's Telemetry panel
+rather than the log. Two sources matter. The `inference` source reports every 16
+batches, and its `dropped` metric must stay at zero: anything else means the main
+loop is not draining windows as fast as acquisition fills them. The `aligner` source
+reports each chip's `surplus_dropped`, `duplicated` and `missing` counts, which are
+that oscillator's real behaviour against the grid; a healthy chip shows a steady few
+percent of surplus and almost no missing. A chip whose `missing` climbs is losing
+conversions, and that is a signal-integrity or interrupt-latency fault, not a
+software one. Put a scope or the analyser on SCLK and DRDY and confirm the read
+finishes well before the next DRDY falls rather than trusting a counter alone.
+
+One log line still appears, if a front end that came up then goes quiet for a
+second:
 
 ```
-inference: mean ... || throughput ... windows/sec || dropped 0
+no ADC window for 1013 ms (dropped N, read errors N, bad status N, recoveries N)
 ```
 
-`dropped` must stay at zero. Anything else means the main loop is not draining windows
-as fast as the ADCs fill them, and the newest window is overwriting an unread one.
-
-Raise `ADC_SPI_BAUD_RATE_HZ` until it does. 4 MHz gives about four times the margin. Put
-a scope or the analyser on SCLK and DRDY and confirm the read finishes well before the
-next DRDY falls, rather than trusting the counter alone: a read that only just fits will
-pass on a quiet bench and fail once wifi is busy.
-
-Four other counters appear if the front end goes quiet for a second:
-
-```
-no ADC window for 1013 ms (dropped N, read errors N, desyncs N, bad status N)
-```
-
-`read errors` counts frames the SPI read refused. `desyncs` counts times chip B was not
-ready when chip A signalled, which means the two chips have drifted apart and the 16
-channels no longer describe one instant. `bad status` counts frames the SPI read
+`read errors` counts frames the read refused. `bad status` counts frames the read
 accepted as a successful transfer but whose status word lost its fixed marker bits
 (bits 23:20, always `1100` per the datasheet) -- a bit-misaligned or corrupted read
-that a clean transaction can't catch on its own. Any of the three above zero is a
-hardware or timing fault, not a software one. Read errors and bad status are each
-logged one in two thousand: a stuck bus fails every frame, and logging each would
-drown the link.
+that a clean transaction can't catch on its own. `recoveries` counts warm recoveries
+of a chip the pipeline declared dead. Any of them climbing is a hardware or timing
+fault.
 
 ## 4. Do the electrodes work?
 
@@ -124,16 +136,19 @@ as lead-off. Check contact and impedance, not the code.
 
 Only now is it worth looking at predictions.
 
-Two known gaps make this the step most likely to disappoint, and neither is a bug you can
+Two things make this the step most likely to disappoint, and neither is a bug you can
 find by reading the log:
 
-**Preprocessing.** The model was trained on windows produced by `emg-gesture-class
-export`, which is not in this repository. `src/adc/preprocess.rs` has to repeat whatever
-that tool did to the raw signal: units, filtering, per-channel normalisation. Right now
-it assumes the simplest chain, code to microvolts to int8, and nothing else. If the
-exporter high-passed its input and this does not, the model sees a baseline offset it
-has never seen before, and the predictions will be poor for a reason no error message
-will mention. Get the exact command and flags from whoever ran the export.
+**Preprocessing.** The training windows are dimensionless and unit-variance, so the
+model's `input_scale` is normalised units per count and not microvolts per count.
+`src/adc/preprocess.rs` and `src/adc/conditioning.rs` are what put a live sample on
+that footing: sign-extended code, to microvolts, through a direct-current blocker
+that removes the electrode offset and a per-channel amplitude tracker, and only then
+to int8. Both modules document the measurement behind every constant, and
+[engineering log 0016](../engineering-logs/0016-input-conditioning-units-and-direct-current.md)
+records how the unit error was found. Read them before adjusting anything in that
+chain: the failure mode is silent, since a mis-scaled input saturates and the
+predictions go poor with no error message.
 
 **Rate.** The ADCs run at 2000 Hz. The model was trained at 2048 Hz. That is a 2.3 %
 stretch in the time base, small enough to be harmless and large enough to be worth
@@ -149,6 +164,6 @@ model.
 ## What to write down
 
 For each step: what you set, what you saw, and the exact log line. The two numbers worth
-recording are the SPI clock at which `dropped` first stayed at zero, and the test-signal
-amplitude you measured against the datasheet figure. Both are cheap to note now and
-tedious to recover later.
+recording are each chip's steady `missing` count at the shipped 8 MHz frame clock, and
+the test-signal amplitude you measured against the datasheet figure. Both are cheap to
+note now and tedious to recover later.
