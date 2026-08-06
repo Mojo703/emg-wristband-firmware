@@ -62,10 +62,15 @@ const CHIP_SELECT_GAP_MICROSECONDS: u32 = 5;
 /// `high_resolution` below and this number follows.
 ///
 /// It comes out at 2000 SPS nominal from the internal 2.048 MHz oscillator, and
-/// each chip misses it by its own oscillator error (±0.5% at 25 °C). The model
-/// trained at 2048 Hz, so the time base is 2.3% slow — the price of self-clocking,
-/// accepted when CLKSEL moved to 3V3; data collected for training rides the same
-/// path, so the next model absorbs it. See [`crate::adc::preprocess`].
+/// each chip misses it by its own oscillator error (±0.5% at 25 °C).
+///
+/// **Training windows must be cut at this rate.** The model reads its 500 samples
+/// as a fixed span of time, so a window exported at any other rate arrives
+/// stretched or compressed, and every temporal feature it learned lands at the
+/// wrong scale. Nothing downstream can detect that: the tensor has the right
+/// shape either way, the accuracy loss looks like a bad model, and the export is
+/// in another repo. Check the exporter's rate against this constant before
+/// believing any on-device accuracy number. See [`crate::adc::preprocess`].
 pub(crate) const SAMPLE_RATE_HZ: u32 = {
     let config1 = device_config1();
     config1

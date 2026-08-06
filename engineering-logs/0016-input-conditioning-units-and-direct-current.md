@@ -48,7 +48,15 @@ footing `input_scale` describes.
 ### Why 0.5 Hz and not the usual 20 Hz
 
 Because the training data was never high-passed. Mean spectral magnitude by band,
-over 200 training windows at 2048 Hz:
+over 200 training windows:
+
+**The band edges below are wrong by a factor of about two.** These windows came
+from the exporter at 1000 Hz, not the 2048 Hz the axis assumes, so every label
+here reads about 2.05x too high: the row marked 45–55 Hz is really 22–27 Hz, and
+true mains sits in the row marked 65–150. The shape is unaffected — the spectrum
+still rises toward DC, which is the only thing the 0.5 Hz decision rests on — but
+do not quote these edges. Recompute on the correct axis before citing the table
+for anything else.
 
 ```text
    0 -   5 Hz   54.2
