@@ -72,6 +72,25 @@ enum Command {
         #[arg(long, default_value_t = 99.9)]
         percentile: f32,
     },
+    /// Score windows from an `.npy` file with a trained checkpoint, writing logits.
+    /// Lets an outside caller — a session-evaluation script, a sweep — reach the
+    /// same inference path the dashboard uses without linking this crate.
+    ScoreWindows {
+        #[arg(long, default_value = "models/gesture-classifier-v1.safetensors")]
+        checkpoint: PathBuf,
+        /// Input windows, float32 `[windows, channels, time]`.
+        #[arg(long)]
+        input: PathBuf,
+        /// Output logits, float32 `[windows, num_classes]`.
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long, default_value_t = 16)]
+        channels: usize,
+        #[arg(long, default_value_t = 5)]
+        num_classes: usize,
+        #[arg(long, default_value_t = 256)]
+        batch_size: usize,
+    },
     /// Pose-regression pretrain the encoder on emg2pose; save a checkpoint.
     Pretrain {
         #[arg(long, default_value = "data")]
@@ -181,6 +200,74 @@ fn accuracy_on_indices(
             .count();
     }
     Ok(correct as f32 / indices.len() as f32)
+}
+
+fn run_score_windows(
+    checkpoint: PathBuf,
+    input: PathBuf,
+    out: PathBuf,
+    channels: usize,
+    num_classes: usize,
+    batch_size: usize,
+) -> Result<()> {
+    use anyhow::Context;
+    let device = select_device()?;
+    let windows: ndarray::Array3<f32> =
+        ndarray_npy::read_npy(&input).with_context(|| format!("read {}", input.display()))?;
+    let (count, window_channels, time) = windows.dim();
+    anyhow::ensure!(
+        window_channels == channels,
+        "input has {window_channels} channels, model expects {channels}"
+    );
+
+    let var_map = VarMap::new();
+    let var_builder = VarBuilder::from_varmap(&var_map, DType::F32, &device);
+    let model = TdsNet::new(Config::classify(channels, num_classes), var_builder)?;
+    let tensors = candle_core::safetensors::load(&checkpoint, &device)
+        .with_context(|| format!("load checkpoint {}", checkpoint.display()))?;
+    let loaded = {
+        let vars = var_map.data().lock().unwrap();
+        let mut loaded = 0usize;
+        for (name, var) in vars.iter() {
+            if let Some(tensor) = tensors.get(name) {
+                var.set(tensor)?;
+                loaded += 1;
+            }
+        }
+        loaded
+    };
+    anyhow::ensure!(
+        loaded > 0,
+        "checkpoint shares no variable names with the model"
+    );
+    println!("loaded {loaded} variables; scoring {count} windows of {time} samples");
+
+    let flat = windows
+        .as_standard_layout()
+        .into_owned()
+        .into_raw_vec_and_offset()
+        .0;
+    let stride = channels * time;
+    let mut logits = Vec::with_capacity(count * num_classes);
+    for start in (0..count).step_by(batch_size) {
+        let end = (start + batch_size).min(count);
+        let batch = Tensor::from_slice(
+            &flat[start * stride..end * stride],
+            (end - start, 1, channels, time),
+            &device,
+        )?;
+        logits.extend(
+            model
+                .forward(&batch, false)?
+                .flatten_all()?
+                .to_vec1::<f32>()?,
+        );
+    }
+
+    let array = ndarray::Array2::from_shape_vec((count, num_classes), logits)?;
+    ndarray_npy::write_npy(&out, &array).with_context(|| format!("write {}", out.display()))?;
+    println!("wrote {}", out.display());
+    Ok(())
 }
 
 fn run_pretrain(
@@ -616,6 +703,14 @@ fn main() -> Result<()> {
             println!("forward-test OK");
             Ok(())
         }
+        Command::ScoreWindows {
+            checkpoint,
+            input,
+            out,
+            channels,
+            num_classes,
+            batch_size,
+        } => run_score_windows(checkpoint, input, out, channels, num_classes, batch_size),
         Command::Pretrain {
             data_dir,
             epochs,

@@ -13,3 +13,6 @@ documentation/
 .idea/
 # Python virtual environments (e.g. pose-service/.venv).
 .venv/
+
+# Python bytecode from the emg-tds analysis scripts.
+__pycache__/
