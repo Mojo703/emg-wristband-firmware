@@ -269,7 +269,7 @@ pub(crate) fn start(
             .name("adc-combine".into())
             .stack_size(THREAD_STACK_BYTES)
             .spawn(move || {
-                set_current_thread_priority(THREAD_PRIORITY);
+                crate::cores::set_current_thread_priority(THREAD_PRIORITY);
                 info!("combiner running");
                 combine(
                     events,
@@ -448,13 +448,5 @@ fn combine(
                 }
             }
         }
-    }
-}
-
-/// Raises the calling thread's FreeRTOS priority. `std::thread` gives every thread the
-/// esp-idf default, which is below the wifi task and equal to the main loop.
-pub(super) fn set_current_thread_priority(priority: u8) {
-    unsafe {
-        esp_idf_svc::sys::vTaskPrioritySet(std::ptr::null_mut(), priority as u32);
     }
 }

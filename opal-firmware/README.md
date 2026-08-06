@@ -37,12 +37,13 @@ fault campaign had characterised.
 The cost is a time base 2.3% slow against the 2048 Hz the model trained at, and
 two oscillators that are *not* phase-locked: the inter-chip offset wanders
 within one sample period and wraps when the faster chip laps the slower one, at
-which point acquisition drops the surplus frame and counts a `clock_slip`. The
-pairing stays honest on two grounds — the skew is bounded to under one sample,
-and training data is collected through this same pipeline, so the skew
-statistics at inference existed in training. `src/adc/preprocess.rs` carries
-the full argument. Either chip can be reset, wedged, or power-cycled without
-the other losing its time base.
+which point the grid aligner drops the surplus frame and counts a
+`surplus_dropped` against that chip (`emg-runtime`'s `alignment` module; the
+counters ride telemetry). The pairing stays honest on two grounds — the skew is
+bounded to under one sample, and training data is collected through this same
+pipeline, so the skew statistics at inference existed in training.
+`src/adc/preprocess.rs` carries the full argument. Either chip can be reset,
+wedged, or power-cycled without the other losing its time base.
 
 ### Per-chip START pins, independent recovery
 
@@ -89,6 +90,11 @@ no wire (it ties to ground at the board), and the CLK lane carries PWDN,
 breaking out to J11. The pin map block in `src/main.rs` is the authoritative
 wiring table.
 
+The feedback outputs sit on the pins the front end leaves free: the DRV2605L
+haptics breakout on GP17 (I2C data) and GP18 (I2C clock), and the Zero's onboard
+addressable LED on GP21. Both are optional at run time — a device with neither
+attached logs the failure and runs the same.
+
 ## Building and flashing
 
 This crate targets Xtensa and needs the esp toolchain; the one-time setup lives in
@@ -106,8 +112,9 @@ recording, since an empty `wifi_ssid` boots the device into the USB serial link.
 
 ## On-device tests
 
-The unit tests (`link_policy`, and the ADC decode, lead-off, conversion and
-preprocessing modules) run on the device, because the crate only builds for Xtensa:
+The unit tests (`link_policy`, `feedback`, and the ADC decode, lead-off, conversion
+and preprocessing modules) run on the device, because the crate only builds for
+Xtensa:
 
 ```sh
 cargo test-device

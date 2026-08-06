@@ -384,6 +384,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "drv2605l"
+version = "0.1.0"
+dependencies = [
+ "embedded-hal 1.0.0",
+ "embuild",
+]
+
+[[package]]
 name = "either"
 version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1064,6 +1072,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "ciborium",
+ "drv2605l",
+ "embedded-hal 1.0.0",
  "embuild",
  "emg-runtime",
  "esp-idf-svc",

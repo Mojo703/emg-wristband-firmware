@@ -23,6 +23,26 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Instant;
 
+/// Which link is carrying the stream right now.
+///
+/// [`Links::send_window`]'s routing rule as a value, so anything reacting to the link
+/// reads the same fact the data follows rather than a second copy of the rule. A
+/// level, not an edge: callers wanting transitions diff it themselves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActiveLink {
+    None,
+    Serial,
+    Wifi,
+}
+
+impl ActiveLink {
+    /// Whether the stream is going anywhere. Which link is a development fact — a
+    /// wearer only ever has wifi — so anything facing them asks this instead.
+    pub fn is_connected(self) -> bool {
+        self != ActiveLink::None
+    }
+}
+
 /// Owns both dashboard links and routes the stream over the active one.
 pub struct Links {
     serial: SerialTransport,
@@ -219,6 +239,23 @@ impl Links {
             .is_some_and(|transport| !transport.alive_handle().load(Ordering::SeqCst))
         {
             self.tcp = None;
+        }
+    }
+
+    /// The link the next window would go out on, by [`Self::send_window`]'s own rule.
+    ///
+    /// A TCP transport dialed while serial held the claim never reaches `self.tcp`
+    /// ([`Self::poll`] drops it on arrival), and a dead socket is cleared at the end
+    /// of `send_window`, which the serve loop calls every iteration even with nothing
+    /// to send. So this cannot name a link the stream is not using, and a link that
+    /// dies while idle still turns up here.
+    pub fn active_link(&self) -> ActiveLink {
+        if self.claim.is_claimed() {
+            ActiveLink::Serial
+        } else if self.tcp.is_some() {
+            ActiveLink::Wifi
+        } else {
+            ActiveLink::None
         }
     }
 

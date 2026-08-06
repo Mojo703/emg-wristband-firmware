@@ -26,6 +26,10 @@ debug = true
 [dependencies]
 emg-runtime = { path = "../emg-runtime" }
 protocol = { path = "../protocol" }
+# Default features are the crate's own bench binary and its esp-idf-svc/log/anyhow
+# dependencies; the driver itself is no_std over embedded-hal and wants none of them.
+drv2605l = { path = "../drv2605l", default-features = false }
+embedded-hal = "1"
 esp-idf-svc = "0.52"
 # Only for naming esp-idf-svc's config-string error type; keep in lockstep with it.
 heapless = "0.9"

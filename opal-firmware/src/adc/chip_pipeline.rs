@@ -623,7 +623,7 @@ pub(super) fn spawn(
             .name(format!("adc{index}"))
             .stack_size(THREAD_STACK_BYTES)
             .spawn(move || {
-                crate::adc::acquisition::set_current_thread_priority(THREAD_PRIORITY);
+                crate::cores::set_current_thread_priority(THREAD_PRIORITY);
                 let _power_down = power_down;
                 let started_us = now_us();
                 Pipeline {

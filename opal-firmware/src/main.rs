@@ -23,6 +23,7 @@
 mod adc;
 mod config;
 mod cores;
+mod feedback;
 mod frames;
 mod link_policy;
 mod links;
@@ -45,9 +46,10 @@ use esp_idf_svc::hal::delay::FreeRtos;
 use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::hal::usb_serial::{UsbSerialConfig, UsbSerialDriver};
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
+use feedback::{DeviceState, Feedback, FeedbackWiring, FrontEnd};
 use links::Links;
 use log::{error, info, warn};
-use protocol::{Frame, WakeState};
+use protocol::{Frame, MediaKey, WakeState};
 use std::time::Instant;
 use transport::{Control, SerialTransport};
 
@@ -93,6 +95,16 @@ const IDLE_POLL_MS: u32 = 5;
 /// How long the front end may stay silent before the loop says so. Long enough that
 /// normal jitter never trips it, short enough to notice a stalled ADC quickly.
 const STALL_WARNING_MS: u128 = 1000;
+
+/// How long windows must arrive unbroken before a stalled front end counts as running
+/// again.
+///
+/// Both the stall and the recovery are announced to the wearer, so a front end that
+/// flaps buzzes them through the pair every cycle — and it does flap:
+/// `adc::chip_pipeline` measured ~2 warm recoveries per second on the bench. This
+/// changes neither the ADC nor the log, only how long the device waits before saying
+/// the trouble is over.
+const RECOVERY_SETTLE_MS: u128 = 3000;
 
 /// Batches between inference-performance telemetry reports (~4 s at the 244 ms
 /// window period, since a batch is normally one window). Telemetry never touches
@@ -312,11 +324,12 @@ fn main() -> anyhow::Result<()> {
     // wires, DAISY_IN gap intact: 1=DRDY, 2=MISO, GP3 empty, 4=SCLK, 5=CS,
     // 6=START, 42=PWDN, 41=RESET, 40=MOSI.
     //
-    // GP3/GP43/GP39 are spare; GP17/GP18 are reserved for the haptics I2C
-    // (SDA/SCL); GP45 (strapping) and GP38 stay unused by design, and the
-    // onboard RGB LED sits on GP21. USB-Serial-JTAG above claims GPIO 19 and 20
-    // internally. The chips' own GPIO pins are tied to GND (SBAS459K forbids
-    // floating them).
+    // GP3/GP43/GP39 are spare; GP45 (strapping) and GP38 stay unused by design.
+    // USB-Serial-JTAG above claims GPIO 19 and 20 internally. The chips' own GPIO
+    // pins are tied to GND (SBAS459K forbids floating them). The feedback outputs
+    // take GP17/GP18 (haptics I2C data and clock) and GP21 (the onboard
+    // addressable LED); their block is below, before ADC bring-up, so the LED is
+    // lit through the front end's settling delays.
     // ---------------------------------------------------------------------------
     // Pads 39-42 come out of reset owned by JTAG (IO_MUX F0 = MTCK/MTDO/MTDI/MTMS;
     // MTDI and MTMS are input-only there, so a GPIO "output" never reaches the
@@ -357,6 +370,16 @@ fn main() -> anyhow::Result<()> {
             data_ready: peripherals.pins.gpio1.into(),
         },
     ];
+
+    // The wearer's own view of the device. Started before the ADC because bring-up
+    // below blocks ~2.5 s on the ADS1298's settling delays, and a device showing
+    // nothing for the first two and a half seconds of every boot looks broken.
+    let mut feedback = Feedback::start(FeedbackWiring {
+        bus: peripherals.i2c0,
+        haptics_data: peripherals.pins.gpio17.into(),
+        haptics_clock: peripherals.pins.gpio18.into(),
+        indicator: peripherals.pins.gpio21.into(),
+    });
 
     // Normalised units per count, not microvolts per count; `adc::conditioning`
     // documents the difference and the acquisition path is what puts the signal on
@@ -413,6 +436,16 @@ fn main() -> anyhow::Result<()> {
     let mut performance = InferencePerformance::default();
     let mut last_window_at = Instant::now();
     let mut stall_reported = false;
+    // What the feedback outputs are told. The silence branch below sets `Stalled`;
+    // clearing it takes RECOVERY_SETTLE_MS of unbroken windows.
+    let mut front_end = if source.is_some() {
+        FrontEnd::Running
+    } else {
+        FrontEnd::Failed
+    };
+    let mut steady_since: Option<Instant> = None;
+    let mut config_generation: u32 = 0;
+    let mut committed: Option<MediaKey> = None;
 
     loop {
         unsafe {
@@ -425,6 +458,7 @@ fn main() -> anyhow::Result<()> {
         for control in links.poll(&device_id, &settings) {
             config_changed |= apply_control(control, &mut settings, &mut pipeline, &store);
         }
+        config_generation += u32::from(config_changed);
 
         // One batch of work: every window acquisition has ready, oldest first.
         // Usually that is exactly one — the ADCs produce one every ~250 ms and this
@@ -458,8 +492,18 @@ fn main() -> anyhow::Result<()> {
                         source.recoveries()
                     );
                     stall_reported = true;
+                    front_end = FrontEnd::Stalled;
+                    steady_since = None;
                 }
             }
+            feedback.observe(DeviceState {
+                front_end,
+                link: links.active_link(),
+                // A held commit stays held: only a decision ends one, and there is
+                // none this iteration.
+                committed,
+                config_generation,
+            });
             // No window to send, but logger::drain() only runs inside send_window,
             // so this is also what flushes buffered logs (e.g. ADS1298 bring-up
             // checkpoints) to the dashboard while the ADC is silent.
@@ -469,6 +513,13 @@ fn main() -> anyhow::Result<()> {
         };
         last_window_at = Instant::now();
         stall_reported = false;
+        if front_end == FrontEnd::Stalled {
+            let steady_for = steady_since.get_or_insert(last_window_at).elapsed();
+            if steady_for.as_millis() >= RECOVERY_SETTLE_MS {
+                front_end = FrontEnd::Running;
+                steady_since = None;
+            }
+        }
         // The batch is never empty (checked above), and its last window is the
         // newest: inference reads it through the persistent input tensor rather than
         // allocating one.
@@ -536,6 +587,16 @@ fn main() -> anyhow::Result<()> {
             provenance: provenance::device(),
         });
         links.send_window(hello.as_ref(), &decision_frames);
+        // The same fact `frames::events` puts on the wire, named by its binding
+        // rather than its class index.
+        committed =
+            (decision.wake_state == WakeState::Active).then(|| settings.key_for(decision.argmax));
+        feedback.observe(DeviceState {
+            front_end,
+            link: links.active_link(),
+            committed,
+            config_generation,
+        });
         performance.record(
             infer_us,
             infer_start.elapsed().as_micros() as u64,

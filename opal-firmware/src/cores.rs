@@ -22,13 +22,14 @@
 //!   (`CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0`), chip A's pipeline thread, the
 //!   wifi link-management thread, TCP transport readers, and esp-idf's
 //!   housekeeping tasks (timers, events), which default there.
-//! - **Core 0**, continued: the combiner (below the pipelines in priority).
+//! - **Core 0**, continued: the combiner (below the pipelines in priority), the
+//!   feedback thread, and chip A's SPI host completion interrupt — allocated
+//!   wherever `build_front_end` runs, which for chip A is the main task.
 //! - **Core 1**: the shared GPIO interrupt dispatcher — both chips' frame reads —
-//!   plus chip B's pipeline thread and both chips' SPI host completion
-//!   interrupts, which now serve only command-path traffic (bring-up, warm
-//!   recovery) and are idle in steady state. Nothing else: the dispatcher's
-//!   latency is both chips' edge-service latency, so this core stays free of
-//!   bulk work.
+//!   plus chip B's pipeline thread and chip B's SPI host completion interrupt,
+//!   which now serves only command-path traffic (bring-up, warm recovery) and is
+//!   idle in steady state. Nothing else: the dispatcher's latency is both chips'
+//!   edge-service latency, so this core stays free of bulk work.
 
 use esp_idf_svc::hal::cpu::Core;
 use esp_idf_svc::hal::task::thread::ThreadSpawnConfiguration;
@@ -66,6 +67,46 @@ pub(crate) const WIFI_LINK_MANAGEMENT_CORE: Core = Core::Core0;
 
 /// TCP transport read loops, beside lwIP.
 pub(crate) const TCP_READER_CORE: Core = Core::Core0;
+
+/// The haptics and indicator-LED outputs. Core 0 because the I2C and RMT drivers
+/// allocate their interrupts on whichever core constructs them, and core 1's budget
+/// is the dispatcher's edge-service latency.
+pub(crate) const FEEDBACK_CORE: Core = Core::Core0;
+
+/// Above the main loop so a cue is not stuck behind a 126 ms inference, far below
+/// the combiner's 9. Both ends were assumptions until measured — `ESP_TASK_MAIN_PRIO`
+/// is 1, the pthread default is 5 — so [`log_thread_priority`] prints the real
+/// numbers every boot.
+pub(crate) const FEEDBACK_THREAD_PRIORITY: u8 = 5;
+
+/// Raises the calling thread's FreeRTOS priority.
+pub(crate) fn set_current_thread_priority(priority: u8) {
+    unsafe {
+        esp_idf_svc::sys::vTaskPrioritySet(std::ptr::null_mut(), priority as u32);
+    }
+}
+
+/// Logs the calling thread's core and FreeRTOS priority under `role`.
+///
+/// Priority is what decides who waits for whom on a shared core, and this firmware
+/// has three threads picking numbers relative to "the main loop's default". Printing
+/// the real ones costs a log line per boot and turns that phrase into something a
+/// boot log can be checked against.
+pub(crate) fn log_thread_priority(role: &str) {
+    let priority = unsafe { esp_idf_svc::sys::uxTaskPriorityGet(std::ptr::null_mut()) };
+    let core = unsafe { esp_idf_svc::sys::xTaskGetCoreID(std::ptr::null_mut()) };
+    log::info!("{role}: core {core}, priority {priority}");
+}
+
+/// Logs how much of the calling thread's stack has never been touched.
+///
+/// The mark is the deepest the stack has ever been, so calling this after a thread's
+/// driver construction turns its `stack_size` constant into a measurement. Worth the
+/// line: an overflow presents as an unexplained reboot, not as an error.
+pub(crate) fn log_stack_headroom(role: &str) {
+    let unused = unsafe { esp_idf_svc::sys::uxTaskGetStackHighWaterMark(std::ptr::null_mut()) };
+    log::info!("{role}: {unused} bytes of stack never used");
+}
 
 /// Runs `spawn` with the process-wide thread-spawn configuration pinned to
 /// `core`, restoring the unpinned default afterwards. Everything a thread
