@@ -83,12 +83,12 @@ def main():
     prepared = []
     for name, arm in names:
         directory = SESSIONS / name
-        manifest, samples, times, cues, count = load_session(directory)
+        manifest, samples, times, device, cues, count = load_session(directory)
         if set(manifest["class_ids"]) - set(CLASS_TO_LABEL):
             continue
-        slope, intercept, residual = time_map(times, count)
+        to_sample, _ = time_map(times, device, count)
         conditioned = per_chip_reference(samples)
-        windows, labels = cut_windows(conditioned, cues, slope, intercept)
+        windows, labels = cut_windows(conditioned, cues, to_sample)
         prepared.append((name, arm, windows, labels))
         print(f"{name}: {len(windows)} windows, arm {arm}")
 

@@ -42,39 +42,54 @@ def load_session(directory):
     raw = raw[: count * per].reshape(count, CHANNELS, SAMPLES_PER_WINDOW_RECORD)
     samples = raw.transpose(1, 0, 2).reshape(CHANNELS, -1).astype(np.float64) * scale
 
-    times, cues = [], []
+    windows, device, cues = [], [], []
     for line in (directory / "events.jsonl").read_text().splitlines():
         if not line.strip():
             continue
         event = json.loads(line)
         if event["type"] == "emg_window":
-            times.append(event["at"])
+            windows.append(event["at"])
+            device.append(event["t0_us"])
         elif event["type"] == "cue" and not event.get("interrupted"):
             cues.append(event)
-    return manifest, samples, np.array(times, float), cues, count
+    return (manifest, samples, np.array(windows, dtype=float),
+            np.array(device, dtype=float), cues, count)
 
 
-def time_map(times, count):
-    """Map backend milliseconds to sample index along the delivery envelope.
+def time_map(host_milliseconds, device_microseconds, window_count):
+    """Map backend milliseconds to sample index through the device clock.
 
-    Windows are written in event order with no gaps, so event k starts at sample
-    k * 500 exactly. The host arrival stamps are the noisy side: a window can be
-    delivered late but never early, so the jitter is one-sided and least squares
-    is biased by it. Fitting the upper envelope of index against arrival time
-    recovers the undelayed clock instead.
+    A window is sent only once it has filled, so an arrival stamp marks its last
+    sample. That shift is constant, so a fit of arrival against t0 absorbs it
+    invisibly and it has to be applied by hand. Transport delay is one-sided, so
+    the undelayed relation is the lower envelope of arrival against device time;
+    the trimming converges on it while keeping a third of the points.
     """
-    usable = min(len(times), count)
-    times = times[:usable]
-    indices = np.arange(usable, dtype=float) * SAMPLES_PER_WINDOW_RECORD
+    usable = min(len(host_milliseconds), len(device_microseconds), window_count)
+    host = host_milliseconds[:usable]
+    window_milliseconds = SAMPLES_PER_WINDOW_RECORD / DEVICE_RATE * 1000.0
+    window_end = device_microseconds[:usable] / 1000.0 + window_milliseconds
+
     keep = np.ones(usable, bool)
-    for _ in range(6):
-        slope, intercept = np.polyfit(times[keep], indices[keep], 1)
-        residual = indices - (slope * times + intercept)
-        keep = residual >= np.percentile(residual[keep], 60.0)
-        if keep.sum() < 8:
+    for _ in range(4):
+        slope, intercept = np.polyfit(window_end[keep], host[keep], 1)
+        delay = host - (slope * window_end + intercept)
+        candidate = delay <= np.percentile(delay[keep], 50.0)
+        if candidate.sum() < max(8, usable // 3):
             break
-    residual = indices - (slope * times + intercept)
-    return slope, intercept, float(np.std(residual[keep]))
+        keep = candidate
+    slope, intercept = np.polyfit(window_end[keep], host[keep], 1)
+
+    window_zero_start = device_microseconds[0] / 1000.0
+    per_millisecond = DEVICE_RATE / 1000.0
+
+    def to_sample(host_time):
+        return ((host_time - intercept) / slope
+                - window_zero_start) * per_millisecond
+
+    residual_milliseconds = float(
+        np.std(host[keep] - (slope * window_end[keep] + intercept)))
+    return to_sample, residual_milliseconds
 
 
 def per_chip_reference(x):
@@ -91,8 +106,7 @@ def per_chip_reference(x):
 
 
 def features(block):
-    """Log power per channel per band — the standard sEMG feature, and the one a
-    noise-dominated recording should still expose if any muscle signal exists."""
+    """Log power per channel per band, the standard sEMG feature."""
     freqs, density = signal.welch(block, fs=DEVICE_RATE, nperseg=256, axis=-1)
     out = []
     for low, high in FEATURE_BANDS:
@@ -105,7 +119,7 @@ def features(block):
     return np.concatenate(out)
 
 
-def build(samples, cues, slope, intercept, class_to_label, reference):
+def build(samples, cues, to_sample, class_to_label, reference):
     if reference:
         samples = per_chip_reference(samples)
     rows, labels, groups = [], [], []
@@ -113,8 +127,8 @@ def build(samples, cues, slope, intercept, class_to_label, reference):
         label = class_to_label.get(cue["class_id"])
         if label is None:
             continue
-        start = int(slope * cue["at"] + intercept)
-        stop = int(slope * cue["release"] + intercept)
+        start = int(to_sample(cue["at"]))
+        stop = int(to_sample(cue["release"]))
         if start < 0 or stop > samples.shape[1] or stop - start < WINDOW_SAMPLES:
             continue
         held = samples[:, start:stop]
@@ -144,15 +158,20 @@ def predict(weights, x):
     return (np.hstack([x, np.ones((len(x), 1))]) @ weights).argmax(axis=1)
 
 
+def permuted_labels(y, groups, rng):
+    """Relabel at the cue level, so window structure is preserved."""
+    unique = np.unique(groups)
+    cue_label = {g: y[groups == g][0] for g in unique}
+    shuffled = rng.permutation(list(cue_label.values()))
+    mapping = dict(zip(cue_label.keys(), shuffled))
+    return np.array([mapping[g] for g in groups])
+
+
 def cross_validate(x, y, groups, classes, rng, permute=False):
     unique = np.unique(groups)
     order = rng.permutation(unique)
     if permute:
-        # permute labels at the cue level, preserving the window structure
-        cue_label = {g: y[groups == g][0] for g in unique}
-        shuffled = rng.permutation(list(cue_label.values()))
-        mapping = dict(zip(cue_label.keys(), shuffled))
-        y = np.array([mapping[g] for g in groups])
+        y = permuted_labels(y, groups, rng)
     correct = total = 0
     for fold in range(FOLDS):
         held = set(order[fold::FOLDS])
@@ -179,14 +198,14 @@ def main():
     rng = np.random.default_rng(0)
     for name in names:
         directory = SESSIONS / name
-        manifest, samples, times, cues, count = load_session(directory)
+        manifest, samples, times, device, cues, count = load_session(directory)
         class_ids = manifest["class_ids"]
         class_to_label = {c: i for i, c in enumerate(class_ids)}
-        slope, intercept, residual = time_map(times, count)
+        to_sample, residual_milliseconds = time_map(times, device, count)
         print(f"\n=== {name} ===")
         print(f"  classes: {', '.join(class_ids)}")
         for reference in (False, True):
-            x, y, groups = build(samples, cues, slope, intercept, class_to_label, reference)
+            x, y, groups = build(samples, cues, to_sample, class_to_label, reference)
             if len(x) == 0 or len(np.unique(y)) < 2:
                 print("  too few labelled windows")
                 break
@@ -200,7 +219,7 @@ def main():
             print(f"  {tag}  {accuracy*100:5.1f}%   null {null.mean()*100:4.1f}% "
                   f"+/- {null.std()*100:.1f}   p = {p:.3f}   "
                   f"({len(x)} windows, {len(np.unique(groups))} cues, "
-                  f"align {residual/DEVICE_RATE*1000:.0f} ms)")
+                  f"align {residual_milliseconds:.1f} ms)")
 
 
 if __name__ == "__main__":

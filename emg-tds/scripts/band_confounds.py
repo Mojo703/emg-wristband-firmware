@@ -21,13 +21,20 @@ them apart.
   this predicts the class, the recording is being read through its own failures.
 - **cross-session** — train on one session, test on another from the same subject
   and class set. This is the one the product actually needs, because the band is
-  re-donned between sessions.
+  re-donned between sessions. Scored per cue as well as per window, since windows
+  inside a cue are not independent.
+
+Whether the signal is myoelectric at all is not asked here. That comparison — the
+20-450 Hz band against a >500 Hz control where surface EMG cannot exist — belongs
+to `verify_front_end_fix.py`, which fixes its thresholds in advance and gives both
+bands the same number of features.
 
 Usage:
     python3 scripts/band_confounds.py
 """
 
 import sys
+from math import comb
 from pathlib import Path
 
 import numpy as np
@@ -37,20 +44,24 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from band_learnability import (  # noqa: E402
     CHANNELS, DEVICE_RATE, FOLDS, SESSIONS, WINDOW_SAMPLES, WINDOW_STRIDE,
     cross_validate, fit_logistic, load_session, per_chip_reference, predict,
-    time_map,
+    permuted_labels, time_map,
 )
 
-PERMUTATIONS = 40
+PERMUTATIONS = 100
 HIGH_BAND = [(150, 250), (250, 350), (350, 450)]
 FULL_BAND = [(20, 60), (60, 100), (100, 200), (200, 450)]
 
 
 def features(block, bands):
     freqs, density = signal.welch(block, fs=DEVICE_RATE, nperseg=256, axis=-1)
+    # Harmonics are counted from the first one: rounding to the nearest multiple
+    # of 60 sends everything under 30 Hz to a 0 Hz harmonic that does not exist.
+    harmonic = np.maximum(np.round(freqs / 60.0), 1.0) * 60.0
+    away_from_mains = np.abs(freqs - harmonic) > 12.0
     out = []
     for low, high in bands:
         mask = (freqs >= low) & (freqs < high)
-        keep = mask & (np.abs(freqs - np.round(freqs / 60.0) * 60.0) > 12.0)
+        keep = mask & away_from_mains
         if keep.sum() == 0:
             keep = mask
         out.append(np.log10(density[:, keep].mean(axis=-1) + 1e-12))
@@ -61,7 +72,7 @@ def saturation(block, scale):
     return np.mean(np.abs(block / scale) > 0.98 * 32768, axis=-1)
 
 
-def build(samples, cues, slope, intercept, class_map, bands, scale,
+def build(samples, cues, to_sample, class_map, bands, scale,
           offset_seconds=0.0, keep_channels=None, saturation_only=False):
     rows, labels, groups, starts = [], [], [], []
     shift = int(offset_seconds * DEVICE_RATE)
@@ -69,8 +80,8 @@ def build(samples, cues, slope, intercept, class_map, bands, scale,
         label = class_map.get(cue["class_id"])
         if label is None:
             continue
-        start = int(slope * cue["at"] + intercept) + shift
-        stop = int(slope * cue["release"] + intercept) + shift
+        start = int(to_sample(cue["at"])) + shift
+        stop = int(to_sample(cue["release"])) + shift
         if start < 0 or stop > samples.shape[1] or stop - start < WINDOW_SAMPLES:
             continue
         held = samples[:, start:stop]
@@ -98,7 +109,6 @@ def blocked_cross_validate(x, y, groups, starts, classes):
     for fold in range(FOLDS):
         test = np.zeros(len(x), bool)
         test[boundaries[fold]] = True
-        # drop training cues that share a group with any test window
         held_groups = set(groups[test])
         train = ~test & ~np.isin(groups, list(held_groups))
         if test.sum() == 0 or train.sum() < classes * 4:
@@ -113,12 +123,18 @@ def blocked_cross_validate(x, y, groups, starts, classes):
     return correct / max(total, 1)
 
 
-def null_distribution(x, y, groups, classes, count=PERMUTATIONS):
-    return np.array([
-        cross_validate(x, y, groups, classes, np.random.default_rng(500 + i),
-                       permute=True)
-        for i in range(count)
-    ])
+def null_distribution(x, y, groups, classes, starts=None, blocked=False,
+                      count=PERMUTATIONS):
+    """The null must come from the same splitter as the estimate it is compared to."""
+    out = []
+    for i in range(count):
+        rng = np.random.default_rng(500 + i)
+        if blocked:
+            out.append(blocked_cross_validate(
+                x, permuted_labels(y, groups, rng), groups, starts, classes))
+        else:
+            out.append(cross_validate(x, y, groups, classes, rng, permute=True))
+    return np.array(out)
 
 
 def report(name, x, y, groups, classes, label, starts=None, blocked=False):
@@ -129,20 +145,36 @@ def report(name, x, y, groups, classes, label, starts=None, blocked=False):
         accuracy = blocked_cross_validate(x, y, groups, starts, classes)
     else:
         accuracy = cross_validate(x, y, groups, classes, np.random.default_rng(1))
-    null = null_distribution(x, y, groups, classes)
-    p = float((null >= accuracy).mean())
+    null = null_distribution(x, y, groups, classes, starts=starts, blocked=blocked)
+    # (b + 1) / (n + 1): a permutation test cannot report a p below 1 / (n + 1).
+    p = float((np.sum(null >= accuracy) + 1) / (len(null) + 1))
     print(f"  {label:<26} {accuracy*100:5.1f}%   null {null.mean()*100:4.1f}"
-          f" +/- {null.std()*100:.1f}   p = {p:.3f}")
+          f" +/- {null.std()*100:.1f}   p {'=' if p > 1/(len(null)+1) else '<='} {p:.3f}")
     return accuracy
 
 
+def standardise(x):
+    """Each session by its own statistics: label-free, and deployable per wear."""
+    return (x - x.mean(axis=0)) / np.maximum(x.std(axis=0), 1e-8)
+
+
 def cross_session(first, second):
-    """Train on one session, test on another. The band is re-donned between."""
-    (xa, ya, _, _), (xb, yb, _, _) = first, second
+    """Train on one session, test on another. The band is re-donned between.
+
+    Standardising each session by its own statistics keeps a per-don feature
+    offset, which needs no labels to remove, out of the boundary being measured.
+    Scored per cue as well as per window, since windows in a cue are dependent.
+    """
+    (xa, ya, ga, _), (xb, yb, gb, _) = first, second
     classes = max(ya.max(), yb.max()) + 1
-    mean, deviation = xa.mean(axis=0), np.maximum(xa.std(axis=0), 1e-8)
-    weights = fit_logistic((xa - mean) / deviation, ya, classes)
-    return float((predict(weights, (xb - mean) / deviation) == yb).mean())
+    weights = fit_logistic(standardise(xa), ya, classes)
+    predicted = predict(weights, standardise(xb))
+    window = float((predicted == yb).mean())
+    cues = np.unique(gb)
+    votes = [np.bincount(predicted[gb == c], minlength=classes).argmax() for c in cues]
+    truth = [yb[gb == c][0] for c in cues]
+    correct = int(np.sum(np.array(votes) == np.array(truth)))
+    return window, correct, len(cues)
 
 
 def main():
@@ -154,11 +186,11 @@ def main():
     prepared = {}
     for name, _ in plan:
         directory = SESSIONS / name
-        manifest, samples, times, cues, count = load_session(directory)
+        manifest, samples, times, device, cues, count = load_session(directory)
         scale = manifest["hardware"]["scale_uv"]
         class_ids = manifest["class_ids"]
         class_map = {c: i for i, c in enumerate(class_ids)}
-        slope, intercept, _ = time_map(times, count)
+        to_sample, _ = time_map(times, device, count)
         classes = len(class_ids)
         referenced = per_chip_reference(samples)
         railed = np.mean(np.abs(samples / scale) > 0.98 * 32768, axis=1)
@@ -167,26 +199,26 @@ def main():
         print(f"\n=== {name} ===")
         print(f"  {int(live.sum())}/16 channels rail under 5% of the time")
 
-        base = build(referenced, cues, slope, intercept, class_map, FULL_BAND, scale)
+        base = build(referenced, cues, to_sample, class_map, FULL_BAND, scale)
         report(name, *base[:3], classes, "random cue folds", starts=base[3])
         report(name, *base[:3], classes, "time-blocked folds",
                starts=base[3], blocked=True)
 
-        offset = build(referenced, cues, slope, intercept, class_map, FULL_BAND,
+        offset = build(referenced, cues, to_sample, class_map, FULL_BAND,
                        scale, offset_seconds=6.0)
         report(name, *offset[:3], classes, "labels offset by 6 s",
                starts=offset[3])
 
-        high = build(referenced, cues, slope, intercept, class_map, HIGH_BAND, scale)
+        high = build(referenced, cues, to_sample, class_map, HIGH_BAND, scale)
         report(name, *high[:3], classes, "150-450 Hz only", starts=high[3])
 
         if live.sum() >= 4:
-            clean = build(referenced, cues, slope, intercept, class_map, FULL_BAND,
+            clean = build(referenced, cues, to_sample, class_map, FULL_BAND,
                           scale, keep_channels=np.flatnonzero(live))
             report(name, *clean[:3], classes, "non-railing channels only",
                    starts=clean[3])
 
-        sat = build(samples, cues, slope, intercept, class_map, FULL_BAND, scale,
+        sat = build(samples, cues, to_sample, class_map, FULL_BAND, scale,
                     saturation_only=True)
         report(name, *sat[:3], classes, "saturation pattern alone", starts=sat[3])
 
@@ -202,9 +234,13 @@ def main():
             (base_b, map_b, classes_b) = prepared[b]
             if map_a != map_b:
                 continue
-            accuracy = cross_session(base_a, base_b)
-            print(f"  train {a[11:19]} -> test {b[11:19]}: {accuracy*100:5.1f}% "
-                  f"(chance {100/classes_a:.0f}%)")
+            window, correct, cues = cross_session(base_a, base_b)
+            chance = 1.0 / classes_a
+            tail = sum(comb(cues, k) * chance**k * (1 - chance)**(cues - k)
+                       for k in range(correct, cues + 1))
+            shown = f"p < 0.001" if tail < 0.001 else f"p = {tail:.3f}"
+            print(f"  train {a[11:19]} -> test {b[11:19]}: {window*100:5.1f}% by window, "
+                  f"{correct}/{cues} cues (chance {100*chance:.0f}%, {shown})")
 
 
 if __name__ == "__main__":

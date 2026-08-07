@@ -59,39 +59,54 @@ def load_session(directory):
     raw = raw[: count * per_window].reshape(count, CHANNELS, SAMPLES_PER_WINDOW_RECORD)
     samples = raw.transpose(1, 0, 2).reshape(CHANNELS, -1).astype(np.float64) * scale
 
-    windows, cues = [], []
+    windows, device, cues = [], [], []
     for line in (directory / "events.jsonl").read_text().splitlines():
         if not line.strip():
             continue
         event = json.loads(line)
         if event["type"] == "emg_window":
             windows.append(event["at"])
+            device.append(event["t0_us"])
         elif event["type"] == "cue" and not event.get("interrupted"):
             cues.append(event)
-    return manifest, samples, np.array(windows, dtype=float), cues, count
+    return (manifest, samples, np.array(windows, dtype=float),
+            np.array(device, dtype=float), cues, count)
 
 
-def time_map(window_times, window_count):
-    """Map backend milliseconds to sample index along the delivery envelope.
+def time_map(host_milliseconds, device_microseconds, window_count):
+    """Map backend milliseconds to sample index through the device clock.
 
-    Windows are written to emg.i16 in event order with no gaps, so event k starts
-    at sample k * 500 exactly. The host arrival stamps are the noisy side: a
-    window can be delivered late but never early, so the jitter is one-sided and
-    least squares is biased by it. Fitting the upper envelope of index against
-    arrival time recovers the undelayed clock instead.
+    A window is sent only once it has filled, so an arrival stamp marks its last
+    sample. That shift is constant, so a fit of arrival against t0 absorbs it
+    invisibly and it has to be applied by hand. Transport delay is one-sided, so
+    the undelayed relation is the lower envelope of arrival against device time;
+    the trimming converges on it while keeping a third of the points.
     """
-    usable = min(len(window_times), window_count)
-    times = window_times[:usable]
-    indices = np.arange(usable, dtype=float) * SAMPLES_PER_WINDOW_RECORD
+    usable = min(len(host_milliseconds), len(device_microseconds), window_count)
+    host = host_milliseconds[:usable]
+    window_milliseconds = SAMPLES_PER_WINDOW_RECORD / DEVICE_RATE * 1000.0
+    window_end = device_microseconds[:usable] / 1000.0 + window_milliseconds
+
     keep = np.ones(usable, bool)
-    for _ in range(6):
-        slope, intercept = np.polyfit(times[keep], indices[keep], 1)
-        residual = indices - (slope * times + intercept)
-        keep = residual >= np.percentile(residual[keep], 60.0)
-        if keep.sum() < 8:
+    for _ in range(4):
+        slope, intercept = np.polyfit(window_end[keep], host[keep], 1)
+        delay = host - (slope * window_end + intercept)
+        candidate = delay <= np.percentile(delay[keep], 50.0)
+        if candidate.sum() < max(8, usable // 3):
             break
-    residual = indices - (slope * times + intercept)
-    return slope, intercept, float(np.std(residual[keep]))
+        keep = candidate
+    slope, intercept = np.polyfit(window_end[keep], host[keep], 1)
+
+    window_zero_start = device_microseconds[0] / 1000.0
+    per_millisecond = DEVICE_RATE / 1000.0
+
+    def to_sample(host_time):
+        return ((host_time - intercept) / slope
+                - window_zero_start) * per_millisecond
+
+    residual_milliseconds = float(
+        np.std(host[keep] - (slope * window_end[keep] + intercept)))
+    return to_sample, residual_milliseconds
 
 
 def per_chip_reference(x):
@@ -141,7 +156,7 @@ VARIANTS = {
 }
 
 
-def cut_windows(conditioned, cues, slope, intercept):
+def cut_windows(conditioned, cues, to_sample):
     """Cue-locked windows, each z-scored over its own hold interval.
 
     Hyser recordings are one second long and hold one gesture, so the export's
@@ -154,8 +169,8 @@ def cut_windows(conditioned, cues, slope, intercept):
         label = CLASS_TO_LABEL.get(cue["class_id"])
         if label is None:
             continue
-        start = int(slope * cue["at"] + intercept)
-        stop = int(slope * cue["release"] + intercept)
+        start = int(to_sample(cue["at"]))
+        stop = int(to_sample(cue["release"]))
         if start < 0 or stop > conditioned.shape[1] or stop - start < 2 * WINDOW_SAMPLES:
             continue
         held = conditioned[:, start:stop]
@@ -219,18 +234,17 @@ def main():
 
     for name in names:
         directory = SESSIONS / name
-        manifest, samples, window_times, cues, count = load_session(directory)
+        manifest, samples, window_times, device, cues, count = load_session(directory)
         if set(manifest["class_ids"]) - set(CLASS_TO_LABEL):
             print(f"\n{name}: class set does not match the checkpoint, skipping")
             continue
-        slope, intercept, residual = time_map(window_times, count)
+        to_sample, residual_milliseconds = time_map(window_times, device, count)
         print(f"\n=== {name} ===")
         print(f"  {samples.shape[1]/DEVICE_RATE:.0f} s, {len(cues)} cues, "
-              f"alignment residual {residual:.0f} samples "
-              f"({residual/DEVICE_RATE*1000:.0f} ms)")
+              f"alignment residual {residual_milliseconds:.1f} ms")
 
         for variant, transform in VARIANTS.items():
-            windows, labels = cut_windows(transform(samples), cues, slope, intercept)
+            windows, labels = cut_windows(transform(samples), cues, to_sample)
             if len(windows) == 0:
                 print(f"  {variant:<22} no usable windows")
                 continue

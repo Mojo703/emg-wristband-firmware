@@ -18,20 +18,21 @@ Usage:
     python3 scripts/layout_match.py
 """
 
-import json
 import os
 import re
+import sys
 from pathlib import Path
 
 import numpy as np
 from scipy import signal
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from band_learnability import load_session, time_map  # noqa: E402
+
 REPO = Path(__file__).resolve().parents[2]
 SESSIONS = REPO / "dashboard" / "sessions"
-# The raw Hyser set and the exporter that owns the layout list both live outside
-# this repo, so these are the one place a path has to be guessed. The environment
-# variables let a checkout laid out differently say where, rather than this file
-# hardcoding somebody else's home directory.
+# The raw Hyser set and the exporter that owns the layout list live outside this
+# repo, so a differently laid out checkout says where through the environment.
 HYSER = Path(os.environ.get(
     "HYSER_PR_DATASET",
     Path.home() / "Documents/Projects/siamese-testing/data/hyser/pr_dataset"))
@@ -43,7 +44,6 @@ GRID_NAMES = {0: "ED", 64: "EP", 128: "FD", 192: "FP"}
 HYSER_RATE = 2048.0
 DEVICE_RATE = 2000.0
 CHANNELS = 16
-SAMPLES_PER_WINDOW_RECORD = 500
 BANDS = [(20, 60), (60, 100), (100, 200), (200, 450)]
 
 # The five the band's later sessions cue, and their Hyser ids.
@@ -119,42 +119,17 @@ def hyser_profile(gesture_ids, subjects):
 
 
 def band_profile(name, class_map):
-    directory = SESSIONS / name
-    manifest = json.loads((directory / "session.json").read_text())
+    manifest, samples, times, device, cues, count = load_session(SESSIONS / name)
     scale = manifest["hardware"]["scale_uv"]
-    raw = np.fromfile(directory / "emg.i16", dtype="<i2")
-    per = CHANNELS * SAMPLES_PER_WINDOW_RECORD
-    count = raw.size // per
-    raw = raw[: count * per].reshape(count, CHANNELS, SAMPLES_PER_WINDOW_RECORD)
-    samples = raw.transpose(1, 0, 2).reshape(CHANNELS, -1).astype(np.float64) * scale
-
-    times, cues = [], []
-    for line in (directory / "events.jsonl").read_text().splitlines():
-        if not line.strip():
-            continue
-        event = json.loads(line)
-        if event["type"] == "emg_window":
-            times.append(event["at"])
-        elif event["type"] == "cue" and not event.get("interrupted"):
-            cues.append(event)
-    times = np.array(times, float)
-    usable = min(len(times), count)
-    indices = np.arange(usable, dtype=float) * SAMPLES_PER_WINDOW_RECORD
-    keep = np.ones(usable, bool)
-    for _ in range(6):
-        slope, intercept = np.polyfit(times[:usable][keep], indices[keep], 1)
-        residual = indices - (slope * times[:usable] + intercept)
-        keep = residual >= np.percentile(residual[keep], 60.0)
-        if keep.sum() < 8:
-            break
+    to_sample, _ = time_map(times, device, count)
 
     railed = np.mean(np.abs(samples / scale) > 0.98 * 32768, axis=1)
     rows, labels = [], []
     for cue in cues:
         if cue["class_id"] not in class_map:
             continue
-        start = int(slope * cue["at"] + intercept)
-        stop = int(slope * cue["release"] + intercept)
+        start = int(to_sample(cue["at"]))
+        stop = int(to_sample(cue["release"]))
         if start < 0 or stop > samples.shape[1] or stop - start < 1000:
             continue
         held = samples[:, start:stop]
