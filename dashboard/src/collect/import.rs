@@ -124,6 +124,7 @@ pub fn import_archive(archive_bytes: &[u8], tracks_root: &Path) -> anyhow::Resul
         beats_per_minute: (info.beats_per_minute * 100.0).round() / 100.0,
         levels,
         duration_ms,
+        rest: None,
     };
 
     let mut source_files = vec![

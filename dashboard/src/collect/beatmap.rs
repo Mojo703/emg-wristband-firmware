@@ -99,6 +99,10 @@ pub struct TrackEntry {
     pub duration_ms: u32,
     /// One ready-made schedule per difficulty level, keyed by level name.
     pub levels: std::collections::BTreeMap<String, LevelEntry>,
+    /// `"static"` or `"moving"` on the synthetic rest tracks; imported music
+    /// never carries this.
+    #[serde(default)]
+    pub rest: Option<String>,
 }
 
 /// One difficulty level's schedule for a track, as the ingest wrote it.
@@ -204,6 +208,7 @@ struct CatalogTrack {
     beats_per_minute: f64,
     levels: std::collections::BTreeMap<DifficultyLevel, CatalogLevel>,
     audio_path: PathBuf,
+    rest: Option<String>,
 }
 
 /// One level's loaded schedule: its cues and, keyed by column count, the column
@@ -345,6 +350,11 @@ impl TrackCatalog {
             .collect()
     }
 
+    /// `Some("static")` or `Some("moving")` when this track is a rest track.
+    pub fn rest_label(&self, track_id: &TrackId) -> Option<String> {
+        self.find(track_id).and_then(|track| track.rest.clone())
+    }
+
     /// A uniform grid at the map's tempo, for the browser's debug
     /// metronome — the clock the map's note times quantize to.
     pub fn beat_times(&self, track_id: &TrackId) -> Option<Vec<TrackMilliseconds>> {
@@ -387,6 +397,7 @@ fn load_track(directory: &Path) -> anyhow::Result<CatalogTrack> {
         beats_per_minute: entry.beats_per_minute,
         levels: load_levels(&entry)?,
         audio_path,
+        rest: entry.rest.clone(),
     })
 }
 
@@ -412,7 +423,8 @@ fn load_levels(
                 entry.id
             );
         };
-        if loaded.map_notes.len() < 2 {
+        // Only a rest track may be cueless.
+        if entry.rest.is_none() && loaded.map_notes.len() < 2 {
             anyhow::bail!(
                 "track {} has {} cues at {level}",
                 entry.id,
@@ -585,6 +597,7 @@ mod tests {
                     beats_per_minute: entry.beats_per_minute,
                     levels: load_levels(&entry)?,
                     audio_path: PathBuf::from(format!("/nonexistent/{}/audio.ogg", entry.id)),
+                    rest: entry.rest.clone(),
                 })
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
@@ -607,6 +620,7 @@ mod tests {
                 .map(|difficulty| (difficulty.to_string(), level.clone()))
                 .collect(),
             duration_ms,
+            rest: None,
         }
     }
 
@@ -1046,6 +1060,28 @@ mod tests {
     }
 
     #[test]
+    fn a_cueless_track_loads_only_as_a_rest_track() {
+        let mut entry = track_entry("rest-static", Vec::new(), 180_000);
+        assert!(catalog_of(vec![entry.clone()]).is_err());
+
+        entry.rest = Some("static".into());
+        let catalog = catalog_of(vec![entry]).unwrap();
+        assert_eq!(
+            catalog.rest_label(&TrackId("rest-static".into())),
+            Some("static".into())
+        );
+        let generated = catalog
+            .generate(
+                &TrackId("rest-static".into()),
+                &catalog.class_ids(),
+                DifficultyLevel::Medium,
+                7,
+            )
+            .unwrap();
+        assert!(generated.is_empty());
+    }
+
+    #[test]
     fn a_track_missing_a_level_is_refused() {
         let map_notes = one_note_per_cell();
         let level = LevelEntry {
@@ -1064,6 +1100,7 @@ mod tests {
             .into_iter()
             .collect(),
             duration_ms: 60_000,
+            rest: None,
         };
         assert!(catalog_of(vec![partial]).is_err());
     }

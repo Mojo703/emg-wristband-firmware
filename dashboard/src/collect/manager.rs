@@ -522,13 +522,14 @@ impl CollectionManager {
         // load-bearing: subscribing to the device starts buffering EMG, and
         // decoding a track takes seconds, so a subscription taken any earlier
         // hands the recorder seconds of windows that predate `session_start`.
-        let (track, class_ids, beatmap, beat_times, audio_path) = {
+        let (track, class_ids, beatmap, beat_times, audio_path, rest_label) = {
             let catalog = self.catalog.read().unwrap();
             let track = catalog
                 .tracks()
                 .into_iter()
                 .find(|track| track.id == track_id)
                 .ok_or_else(|| anyhow::anyhow!("unknown track '{track_id}'"))?;
+            let rest_label = catalog.rest_label(&track_id);
             let class_ids = catalog.class_ids();
             let seed = now().get();
             let beatmap = catalog.generate(&track_id, &class_ids, difficulty, seed)?;
@@ -536,7 +537,9 @@ impl CollectionManager {
             let audio_path = catalog
                 .audio_path(&track_id)
                 .ok_or_else(|| anyhow::anyhow!("track '{track_id}' has no audio"))?;
-            (track, class_ids, beatmap, beat_times, audio_path)
+            (
+                track, class_ids, beatmap, beat_times, audio_path, rest_label,
+            )
         };
 
         // Decoding a whole track and opening a device both block, so this runs
@@ -687,6 +690,7 @@ impl CollectionManager {
             recording_handle,
             beatmap,
             track,
+            rest_label,
             playback,
         );
         tokio::spawn(session.run());
@@ -974,6 +978,8 @@ struct RunningSession {
     recording_handle: Option<RecordingHandle>,
     cues: Vec<CueState>,
     track: TrackInfo,
+    /// `Some` on a rest track; the finalizer logs the played stretch.
+    rest_label: Option<String>,
     playback: Playback,
     /// The instant the subject heard audio t = 0, for the segment now playing.
     /// Read off the mixer's cursor when the track starts and re-derived on every
@@ -1003,6 +1009,7 @@ impl RunningSession {
         recording_handle: Option<RecordingHandle>,
         beatmap: Beatmap,
         track: TrackInfo,
+        rest_label: Option<String>,
         playback: Playback,
     ) -> Self {
         let cues = beatmap
@@ -1030,6 +1037,7 @@ impl RunningSession {
             recording_handle,
             cues,
             track,
+            rest_label,
             playback,
             anchor: None,
             last_window_at: None,
@@ -1572,6 +1580,17 @@ impl RunningSession {
             self.log_event(&SessionEvent::ArmedPrefix {
                 from: armed_at,
                 to: now(),
+            });
+        }
+
+        if let (Some(label), Some(anchor)) = (self.rest_label.clone(), self.anchor) {
+            let track_end =
+                anchor.at_track_position(TrackMilliseconds::new(self.track.duration.get()));
+            let to = track_end.min(now());
+            self.log_event(&SessionEvent::Rest {
+                label,
+                from: anchor,
+                to,
             });
         }
 

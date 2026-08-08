@@ -189,6 +189,13 @@ pub enum SessionEvent {
     },
     /// A placement photo was written.
     PlacementPhoto { at: UnixMilliseconds },
+    /// The played stretch of a rest track, `label` naming the regime
+    /// (`static` or `moving`).
+    Rest {
+        label: String,
+        from: UnixMilliseconds,
+        to: UnixMilliseconds,
+    },
     /// Last line of a completed session.
     SessionEnd {
         at: UnixMilliseconds,

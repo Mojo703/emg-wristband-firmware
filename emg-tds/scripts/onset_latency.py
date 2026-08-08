@@ -29,7 +29,8 @@ from band_learnability import (  # noqa: E402
     DEVICE_RATE, SESSIONS, load_session, per_chip_reference, time_map,
 )
 
-SESSION_NAMES = [
+# Sessions named on the command line, or the original three when none are.
+SESSION_NAMES = sys.argv[1:] or [
     "2026-08-04T14-22-07_Matthew",
     "2026-08-04T17-46-47_Matthew",
     "2026-08-04T22-02-50_Matthew",
