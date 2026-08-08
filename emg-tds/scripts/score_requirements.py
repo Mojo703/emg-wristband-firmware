@@ -27,6 +27,8 @@ CALIBRATION_CUES = 10
 NEEDED = 3
 # The spine latches late, so a commit this long after release still counts.
 GRACE_MILLISECONDS = 1000.0
+# --model sets this: score with a trained checkpoint instead of the stand-in.
+MODEL_CHECKPOINT = None
 
 
 class RejectPipelineReplica:
@@ -61,8 +63,10 @@ def softmax_rows(logits):
     return exponentials / exponentials.sum(axis=1, keepdims=True)
 
 
-def fit_session_classifier(referenced, cues, to_sample, class_index):
-    """Per-don calibration on the first cues of each class."""
+def fit_session_classifier(referenced, cues, to_sample, class_index,
+                           rest_windows=None):
+    """Per-don calibration on the first cues of each class, plus a rest class
+    from `rest_windows` so tau has probability mass to reject with."""
     calibration = {label: [] for label in range(len(class_index))}
     calibration_cue_ids = set()
     for cue_id, cue in enumerate(cues):
@@ -87,16 +91,26 @@ def fit_session_classifier(referenced, cues, to_sample, class_index):
                 block = held[:, at : at + DEVICE_WINDOW_SAMPLES]
                 rows.append(band_features(block, EMG_BAND))
                 labels.append(label)
+    classes = len(class_index)
+    if rest_windows is not None and len(rest_windows):
+        rows.extend(rest_windows)
+        labels.extend([classes] * len(rest_windows))
+        classes += 1
     rows = np.asarray(rows)
     mean = rows.mean(axis=0)
     deviation = np.maximum(rows.std(axis=0), 1e-8)
     weights = fit_logistic((rows - mean) / deviation, np.asarray(labels),
-                           len(class_index))
+                           classes)
     return weights, mean, deviation, calibration_cue_ids
 
 
 def rest_spans(directory, to_sample):
-    """`rest` events, as (regime, start_sample, stop_sample)."""
+    """`rest` events plus the armed prefix, as (regime, start, stop) samples.
+
+    The prefix (arming to track start) is gestureless but unprotocolized, and
+    its tail is the operator reaching for the mouse: approximate static rest,
+    reported under its own label rather than against the S1.1.1 budget.
+    """
     import json
 
     spans = []
@@ -105,13 +119,41 @@ def rest_spans(directory, to_sample):
         return spans
     for line in events_path.open():
         event = json.loads(line)
-        if event.get("type") != "rest":
+        if event.get("type") == "rest":
+            label = event["label"]
+        elif event.get("type") == "armed_prefix":
+            label = "prefix"
+        else:
             continue
         start = to_sample(event["from"])
         stop = to_sample(event["to"])
         if start is not None and stop is not None:
-            spans.append((event["label"], int(start), int(stop)))
+            spans.append((label, int(start), int(stop)))
     return spans
+
+
+def model_probabilities(name, referenced, starts, class_count):
+    """Logits from a trained checkpoint via `emg-tds score-windows`."""
+    import subprocess
+    import tempfile
+
+    from export_band_sessions import condition
+
+    conditioned = np.stack([condition(channel) for channel in referenced])
+    windows = np.stack([conditioned[:, at : at + DEVICE_WINDOW_SAMPLES]
+                        for at in starts]).astype(np.float32)
+    crate = Path(__file__).resolve().parent.parent
+    with tempfile.TemporaryDirectory() as scratch:
+        input_path = Path(scratch) / "windows.npy"
+        logits_path = Path(scratch) / "logits.npy"
+        np.save(input_path, windows)
+        subprocess.run(
+            [str(crate / "target/release/emg-tds"), "score-windows",
+             "--checkpoint", MODEL_CHECKPOINT, "--input", str(input_path),
+             "--out", str(logits_path), "--num-classes", str(class_count)],
+            check=True, cwd=crate, capture_output=True,
+        )
+        return softmax_rows(np.load(logits_path))
 
 
 def replay(name):
@@ -122,17 +164,35 @@ def replay(name):
     class_index = {c: i for i, c in enumerate(manifest["class_ids"])}
     tau = manifest["hardware"]["device_config"]["tau"]
 
-    weights, mean, deviation, calibration_cue_ids = fit_session_classifier(
-        referenced, cues, to_sample, class_index)
+    # The first half of each rest span trains the stand-in's rest class; the
+    # second half stays unseen so false positives are not scored on training
+    # data. A real checkpoint scores both halves and skips the fit entirely.
+    rest_training = []
+    scored_rests = []
+    for label, start, stop in rest_spans(directory, to_sample):
+        middle = start if MODEL_CHECKPOINT else (start + stop) // 2
+        held = referenced[:, start:middle]
+        for at in range(0, held.shape[1] - DEVICE_WINDOW_SAMPLES + 1, 250):
+            rest_training.append(
+                band_features(held[:, at : at + DEVICE_WINDOW_SAMPLES], EMG_BAND))
+        scored_rests.append((label, middle, stop))
 
     total = referenced.shape[1]
     starts = range(0, total - DEVICE_WINDOW_SAMPLES + 1, DEVICE_WINDOW_SAMPLES)
-    rows = np.asarray([
-        band_features(referenced[:, at : at + DEVICE_WINDOW_SAMPLES], EMG_BAND)
-        for at in starts
-    ])
-    logits = (rows - mean) / deviation @ weights[:-1] + weights[-1]
-    probabilities = softmax_rows(logits)
+
+    if MODEL_CHECKPOINT:
+        calibration_cue_ids = set()
+        probabilities = model_probabilities(
+            name, referenced, starts, len(class_index) + 1)
+    else:
+        weights, mean, deviation, calibration_cue_ids = fit_session_classifier(
+            referenced, cues, to_sample, class_index, rest_training)
+        rows = np.asarray([
+            band_features(referenced[:, at : at + DEVICE_WINDOW_SAMPLES], EMG_BAND)
+            for at in starts
+        ])
+        logits = (rows - mean) / deviation @ weights[:-1] + weights[-1]
+        probabilities = softmax_rows(logits)
 
     pipeline = RejectPipelineReplica(len(class_index), tau)
     commits = []
@@ -143,7 +203,7 @@ def replay(name):
             commits.append((window_start + DEVICE_WINDOW_SAMPLES, argmax))
         latched_before = latched
     return manifest, cues, to_sample, calibration_cue_ids, commits, total, \
-        rest_spans(directory, to_sample), class_index
+        scored_rests, class_index
 
 
 def score(name, sample_rate=2000.0):
@@ -182,7 +242,7 @@ def score(name, sample_rate=2000.0):
                           if cue_id not in first_commit)
 
     per_regime = {}
-    for regime in ("static", "moving"):
+    for regime in ("static", "moving", "prefix"):
         spans = [(start, stop) for label, start, stop in rests if label == regime]
         minutes = sum(stop - start for start, stop in spans) / sample_rate / 60.0
         strays = sum(1 for at, _ in stray
@@ -205,17 +265,29 @@ def score(name, sample_rate=2000.0):
             rate = strays / minutes * 10.0
             print(f"  {regime:6s} rest FP    {strays} in {minutes:.1f} min "
                   f"= {rate:.1f}/10 min   (budget {budget:.0f})")
+    strays, minutes = per_regime["prefix"]
+    if minutes > 0:
+        print(f"  armed prefix FP    {strays} in {minutes:.1f} min "
+              f"(approximate static rest, not the S1.1.1 measurement)")
     outside = len(stray) - sum(count for count, _ in per_regime.values())
     print(f"  stray commits outside cues and rest: {outside} "
           f"(inter-cue transitions, not a requirement number)")
 
 
 def main():
-    names = sys.argv[1:]
-    if not names:
+    global MODEL_CHECKPOINT
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("sessions", nargs="*")
+    parser.add_argument("--model", help="checkpoint for score-windows; "
+                        "omitted, the calibrated stand-in is fit per session")
+    arguments = parser.parse_args()
+    if not arguments.sessions:
         print(__doc__)
         return
-    for name in names:
+    MODEL_CHECKPOINT = arguments.model
+    for name in arguments.sessions:
         score(name)
 
 
