@@ -15,7 +15,7 @@ use esp_idf_svc::hal::spi::{Operation, SpiDeviceDriver, SpiDriver};
 use log::{info, warn};
 use std::sync::Arc;
 
-use super::channel::Channel;
+use super::channel::{Channel, DEVICE_COUNT};
 use super::decode::parse_sample;
 use super::decode::{Sample, FRAME_BYTES};
 
@@ -94,51 +94,59 @@ const fn device_config1() -> Config1 {
     }
 }
 
-/// How the chip drives the subject bias reference.
+/// How a chip drives the subject bias reference.
 ///
-/// TODO(bias drive): the subject bias / right-leg drive is OFF. On-skin sessions run
-/// without common-mode rejection, so expect visibly more 50/60 Hz mains pickup in
-/// collected data. Before enabling it: (1) fix the board, which needs one wire from
-/// J4 pin 1 to the BIAS_DRV node so the compensation network closes the loop into
-/// RLDINV rather than padding the output; (2) validate the powered loop on the bench
-/// with a scope on BIAS_DRV and the survival harness, since RLD load was never
-/// exonerated in the conversion-death campaign.
+/// The drive is per chip, and exactly one chip may hold it. Each board carries its
+/// own amplifier, its own R1/C2 compensation network, and its own driven electrode
+/// on J5 pins 3 and 4. Two powered amplifiers are two closed loops on one arm, each
+/// summing a different eight channels and each forcing the body toward its own
+/// RLDREF through its own electrode, so neither can see the other except as a
+/// disturbance. The datasheet's multi-device arrangement, master RLDOUT into slave
+/// RLDIN with the slave amplifier down, is not wired here: RLDOUT ties straight to
+/// RLDIN on each board and reaches no connector.
+///
+/// One amplifier covers both chips because they share ground, so driving the arm
+/// toward that reference lowers common mode everywhere. The driving chip's
+/// RLD_SENSP/N still only sums its own eight channels, so the loop nulls what its
+/// own electrodes see and the other chip benefits through the body. Expect the two
+/// to improve by different amounts.
 ///
 /// Either reference mode suits this board. AVDD is +2.5 V and AVSS is -2.5 V, so
 /// mid-supply is 0 V, and the grounded RLDREF pin presents exactly the reference the
 /// internal option would generate.
 ///
-/// `Disabled` is the only bench-validated setting: the entire bring-up campaign ran
-/// with the amplifier off, and the netlist puts the compensation network between
-/// RLDOUT and the electrode while RLDINV, the feedback node, reaches nothing but a
-/// header pin (SBAS459K figure 94). An amplifier whose inverting input floats has no
-/// closed loop, so powering this one before the board is fixed drives its output to a
-/// rail. Engineering log 0019 carries the trace and the one-wire fix.
+/// A powered amplifier needs its board's jumper from J4 pin 1 to the BIAS_DRV node,
+/// which closes the compensation network into RLDINV instead of padding the output
+/// (SBAS459K figure 94). Without it RLDINV floats, the loop is open, and the output
+/// sits at a rail. Engineering log 0019 carries the trace and the one-wire fix.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum RightLegDriveMode {
     /// Amplifier powered, reference taken from the RLDREF pin (`0xC6`). The pin is
     /// grounded, which is mid-supply on this board's bipolar rails, so this mode is
     /// correct here.
-    #[allow(dead_code)]
     ExternalReference,
     /// Amplifier powered, reference generated internally at mid-supply (`0xCE`).
     #[allow(dead_code)]
     InternalReference,
-    /// Amplifier powered down entirely (`0xC0`). The validated configuration.
+    /// Amplifier powered down entirely (`0xC0`).
     Disabled,
 }
 
-/// The mode the chip is running right now.
-const RIGHT_LEG_DRIVE_MODE: RightLegDriveMode = RightLegDriveMode::Disabled;
+/// Which chip drives, in chip order. Chip 0's board carries the jumper, so the
+/// boards are no longer interchangeable between the two positions: the jumpered one
+/// goes in the chip 0 socket or the drive runs open-loop into a rail.
+///
+/// TODO(bias drive): the powered loop is not bench-validated. Scope BIAS_DRV with the
+/// survival harness before trusting a session, since RLD load was never exonerated in
+/// the conversion-death campaign, and leave chip 1's bias electrode off the arm until
+/// a powered-down RLDOUT is confirmed high-impedance.
+pub(super) const RIGHT_LEG_DRIVE_MODE: [RightLegDriveMode; DEVICE_COUNT] = [
+    RightLegDriveMode::ExternalReference,
+    RightLegDriveMode::Disabled,
+];
 
 /// CONFIG3: the internal reference buffer on the 2.4 V reference, and the right-leg
-/// drive wherever [`RIGHT_LEG_DRIVE_MODE`] puts it.
-const fn device_config3() -> Config3 {
-    config3_for_mode(RIGHT_LEG_DRIVE_MODE)
-}
-
-/// [`device_config3`] with the setting passed in, so the tests can pin every mode's
-/// byte rather than only whichever one the bench happens to be running.
+/// drive wherever this chip's [`RIGHT_LEG_DRIVE_MODE`] entry puts it.
 const fn config3_for_mode(mode: RightLegDriveMode) -> Config3 {
     let drive_enabled = !matches!(mode, RightLegDriveMode::Disabled);
     Config3 {
@@ -154,10 +162,10 @@ const fn config3_for_mode(mode: RightLegDriveMode) -> Config3 {
     }
 }
 
-/// RLD_SENSP/N: which channels sum into the right-leg drive. Nothing while the drive
-/// is off; every channel once a powered mode is validated.
-const fn right_leg_drive_channels() -> ChannelMask {
-    match RIGHT_LEG_DRIVE_MODE {
+/// RLD_SENSP/N: which of this chip's channels sum into its right-leg drive. All
+/// eight where the amplifier is powered, none where it is not.
+const fn sense_channels_for_mode(mode: RightLegDriveMode) -> ChannelMask {
+    match mode {
         RightLegDriveMode::Disabled => ChannelMask::NONE,
         _ => ChannelMask::ALL,
     }
@@ -261,6 +269,9 @@ pub(super) struct Ads1298Device {
     chip_select: PinDriver<'static, Output>,
     drdy: PinDriver<'static, Input>,
     reset_n: PinDriver<'static, Output>,
+    /// This chip's entry in [`RIGHT_LEG_DRIVE_MODE`]. Only one chip may hold a
+    /// powered mode; the reasoning is on that constant.
+    right_leg_drive: RightLegDriveMode,
 }
 
 impl Ads1298Device {
@@ -270,6 +281,7 @@ impl Ads1298Device {
         mut chip_select: PinDriver<'static, Output>,
         drdy: PinDriver<'static, Input>,
         mut reset_n: PinDriver<'static, Output>,
+        right_leg_drive: RightLegDriveMode,
     ) -> Result<Self> {
         // Held in reset from construction until `bring_up` runs the shared power
         // sequence and calls `initialize()`. The shared PWDN line lives there too.
@@ -282,6 +294,7 @@ impl Ads1298Device {
             chip_select,
             drdy,
             reset_n,
+            right_leg_drive,
         })
     }
 
@@ -456,7 +469,10 @@ impl Ads1298Device {
         let expected = [
             (Register::Config1, device_config1().to_byte()),
             (Register::Config2, NORMAL_CONFIG2.to_byte()),
-            (Register::Config3, device_config3().to_byte()),
+            (
+                Register::Config3,
+                config3_for_mode(self.right_leg_drive).to_byte(),
+            ),
             (
                 Register::LoffSensP,
                 LeadOffSensePositive(lead_off_channels()).to_byte(),
@@ -496,10 +512,11 @@ impl Ads1298Device {
     pub(super) fn configure(&mut self) -> Result<()> {
         self.write_register(device_config1())?;
 
-        self.write_register(device_config3())?;
+        self.write_register(config3_for_mode(self.right_leg_drive))?;
 
-        self.write_register(RightLegDriveSensePositive(right_leg_drive_channels()))?;
-        self.write_register(RightLegDriveSenseNegative(right_leg_drive_channels()))?;
+        let sense = sense_channels_for_mode(self.right_leg_drive);
+        self.write_register(RightLegDriveSensePositive(sense))?;
+        self.write_register(RightLegDriveSenseNegative(sense))?;
 
         self.write_register(NORMAL_CONFIG2)?;
         self.write_register(LEAD_OFF_CONTROL)?;
@@ -565,8 +582,8 @@ impl Ads1298Device {
         self.write_register(LeadOffSensePositive(ChannelMask::NONE))?;
         self.write_register(LeadOffSenseNegative(ChannelMask::NONE))?;
 
-        // `configure()` includes every channel in the RLD derivation (RLD_SENSP/N =
-        // 0xFF on chip A) for real electrode use. With the test signal active, that
+        // `configure()` puts every channel of the driving chip into the RLD
+        // derivation for real electrode use. With the test signal active, that
         // sums the driven channel's square wave into the shared RLD reference and
         // bleeds an attenuated copy of it back onto every other channel, including
         // ones shorted above. There's no patient loop to cancel common-mode noise on
@@ -638,17 +655,35 @@ mod tests {
         // CONFIG2: the internal test signal generator off.
         assert_eq!(NORMAL_CONFIG2.to_byte(), 0x00);
 
-        // CONFIG3: internal reference on, bias drive off — the only bench-validated
-        // drive mode (see the TODO on RightLegDriveMode).
-        assert_eq!(device_config3().to_byte(), 0xC0);
-
-        // RLD_SENSP/N: no channels sum into a drive that is powered down.
+        // CONFIG3: internal reference on, and the bias drive only where the board
+        // carries the jumper. Chip 0 drives, chip 1 does not, and both driving at
+        // once is the failure this pins against (see RIGHT_LEG_DRIVE_MODE).
+        let [drive_zero, drive_one] = RIGHT_LEG_DRIVE_MODE;
+        assert_eq!(config3_for_mode(drive_zero).to_byte(), 0xC6);
+        assert_eq!(config3_for_mode(drive_one).to_byte(), 0xC0);
         assert_eq!(
-            RightLegDriveSensePositive(right_leg_drive_channels()).to_byte(),
+            RIGHT_LEG_DRIVE_MODE
+                .iter()
+                .filter(|mode| !matches!(mode, RightLegDriveMode::Disabled))
+                .count(),
+            1
+        );
+
+        // RLD_SENSP/N: all eight channels of the driving chip, none of the other's.
+        assert_eq!(
+            RightLegDriveSensePositive(sense_channels_for_mode(drive_zero)).to_byte(),
+            0xFF
+        );
+        assert_eq!(
+            RightLegDriveSenseNegative(sense_channels_for_mode(drive_zero)).to_byte(),
+            0xFF
+        );
+        assert_eq!(
+            RightLegDriveSensePositive(sense_channels_for_mode(drive_one)).to_byte(),
             0x00
         );
         assert_eq!(
-            RightLegDriveSenseNegative(right_leg_drive_channels()).to_byte(),
+            RightLegDriveSenseNegative(sense_channels_for_mode(drive_one)).to_byte(),
             0x00
         );
 
@@ -714,8 +749,8 @@ mod tests {
             Some(device_config1())
         );
         assert_eq!(
-            Config3::from_byte(device_config3().to_byte()),
-            Some(device_config3())
+            Config3::from_byte(config3_for_mode(RIGHT_LEG_DRIVE_MODE[0]).to_byte()),
+            Some(config3_for_mode(RIGHT_LEG_DRIVE_MODE[0]))
         );
         assert_eq!(
             Config2::from_byte(TEST_SIGNAL_CONFIG2.to_byte()),

@@ -113,6 +113,7 @@ pub(crate) struct FrontEnds {
 fn build_front_end<SPI: SpiAnyPins + 'static>(
     spi: SPI,
     wiring: AdcChipWiring,
+    right_leg_drive: ads1298::RightLegDriveMode,
     command_config: &SpiConfig,
     frame_config: &SpiConfig,
 ) -> Result<(
@@ -146,6 +147,7 @@ fn build_front_end<SPI: SpiAnyPins + 'static>(
         // DRDY is actively driven by the ADS1298, so no internal pull is needed.
         PinDriver::input(wiring.data_ready, Pull::Floating)?,
         PinDriver::output(wiring.reset)?,
+        right_leg_drive,
     )
     .context("ADC pin init")?;
     Ok((
@@ -199,8 +201,9 @@ pub(crate) fn bring_up<SpiA: SpiAnyPins + 'static, SpiB: SpiAnyPins + 'static>(
         .polling(false);
 
     let [wiring_a, wiring_b] = wiring;
+    let [drive_a, drive_b] = ads1298::RIGHT_LEG_DRIVE_MODE;
     let (front_end_a, power_down_a, spi_host_a) =
-        build_front_end(spi_a, wiring_a, &command_config, &frame_config)?;
+        build_front_end(spi_a, wiring_a, drive_a, &command_config, &frame_config)?;
     // The GPIO interrupt dispatcher is installed from a thread pinned to core 1
     // because esp-idf allocates an interrupt on whichever core runs the
     // allocating call, and that dispatcher is now the frame-read path for both
@@ -216,7 +219,7 @@ pub(crate) fn bring_up<SpiA: SpiAnyPins + 'static, SpiB: SpiAnyPins + 'static>(
                 .stack_size(8192)
                 .spawn(move || {
                     frame_reader::install_interrupt_dispatcher()?;
-                    build_front_end(spi_b, wiring_b, &command_config_b, &frame_config_b)
+                    build_front_end(spi_b, wiring_b, drive_b, &command_config_b, &frame_config_b)
                 })
         })??
         .join();

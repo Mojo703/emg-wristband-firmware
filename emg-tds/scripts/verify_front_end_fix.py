@@ -56,12 +56,16 @@ def band_features(block, bands):
 WINDOW = 1000
 STRIDE = 250
 RAIL_LIMIT = 0.05
+# Only one board carries the RLDINV jumper, and only one amplifier may drive the
+# arm: two closed loops on one body fight through it. This is the chip whose board
+# has the jumper, and it has to match RIGHT_LEG_DRIVE_MODE in the firmware.
+DRIVING_CHIP = 0
 
 # What "it worked" means, written down in advance. The pre-fix figures each of
 # these has to beat are printed from the recordings, not quoted here.
 CRITERIA = [
     ("bias drive actually enabled", "CONFIG3 shows the amplifier powered and "
-     "RLD_SENSP/N non-zero on both chips"),
+     f"RLD_SENSP/N non-zero on chip {DRIVING_CHIP} alone"),
     ("mains falls", "median in-band mains amplitude at least 10x lower than the "
      "pre-fix median"),
     ("railing falls", "at least 14 of 16 channels rail under 5% of the time"),
@@ -85,7 +89,11 @@ def register(manifest, chip, name):
 
 
 def drive_enabled(manifest):
-    """CONFIG3 bit 2 (0x04) is PD_RLD, the amplifier's power bit."""
+    """CONFIG3 bit 2 (0x04) is PD_RLD, the amplifier's power bit.
+
+    A chip reading OFF is only wrong if it is the one meant to drive. Every other
+    chip has to read OFF, so the state each chip should be in is what gets named.
+    """
     states = []
     for chip in (0, 1):
         config3 = register(manifest, chip, "CONFIG3")
@@ -94,9 +102,19 @@ def drive_enabled(manifest):
         if config3 is None:
             states.append((chip, None, None, "no readback"))
             continue
-        powered = bool(config3 & 0x04)
-        states.append((chip, config3, sense, "on" if powered and sense else "OFF"))
+        powered = bool(config3 & 0x04) and bool(sense)
+        wanted = chip == DRIVING_CHIP
+        state = "on" if powered else "off"
+        if powered != wanted:
+            state += " (WRONG)"
+        states.append((chip, config3, sense, state))
     return states
+
+
+def drive_correct(row):
+    """Exactly the intended chip driving, and no other."""
+    return all("WRONG" not in state and state != "no readback"
+               for _, _, _, state in row["drive"])
 
 
 def measure(name):
@@ -201,8 +219,8 @@ def main():
     # One entry per CRITERIA entry, same threshold in both. Loosening one here
     # without changing the text there is how a pre-registration stops being one.
     checks = [
-        ("bias drive actually enabled",
-         all(state == "on" for r in rows for _, _, _, state in r["drive"])),
+        (f"bias drive on chip {DRIVING_CHIP} alone",
+         all(drive_correct(r) for r in rows)),
         ("mains falls 10x", after_mains <= before_mains / 10),
         ("railing falls to 14+ of 16", all(r["live"] >= 14 for r in rows)),
         ("common mode under 60%", all(r["common_mode"] < 0.60 for r in rows)),

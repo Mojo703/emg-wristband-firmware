@@ -376,8 +376,8 @@ fn main() -> anyhow::Result<()> {
     // nothing for the first two and a half seconds of every boot looks broken.
     let mut feedback = Feedback::start(FeedbackWiring {
         bus: peripherals.i2c0,
-        haptics_data: peripherals.pins.gpio17.into(),
-        haptics_clock: peripherals.pins.gpio18.into(),
+        haptics_data: peripherals.pins.gpio16.into(),
+        haptics_clock: peripherals.pins.gpio15.into(),
         indicator: peripherals.pins.gpio21.into(),
     });
 
