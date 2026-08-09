@@ -4,6 +4,7 @@
 # directory, which is what lets the negation work.
 /config/*
 !/config/collection.json
+!/config/collection-modifier.json
 # The track library: audio, converted schedules, and the Beat Saber maps they
 # came from. Personal music, re-importable from the dashboard.
 /tracks

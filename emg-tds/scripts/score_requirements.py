@@ -2,11 +2,12 @@
 four S1.1 numbers: false positives per 10 min of static and of moving rest, the
 false-negative rate, and the misclassification rate.
 
-The windowing and reject spine match the firmware. The classifier does not: the
-int8 network is not runnable here, so a per-don calibrated band-power logistic
-stands in via `fit_session_classifier`, which the retrained product model will
-replace. Rest spans come from `rest` events in events.jsonl; sessions without
-them print those columns as unmeasured.
+The windowing and reject spine match the firmware. The stand-in classifier is
+the calibrated filter-bank logistic — streaming notch and bandpass biquads the
+MCU can afford, measured at or above the Welch features it replaces — fit per
+session by `fit_session_classifier`; --model scores through a trained
+checkpoint instead. Rest spans come from `rest` events in events.jsonl;
+sessions without them print those columns as unmeasured.
 
     python3 scripts/score_requirements.py <session> [...]
 """
@@ -20,7 +21,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from band_learnability import (  # noqa: E402
     SESSIONS, fit_logistic, load_session, per_chip_reference, time_map,
 )
-from verify_front_end_fix import EMG_BAND, band_features  # noqa: E402
+from scipy import signal  # noqa: E402
+
+from verify_front_end_fix import EMG_BAND  # noqa: E402
 
 DEVICE_WINDOW_SAMPLES = 500
 CALIBRATION_CUES = 10
@@ -29,6 +32,28 @@ NEEDED = 3
 GRACE_MILLISECONDS = 1000.0
 # --model sets this: score with a trained checkpoint instead of the stand-in.
 MODEL_CHECKPOINT = None
+SAMPLE_RATE = 2000.0
+MAINS_HARMONICS = (60, 120, 180, 240, 300, 360, 420)
+SUB_WINDOWS = 4
+
+
+def filter_banks(referenced):
+    """Session-long streaming filters, as the device would run them."""
+    x = referenced
+    for b, a in [signal.iirnotch(h, 30.0, fs=SAMPLE_RATE) for h in MAINS_HARMONICS]:
+        x = signal.lfilter(b, a, x, axis=1)
+    return [signal.sosfilt(signal.butter(4, band, btype="band", fs=SAMPLE_RATE,
+                                         output="sos"), x, axis=1)
+            for band in EMG_BAND]
+
+
+def window_features(banded, at):
+    features = []
+    for band in banded:
+        segment = band[:, at : at + DEVICE_WINDOW_SAMPLES]
+        quarters = segment.reshape(segment.shape[0], SUB_WINDOWS, -1)
+        features.append(np.log10((quarters ** 2).mean(axis=2) + 1e-12).mean(axis=1))
+    return np.concatenate(features)
 
 
 class RejectPipelineReplica:
@@ -63,7 +88,7 @@ def softmax_rows(logits):
     return exponentials / exponentials.sum(axis=1, keepdims=True)
 
 
-def fit_session_classifier(referenced, cues, to_sample, class_index,
+def fit_session_classifier(banded, cues, to_sample, class_index,
                            rest_windows=None):
     """Per-don calibration on the first cues of each class, plus a rest class
     from `rest_windows` so tau has probability mass to reject with."""
@@ -86,10 +111,8 @@ def fit_session_classifier(referenced, cues, to_sample, class_index,
     rows, labels = [], []
     for label, spans in calibration.items():
         for start, stop in spans:
-            held = referenced[:, start:stop]
-            for at in range(0, held.shape[1] - DEVICE_WINDOW_SAMPLES + 1, 125):
-                block = held[:, at : at + DEVICE_WINDOW_SAMPLES]
-                rows.append(band_features(block, EMG_BAND))
+            for at in range(start, stop - DEVICE_WINDOW_SAMPLES + 1, 125):
+                rows.append(window_features(banded, at))
                 labels.append(label)
     classes = len(class_index)
     if rest_windows is not None and len(rest_windows):
@@ -167,14 +190,13 @@ def replay(name):
     # The first half of each rest span trains the stand-in's rest class; the
     # second half stays unseen so false positives are not scored on training
     # data. A real checkpoint scores both halves and skips the fit entirely.
+    banded = None if MODEL_CHECKPOINT else filter_banks(referenced)
     rest_training = []
     scored_rests = []
     for label, start, stop in rest_spans(directory, to_sample):
         middle = start if MODEL_CHECKPOINT else (start + stop) // 2
-        held = referenced[:, start:middle]
-        for at in range(0, held.shape[1] - DEVICE_WINDOW_SAMPLES + 1, 250):
-            rest_training.append(
-                band_features(held[:, at : at + DEVICE_WINDOW_SAMPLES], EMG_BAND))
+        for at in range(start, middle - DEVICE_WINDOW_SAMPLES + 1, 250):
+            rest_training.append(window_features(banded, at))
         scored_rests.append((label, middle, stop))
 
     total = referenced.shape[1]
@@ -186,11 +208,8 @@ def replay(name):
             name, referenced, starts, len(class_index) + 1)
     else:
         weights, mean, deviation, calibration_cue_ids = fit_session_classifier(
-            referenced, cues, to_sample, class_index, rest_training)
-        rows = np.asarray([
-            band_features(referenced[:, at : at + DEVICE_WINDOW_SAMPLES], EMG_BAND)
-            for at in starts
-        ])
+            banded, cues, to_sample, class_index, rest_training)
+        rows = np.asarray([window_features(banded, at) for at in starts])
         logits = (rows - mean) / deviation @ weights[:-1] + weights[-1]
         probabilities = softmax_rows(logits)
 

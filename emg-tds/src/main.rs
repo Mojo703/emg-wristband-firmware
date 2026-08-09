@@ -163,14 +163,23 @@ fn parameter_count(var_map: &VarMap) -> usize {
         .sum()
 }
 
-/// Load matching-name vars from a safetensors checkpoint (encoder transfers; the
-/// wrong-task head is skipped because its name differs: pose_head vs cls_head).
+/// Load matching vars from a safetensors checkpoint (encoder transfers; the
+/// wrong-task head is skipped by name — pose_head vs cls_head — and a same-task
+/// head with a different class count by shape).
 fn load_matching_tensors(var_map: &VarMap, path: &Path, device: &Device) -> Result<usize> {
     let tensors = candle_core::safetensors::load(path, device)?;
     let variables = var_map.data().lock().unwrap();
     let mut loaded = 0usize;
     for (name, variable) in variables.iter() {
         if let Some(tensor) = tensors.get(name) {
+            if tensor.dims() != variable.dims() {
+                println!(
+                    "skipping {name}: checkpoint {:?} vs model {:?}",
+                    tensor.dims(),
+                    variable.dims()
+                );
+                continue;
+            }
             variable.set(tensor)?;
             loaded += 1;
         }

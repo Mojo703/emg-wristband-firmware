@@ -1,0 +1,86 @@
+{
+  "note": "The thumb-modifier block of 2026-08-08: the four wrist atoms performed with the thumb held extended out of the grip, plus the extended thumb held on its own. The same four wrist motions with the thumb gripping are already recorded against collection.json and train as no-ops, so the thumb is what separates a command from ordinary motion. The thumb stays extended for the whole hold, not just the start of it. Thumb up hold carries no arrow — a hint travels with an arrow and the pole tip does not move — so the operator reads its instruction off the bench checklist: the thumb comes up out of the grip and stays there, wrist still. Arrows are a plan view of the pole tip seen from above, with forward meaning down-track; the lateral pair is written for the right arm. This file is read only at startup, so a change here needs a backend restart.",
+  "subjects": [
+    "Matthew",
+    "Zachary",
+    "Cole",
+    "Julian",
+    "Hoomehr"
+  ],
+  "collection_classes": [
+    {
+      "id": "thumb_up_radial_deviation",
+      "label": "Tip forward, thumb up",
+      "color": "green",
+      "motion": {
+        "arrow": "up",
+        "hint": "thumb extended clear of the grip; wrist cocks toward the thumb and the pole tip swings down-track"
+      }
+    },
+    {
+      "id": "thumb_up_ulnar_deviation",
+      "label": "Tip back, thumb up",
+      "color": "purple",
+      "motion": {
+        "arrow": "down",
+        "hint": "thumb extended clear of the grip; wrist drops toward the pinky and the pole tip swings behind you"
+      }
+    },
+    {
+      "id": "thumb_up_supination",
+      "label": "Tip in, thumb up",
+      "color": "amber",
+      "motion": {
+        "arrow": "left",
+        "hint": "thumb extended clear of the grip; forearm rotates in and the pole tip swings toward you"
+      }
+    },
+    {
+      "id": "thumb_up_pronation",
+      "label": "Tip out, thumb up",
+      "color": "blue",
+      "motion": {
+        "arrow": "right",
+        "hint": "thumb extended clear of the grip; forearm rotates out and the pole tip swings away from you"
+      }
+    },
+    {
+      "id": "thumb_up_hold",
+      "label": "Thumb up, hold",
+      "color": "pink",
+      "motion": null
+    }
+  ],
+  "activities": [
+    {
+      "id": "seated",
+      "label": "Seated"
+    },
+    {
+      "id": "standing",
+      "label": "Standing"
+    },
+    {
+      "id": "post_workout",
+      "label": "Post workout"
+    },
+    {
+      "id": "arm_swing",
+      "label": "Arm swinging"
+    }
+  ],
+  "sweat_levels": [
+    {
+      "id": "dry",
+      "label": "Dry"
+    },
+    {
+      "id": "damp",
+      "label": "Damp"
+    },
+    {
+      "id": "sweaty",
+      "label": "Sweaty"
+    }
+  ]
+}
