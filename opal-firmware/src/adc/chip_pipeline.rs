@@ -40,6 +40,10 @@ use super::decode::{parse_sample, Sample};
 use super::frame_reader::FrameReader;
 use super::status::StatusWord;
 
+/// Lead-off bits one chip contributes to the device-wide word: its eight
+/// channels, placed at `index * CHIP_LEAD_OFF_BITS`.
+const CHIP_LEAD_OFF_BITS: usize = 8;
+
 /// Stack for a pipeline thread. It holds no large locals, but esp-idf's default is
 /// tight, and a stack overflow here presents as an unexplained reboot rather than an
 /// error. The TCP thread in `links.rs` hit exactly that.
@@ -404,6 +408,41 @@ impl Pipeline {
         // The transfer completed, but that only means the host clocked 27 bytes --
         // not that they were the right 27 bytes. The status word's fixed marker
         // bits catch a bit-misaligned or corrupted read that a completion cannot.
+        // Counted here, where the word is already decoded, because it is the
+        // only place in the firmware that sees every frame. A calibration's
+        // rep-validity rule reads the difference across a labeled span.
+        if let Some(status) = frame.status_word() {
+            let flagged = status.positive_lead_off.bits() | status.negative_lead_off.bits();
+            if flagged != 0 {
+                self.counters
+                    .lead_off_frames
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            // The live per-channel state, this chip's eight bits placed in the
+            // device-wide word and the other chip's left alone. Written every
+            // frame so a wearer seating a band sees the answer move as they
+            // move it — the count above answers a different question, whether
+            // anything lifted during a rep.
+            let shift = self.index * CHIP_LEAD_OFF_BITS;
+            let mask = 0xFFu32 << shift;
+            let bits = (flagged as u32) << shift;
+            let mut current = self.counters.lead_off_channels.load(Ordering::Relaxed);
+            loop {
+                let next = (current & !mask) | bits;
+                if current == next {
+                    break;
+                }
+                match self.counters.lead_off_channels.compare_exchange_weak(
+                    current,
+                    next,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(seen) => current = seen,
+                }
+            }
+        }
         if frame.status_word().is_none() {
             self.bad_status += 1;
             let total = self.counters.bad_status.fetch_add(1, Ordering::Relaxed) + 1;

@@ -44,7 +44,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
 
-use super::ads1298::SAMPLE_RATE_HZ;
+use super::ads1298::{self, SAMPLE_RATE_HZ};
 use super::channel::{Board, DEVICE_COUNT};
 use super::chip_pipeline::{self, ChipEvent};
 use super::decode::Sample;
@@ -149,6 +149,18 @@ pub(super) struct HealthCounters {
     /// the front end dies stochastically under multi-channel conversion; recovery
     /// restores it in a few milliseconds at the cost of a gap in that chip's stream.
     pub(super) recoveries: AtomicU32,
+    /// Frames on which either chip flagged any channel lead-off, summed over
+    /// both. A count rather than a mask: a calibration asks only whether an
+    /// electrode was off the skin anywhere across a labeled span, and which
+    /// one it was belongs in telemetry, where the per-chip bit patterns
+    /// already go.
+    pub(super) lead_off_frames: AtomicU32,
+    /// Which channels the front end currently says are not in contact, one bit
+    /// per channel across both chips. The newest reading rather than a count:
+    /// a wearer seating a band needs to know which electrode is lifted *now*,
+    /// and the count beside it answers a different question — whether anything
+    /// lifted during a rep.
+    pub(super) lead_off_channels: AtomicU32,
 }
 
 /// The consumer side of acquisition.
@@ -188,6 +200,30 @@ impl AdcSource {
     /// slots read zero while the other chip's stream continues.
     pub(crate) fn recoveries(&self) -> u32 {
         self.counters.recoveries.load(Ordering::Relaxed)
+    }
+
+    /// Frames on which either chip flagged any channel lead-off, cumulative.
+    ///
+    /// A calibration reads the difference across a labeled span rather than the
+    /// value: an electrode that came off the skin at any point during a rep
+    /// makes that rep unusable, and the span is short enough that a count that
+    /// moved at all is the answer.
+    pub(crate) fn lead_off_frames(&self) -> u32 {
+        self.counters.lead_off_frames.load(Ordering::Relaxed)
+    }
+
+    /// Channels currently flagged lead-off, one bit per channel, or `None` when
+    /// the front end is not watching for it.
+    ///
+    /// The distinction is the whole point. With the comparators unpowered the
+    /// status bits read zero forever, and zero is exactly what a seated band
+    /// looks like — so a bare `u16` would tell a wearer every electrode is fine
+    /// on a device that cannot tell. `None` says "no answer"; nothing
+    /// downstream may read it as good news. See [`ads1298::LEAD_OFF_ENABLED`],
+    /// which is off until the block earns its bench experiment.
+    pub(crate) fn lead_off_channels(&self) -> Option<u16> {
+        ads1298::LEAD_OFF_ENABLED
+            .then(|| self.counters.lead_off_channels.load(Ordering::Relaxed) as u16)
     }
 
     /// Every window waiting, oldest first, or empty if none is. Never blocks.

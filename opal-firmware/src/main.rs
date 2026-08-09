@@ -21,6 +21,7 @@
 //! the stream otherwise.
 
 mod adc;
+mod calibration;
 mod config;
 mod cores;
 mod feedback;
@@ -30,13 +31,17 @@ mod links;
 mod logger;
 #[cfg(test)]
 mod model_checks;
+#[cfg(feature = "playback")]
+mod playback;
 mod provenance;
 mod telemetry;
+mod training_rows;
 mod transport;
 mod wifi;
 
 use adc::acquisition::AcquiredWindow;
 use adc::Channel;
+use calibration::{Calibration, WearerFeatures};
 use config::{Sensitivity, Settings, Store};
 use emg_runtime::model::{Model, INPUT_CH, NUM_CLASSES};
 use emg_runtime::tensor::I8Activation;
@@ -46,7 +51,7 @@ use esp_idf_svc::hal::delay::FreeRtos;
 use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::hal::usb_serial::{UsbSerialConfig, UsbSerialDriver};
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
-use feedback::{DeviceState, Feedback, FeedbackWiring, FrontEnd};
+use feedback::{DeviceState, Feedback, FeedbackWiring, FrontEnd, Phone};
 use links::Links;
 use log::{error, info, warn};
 use protocol::{Frame, MediaKey, WakeState};
@@ -83,6 +88,26 @@ const ADC_FRAME_SPI_BAUD_RATE_HZ: u32 = 8_000_000;
 /// refuses it at compile time; `Channel::new` is the wrong constructor here, because
 /// its `None` would read as "no test signal" instead of failing.
 const ADC_TEST_SIGNAL_CHANNEL: Option<Channel> = None;
+
+/// The USB receive ring. Control frames arrive one at a time and a kilobyte has
+/// always been ample for them.
+///
+/// Playback pushes megabytes of samples through the same pipe, and the driver
+/// drops what its ring cannot hold rather than making the host wait — a lost
+/// byte there is a torn frame, a sequence gap, and an abandoned bench run.
+/// Sixteen kilobytes is four times the credit window the playback engine grants,
+/// so a serve-loop iteration that runs long still cannot cost a byte; a unit
+/// test in `playback` holds the two numbers together.
+#[cfg(not(feature = "playback"))]
+const SERIAL_RX_BUFFER_BYTES: usize = 1024;
+#[cfg(feature = "playback")]
+pub(crate) const SERIAL_RX_BUFFER_BYTES: usize = 16 * 1024;
+
+/// Command classes a calibration model's reject pipeline scores over, per
+/// `ARITHMETIC.md`. Smaller than the model's own class count, which also holds
+/// the no-op and rest classes — their probability mass is never eligible to
+/// commit, which is the whole reason they are in the model.
+const CALIBRATION_COMMAND_CLASSES: usize = 5;
 
 /// How long the loop sleeps when no window is waiting.
 ///
@@ -184,7 +209,14 @@ impl InferencePerformance {
     /// processing time (inference through frame send, excluding the intentional
     /// real-time pacing sleep), and how many windows it carried. Logs and resets every
     /// [`PERFORMANCE_REPORT_INTERVAL`] batches.
-    fn record(&mut self, inference_us: u64, total_us: u64, windows: usize, dropped_total: u32) {
+    fn record(
+        &mut self,
+        inference_us: u64,
+        total_us: u64,
+        windows: usize,
+        dropped_total: u32,
+        lead_off_channel_bits: Option<u16>,
+    ) {
         let start = *self.interval_start.get_or_insert_with(Instant::now);
         if self.count == 0 {
             self.dropped_at_interval_start = dropped_total;
@@ -205,34 +237,53 @@ impl InferencePerformance {
             // transient allocation on the device (see
             // `acquisition::WINDOW_QUEUE_DEPTH`), and
             // an out-of-memory abort here would otherwise arrive with no warning.
-            let free_heap_kilobytes = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() / 1024 };
+            // The largest free block rides beside it because the allocations that
+            // actually fail here are large and contiguous — the 18 KB encode
+            // buffer, a link thread's stack — and a heap with plenty free in small
+            // pieces refuses them while the free total says nothing is wrong.
+            let free_heap_kilobytes = telemetry::heap_free_bytes() / 1024;
+            let largest_free_block_kilobytes = telemetry::largest_free_block_bytes() / 1024;
             let (inference_p50, inference_p95) = self.inference_latency.percentiles();
             let (total_p50, total_p95) = self.total_latency.percentiles();
             let metric = telemetry::metric;
-            telemetry::report(
-                "inference",
-                vec![
-                    metric(
-                        "inference_mean_us",
-                        (self.inference_sum_us / self.count as u64) as f64,
-                    ),
-                    metric("inference_p50_us", inference_p50 as f64),
-                    metric("inference_p95_us", inference_p95 as f64),
-                    metric("inference_max_us", self.inference_max_us as f64),
-                    metric(
-                        "total_processing_mean_us",
-                        (self.total_sum_us / self.count as u64) as f64,
-                    ),
-                    metric("total_processing_p50_us", total_p50 as f64),
-                    metric("total_processing_p95_us", total_p95 as f64),
-                    metric("total_processing_max_us", self.total_max_us as f64),
-                    metric("throughput_windows_per_second", throughput_hz),
-                    metric("windows", self.windows as f64),
-                    metric("batches", self.count as f64),
-                    metric("dropped", dropped as f64),
-                    metric("free_heap_kilobytes", free_heap_kilobytes as f64),
-                ],
-            );
+            let mut metrics = vec![
+                metric(
+                    "inference_mean_us",
+                    (self.inference_sum_us / self.count as u64) as f64,
+                ),
+                metric("inference_p50_us", inference_p50 as f64),
+                metric("inference_p95_us", inference_p95 as f64),
+                metric("inference_max_us", self.inference_max_us as f64),
+                metric(
+                    "total_processing_mean_us",
+                    (self.total_sum_us / self.count as u64) as f64,
+                ),
+                metric("total_processing_p50_us", total_p50 as f64),
+                metric("total_processing_p95_us", total_p95 as f64),
+                metric("total_processing_max_us", self.total_max_us as f64),
+                metric("throughput_windows_per_second", throughput_hz),
+                metric("windows", self.windows as f64),
+                metric("batches", self.count as f64),
+                metric("dropped", dropped as f64),
+                metric("free_heap_kilobytes", free_heap_kilobytes as f64),
+                metric(
+                    "largest_free_block_kilobytes",
+                    largest_free_block_kilobytes as f64,
+                ),
+            ];
+            // Which electrodes are off the skin right now, one bit per channel.
+            // The per-chip bits already ride the chip telemetry; this is the
+            // device-wide word the electrode display and the calibration
+            // precondition both read, so the two agree by construction rather
+            // than by coincidence.
+            //
+            // Absent, not zero, when the front end is not watching: zero is what
+            // a well-seated band reads, and a panel cannot tell "every contact
+            // good" from "nobody looked" once the difference is off the wire.
+            if let Some(bits) = lead_off_channel_bits {
+                metrics.push(metric("lead_off_channel_bits", bits as f64));
+            }
+            telemetry::report("inference", metrics);
             self.interval_start = None;
             self.count = 0;
             self.windows = 0;
@@ -286,6 +337,15 @@ fn main() -> anyhow::Result<()> {
         esp_idf_svc::sys::esp_get_free_heap_size() / 1024
     });
 
+    // The second view of every window: band power, which is what a calibration
+    // model reads. Only fed when something downstream would read the answer —
+    // see `WearerFeatures::wanted` — but built *here*, before wifi and the ADC
+    // pipeline take their share, because it reserves one contiguous 16 KB
+    // window buffer and this is the last moment the heap can certainly promise
+    // one. Measured after wifi is up: 21 KB free, largest block 7.7 KB. Its
+    // gains are set from the stored calibration once that is readable, below.
+    let mut band_features = Box::new(WearerFeatures::new());
+
     // The serial link exists from boot: dashboard discovery, provisioning, and the
     // wifi-less data path all ride the USB-Serial-JTAG CDC channel.
     let serial = SerialTransport::new(UsbSerialDriver::new(
@@ -294,7 +354,7 @@ fn main() -> anyhow::Result<()> {
         peripherals.pins.gpio20,
         &UsbSerialConfig::new()
             .tx_buffer_size(8192)
-            .rx_buffer_size(1024),
+            .rx_buffer_size(SERIAL_RX_BUFFER_BYTES),
     )?);
 
     let mut links = Links::new(serial, peripherals.modem, sysloop, nvs_partition, &settings)?;
@@ -381,6 +441,26 @@ fn main() -> anyhow::Result<()> {
         indicator: peripherals.pins.gpio21.into(),
     });
 
+    // The wearer's calibration. Mapped before the ADC comes up so a partition
+    // that will not map is in the log next to the boot it belongs to, and so the
+    // one erase a run performs is never the first thing a wearer waits on.
+    // Boxed: the engine and the feature pipeline below carry kilobytes of
+    // inline state, and building them in the main task's frame overflowed its
+    // stack at boot. One boot-time heap allocation each, per the heap rule.
+    let mut calibration = Box::new(Calibration::start(calibration_flow::Constants::DEFAULT));
+    // Now that the stored gains are readable, point the pipeline reserved above
+    // at them. The reservation happened before wifi for a reason — see there.
+    band_features.adopt_gains(calibration.stored_gains());
+    // A calibration installed on some previous boot. A device calibrated
+    // yesterday runs calibrated today; a device that never was runs the int8
+    // model alone, as it always has.
+    let mut calibrated = calibration.stored_model();
+    let mut calibrated_reject =
+        emg_runtime::RejectPipeline::new(CALIBRATION_COMMAND_CLASSES, settings.sensitivity.tau());
+    if calibrated.is_some() {
+        info!("a stored calibration is installed; it decides commits this boot");
+    }
+
     // Normalised units per count, not microvolts per count; `adc::conditioning`
     // documents the difference and the acquisition path is what puts the signal on
     // that footing.
@@ -419,6 +499,23 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
+    // A board with no front end is the validation bench's board: bring-up
+    // failing is its normal boot, not a fault. Start the playback engine there
+    // and the recorded sessions a host streams in take the place of the ADC.
+    // Nothing starts when bring-up succeeded — a wired board runs the real
+    // pipeline, and the same image serves both.
+    #[cfg(feature = "playback")]
+    let playback = match source {
+        Some(_) => None,
+        None => match playback::PlaybackEngine::start() {
+            Ok(engine) => Some(engine),
+            Err(error) => {
+                error!("playback engine failed to start: {error:#}");
+                None
+            }
+        },
+    };
+
     // The main loop paces at one window (~244 ms); if it ever stops feeding the task
     // watchdog (default 5 s), something below hung on I/O and the chip must reboot
     // rather than sit dead until unplugged. The boot log names the reset reason.
@@ -444,6 +541,9 @@ fn main() -> anyhow::Result<()> {
         FrontEnd::Failed
     };
     let mut steady_since: Option<Instant> = None;
+    // The lead-off frame count as of the previous window, so a calibration
+    // reads a change rather than a total.
+    let mut lead_off_frames: u32 = 0;
     let mut config_generation: u32 = 0;
     let mut committed: Option<MediaKey> = None;
 
@@ -452,13 +552,92 @@ fn main() -> anyhow::Result<()> {
             esp_idf_svc::sys::esp_task_wdt_reset();
         }
 
+        // What the wearer's band is doing, posted before the controls are polled
+        // so a Start arriving this iteration is judged against it rather than
+        // against the iteration before — and so the first pass through the loop
+        // judges it against the front end instead of the constructor's default.
+        // Cheap: a comparison and an atomic load, read only when a run is asked
+        // for.
+        calibration.note_wear_state(
+            front_end == FrontEnd::Running,
+            source
+                .as_ref()
+                .and_then(|source| source.lead_off_channels()),
+        );
+
         // Link upkeep first, config second: the returned controls are applied here
         // because they mutate the settings, pipeline, and store the links only read.
         let mut config_changed = false;
         for control in links.poll(&device_id, &settings) {
+            // The playback engine takes the bench frames and hands everything
+            // else straight back, so a bench run cannot touch stored config and
+            // a build without the feature behaves as it always did.
+            #[cfg(feature = "playback")]
+            let control = match playback.as_ref() {
+                Some(engine) => match engine.accept(control) {
+                    Some(control) => control,
+                    None => continue,
+                },
+                None => control,
+            };
+            // Calibration takes its own frames and hands everything else back,
+            // so a run cannot touch stored config and a device with no
+            // partition still refuses the request out loud rather than silently.
+            let Some(control) = calibration.accept(control) else {
+                continue;
+            };
             config_changed |= apply_control(control, &mut settings, &mut pipeline, &store);
         }
         config_generation += u32::from(config_changed);
+
+        // Whatever the playback worker produced since the last iteration.
+        // Routed through the same link the stream uses, so a bench run is
+        // visible to a dashboard watching the device as ordinary data frames.
+        #[cfg(feature = "playback")]
+        if let Some(engine) = playback.as_ref() {
+            let produced = engine.drain_outbound();
+            if !produced.is_empty() {
+                links.send_window(None, &produced);
+            }
+        }
+
+        // A scripted calibration is fed by the replayed session rather than by
+        // a front end, and paced by its sample indices rather than by how fast
+        // the board got through them.
+        #[cfg(feature = "playback")]
+        if let Some(engine) = playback.as_ref() {
+            if let Some(gains) = engine.session_gains() {
+                calibration.adopt_gains(gains);
+            }
+            for window in engine.drain_windows() {
+                calibration.observe_window(&window, &settings);
+            }
+        }
+
+        // The calibration state machine gets one action per iteration, because
+        // every one of them stalls something: an erase, a flash write, or a run
+        // of optimizer passes.
+        calibration.poll(IDLE_POLL_MS, &settings);
+        let calibration_frames = calibration.drain_outbound();
+        if !calibration_frames.is_empty() {
+            links.send_window(None, &calibration_frames);
+        }
+        // The model is committed to flash and reported; swapping it into the
+        // inference path is the remaining step, and it waits on the wearer
+        // build running the band-feature pipeline the calibration model reads.
+        if let Some(model) = calibration.take_installed_model() {
+            info!(
+                "calibration installed a {}-class model; it decides commits from here",
+                model.class_count
+            );
+            // Rebuilt against the gains the run just measured: the model was
+            // fitted on features referenced through them, so scoring through
+            // any others would be scoring a different signal.
+            band_features.adopt_gains(calibration.stored_gains());
+            calibrated_reject =
+                emg_runtime::RejectPipeline::new(CALIBRATION_COMMAND_CLASSES, pipeline.tau);
+            calibrated = Some(model);
+        }
 
         // One batch of work: every window acquisition has ready, oldest first.
         // Usually that is exactly one — the ADCs produce one every ~250 ms and this
@@ -494,6 +673,10 @@ fn main() -> anyhow::Result<()> {
                     stall_reported = true;
                     front_end = FrontEnd::Stalled;
                     steady_since = None;
+                    // A run cannot continue on a front end that stopped
+                    // producing; the slot never gets its CRC and whatever was
+                    // installed before stays installed.
+                    calibration.front_end_lost();
                 }
             }
             feedback.observe(DeviceState {
@@ -503,6 +686,8 @@ fn main() -> anyhow::Result<()> {
                 // none this iteration.
                 committed,
                 config_generation,
+                calibration: calibration.feedback(),
+                phone: Phone::Off,
             });
             // No window to send, but logger::drain() only runs inside send_window,
             // so this is also what flushes buffered logs (e.g. ADS1298 bring-up
@@ -545,6 +730,7 @@ fn main() -> anyhow::Result<()> {
         // so a catch-up burst holds one window's payload at a time.
         let batch_size = windows.len();
         let mut newest_seq = seq;
+        let mut newest_features = None;
         for window in windows {
             newest_seq = seq;
             let frame = frames::emg(
@@ -567,6 +753,29 @@ fn main() -> anyhow::Result<()> {
             else {
                 unreachable!("frames::emg builds an Emg frame");
             };
+            // The band-feature view of the same window, for a calibration
+            // running or installed. Off entirely otherwise: four bandpass
+            // cascades over sixteen channels cost about what the inference
+            // above does, and a device with nothing to calibrate has no use
+            // for the answer.
+            if WearerFeatures::wanted(&calibration, calibrated.is_some()) {
+                // Whether an electrode came off the skin anywhere in this
+                // window. The difference rather than the value: a rep spans
+                // several windows and any one of them flagging is enough to
+                // throw it away.
+                let lead_off_now = source.lead_off_frames();
+                let lead_off = lead_off_now != lead_off_frames;
+                lead_off_frames = lead_off_now;
+                if let Some(features) = band_features.push_window(
+                    &packed_wire,
+                    lead_off,
+                    front_end == FrontEnd::Stalled,
+                    &mut calibration,
+                    &settings,
+                ) {
+                    newest_features = Some(features);
+                }
+            }
             source.recycle(window.samples, packed_wire, missing);
         }
 
@@ -587,21 +796,47 @@ fn main() -> anyhow::Result<()> {
             provenance: provenance::device(),
         });
         links.send_window(hello.as_ref(), &decision_frames);
+        // Which decision fires a key. A calibrated device commits on its own
+        // calibration; one that has never been calibrated commits on the
+        // shipped int8 model, as it always has. The prediction frames above
+        // are the int8 model's either way — they are the parity bench's
+        // subject, and changing what they mean would change what every
+        // recorded session means (`firmware-bench/PROTOCOL.md` says so out
+        // loud, because a dashboard can therefore show a prediction that
+        // disagrees with the key that fired).
+        let calibrated_decision = match (calibrated.as_ref(), newest_features) {
+            (Some(model), Some(features)) => {
+                let mut probabilities = vec![0.0f32; model.class_count];
+                model.probabilities(&features, &mut probabilities);
+                Some(calibrated_reject.step(&probabilities))
+            }
+            _ => None,
+        };
+        let committing = calibrated_decision.as_ref().unwrap_or(&decision);
         // The same fact `frames::events` puts on the wire, named by its binding
         // rather than its class index.
-        committed =
-            (decision.wake_state == WakeState::Active).then(|| settings.key_for(decision.argmax));
+        //
+        // Suppressed for the whole run: a wearer performing a gesture because
+        // the device asked for it must not also fire the command it is bound
+        // to. The reject spine is untouched — the decision still happens and
+        // still streams; only the commit is withheld.
+        committed = (committing.wake_state == WakeState::Active
+            && !calibration.suppresses_commits())
+        .then(|| settings.key_for(committing.argmax));
         feedback.observe(DeviceState {
             front_end,
             link: links.active_link(),
             committed,
             config_generation,
+            calibration: calibration.feedback(),
+            phone: Phone::Off,
         });
         performance.record(
             infer_us,
             infer_start.elapsed().as_micros() as u64,
             batch_size,
             source.dropped_windows(),
+            source.lead_off_channels(),
         );
 
         prev_wake = decision.wake_state;
@@ -647,6 +882,27 @@ fn apply_control(
             true
         }
         Control::Probe {} | Control::Heartbeat {} => false, // handled by the caller
+        // The serve loop routes these to the calibration state machine before
+        // they reach here; nothing about a calibration is persisted config.
+        Control::CalibrationStart { .. }
+        | Control::CalibrationAbort {}
+        | Control::CalibrationCueSchedule { .. }
+        | Control::CalibrationRowsRequest { .. } => false,
+        // The serve loop routes these to the playback engine before they reach
+        // here, and a build without the feature has no engine to route them to.
+        // Listed rather than caught by a wildcard so a new control frame still
+        // forces a decision in this match.
+        #[cfg(feature = "playback")]
+        Control::PlaybackBegin { .. }
+        | Control::PlaybackSamples { .. }
+        | Control::PlaybackEnd {}
+        | Control::BenchModelLoad { .. }
+        | Control::BenchReplayRows { .. }
+        | Control::BenchFitBegin { .. }
+        | Control::BenchFitRows { .. }
+        | Control::BenchFitRun { .. }
+        | Control::BenchStatusRequest {}
+        | Control::BenchReset {} => false,
     }
 }
 

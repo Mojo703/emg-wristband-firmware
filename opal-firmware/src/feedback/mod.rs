@@ -25,7 +25,7 @@ mod cue;
 mod haptics;
 mod indicator_led;
 
-pub(crate) use cue::{DeviceState, FrontEnd};
+pub(crate) use cue::{Calibrating, DeviceState, FrontEnd, Phone, Prompt, RepNotice};
 
 use crate::cores;
 use cue::Cue;
@@ -161,8 +161,26 @@ impl Feedback {
 /// cues arrive inside a single tick, which needs two device changes ~20 ms apart.
 fn precedence(cue: Cue) -> u8 {
     match cue {
-        Cue::FrontEndFailed | Cue::FrontEndStalled => 4,
-        Cue::ReadyToUse => 3,
+        Cue::FrontEndFailed | Cue::FrontEndStalled => 6,
+        Cue::ReadyToUse => 5,
+        // Above the link, matching the indicator: a wearer mid-run is working to
+        // the device's schedule, and a link that came or went is not worth the one
+        // motor while they are.
+        Cue::CalibrationBegins
+        | Cue::PhaseBoundary
+        | Cue::ThumbDownHandover
+        | Cue::RepPrompt(_)
+        | Cue::RepRejected
+        | Cue::GestureFailed(_)
+        | Cue::CalibrationComplete => 4,
+        // Between the run and the link, which is the order `feedback-vocabulary`
+        // states and tests: pairing is something the wearer did with their hands
+        // and is standing there waiting on, while a dashboard link is something
+        // that happened near them. This is a second copy of an ordering that crate
+        // already owns, and the two should become one — `transition_from` decides
+        // it for every cue that reaches here, and this is consulted only when two
+        // arrive inside one ~20 ms tick.
+        Cue::PhoneListening | Cue::PhonePaired | Cue::PhoneLost | Cue::PhoneUnavailable => 3,
         Cue::LinkEstablished | Cue::LinkLost => 2,
         Cue::Committed(_) => 1,
         Cue::ConfigChanged => 0,

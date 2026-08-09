@@ -41,6 +41,123 @@ pub enum Control {
     Probe {},
     /// Serial-link keepalive; silence for a few seconds means the dashboard is gone.
     Heartbeat {},
+
+    // On-device calibration (`firmware-bench/CALIBRATION-PLAN.md`). Not behind
+    // the playback feature: calibration is what a wearer's firmware does, and
+    // the scripted schedule is refused rather than absent in a build that
+    // cannot replay one.
+    CalibrationStart {
+        scripted_wearer: bool,
+    },
+    CalibrationAbort {},
+    CalibrationCueSchedule {
+        first_entry: u32,
+        #[serde(with = "serde_bytes")]
+        entries: Vec<u8>,
+    },
+    CalibrationRowsRequest {
+        slot: u32,
+        first_row: u32,
+        max_rows: u32,
+    },
+
+    // The firmware validation bench (`firmware-bench/PROTOCOL.md`). Mirrors of
+    // the `protocol::Frame` variants of the same names, decoded here for the
+    // same float-free reason as everything above: the byte blobs carry `f32`
+    // payloads as little-endian bits and are widened by hand, so no ciborium
+    // float path is ever instantiated.
+    //
+    // Behind the feature, so a firmware built for a wearer neither decodes nor
+    // allocates for a frame it has nothing to do with.
+    #[cfg(feature = "playback")]
+    PlaybackBegin {
+        session: String,
+        sample_count: u32,
+        chunk_samples: u32,
+        #[serde(with = "serde_bytes")]
+        constants: Vec<u8>,
+    },
+    #[cfg(feature = "playback")]
+    PlaybackSamples {
+        sequence: u32,
+        #[serde(with = "serde_bytes")]
+        samples: Vec<u8>,
+    },
+    #[cfg(feature = "playback")]
+    PlaybackEnd {},
+    #[cfg(feature = "playback")]
+    BenchModelLoad {
+        class_count: u32,
+        #[serde(with = "serde_bytes")]
+        model: Vec<u8>,
+    },
+    #[cfg(feature = "playback")]
+    BenchReplayRows {
+        first_window: u32,
+        #[serde(with = "serde_bytes")]
+        rows: Vec<u8>,
+    },
+    #[cfg(feature = "playback")]
+    BenchFitBegin {
+        row_capacity: u32,
+        precision: u8,
+        class_count: u32,
+        #[serde(with = "serde_bytes")]
+        quantization: Vec<u8>,
+    },
+    #[cfg(feature = "playback")]
+    BenchFitRows {
+        #[serde(with = "serde_bytes")]
+        labels: Vec<u8>,
+        #[serde(with = "serde_bytes")]
+        row_weights: Vec<u8>,
+        #[serde(with = "serde_bytes")]
+        rows: Vec<u8>,
+    },
+    #[cfg(feature = "playback")]
+    BenchFitRun {
+        use_static_rows: bool,
+    },
+    #[cfg(feature = "playback")]
+    BenchStatusRequest {},
+    #[cfg(feature = "playback")]
+    BenchReset {},
+}
+
+impl Control {
+    /// Whether the calibration state machine owns this frame. The serve loop
+    /// routes on it so a calibration control never reaches the settings store.
+    pub fn is_calibration(&self) -> bool {
+        matches!(
+            self,
+            Control::CalibrationStart { .. }
+                | Control::CalibrationAbort {}
+                | Control::CalibrationCueSchedule { .. }
+                | Control::CalibrationRowsRequest { .. }
+        )
+    }
+}
+
+#[cfg(feature = "playback")]
+impl Control {
+    /// Whether this is a bench frame the playback engine owns, as opposed to a
+    /// config or link-management control. The serve loop routes on this so a
+    /// bench frame never reaches the settings store.
+    pub fn is_bench(&self) -> bool {
+        matches!(
+            self,
+            Control::PlaybackBegin { .. }
+                | Control::PlaybackSamples { .. }
+                | Control::PlaybackEnd {}
+                | Control::BenchModelLoad { .. }
+                | Control::BenchReplayRows { .. }
+                | Control::BenchFitBegin { .. }
+                | Control::BenchFitRows { .. }
+                | Control::BenchFitRun { .. }
+                | Control::BenchStatusRequest {}
+                | Control::BenchReset {}
+        )
+    }
 }
 
 /// One end of a dashboard link.

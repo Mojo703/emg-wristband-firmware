@@ -23,25 +23,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Instant;
 
-/// Which link is carrying the stream right now.
-///
-/// [`Links::send_window`]'s routing rule as a value, so anything reacting to the link
-/// reads the same fact the data follows rather than a second copy of the rule. A
-/// level, not an edge: callers wanting transitions diff it themselves.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ActiveLink {
-    None,
-    Serial,
-    Wifi,
-}
-
-impl ActiveLink {
-    /// Whether the stream is going anywhere. Which link is a development fact — a
-    /// wearer only ever has wifi — so anything facing them asks this instead.
-    pub fn is_connected(self) -> bool {
-        self != ActiveLink::None
-    }
-}
+// Which link is carrying the stream is a fact about the wearer's device, not
+// about these transports, so the type lives with the rest of the vocabulary
+// that faces them and is re-exported here for the code that sets it.
+pub(crate) use feedback_vocabulary::ActiveLink;
 
 /// Owns both dashboard links and routes the stream over the active one.
 pub struct Links {

@@ -48,3 +48,22 @@ pub fn report(source: &str, metrics: Vec<TelemetryMetric>) {
 pub fn drain() -> Vec<Frame> {
     PENDING.lock().unwrap().drain(..).collect()
 }
+
+/// Bytes of heap still free.
+pub fn heap_free_bytes() -> u32 {
+    unsafe { esp_idf_svc::sys::esp_get_free_heap_size() }
+}
+
+/// The largest single allocation the heap could still satisfy.
+///
+/// Free bytes alone cannot answer the question this firmware keeps asking. The
+/// encode buffer is 18 KB, a wifi dial wants two 8 KB stacks, and a calibration
+/// fit wants its weight matrix — each needs one contiguous block, and a heap
+/// with 150 KB free in 4 KB pieces refuses all of them. Reported beside the free
+/// total so fragmentation is visible as the gap between the two.
+pub fn largest_free_block_bytes() -> u32 {
+    let bytes = unsafe {
+        esp_idf_svc::sys::heap_caps_get_largest_free_block(esp_idf_svc::sys::MALLOC_CAP_8BIT)
+    };
+    bytes as u32
+}

@@ -195,6 +195,32 @@ firmware built without the playback feature refuses a scripted start.
 | `calibration_result` | outcome, installed slot + sequence, rounds, rows, rep counts, four-number self-estimate, weak pair, per-class summary, fit wall ms |
 | `calibration_rows_dump` | slot, sequence, `valid`, `record` blob, `first_row`, `row_count`, `total_rows`, `row_stride`, `precision`, `rows` blob |
 
+**Calibration refuses to start on a bad wear state.** Before the sixty seconds
+of settling are spent, the device checks the two things it already knows: that
+the front end is running, and that no channel is flagged lead-off. A run that
+settles against a lifted electrode measures the lift and fits every later rep
+through it, and nothing downstream notices — so this is a precondition rather
+than a warning, and the refusal names the channels so a wearer knows which side
+of their wrist to look at. Scripted runs are exempt; a bench board has no
+electrodes.
+
+The same per-channel word rides the inference telemetry as
+`lead_off_channel_bits`, one bit per channel, so the dashboard's electrode
+display and the calibration precondition read the same signal rather than two
+that can disagree. No new statistic: these are the ADS1298's own LOFF_STATP and
+LOFF_STATN bits, which the per-chip telemetry has always carried.
+
+**The metric is absent, never zero, when the front end is not watching for
+lead-off** — which is its state today (`LEAD_OFF_ENABLED` is off; see
+CALIBRATION-PLAN.md's limitations for why). Zero is what a well-seated band
+reads, so a consumer that cannot tell a missing metric from a zero one will
+report every electrode good on a device that never looked. Telemetry metrics
+are self-describing name/value pairs and a dropped frame is already
+indistinguishable from a quiet one, so absence is the only honest encoding
+available here: **render a missing `lead_off_channel_bits` as unknown, not as
+good contact.** The calibration precondition follows the same rule — it
+refuses on a positive flag and never on a missing one.
+
 The quality gate is **report only**. It names the classes the self-test
 recovers poorly and the pair it confuses most, and it changes nothing about the
 schedule. It could once add rounds for a weak class, on the reasoning that more
@@ -223,6 +249,32 @@ negatives, misclassification, false fires, and rest commits the golden numbers
 name, scaled by a thousand. They are the device's own leave-recent-cues-out
 self-test over the wearer's reps, not a measurement against the fixtures, and
 the panel shows them as information rather than a pass mark.
+
+**The slot erase happens at boot, not at the start of a run.** Erasing a slot
+is roughly forty-eight sector erases, each of which suspends the other core and
+takes the flash cache down with it for tens of milliseconds — about two seconds
+in total. Beside two ADS1298s servicing DRDY at 2 kHz through non-IRAM code that
+is not a stall but a dead device, and the first wearer to press Start had the
+board re-enumerate under their hand. The bench never saw it because the bench
+has no acquisition to starve.
+
+So the firmware erases the slot the next calibration will claim during boot,
+before `adc::bring_up` runs, and the run's own erase step became a check that
+the slot really is blank. Rule 7's announced window for the erase is boot.
+
+One consequence, stated because it is visible to a wearer: **a second
+calibration in the same boot is refused.** The first commits to the slot boot
+erased, so the next run would claim the other one, which still holds the
+previous calibration — and erasing it is the thing the front end cannot
+survive. The device says so and asks for a reboot.
+
+The between-round row flushes stay where they are. Each is a few small writes
+into pre-erased flash, one to four milliseconds of cache-down against a 250 ms
+window, and they are scheduled between rounds with no labeled span open. That
+said, they have only ever run on a bench board with no acquisition, so the
+wearer test is the first time they meet a live DRDY at all. If they turn out to
+cost frames, the honest fallback is buffering the whole run's rows in RAM —
+about 40 KB at the fifty-rep recipe — and writing once at install.
 
 `calibration_state.flash_flushes` is a telemetry proof, not a statistic:
 flushes are scheduled strictly between rounds, so a labeled window can never

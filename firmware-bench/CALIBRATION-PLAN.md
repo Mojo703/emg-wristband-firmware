@@ -85,8 +85,17 @@ Partition (983,040 B) layout, version-bumped image format:
 Write discipline (the flash-cache stall is real: every write/erase stalls
 the other core and blocks all non-IRAM code):
 
-- The active slot's region is **erased once, before collection begins**,
-  during the announced settling phase — never during it.
+- The active slot's region is **erased once, at boot**, before the front end
+  is brought up — not during the settling phase, which is where this plan
+  first put it. A slot erase is ~48 sector erases, each suspending the other
+  core and taking the flash cache down with it for tens of milliseconds, ~2 s
+  in total. Beside two ADS1298s servicing DRDY at 2 kHz through non-IRAM code
+  that is not a stall, it is a dead board: a worn device re-enumerated under
+  the wearer's hand at the first erase, while the bench survived every run
+  because the bench has no acquisition to starve. Boot is the only window
+  wide enough. The state machine keeps its `EraseSlot` action;
+  what the firmware does with it is now a check that the slot really is
+  blank, and a run that finds otherwise refuses rather than erasing.
 - Rows buffer in RAM (one round is ≤ ~2 KB at i8) and **flush only in the
   gaps between rounds**, never inside a labeling window; each flush is a
   few small writes into pre-erased flash (~1–4 ms of cache-down each). The
@@ -204,6 +213,50 @@ with validators; the two inbound frames (start, abort) are float-free.
 7. Reference gains are per-calibration and assumed stable within a wear;
    drift within a wear is unmeasured and listed as an open item.
 
+## Known limitations of what ships
+
+Both of these are visible to a wearer, so both are stated rather than left to
+be discovered.
+
+- **One calibration per boot.** The erase happens at boot on the slot the next
+  calibration will claim. A run that commits moves the sequences, so a second
+  run in the same boot would claim the other slot — the one still holding the
+  previous calibration — and erasing that beside a live front end is the crash
+  this design exists to avoid. The second run therefore refuses, naming the
+  reboot as the answer. The complete fix is to suspend acquisition, erase, and
+  restart it inside the settling phase (the warm-recovery machinery already
+  does the suspend and restart); it is designed and deliberately not built
+  here, because a partial version of it is a third architecture for the same
+  40 KB.
+- **The wear-state check cannot see a lifted electrode yet.** The precondition
+  and the `lead_off_channel_bits` telemetry read the ADS1298's LOFF_STATP and
+  LOFF_STATN bits, and lead-off detection is off on this front end
+  (`LEAD_OFF_ENABLED`, `adc/ads1298.rs`): the bring-up campaign measured ~35
+  front-end deaths per second with the block powered against ~2 without it, so
+  it stays off until it earns its own bench experiment. Until then the front
+  end reports *no answer* rather than *all electrodes seated* — the telemetry
+  metric is absent instead of zero, and the precondition refuses only on a
+  positive flag. Nothing downstream may render a missing value as good
+  contact; a disconnected electrode currently rails its channel instead of
+  being flagged, which is the signal that does exist. The front-end-not-running
+  half of the check works today; the lead-off half is machinery waiting on its
+  signal.
+
+Both carry deferred work, and it is capstone work rather than a follow-up
+commit — each needs bench time and its own acceptance numbers, which is
+exactly what neither had when it was found:
+
+- **Re-enable lead-off detection**, as its own bench experiment against the
+  ~35-per-second death rate the bring-up campaign measured. Until it passes,
+  the wear-state check is half a feature and the plan says so rather than the
+  panel implying otherwise. The firmware side needs no further work: flipping
+  `LEAD_OFF_ENABLED` is what turns the machinery on.
+- **Erase within the settling phase** by suspending acquisition around it, so
+  a wearer can calibrate twice without a power cycle. The warm-recovery path
+  already suspends and restarts a chip; what it does not have is a measured
+  answer for how a two-second suspension reads to the wearer, or what it costs
+  the settle's own baseline.
+
 ## Rules
 
 1. Every deviation from the parity-validated recipe is host-replayable and
@@ -220,7 +273,10 @@ with validators; the two inbound frames (start, abort) are float-free.
 6. Labels come from the device cue clock by sample index. The validity
    check may reject a rep; nothing ever relabels one.
 7. Flash writes and erases happen only in announced or inter-round
-   windows; a labeled window never overlaps one.
+   windows; a labeled window never overlaps one. **The erase's announced
+   window is boot**, before acquisition starts — the only window on this
+   device wide enough for it (see the write discipline above). Writes keep
+   the inter-round gaps.
 8. Wire changes: one definition in `protocol/`, TS mirrors + validators,
    inbound float-free.
 

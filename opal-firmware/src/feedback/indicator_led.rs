@@ -141,111 +141,26 @@ impl Dither {
     }
 }
 
-/// How a moment of light is shaped over its lifetime.
+pub(crate) use feedback_vocabulary::{Color, Shape};
+
+/// The duty each channel of `color` wants at perceived brightness `level`, in
+/// [`DUTY_FRACTION_BITS`] fixed point and still owing [`Dither`] a visit. Hue and
+/// `level` are both perceptual, so they combine by plain multiplication.
 ///
-/// A ramp reads as ambient, something that is true; a hard edge reads as an event.
-/// With the palette this small, shape is also the only axis left for telling cues
-/// apart.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Shape {
-    /// Full brightness throughout, edges included. For things that happened at an
-    /// instant, and for faults, where a soft edge does not read as an alarm.
-    Snap,
-    /// Up and back down in perceived brightness, the fall slower than the rise, which
-    /// is what makes it read as breathing rather than a blink with soft corners.
-    Swell,
-}
-
-impl Shape {
-    /// Milliseconds rather than ticks, so changing the tick rate does not silently
-    /// restyle every shape.
-    pub const fn duration_milliseconds(self) -> u32 {
-        match self {
-            Shape::Snap => 160,
-            Shape::Swell => 2500,
-        }
-    }
-
-    /// How much of a swell is spent rising; the rest falls, more slowly.
-    const SWELL_RISE_MILLISECONDS: u32 = 1000;
-
-    /// Perceived brightness at `elapsed` of `duration`.
-    pub const fn level(self, elapsed: u32, duration: u32) -> u8 {
-        if elapsed >= duration {
-            return 0;
-        }
-        match self {
-            Shape::Snap => u8::MAX,
-            Shape::Swell => {
-                let apex = if Self::SWELL_RISE_MILLISECONDS < duration {
-                    Self::SWELL_RISE_MILLISECONDS
-                } else {
-                    duration / 2
-                };
-                let (position, span) = if elapsed < apex {
-                    (elapsed, apex)
-                } else {
-                    (duration - elapsed, duration - apex)
-                };
-                ease_in_out(position, span)
-            }
-        }
-    }
-}
-
-/// Smoothstep, `t²(3 − 2t)`, over `position` of `span`.
-///
-/// Its slope is zero at both ends, so a swell leaves black and reaches its apex
-/// without a corner at either — and since rise and fall both end flat, the apex has
-/// no kink despite their different lengths. Applied to perceived brightness rather
-/// than duty, so it eases what the eye sees.
-const fn ease_in_out(position: u32, span: u32) -> u8 {
-    if span == 0 || position >= span {
-        return u8::MAX;
-    }
-    let position = position as u64;
-    let span = span as u64;
-    // Full scale carried to the last operation: `t` is well below one, so dividing
-    // first would floor the curve to zero.
-    let scaled =
-        u8::MAX as u64 * position * position * (3 * span - 2 * position) / (span * span * span);
-    scaled as u8
-}
-
-/// A colour before brightness is applied, so the constants below read as hues.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Color {
-    pub red: u8,
-    pub green: u8,
-    pub blue: u8,
-}
-
-impl Color {
-    pub const OFF: Self = Self::new(0, 0, 0);
-    pub const WHITE: Self = Self::new(255, 255, 255);
-    pub const RED: Self = Self::new(255, 0, 0);
-    pub const AMBER: Self = Self::new(255, 140, 0);
-    pub const GREEN: Self = Self::new(0, 255, 0);
-    pub const BLUE: Self = Self::new(0, 60, 255);
-    pub const VIOLET: Self = Self::new(160, 0, 255);
-
-    pub const fn new(red: u8, green: u8, blue: u8) -> Self {
-        Self { red, green, blue }
-    }
-
-    /// The duty each channel wants at perceived brightness `level`, in
-    /// [`DUTY_FRACTION_BITS`] fixed point and still owing [`Dither`] a visit. Hue and
-    /// `level` are both perceptual, so they combine by plain multiplication.
-    ///
-    /// Red-green-blue order, worth stating because the famous ordering for this class
-    /// of part is green-red-blue. Measured on the board, not taken from a datasheet:
-    /// an amber test colour came out yellow-green and a cyan one lavender, which is
-    /// what green-red-blue bytes look like read as red-green-blue.
-    fn duty(self, level: u8) -> [u32; 3] {
-        let channel =
-            |value: u8| PERCEIVED_TO_DUTY[(value as u16 * level as u16 / u8::MAX as u16) as usize];
-        [channel(self.red), channel(self.green), channel(self.blue)]
-    }
+/// Here rather than on [`Color`] itself: the colour is vocabulary and this is
+/// what this particular part does with it. Red-green-blue order, worth stating
+/// because the famous ordering for this class of part is green-red-blue.
+/// Measured on the board, not taken from a datasheet: an amber test colour came
+/// out yellow-green and a cyan one lavender, which is what green-red-blue bytes
+/// look like read as red-green-blue.
+fn duty(color: Color, level: u8) -> [u32; 3] {
+    let channel =
+        |value: u8| PERCEIVED_TO_DUTY[(value as u16 * level as u16 / u8::MAX as u16) as usize];
+    [
+        channel(color.red),
+        channel(color.green),
+        channel(color.blue),
+    ]
 }
 
 pub struct IndicatorLed {
@@ -306,7 +221,7 @@ impl IndicatorLed {
     /// remainder across consecutive frames, so a level between two duty steps only
     /// looks like itself if the frames keep coming. The transmission is ~30 µs.
     pub fn show(&mut self, color: Color, level: u8) -> anyhow::Result<()> {
-        let bytes = self.dither.next(color.duty(level));
+        let bytes = self.dither.next(duty(color, level));
         if self.shown == Some(bytes) {
             return Ok(());
         }
@@ -338,7 +253,7 @@ mod tests {
         let mut dither = Dither::default();
         let mut totals = [0u32; 3];
         for _ in 0..frames {
-            let bytes = dither.next(color.duty(level));
+            let bytes = dither.next(duty(color, level));
             for (total, byte) in totals.iter_mut().zip(bytes) {
                 *total += byte as u32;
             }
@@ -349,7 +264,7 @@ mod tests {
     #[test]
     fn wire_order_is_red_green_blue() {
         // Three different channels cannot be permuted without one of these moving.
-        let duty = Color::new(255, 128, 32).duty(u8::MAX);
+        let duty = duty(Color::new(255, 128, 32), u8::MAX);
         assert!(duty[0] > duty[1], "red must lead");
         assert!(duty[1] > duty[2], "green must sit between");
     }
@@ -358,7 +273,7 @@ mod tests {
     fn brightness_never_exceeds_the_peak() {
         let mut dither = Dither::default();
         for level in 0..=u8::MAX {
-            for byte in dither.next(Color::WHITE.duty(level)) {
+            for byte in dither.next(duty(Color::WHITE, level)) {
                 assert!(byte as u32 <= PEAK_DUTY, "level {level} drove duty {byte}");
             }
         }
@@ -368,9 +283,9 @@ mod tests {
     fn off_is_off_at_every_level() {
         let mut dither = Dither::default();
         for level in 0..=u8::MAX {
-            assert_eq!(dither.next(Color::OFF.duty(level)), [0, 0, 0]);
+            assert_eq!(dither.next(duty(Color::OFF, level)), [0, 0, 0]);
         }
-        assert_eq!(dither.next(Color::WHITE.duty(0)), [0, 0, 0]);
+        assert_eq!(dither.next(duty(Color::WHITE, 0)), [0, 0, 0]);
     }
 
     #[test]
@@ -402,7 +317,7 @@ mod tests {
         // The point of the mechanism: single-digit whole steps at the dim end, and
         // the average still has to land on the target.
         for level in [64, 128, 200, 255] {
-            let target = Color::WHITE.duty(level);
+            let target = duty(Color::WHITE, level);
             assert!(
                 target[0] >= DITHER_MINIMUM_STEPS * DUTY_ONE,
                 "level {level} is below the floor, so this test is not testing dithering"
@@ -426,7 +341,7 @@ mod tests {
         // every frame. Three identical frames then a different one is the slow
         // pattern that rounding to half steps makes unreachable.
         for level in 0..=u8::MAX {
-            let target = Color::WHITE.duty(level);
+            let target = duty(Color::WHITE, level);
             let mut dither = Dither::default();
             let frames: Vec<u8> = (0..64).map(|_| dither.next(target)[0]).collect();
             let steady = frames.windows(2).all(|pair| pair[0] == pair[1]);
@@ -444,7 +359,7 @@ mod tests {
         // One duty step against black is full contrast, so alternating onto it reads
         // as a flash however fast the frames come. Steady, even if the fade plateaus.
         for level in 0..=u8::MAX {
-            let target = Color::WHITE.duty(level);
+            let target = duty(Color::WHITE, level);
             if target[0] >= DITHER_MINIMUM_STEPS * DUTY_ONE {
                 continue;
             }
@@ -464,65 +379,13 @@ mod tests {
     fn the_dither_only_ever_spends_what_it_was_given() {
         // A carried remainder must not become brightness of its own.
         let mut dither = Dither::default();
-        let target = Color::WHITE.duty(96);
+        let target = duty(Color::WHITE, 96);
         let ceiling = target[0].div_ceil(DUTY_ONE);
         for _ in 0..512 {
             for byte in dither.next(target) {
                 assert!(byte as u32 <= ceiling, "frame drove {byte} above {ceiling}");
             }
         }
-    }
-
-    #[test]
-    fn a_swell_rises_from_dark_and_returns_to_it() {
-        let duration = Shape::Swell.duration_milliseconds();
-        let levels: Vec<u8> = (0..duration)
-            .map(|elapsed| Shape::Swell.level(elapsed, duration))
-            .collect();
-        assert_eq!(levels[0], 0, "a swell starts dark");
-        assert_eq!(
-            Shape::Swell.level(duration, duration),
-            0,
-            "a swell ends dark"
-        );
-        let apex = levels
-            .iter()
-            .position(|level| *level == u8::MAX)
-            .expect("a swell reaches full brightness");
-        // Monotonic either side of the apex.
-        assert!(levels[..=apex].windows(2).all(|pair| pair[0] <= pair[1]));
-        assert!(levels[apex..].windows(2).all(|pair| pair[0] >= pair[1]));
-        assert!(
-            apex < duration as usize / 2,
-            "the fall should be the longer half"
-        );
-    }
-
-    #[test]
-    fn a_swell_eases_rather_than_ramping() {
-        // Smoothstep leaves and arrives flat, so the first and last tenth of the
-        // rise cover less ground than a straight line would.
-        let rise = Shape::SWELL_RISE_MILLISECONDS;
-        let duration = Shape::Swell.duration_milliseconds();
-        let tenth = Shape::Swell.level(rise / 10, duration) as u32;
-        assert!(
-            tenth < u8::MAX as u32 / 10,
-            "the start is not eased: {tenth}"
-        );
-        let ninth_tenth = Shape::Swell.level(rise * 9 / 10, duration) as u32;
-        assert!(
-            ninth_tenth > u8::MAX as u32 * 9 / 10,
-            "the approach to the apex is not eased: {ninth_tenth}"
-        );
-    }
-
-    #[test]
-    fn a_snap_has_hard_edges() {
-        let duration = Shape::Snap.duration_milliseconds();
-        for elapsed in 0..duration {
-            assert_eq!(Shape::Snap.level(elapsed, duration), u8::MAX);
-        }
-        assert_eq!(Shape::Snap.level(duration, duration), 0);
     }
 
     #[test]

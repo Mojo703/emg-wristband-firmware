@@ -201,7 +201,7 @@ const NORMAL_CHANNEL_SETTINGS: ChannelSettings = ChannelSettings {
 /// therefore rail their channels instead of being zeroed by `preprocess` — re-enable
 /// as its own bench experiment (flip LEAD_OFF_ENABLED) once the front end is stable
 /// enough to isolate its effect.
-const LEAD_OFF_ENABLED: bool = false;
+pub(crate) const LEAD_OFF_ENABLED: bool = false;
 
 /// CONFIG4: continuous conversion; lead-off comparators per [`LEAD_OFF_ENABLED`].
 const CONFIG4: Config4 = Config4 {

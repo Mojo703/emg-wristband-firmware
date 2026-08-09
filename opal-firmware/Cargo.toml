@@ -16,6 +16,15 @@ description = "ESP32-S3 EMG wristband device: fake provider → int8 inference �
 [[bin]]
 name = "opal-firmware"
 
+# One binary, two roles. `playback` adds the firmware validation bench: when ADC
+# bring-up fails — which is what a bare ESP32-S3 with no front end always does —
+# the serve loop starts the playback engine instead of running without EMG, and
+# a host tool streams recorded sessions in over the serial link. On a wired
+# board bring-up succeeds and the feature changes nothing about the run, so the
+# same image can be flashed to either. See `firmware-bench/PROTOCOL.md`.
+[features]
+playback = []
+
 [profile.release]
 opt-level = 3
 
@@ -25,6 +34,8 @@ debug = true
 
 [dependencies]
 emg-runtime = { path = "../emg-runtime" }
+calibration-flow = { path = "../calibration-flow" }
+feedback-vocabulary = { path = "../feedback-vocabulary" }
 protocol = { path = "../protocol" }
 # Default features are the crate's own bench binary and its esp-idf-svc/log/anyhow
 # dependencies; the driver itself is no_std over embedded-hal and wants none of them.
@@ -37,6 +48,9 @@ log = "0.4"
 anyhow = "1"
 ciborium = "0.2"
 serde = { version = "1", features = ["derive"] }
+# Byte-blob fields in the inbound control mirror. Without it serde asks for a
+# CBOR array of small integers where the wire carries a byte string.
+serde_bytes = "0.11"
 toml-cfg = "0.2"
 
 [build-dependencies]
