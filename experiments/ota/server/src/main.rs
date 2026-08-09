@@ -33,7 +33,10 @@ async fn main() {
     }
 
     let app = Router::new()
-        .route("/", get(|| async { "ota-server up. firmware at /firmware/<name>.bin\n" }))
+        .route(
+            "/",
+            get(|| async { "ota-server up. firmware at /firmware/<name>.bin\n" }),
+        )
         .nest_service("/firmware", ServeDir::new(FIRMWARE_DIR))
         .layer(TraceLayer::new_for_http());
 

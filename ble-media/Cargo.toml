@@ -13,9 +13,9 @@ description = "ESP32-S3 BLE HID consumer-control media remote (serial-driven for
 [lib]
 name = "ble_media"
 
-[[bin]]
-name = "ble-media"
-harness = false
+[[example]]
+name = "ble-media-bench"
+path = "examples/ble-media-bench.rs"
 
 [profile.release]
 opt-level = "s"

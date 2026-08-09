@@ -1,7 +1,9 @@
-# CLAUDE.md: ota-client
+# CLAUDE.md: OTA client experiment
 
-ESP32-S3 OTA update client (`std` / `esp-idf-svc`). See `README.md` for the boot
-flow, flash layout, toolchain setup, and the staged end-to-end verification.
+Deferred ESP32-S3 OTA update client proof (`std` / `esp-idf-svc`). It is not
+integrated into Opal. See `README.md` for the boot flow, flash layout, and staged
+end-to-end verification; shared toolchain setup lives at
+`../../../FIRMWARE-SETUP.md`.
 
 Agent notes:
 

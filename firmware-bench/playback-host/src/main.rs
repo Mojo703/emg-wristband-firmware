@@ -14,13 +14,17 @@
 mod capture;
 mod link;
 mod numpy;
-mod partition;
 mod partition_v2;
 mod sources;
 
 use anyhow::{bail, Context, Result};
 use capture::Capture;
 use clap::{Parser, Subcommand};
+use emg_runtime::band_features::FEATURE_COUNT;
+use emg_runtime::flash_image::{
+    build_prior, whole_partition, PriorBuildInputs, PriorImage, StandardizationVariant,
+};
+use emg_runtime::streaming_fit::{Standardization, StandardizedQuantization};
 use link::Link;
 use protocol::{
     CalibrationGesture, CalibrationOutcome, Frame, CALIBRATION_SCHEDULE_ENTRY_BYTES,
@@ -134,8 +138,8 @@ enum Step {
         /// Store at most this many rows, to find where the device runs out.
         #[arg(long)]
         rows: Option<usize>,
-        /// Stream only these sessions' rows. Repeatable; the complement of what
-        /// `build-partition --exclude-session` put in flash.
+        /// Stream only these sessions' rows. Repeatable; the complement of the
+        /// rows placed in the v2 prior image.
         #[arg(long = "session")]
         sessions: Vec<String>,
         /// Stream only these roles' rows. Repeatable.
@@ -155,32 +159,6 @@ enum Step {
     Script {
         #[arg(long)]
         plan: PathBuf,
-    },
-    /// Pack a model directory's training rows into a flashable image for the
-    /// device's `training` partition. Touches no port: the image is written
-    /// with `espflash write-bin` at the hardware phase, not streamed.
-    BuildPartition {
-        #[arg(long)]
-        model: PathBuf,
-        /// Leave these sessions' rows out of the image — they are the ones the
-        /// bench streams live. Repeatable.
-        #[arg(long = "exclude-session")]
-        exclude_sessions: Vec<String>,
-        /// Leave these roles' rows out. Repeatable.
-        #[arg(long = "exclude-role")]
-        exclude_roles: Vec<String>,
-        /// Row storage precision. The device joins flash rows only when they
-        /// match the store's precision, so a precision sweep needs one image
-        /// each.
-        #[arg(long, default_value = "i8")]
-        precision: String,
-        #[arg(long)]
-        quantization: Option<PathBuf>,
-        /// Pack at most this many rows.
-        #[arg(long)]
-        rows: Option<usize>,
-        #[arg(long)]
-        image: PathBuf,
     },
     /// Build the v2 prior image: the same rows, standardized by the prior's
     /// own statistics and quantized to int8 against a standardized-feature
@@ -292,29 +270,6 @@ impl AbortController {
 
 fn main() -> Result<()> {
     let arguments = Arguments::parse();
-    if let Step::BuildPartition {
-        model,
-        exclude_sessions,
-        exclude_roles,
-        precision,
-        quantization,
-        rows,
-        image,
-    } = &arguments.step
-    {
-        return build_partition(
-            model,
-            precision,
-            quantization.as_deref(),
-            *rows,
-            image,
-            &sources::Selection {
-                sessions: exclude_sessions.clone(),
-                roles: exclude_roles.clone(),
-                exclude: true,
-            },
-        );
-    }
     if let Step::BuildPartitionV2 {
         model,
         exclude_sessions,
@@ -486,87 +441,9 @@ fn run(step: &Step, link: &mut Link, capture: &mut Capture) -> Result<()> {
         }
         Step::Script { plan } => bail!("nested script {}", plan.display()),
         Step::Inspect { .. } => bail!("inspect does not run over a link"),
-        Step::BuildPartition { .. } => bail!("build-partition does not run over a link"),
         Step::BuildPartitionV2 { .. } => bail!("build-partition-v2 does not run over a link"),
         Step::InspectPartition { .. } => bail!("inspect-partition does not run over a link"),
     }
-}
-
-/// Pack a model directory's training rows into the flash image the device maps.
-///
-/// The rows are the same ones `fit` streams; the difference is only where they
-/// end up. Flash is the answer for the full set — 9654 rows is 604 KB even at
-/// int8, which no amount of streaming will fit in SRAM.
-fn build_partition(
-    directory: &Path,
-    precision: &str,
-    quantization_path: Option<&Path>,
-    row_limit: Option<usize>,
-    image_path: &Path,
-    selection: &sources::Selection,
-) -> Result<()> {
-    let precision = partition::Precision::parse(precision)?;
-    let features = numpy::read(directory.join("training_rows.npy"))?;
-    let labels = numpy::read(directory.join("training_labels.npy"))?;
-    let weights = numpy::read(directory.join("row_weights.npy"))?;
-    if features.columns()? != partition::FEATURE_COUNT {
-        bail!("training rows have {} columns", features.columns()?);
-    }
-    let available = features.rows();
-    if labels.values.len() != available || weights.values.len() != available {
-        bail!(
-            "{available} rows but {} labels and {} weights",
-            labels.values.len(),
-            weights.values.len()
-        );
-    }
-    // Everything the bench does not stream live. The two selections are
-    // complements over the same breakdown, so a row cannot end up in both the
-    // partition and the stream — which would train on it twice.
-    let breakdown = sources::read(directory, available)?;
-    let (kept, indices) = selection.resolve(&breakdown)?;
-    let features_selected = sources::gather(&features.values, partition::FEATURE_COUNT, &indices);
-    let labels_selected: Vec<f32> = indices.iter().map(|index| labels.values[*index]).collect();
-    let weights_selected: Vec<f32> = indices.iter().map(|index| weights.values[*index]).collect();
-
-    let selected = indices.len();
-    let rows = row_limit.unwrap_or(selected).min(selected);
-    println!("flashing rows from:\n  {}", sources::describe(&kept));
-    if rows < selected {
-        println!("  cut to {rows} of {selected} rows by --rows");
-    }
-
-    let quantization = if precision == partition::Precision::Int8 {
-        let path = quantization_path
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| default_quantization_path(directory));
-        partition::Quantization::from_bits(&read_quantization(&path)?)?
-    } else {
-        partition::Quantization::identity()
-    };
-    let class_count = numpy::read(directory.join("weights.npy"))?.columns()?;
-
-    let image = partition::build(
-        precision,
-        &quantization,
-        &features_selected[..rows * partition::FEATURE_COUNT],
-        &labels_selected[..rows],
-        &weights_selected[..rows],
-        class_count,
-    )?;
-    partition::write(image_path, &image)?;
-    println!(
-        "wrote {} : {rows} rows at {precision:?}, {} bytes ({} header + {} rows)",
-        image_path.display(),
-        image.len(),
-        partition::ROWS_OFFSET,
-        rows * precision.row_bytes()
-    );
-    println!(
-        "flash with: espflash write-bin 0x310000 {}",
-        image_path.display()
-    );
-    Ok(())
 }
 
 /// The sessions whose rows are the wearer's own, collected live at calibration
@@ -596,7 +473,7 @@ fn build_partition_v2(
     selection: &sources::Selection,
 ) -> Result<()> {
     let raw = numpy::read(directory.join("training_rows.npy"))?;
-    if raw.columns()? != partition::FEATURE_COUNT {
+    if raw.columns()? != FEATURE_COUNT {
         bail!("training rows have {} columns", raw.columns()?);
     }
     let labels = numpy::read(directory.join("training_labels.npy"))?;
@@ -618,11 +495,21 @@ fn build_partition_v2(
     // Standardize before selecting, so the statistics are the fit's own over
     // the whole set — the prior's statistics, which is what the device scores
     // through — and not the statistics of whatever subset ships.
-    let statistics = partition_v2::Standardization {
-        mean: mean.values.clone(),
-        deviation: deviation.values.clone(),
+    let statistics = Standardization {
+        mean: mean.values.try_into().map_err(|values: Vec<f32>| {
+            anyhow::anyhow!(
+                "prior mean has {} values, want {FEATURE_COUNT}",
+                values.len()
+            )
+        })?,
+        deviation: deviation.values.try_into().map_err(|values: Vec<f32>| {
+            anyhow::anyhow!(
+                "prior deviation has {} values, want {FEATURE_COUNT}",
+                values.len()
+            )
+        })?,
     };
-    let standardized = partition_v2::standardize(&raw.values, available, &statistics);
+    let standardized = partition_v2::standardize(&raw.values, &statistics);
 
     let breakdown = sources::read(directory, available)?;
     // Naming nothing means the product's split, not "ship everything": a
@@ -647,8 +534,11 @@ fn build_partition_v2(
         selection
     };
     let (kept, indices) = selection.resolve(&breakdown)?;
-    let selected_rows = sources::gather(&standardized, partition::FEATURE_COUNT, &indices);
-    let selected_labels: Vec<f32> = indices.iter().map(|index| labels.values[*index]).collect();
+    let selected_rows = sources::gather(&standardized, FEATURE_COUNT, &indices);
+    let selected_labels: Vec<u8> = indices
+        .iter()
+        .map(|index| labels.values[*index] as u8)
+        .collect();
     // A row stores its class scale and nothing else. The divisor is the count
     // of rows of that class present at a checkpoint, which grows every round,
     // so it is formed at fit time — the alternative would need a row in flash
@@ -681,22 +571,22 @@ fn build_partition_v2(
     // One scale for every feature, zero offset: full scale at ten prior
     // deviations. Fitted to standardized values, so the per-feature constants
     // in feature_quantization.json — fitted to raw features — must not be used.
-    let quantization = partition_v2::Quantization::uniform(calibration.row_quantization_scale);
+    let quantization = StandardizedQuantization::uniform(calibration.row_quantization_scale);
     println!(
         "row quantization: offset 0, scale {} for all {} features",
-        calibration.row_quantization_scale,
-        partition::FEATURE_COUNT
+        calibration.row_quantization_scale, FEATURE_COUNT
     );
-    let prior = partition_v2::build_prior(&partition_v2::PriorInputs {
+    let prior = build_prior(&PriorBuildInputs {
         class_count,
-        standardized: &selected_rows[..rows * partition::FEATURE_COUNT],
+        standardized: &selected_rows[..rows * FEATURE_COUNT],
         labels: &selected_labels[..rows],
-        row_weights: &selected_weights[..rows],
+        class_scales: &selected_weights[..rows],
         warm_start_weights: &warm_start_weights,
-        statistics: &statistics,
+        standardization: &statistics,
         quantization: &quantization,
         variant,
-    })?;
+    })
+    .map_err(|error| anyhow::anyhow!(error))?;
 
     // The safety property, checked on the rows the prior deliberately excludes:
     // the wearer's own reps, which are the closest thing to what a device
@@ -706,10 +596,9 @@ fn build_partition_v2(
         .filter(|index| !indices.contains(index))
         .collect();
     if !live_indices.is_empty() {
-        let live_rows = sources::gather(&raw.values, partition::FEATURE_COUNT, &live_indices);
+        let live_rows = sources::gather(&raw.values, FEATURE_COUNT, &live_indices);
         let (worst_total, worst_single) = partition_v2::command_mass(
             &live_rows,
-            live_indices.len(),
             &statistics,
             &quantization,
             &warm_start_weights,
@@ -733,13 +622,17 @@ fn build_partition_v2(
     let image = if prior_only {
         prior
     } else {
-        partition_v2::whole_partition(&prior)?
+        whole_partition(&prior).map_err(|error| anyhow::anyhow!(error))?
     };
-    partition::write(image_path, &image)?;
+    std::fs::write(image_path, &image)
+        .with_context(|| format!("write {}", image_path.display()))?;
+    let prior_hash = PriorImage::parse(&image)
+        .map_err(|error| anyhow::anyhow!("built prior did not parse: {}", error.as_str()))?
+        .hash();
     println!(
         "wrote {} : {rows} rows x {class_count} classes at 72 B, hash {:08x}, {} bytes",
         image_path.display(),
-        partition_v2::prior_hash(&image),
+        prior_hash,
         image.len(),
     );
     print!("{}", partition_v2::describe(&image)?);
@@ -810,7 +703,7 @@ fn calibration_fixtures(
 /// present at each checkpoint, and that count grows with every collection
 /// round — so it cannot live in a row, because a row in flash can never be
 /// rewritten. ARITHMETIC.md calls the convention `checkpoint_counts`.
-fn prior_class_scales(labels: &[f32], command_classes: usize) -> Vec<f32> {
+fn prior_class_scales(labels: &[u8], command_classes: usize) -> Vec<f32> {
     const NO_OP_SCALE: f32 = 0.4;
     labels
         .iter()
@@ -847,10 +740,14 @@ fn command_class_count(model_directory: &Path) -> Result<usize> {
 fn standardization_variant(
     model_directory: &Path,
     constants_path: Option<&Path>,
-) -> Result<partition_v2::StandardizationVariant> {
+) -> Result<StandardizationVariant> {
     let calibration = calibration_fixtures(model_directory, constants_path)?;
     let name = calibration.standardization_variant.as_str();
-    let variant = partition_v2::StandardizationVariant::parse(name)?;
+    let variant = match name {
+        "frozen_prior" | "frozen" => StandardizationVariant::FrozenPrior,
+        "recomputed_per_round" | "recomputed" => StandardizationVariant::RecomputedPerRound,
+        other => bail!("standardization must be frozen_prior or recomputed_per_round, not {other}"),
+    };
     println!("standardization: {name}");
     Ok(variant)
 }
@@ -913,28 +810,20 @@ fn inspect(
         println!("  {class_count} classes, {} bytes", bits.len());
         let rows = numpy::read(directory.join("training_rows.npy"))?;
         println!("  {} training rows of {}", rows.rows(), rows.columns()?);
-        // The breakdown a split is cut from, with each source's flashed size,
-        // so a case can be planned against the partition's capacity before
-        // anything is built.
+        // The breakdown a split is cut from, so the v2 prior selection can be
+        // checked before an image is built.
         for source in sources::read(directory, rows.rows())? {
             println!(
-                "    {} {} {} rows: {} B i8, {} B f16, {} B f32",
+                "    {} {} {} rows: {} B in the v2 prior",
                 source.session,
                 source.role,
                 source.rows,
-                source.rows * partition::Precision::Int8.row_bytes(),
-                source.rows * partition::Precision::Float16.row_bytes(),
-                source.rows * partition::Precision::Float32.row_bytes(),
+                source.rows * emg_runtime::streaming_fit::ROW_STRIDE,
             );
         }
         println!(
-            "  partition holds {} rows at i8, {} at f16, {} at f32",
-            (partition::PARTITION_BYTES - partition::ROWS_OFFSET)
-                / partition::Precision::Int8.row_bytes(),
-            (partition::PARTITION_BYTES - partition::ROWS_OFFSET)
-                / partition::Precision::Float16.row_bytes(),
-            (partition::PARTITION_BYTES - partition::ROWS_OFFSET)
-                / partition::Precision::Float32.row_bytes(),
+            "  v2 prior holds {} standardized int8 rows",
+            emg_runtime::flash_image::prior_row_capacity(),
         );
     }
     let quantization_path = quantization
@@ -1708,7 +1597,7 @@ fn calibrate(
 
 #[cfg(test)]
 mod tests {
-    use super::{read_plan, CalibrationAbort};
+    use super::{read_plan, Arguments, CalibrationAbort, Parser, Step};
     use std::path::PathBuf;
 
     fn write_plan(contents: &str) -> PathBuf {
@@ -1754,5 +1643,23 @@ mod tests {
         std::fs::remove_file(path).unwrap();
 
         assert!(format!("{error:#}").contains("more than one calibrate step"));
+    }
+
+    #[test]
+    fn the_legacy_partition_builder_is_not_a_cli_command() {
+        assert!(Arguments::try_parse_from(["playback-host", "build-partition"]).is_err());
+        assert!(matches!(
+            Arguments::try_parse_from([
+                "playback-host",
+                "build-partition-v2",
+                "--model",
+                "model",
+                "--image",
+                "image.bin"
+            ])
+            .unwrap()
+            .step,
+            Step::BuildPartitionV2 { .. }
+        ));
     }
 }

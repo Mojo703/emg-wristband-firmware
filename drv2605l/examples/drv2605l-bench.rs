@@ -1,4 +1,4 @@
-//! Bench harness for the DRV2605L breakout: bring the chip up on I2C, then cycle
+//! Standalone bench for the DRV2605L breakout: bring the chip up on I2C, then cycle
 //! through the candidate gesture-feedback patterns so they can be told apart by feel.
 //!
 //! There is nothing to type at the console. Flash it, hold the motor, and listen to the

@@ -8,14 +8,14 @@ version = "0.1.0"
 edition = "2021"
 resolver = "2"
 rust-version = "1.81"
-description = "TI DRV2605L haptic driver over I2C, plus an ESP32-S3 bench binary that plays a candidate set of wristband feedback patterns"
+description = "TI DRV2605L haptic driver over I2C, plus an ESP32-S3 bench example that plays a candidate set of wristband feedback patterns"
 
 [lib]
 name = "drv2605l"
 
-[[bin]]
+[[example]]
 name = "drv2605l-bench"
-path = "src/main.rs"
+path = "examples/drv2605l-bench.rs"
 required-features = ["bench"]
 
 [profile.release]

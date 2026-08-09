@@ -6,15 +6,23 @@ model-free reject pipeline that turns one window's logits into a decision, and t
 grid aligner that puts the two ADS1298s' independently clocked sample streams on
 one time base. `opal-firmware` is the consumer.
 
-The crate is `no_std` plus `alloc` and depends on nothing but
-[`protocol`](../protocol) and `libm`, so it carries no ESP dependency and builds on
-the host as readily as on Xtensa. That is deliberate: the same code that runs on the
-device can be run, tested, and compared against a reference on a laptop.
+The runtime library is `no_std` plus `alloc` and depends only on
+[`protocol`](../protocol), `libm`, and `half`. Its ESP dependency is target-specific
+and used only by the device-test example. The small build script forwards ESP-IDF
+linker metadata when that example is selected. Ordinary host builds remain portable,
+so the same runtime code can be tested against a laptop reference.
 
 `cargo test` runs the host suite. Off Xtensa the SIMD entry points resolve to the
-scalar oracle, so their comparison would prove nothing. The separate
-`emg-runtime-esp32s3-tests` package runs those checks on the device with
-`cargo test-device`.
+scalar oracle, so their comparison would prove nothing. The `esp32s3-tests`
+example runs those checks on the device:
+
+```sh
+. ~/export-esp.sh
+cargo +esp test-device
+```
+
+For a compile-only check, append `--no-run`. The explicit `+esp` keeps the crate's
+ordinary host commands on stable Rust while the example selects the Xtensa toolchain.
 
 ## The model
 

@@ -29,8 +29,10 @@ Then:
 cargo run --release
 ```
 
-The ADCs are the only source of EMG. If they do not come up, boot fails and prints why,
-so read the boot log before anything else.
+The ADCs are the only live source of EMG. If they do not come up, the firmware
+keeps the dashboard link alive and reports the failure, but acquisition remains
+unavailable. A build with the `playback` feature can start its recorded source on
+a bare board. Read the boot log before anything else.
 
 ## 1. Does the bus answer?
 
@@ -57,10 +59,10 @@ that board's own wiring. A mismatch names what it read and guesses at the cause:
   mode 1, which the datasheet requires, and an unclocked chip cannot decode commands
   at all.
 
-Bring-up failure stops the boot. The error names which chip and which step failed, and
-that is the whole diagnostic: `ADS1298 chip 0 identity probe` points somewhere
-different from `ADS1298 chip 1 initialise`. The chips are numbered 0 and 1 in the log
-and called A and B in the wiring; chip 0 is board A.
+Bring-up failure degrades the device to a linked, no-EMG state. The error names
+which chip and step failed: `ADS1298 chip 0 identity probe` points somewhere
+different from `ADS1298 chip 1 initialise`. The chips are numbered 0 and 1 in
+the log and called A and B in the wiring; chip 0 is board A.
 
 ## 2. Is the read path right?
 
@@ -124,13 +126,17 @@ fault.
 
 Set `ADC_TEST_SIGNAL_CHANNEL` back to `None`, flash, and put the band on someone.
 
-At rest each channel should sit near zero and drift slowly. Clench, and the channels
-over the active muscle should jump. Lift an electrode and its channel should go to
-exactly zero: the lead-off comparators flag it and the firmware zeroes flagged channels
-rather than passing on a railed input.
+At rest each conditioned channel should sit near zero and drift slowly. Clench,
+and the channels over the active muscle should jump. Check the dashboard's
+waveform, rail, offset, headroom, and noise measurements while seating each
+electrode.
 
-If a channel reads zero and stays there with the electrode attached, it is being flagged
-as lead-off. Check contact and impedance, not the code.
+Lead-off detection is disabled in the current image, so lifting an electrode is
+not expected to produce a LOFF flag or a zeroed channel. A disconnected channel
+may rail. Treat an absent lead-off metric as unknown. Test LOFF only in a
+separate build with scopes and the front-end recovery counters visible; earlier
+failure-rate measurements predate the current driver and hardware fixes and do
+not establish current behavior.
 
 ## 5. Does the model see anything sensible?
 

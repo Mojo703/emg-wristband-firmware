@@ -556,6 +556,7 @@ dependencies = [
 name = "emg-runtime"
 version = "0.1.0"
 dependencies = [
+ "embuild",
  "half",
  "libm",
  "protocol",

@@ -542,7 +542,7 @@ impl App {
         // GP3/GP43/GP39 are spare; GP45 (strapping) and GP38 stay unused by design.
         // USB-Serial-JTAG above claims GPIO 19 and 20 internally. The chips' own GPIO
         // pins are tied to GND (SBAS459K forbids floating them). The feedback outputs
-        // take GP17/GP18 (haptics I2C data and clock) and GP21 (the onboard
+        // take GP16/GP15 (haptics I2C data and clock) and GP21 (the onboard
         // addressable LED); their block is below, before ADC bring-up, so the LED is
         // lit through the front end's settling delays.
         // ---------------------------------------------------------------------------

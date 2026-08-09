@@ -10,6 +10,14 @@ resolver = "2"
 rust-version = "1.77"
 description = "On-device EMG gesture inference (int8 + ESP32-S3 SIMD) and the reject pipeline"
 
+[features]
+esp32s3-tests = ["dep:esp-idf-svc"]
+
+[[example]]
+name = "esp32s3-tests"
+path = "examples/esp32s3-tests.rs"
+required-features = ["esp32s3-tests"]
+
 # no_std + alloc, no esp dependencies: pure compute plus the model-free decision
 # spine. Builds on the host (scalar kernels) for verification and on Xtensa (SIMD
 # kernels) when pulled in by a firmware crate, which supplies the esp toolchain.
@@ -28,3 +36,9 @@ opt-level = 3
 [dev-dependencies]
 ciborium = "0.2"
 serde_json = "1.0.151"
+
+[target.'cfg(all(target_arch = "xtensa", target_os = "espidf"))'.dependencies]
+esp-idf-svc = { version = "0.52", optional = true }
+
+[build-dependencies]
+embuild = { version = "0.33", features = ["espidf"] }

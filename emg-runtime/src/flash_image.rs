@@ -11,6 +11,7 @@
 //! and the tests at the bottom pin this file against it.
 
 use alloc::vec::Vec;
+use core::fmt;
 
 use crate::band_features::FEATURE_COUNT;
 use crate::calibration::INPUT_COUNT;
@@ -29,7 +30,7 @@ pub const PRIOR_MAGIC: [u8; 8] = *b"OPALROW2";
 pub const SLOT_MAGIC: [u8; 8] = *b"OPALSLOT";
 pub const FORMAT_VERSION: u32 = 2;
 
-const HEADER_BYTES: usize = 64;
+pub const HEADER_BYTES: usize = 64;
 const STATISTICS_BYTES: usize = FEATURE_COUNT * 4;
 const QUANTIZATION_BYTES: usize = FEATURE_COUNT * 2 * 4;
 
@@ -65,6 +66,73 @@ pub fn slot_row_capacity() -> usize {
 /// that follows is the one that decides.
 const MAX_CLASS_COUNT: usize = 64;
 
+/// Inputs for the canonical v2 prior-region encoder.
+pub struct PriorBuildInputs<'a> {
+    pub class_count: usize,
+    /// Standardized features, row-major with [`FEATURE_COUNT`] values per row.
+    pub standardized: &'a [f32],
+    pub labels: &'a [u8],
+    pub class_scales: &'a [f32],
+    /// `(64 + 1) * class_count`, input-major with the bias input last.
+    pub warm_start_weights: &'a [f32],
+    pub standardization: &'a Standardization,
+    pub quantization: &'a StandardizedQuantization,
+    pub variant: StandardizationVariant,
+}
+
+/// Why a v2 prior image could not be encoded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BuildError {
+    ShapeMismatch,
+    WeightCountMismatch { actual: usize, expected: usize },
+    NoClasses,
+    LabelPastClassCount { label: u8, class_count: usize },
+    ClassCountPastMetadata(usize),
+    UnsupportedStandardization(StandardizationVariant),
+    TooManyRows(usize),
+    WrongPriorRegionSize(usize),
+}
+
+impl fmt::Display for BuildError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BuildError::ShapeMismatch => formatter.write_str(
+                "labels, class scales, and standardized feature rows have different lengths",
+            ),
+            BuildError::WeightCountMismatch { actual, expected } => {
+                write!(
+                    formatter,
+                    "warm-start weights contain {actual} values, want {expected}"
+                )
+            }
+            BuildError::NoClasses => formatter.write_str("a prior must name at least one class"),
+            BuildError::LabelPastClassCount { label, class_count } => write!(
+                formatter,
+                "row label {label} is outside the prior's {class_count} classes"
+            ),
+            BuildError::ClassCountPastMetadata(count) => write!(
+                formatter,
+                "{count} classes need metadata that reaches the prior rows"
+            ),
+            BuildError::UnsupportedStandardization(variant) => write!(
+                formatter,
+                "no firmware implements {variant:?} standardization"
+            ),
+            BuildError::TooManyRows(rows) => write!(
+                formatter,
+                "{rows} rows exceeds the prior region's {}-row capacity",
+                prior_row_capacity()
+            ),
+            BuildError::WrongPriorRegionSize(actual) => {
+                write!(
+                    formatter,
+                    "prior region is {actual} bytes, want {PRIOR_REGION_BYTES}"
+                )
+            }
+        }
+    }
+}
+
 /// Bytes the metadata occupies for a given class count, prior region.
 pub fn prior_metadata_bytes(class_count: usize) -> usize {
     HEADER_BYTES + QUANTIZATION_BYTES + 2 * STATISTICS_BYTES + INPUT_COUNT * class_count * 4
@@ -80,6 +148,108 @@ pub fn slot_metadata_bytes(class_count: usize) -> usize {
         + INPUT_COUNT * class_count * 4
 }
 
+/// Encode a complete v2 prior region, including erased (`0xFF`) tail padding.
+pub fn build_prior(inputs: &PriorBuildInputs<'_>) -> Result<Vec<u8>, BuildError> {
+    let rows = inputs.labels.len();
+    let expected_features = rows
+        .checked_mul(FEATURE_COUNT)
+        .ok_or(BuildError::ShapeMismatch)?;
+    if inputs.standardized.len() != expected_features || inputs.class_scales.len() != rows {
+        return Err(BuildError::ShapeMismatch);
+    }
+    if inputs.class_count == 0 {
+        return Err(BuildError::NoClasses);
+    }
+    if let Some(&label) = inputs
+        .labels
+        .iter()
+        .find(|&&label| label as usize >= inputs.class_count)
+    {
+        return Err(BuildError::LabelPastClassCount {
+            label,
+            class_count: inputs.class_count,
+        });
+    }
+    let expected_weights = INPUT_COUNT
+        .checked_mul(inputs.class_count)
+        .ok_or(BuildError::ClassCountPastMetadata(inputs.class_count))?;
+    if inputs.warm_start_weights.len() != expected_weights {
+        return Err(BuildError::WeightCountMismatch {
+            actual: inputs.warm_start_weights.len(),
+            expected: expected_weights,
+        });
+    }
+    if inputs.class_count > MAX_CLASS_COUNT
+        || prior_metadata_bytes(inputs.class_count) > PRIOR_ROWS_OFFSET
+    {
+        return Err(BuildError::ClassCountPastMetadata(inputs.class_count));
+    }
+    if inputs.variant != StandardizationVariant::FrozenPrior {
+        return Err(BuildError::UnsupportedStandardization(inputs.variant));
+    }
+    if rows > prior_row_capacity() {
+        return Err(BuildError::TooManyRows(rows));
+    }
+
+    let mut image = Vec::with_capacity(PRIOR_REGION_BYTES);
+    image.extend_from_slice(&PRIOR_MAGIC);
+    for word in [
+        FORMAT_VERSION,
+        inputs.class_count as u32,
+        rows as u32,
+        ROW_STRIDE as u32,
+        FEATURE_COUNT as u32,
+        inputs.variant.selector(),
+        0,
+    ] {
+        image.extend_from_slice(&word.to_le_bytes());
+    }
+    image.resize(HEADER_BYTES, 0);
+    image.extend_from_slice(&inputs.quantization.to_bits());
+    write_f32s(&mut image, &inputs.standardization.mean);
+    write_f32s(&mut image, &inputs.standardization.deviation);
+    write_f32s(&mut image, inputs.warm_start_weights);
+    debug_assert_eq!(image.len(), prior_metadata_bytes(inputs.class_count));
+    image.resize(PRIOR_ROWS_OFFSET, 0);
+
+    let mut standardized = [0.0f32; FEATURE_COUNT];
+    let mut codes = [0u8; FEATURE_COUNT];
+    let mut packed = [0u8; ROW_STRIDE];
+    for ((features, &label), &class_scale) in inputs
+        .standardized
+        .chunks_exact(FEATURE_COUNT)
+        .zip(inputs.labels)
+        .zip(inputs.class_scales)
+    {
+        standardized.copy_from_slice(features);
+        inputs.quantization.encode(&standardized, &mut codes);
+        RowSource::pack(&codes, label, class_scale, &mut packed);
+        image.extend_from_slice(&packed);
+    }
+
+    let hash = crc32(&image[HEADER_BYTES..]);
+    image[32..36].copy_from_slice(&hash.to_le_bytes());
+    image.resize(PRIOR_REGION_BYTES, 0xFF);
+    Ok(image)
+}
+
+/// Append two erased wearer slots to a complete prior region.
+pub fn whole_partition(prior: &[u8]) -> Result<Vec<u8>, BuildError> {
+    if prior.len() != PRIOR_REGION_BYTES {
+        return Err(BuildError::WrongPriorRegionSize(prior.len()));
+    }
+    let mut image = Vec::with_capacity(PARTITION_BYTES);
+    image.extend_from_slice(prior);
+    image.resize(PARTITION_BYTES, 0xFF);
+    Ok(image)
+}
+
+fn write_f32s(image: &mut Vec<u8>, values: &[f32]) {
+    for value in values {
+        image.extend_from_slice(&value.to_le_bytes());
+    }
+}
+
 /// Why a region could not be used. An absence and a corruption are different
 /// answers: the first runs the prior alone, the second is reported to the
 /// wearer.
@@ -89,6 +259,7 @@ pub enum ImageError {
     Absent,
     Truncated,
     UnsupportedVersion(u32),
+    UnsupportedStandardization(u32),
     BadStride(u32),
     BadFeatureCount(u32),
     /// The row count does not fit the region it claims to sit in.
@@ -114,6 +285,9 @@ impl ImageError {
             ImageError::Truncated => "region is shorter than its own layout",
             ImageError::UnsupportedVersion(_) => {
                 "region names a format version this build cannot read"
+            }
+            ImageError::UnsupportedStandardization(_) => {
+                "region names a standardization recipe this build cannot use"
             }
             ImageError::BadStride(_) => "region names a row stride this build does not pack",
             ImageError::BadFeatureCount(_) => {
@@ -205,10 +379,11 @@ impl StandardizationVariant {
         }
     }
 
-    fn from_selector(value: u32) -> StandardizationVariant {
+    fn from_selector(value: u32) -> Result<StandardizationVariant, ImageError> {
         match value {
-            1 => StandardizationVariant::RecomputedPerRound,
-            _ => StandardizationVariant::FrozenPrior,
+            0 => Ok(StandardizationVariant::FrozenPrior),
+            1 => Ok(StandardizationVariant::RecomputedPerRound),
+            other => Err(ImageError::UnsupportedStandardization(other)),
         }
     }
 }
@@ -266,12 +441,13 @@ impl<'a> PriorImage<'a> {
         if rows_end > bytes.len() {
             return Err(ImageError::RowCountPastRegion(row_count as u32));
         }
+        let variant = StandardizationVariant::from_selector(read_u32(bytes, 28))?;
         Ok(PriorImage {
             bytes,
             class_count,
             row_count,
             hash: read_u32(bytes, 32),
-            variant: StandardizationVariant::from_selector(read_u32(bytes, 28)),
+            variant,
         })
     }
 
@@ -763,6 +939,143 @@ mod tests {
     }
 
     #[test]
+    fn the_canonical_builder_is_byte_identical_to_the_pinned_layout() {
+        let rows = 40;
+        let class_count = 12;
+        let standardized: Vec<f32> = (0..rows * FEATURE_COUNT)
+            .map(|index| {
+                if index % FEATURE_COUNT == 0 {
+                    (index / FEATURE_COUNT) as f32 * 0.5 + 0.25
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        let labels: Vec<u8> = (0..rows).map(|row| (row % class_count) as u8).collect();
+        let class_scales = vec![1.0; rows];
+        let weights = vec![0.125; INPUT_COUNT * class_count];
+        let standardization = Standardization {
+            mean: [1.5; FEATURE_COUNT],
+            deviation: [2.5; FEATURE_COUNT],
+        };
+        let quantization = StandardizedQuantization {
+            offset: [0.25; FEATURE_COUNT],
+            scale: [0.5; FEATURE_COUNT],
+        };
+
+        let built = build_prior(&PriorBuildInputs {
+            class_count,
+            standardized: &standardized,
+            labels: &labels,
+            class_scales: &class_scales,
+            warm_start_weights: &weights,
+            standardization: &standardization,
+            quantization: &quantization,
+            variant: StandardizationVariant::FrozenPrior,
+        })
+        .unwrap();
+        let expected = prior_bytes(class_count, rows);
+
+        assert_eq!(&built[..expected.len()], expected);
+        assert!(built[expected.len()..].iter().all(|&byte| byte == 0xFF));
+        assert_eq!(built.len(), PRIOR_REGION_BYTES);
+        assert_eq!(crc32(&built), 0x2A74_ECD1);
+    }
+
+    #[test]
+    fn the_canonical_builder_refuses_shapes_the_parser_cannot_use() {
+        let standardization = Standardization {
+            mean: [0.0; FEATURE_COUNT],
+            deviation: [1.0; FEATURE_COUNT],
+        };
+        let quantization = StandardizedQuantization::IDENTITY;
+        let inputs = PriorBuildInputs {
+            class_count: 12,
+            standardized: &[0.0; FEATURE_COUNT],
+            labels: &[0],
+            class_scales: &[],
+            warm_start_weights: &[0.0; INPUT_COUNT * 12],
+            standardization: &standardization,
+            quantization: &quantization,
+            variant: StandardizationVariant::FrozenPrior,
+        };
+        assert_eq!(build_prior(&inputs).unwrap_err(), BuildError::ShapeMismatch);
+        assert_eq!(
+            whole_partition(&[0; 4]).unwrap_err(),
+            BuildError::WrongPriorRegionSize(4)
+        );
+
+        let no_classes = PriorBuildInputs {
+            class_count: 0,
+            class_scales: &[1.0],
+            warm_start_weights: &[],
+            ..inputs
+        };
+        assert_eq!(build_prior(&no_classes).unwrap_err(), BuildError::NoClasses);
+
+        let bad_label = PriorBuildInputs {
+            class_count: 12,
+            labels: &[12],
+            class_scales: &[1.0],
+            ..inputs
+        };
+        assert_eq!(
+            build_prior(&bad_label).unwrap_err(),
+            BuildError::LabelPastClassCount {
+                label: 12,
+                class_count: 12,
+            }
+        );
+
+        let unsupported = PriorBuildInputs {
+            class_scales: &[1.0],
+            variant: StandardizationVariant::RecomputedPerRound,
+            ..inputs
+        };
+        assert_eq!(
+            build_prior(&unsupported).unwrap_err(),
+            BuildError::UnsupportedStandardization(StandardizationVariant::RecomputedPerRound)
+        );
+
+        let class_count = 40;
+        let weights = vec![0.0; INPUT_COUNT * class_count];
+        let excessive_metadata = PriorBuildInputs {
+            class_count,
+            standardized: &[0.0; FEATURE_COUNT],
+            labels: &[0],
+            class_scales: &[1.0],
+            warm_start_weights: &weights,
+            standardization: &standardization,
+            quantization: &quantization,
+            variant: StandardizationVariant::FrozenPrior,
+        };
+        assert_eq!(
+            build_prior(&excessive_metadata).unwrap_err(),
+            BuildError::ClassCountPastMetadata(class_count)
+        );
+
+        let rows = prior_row_capacity() + 1;
+        let standardized = vec![0.0; rows * FEATURE_COUNT];
+        let labels = vec![0; rows];
+        let class_scales = vec![1.0; rows];
+        let weights = vec![0.0; INPUT_COUNT * 12];
+        let oversized = PriorBuildInputs {
+            class_count: 12,
+            standardized: &standardized,
+            labels: &labels,
+            class_scales: &class_scales,
+            warm_start_weights: &weights,
+            standardization: &standardization,
+            quantization: &quantization,
+            variant: StandardizationVariant::FrozenPrior,
+        };
+        assert_eq!(
+            build_prior(&oversized).unwrap_err(),
+            BuildError::TooManyRows(rows)
+        );
+    }
+
+    #[test]
     fn an_unwritten_prior_is_an_absence_and_a_wrong_version_is_a_fault() {
         let erased = vec![0xFFu8; PRIOR_REGION_BYTES];
         assert_eq!(PriorImage::parse(&erased).unwrap_err(), ImageError::Absent);
@@ -779,6 +1092,13 @@ mod tests {
         assert_eq!(
             PriorImage::parse(&future).unwrap_err(),
             ImageError::UnsupportedVersion(3)
+        );
+
+        let mut unknown_standardization = prior_bytes(12, 4);
+        unknown_standardization[28..32].copy_from_slice(&2u32.to_le_bytes());
+        assert_eq!(
+            PriorImage::parse(&unknown_standardization).unwrap_err(),
+            ImageError::UnsupportedStandardization(2)
         );
 
         let mut wrong_stride = prior_bytes(12, 4);

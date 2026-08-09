@@ -109,6 +109,10 @@ so the playhead the cues are logged against is the mixer's own sample cursor. Th
 browser sends the operator's playback intents and draws the positions it is
 sent.
 
+This is the research and offline-validation path. The live media-control demo
+does not train from this game; the wristband runs its on-don calibration flow
+from the Calibrate panel and installs the resulting wearer model on-device.
+
 ### Getting a song in
 
 Each track in the library is one directory under `tracks/`, holding `audio.ogg`,

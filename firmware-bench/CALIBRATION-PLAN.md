@@ -2,15 +2,20 @@
 
 Streaming calibration for the thumb-modifier pipeline: a deterministic
 per-round fit schedule that finishes within 10 seconds of the last example,
-a ~30-second rest phase justified by the golden protocol itself, calibration
-persistence with slots and crash consistency, and a device-only feedback
-flow that extends the existing cue vocabulary without colliding with it.
+a 60-second still phase, calibration persistence with slots and crash
+consistency, and a device-only feedback flow that extends the existing cue
+vocabulary without colliding with it.
 Builds on the validated bench (`RESULTS.md`); every recipe deviation is
 re-earned against the golden fixtures, not inherited.
 
 The pre-critique version of this plan is at commit 063eb34; the critique
 (fatal findings F1–F6, serious S1–S8, and the missing-cases list) drove
 every change below.
+
+The implementation is now authoritative where this design record names
+provisional values. `calibration-flow::Constants::DEFAULT` fixes the current
+timings and round counts, `PROTOCOL.md` fixes the wire and flash formats, and
+`TESTING.md` is the operator procedure.
 
 ## What changed after review, in one paragraph
 
@@ -22,8 +27,8 @@ passes per completed round, checkpointed), so it is host-replayable; it is
 acknowledged as a new model whose four numbers are re-scored, not assumed.
 Calibration reuse is descoped to machinery-behind-a-flag: the accept
 threshold cannot be set without deliberately re-seated re-don recordings,
-which the test protocol will collect. The quality gate never shortens
-collection below the validated floor — it extends and reports. Per-don rest
+which the test protocol will collect. The implemented quality gate reports
+only and uses fixed round counts; extension harmed misclassification. Per-don rest
 collection is dropped because the golden fit never had it: rest rows come
 from the static prior, which is exactly the configuration the golden
 numbers were measured in. The cue vocabulary is redesigned collision-free.
@@ -73,8 +78,8 @@ Partition (983,040 B) layout, version-bumped image format:
   count, stride, prior-image content hash), the i8 quantization constants,
   the prior's standardization statistics, the prior's warm-start weights
   (65 × 12 f32), then pre-standardized i8 rows. Written by
-  `build-partition` v2, flashed once.
-- **Two wearer slots** (fixed offsets, 128 KB each): a slot holds a
+  `build-partition-v2`, flashed once.
+- **Two wearer slots** (fixed offsets, 192 KB each): a slot holds a
   monotonic sequence number, the prior hash it was built against, the
   reference gains, per-class centroid + spread, the fitted model, the live
   rows (i8, standardized-at-append), and a CRC written last. Eviction is
@@ -119,36 +124,30 @@ boot (Rule 5).
 1. Entry from the dashboard panel. New calibration cue plays; the LED
    enters the calibration level (see vocabulary). Commits and media keys
    are **suppressed** for the whole calibration.
-2. **Settling and gains, ~30 s still.** Covers: slot erase, filter and
-   amplitude settling, reference-gain estimation (window length set by V),
-   and the rest-validity baseline. There is no separate rest collection:
+2. **Settling and gains, 60 s still.** The first 30 seconds settle the
+   filter and amplitude tracker; the next 30 seconds estimate reference
+   gains. There is no separate rest collection:
    the golden fit's rest classes come from the static prior's rest
    sessions, and V re-confirms the four numbers in exactly that shape.
    Moving rest is likewise prior-only.
 3. **Thumb-up rounds** then **thumb-down rounds** (pole in hand, handover
    cue between): device-paced prompts in the fixed order, one rep per
    gesture per round. Labeling: the span starts at the first window-grid
-   boundary at least R ms after the prompt (R from V, initial 500 ms) and
-   covers a fixed number of whole grid windows (initial 4), so every rep
-   yields the same row count regardless of prompt phase. Labels are by
-   sample index on the device's own grid.
-4. **Rep validity, not segmentation**: a labeled span whose band energy
-   sits at the rest baseline (no gesture performed), or that overlaps
-   lead-off-flagged channels, an ADC recovery settle, or a flash
-   operation, is rejected — the "again" cue plays and the same gesture is
-   re-prompted. Rejection never relabels; Rule 6 stands.
-5. **Rounds and the gate**: the floor is the validated cue count
-   (10 per class, or the lower floor V proves holds the golden numbers —
-   V sweeps 6..10). The gate only *extends* collection for weak classes
-   (cap +2 rounds) and *reports* the weak pair to the panel. It never
-   shortens below the floor: log 0022 says the instrument ranks reliably
-   at m=6 but its pass-fail threshold is unresolved, so early stop by
-   gate ships only when ten dons exist to calibrate it.
+   boundary after the prompt hold-off and covers nine overlapping feature
+   windows. Labels are by sample index on the device's own grid.
+4. **Rep validity, not segmentation**: a labeled span is rejected for
+   missing samples, flash overlap, a positive lead-off flag, or ADC recovery
+   overlap. There is no energy-based detector for a gesture the wearer did
+   not perform; the watched demo and per-class self-test carry that gap.
+   Rejection never relabels; Rule 6 stands.
+5. **Rounds and the gate**: thumb-up uses 10 fixed rounds and thumb-down
+   uses 12. The gate reports weak classes and the most confused pair but
+   never changes collection length.
 6. **Finish**: K_final passes (the ≤10 s window), atomic install, then the
-   existing ReadyToUse cue. On any failure or abort — including link loss,
-   brownout, or a wearer walking away — the previous calibration (or the
-   prior alone) remains installed; the slot protocol guarantees a torn
-   record is detected and ignored.
+   existing ReadyToUse cue. An explicit abort or device failure leaves the
+   previous calibration (or the prior alone) installed; the slot protocol
+   detects and ignores a torn record. Dashboard link loss does not abort a
+   run; the device continues standalone.
 
 ### Reuse (descoped to experimental)
 
@@ -174,12 +173,12 @@ haptic) triple, per-rep prompts driven by a generation counter (the
 state edge:
 
 - Calibration begins / phase boundary / thumb-down handover / rep-again /
-  gesture-failed / calibration-complete each get distinct responses; the
+  gesture-failed / calibration-complete each have distinct responses; the
   per-rep prompt reuses each gesture's command rhythm (identity by rhythm,
   as shipped) with a **cyan** snap — not white, which stays "you just
   committed"; nothing new uses red, amber, violet, or the shipped haptic
-  meanings. Exact patterns are F2's to design under the rule that the
-  collision tests in cue.rs, extended to the new variants, pass.
+  meanings. The collision tests in `feedback-vocabulary` pin the exact
+  patterns.
 - LED-only fallback: fixed order carries identity; cyan snap = go,
   the rep-again flash = redo, green = done.
 
@@ -198,11 +197,11 @@ with validators; the two inbound frames (start, abort) are float-free.
    loss mid-run continues standalone (LinkLost cue suppressed during
    calibration, shown after) and abort-by-timeout does not exist — only
    explicit abort or completion.
-2. A pole is in hand for thumb-down blocks (assumption, unverifiable
-   on-device; the validity check catches its grossest violation).
+2. The operator follows the handover cue and puts the pole in hand for
+   thumb-down blocks. The device cannot verify that action.
 3. Fixed gesture order, shown on the panel, never changes.
-4. Gate and probe thresholds from one wearer's ten sessions are
-   provisional; the gate therefore only extends/reports (rule above).
+4. Gate and probe thresholds from one wearer's sessions are provisional;
+   the gate reports only (rule above).
 5. The static prior ships in flash, pre-standardized, hashed; stored
    calibrations bind to the hash.
 6. The acceptance bar is the four **golden** numbers (FN 8.0%, misclass
@@ -231,9 +230,10 @@ be discovered.
 - **The wear-state check cannot see a lifted electrode yet.** The precondition
   and the `lead_off_channel_bits` telemetry read the ADS1298's LOFF_STATP and
   LOFF_STATN bits, and lead-off detection is off on this front end
-  (`LEAD_OFF_ENABLED`, `adc/ads1298.rs`): the bring-up campaign measured ~35
-  front-end deaths per second with the block powered against ~2 without it, so
-  it stays off until it earns its own bench experiment. Until then the front
+  (`LEAD_OFF_ENABLED`, `adc/ads1298.rs`). Historical failure-rate measurements
+  predate the current ADC driver and hardware fixes, so they do not describe
+  the present build. LOFF stays off until a fresh bench experiment measures
+  current behavior. Until then the front
   end reports *no answer* rather than *all electrodes seated* — the telemetry
   metric is absent instead of zero, and the precondition refuses only on a
   positive flag. Nothing downstream may render a missing value as good
@@ -246,8 +246,9 @@ Both carry deferred work, and it is capstone work rather than a follow-up
 commit — each needs bench time and its own acceptance numbers, which is
 exactly what neither had when it was found:
 
-- **Re-enable lead-off detection**, as its own bench experiment against the
-  ~35-per-second death rate the bring-up campaign measured. Until it passes,
+- **Re-enable lead-off detection** in its own current-hardware bench experiment.
+  Measure front-end survival, recovery counters, attached and lifted electrodes,
+  and false flags during motion. Until it passes,
   the wear-state check is half a feature and the plan says so rather than the
   panel implying otherwise. The firmware side needs no further work: flipping
   `LEAD_OFF_ENABLED` is what turns the machinery on.
@@ -307,8 +308,8 @@ exactly what neither had when it was found:
    distillation) is scoped but each step costs validation time.
 2. The redefined recipe may not reproduce the golden numbers at any
    (K, K_final) — V finds out first, on fixtures, before firmware exists.
-3. Real-firmware coexistence (fitter beside wifi + acquisition at ~70 KB
-   free heap) is measured only at H on the wristband.
+3. Real-firmware coexistence (fitter beside BLE + acquisition) is measured
+   only at H on the wristband.
 4. The rest-from-prior simplification rests on the golden protocol's own
-   shape; if V's re-confirmation finds the four numbers depended on
-   anything about per-don rest, the 30 s phase grows back.
+   shape; if later validation finds a need for per-don rest rows, the
+   calibration recipe must change explicitly.

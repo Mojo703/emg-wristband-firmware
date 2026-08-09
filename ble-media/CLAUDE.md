@@ -15,11 +15,14 @@ Agent notes:
   ```
 
   From inside the crate, `.cargo/config.toml` pins the Xtensa target and the esp
-  toolchain instead, which is what `cargo run` (flash + monitor) wants.
+  toolchain. Build the standalone hardware bench without flashing via
+  `. ~/export-esp.sh && cargo build --example ble-media-bench`. Flash and monitor
+  it via `. ~/export-esp.sh && cargo run --example ble-media-bench`. Always name
+  the example; this library package has no default binary.
 - The radio dependencies are behind `[target.'cfg(target_os = "espidf")']` to keep
   that split working. New logic goes in `phone.rs`; only calls into esp32-nimble
   go in `nimble.rs`.
-- Firmware otherwise: it flashes to hardware and you cannot run the binary here.
+- Firmware otherwise: the example runs on hardware and cannot run on this host.
 - `Phone::press` / `Phone::tick` are the seam the wearer firmware calls from its
   feedback thread. Keep those stable. `tick` must be called unconditionally, not
   only when there is something to send: it also restarts advertising after a peer

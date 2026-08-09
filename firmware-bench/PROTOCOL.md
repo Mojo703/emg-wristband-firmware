@@ -315,6 +315,9 @@ The scripted wearer. The device's own state machine runs every phase, every
 validity check, and the same fit; the session's `cue_spans` stand in for a
 person, and the tool maps each span's `class_id` onto the canonical five
 (`thumb_up_pronation` and `wrist_pronation` are the same gesture to the flow).
+Recorded cue order does not need to match the device's fixed prompt order.
+The host numbers each cue within its gesture and block, and the device looks
+it up by `(gesture, block, round)`. Cue count per gesture is the constraint.
 The subcommand sends the schedule, starts the run, streams the samples exactly
 as `stream` does, and then waits for the result frame rather than for a fixed
 settle — the polish passes happen after the last sample, and how long they take
@@ -402,114 +405,23 @@ decision behaviour made by accident in the name of calibration.
 
 ## The flash training partition
 
-The full training set is 9654 rows. That is 604 KB even at int8, against a
-device with a couple of hundred kilobytes of free heap, so the rows a
-calibration wants to keep cannot be streamed and held — they live in flash and
-the fit maps them.
+The current firmware accepts only the v2 `OPALROW2` image. The `training`
+partition occupies 983,040 bytes at `0x310000` and contains a standardized
+int8 prior plus two crash-consistent wearer slots. The first flash on a board
+requires a full erase because the custom partition table changes flash layout
+and clears NVS.
 
-`opal-firmware/partitions.csv` gains `training, data, undefined, 0x310000,
-0xF0000`, which fills the 4 MB part exactly. **Adding it changes the partition
-table, so the first bench flash is a full erase and reflash and NVS is wiped.**
-
-The image is written separately and never by the app:
+Build and write the prior separately:
 
 ```
-playback-host build-partition --model fixtures/models/<name> --precision i8 --image training.bin
-espflash write-bin 0x310000 training.bin
+playback-host build-partition-v2 --model fixtures/models/<name> --image training-v2.bin
+espflash write-bin 0x310000 training-v2.bin
 ```
 
-### Image layout
-
-All little-endian. The header is 544 bytes; rows follow with no padding.
-
-| Offset | Size | Field |
-| --- | --- | --- |
-| 0 | 8 | magic `OPALROWS` |
-| 8 | 4 | version, currently 1 |
-| 12 | 4 | precision: 0 `f32`, 1 `f16`, 2 `i8` |
-| 16 | 4 | row count |
-| 20 | 4 | bytes per row |
-| 24 | 4 | class count (informational) |
-| 28 | 4 | reserved, zero |
-| 32 | 512 | int8 affine: 64 `f32` offsets, then 64 scales |
-| 544 | rows × stride | packed rows |
-
-One row is `[features at precision][label u8][row weight f32]` — strides 261,
-133, and 69 bytes. The magic exists because erased flash reads as `0xFF`: a fit
-that took that for rows would train on fourteen thousand rows of garbage and
-report a plausible wall time for it. The int8 constants live in the image rather
-than arriving with the fit command because they are a property of how these
-particular rows were quantized; an image and the affine that decodes it must not
-travel separately.
-
-The device maps the image at boot and joins it at `bench_fit_run` when
-`use_static_rows` is set. **The two sources may hold different precisions.**
-`fit_calibration` walks each through its own `RowLayout`, decoding and
-standardizing over the joined set, so a float live pool over int8 flash rows is
-a supported arrangement rather than a compromise — and it is the validated one:
-the host pass found zero decision flips against a float-only fit.
-
-That settles the sweep question raised above. The flash partition holds **int8
-only, one image, the full static row set** — flash-resident rows are
-architecture, not a variable. The precision sweep varies the *live* calibration
-buffer, and the canonical hardware case is a live store at f32 (with f16 as a
-variant) over int8 flash rows. So the f16 and f32 capacity figures in the table
-below describe what the partition could hold, not anything the bench flashes.
-
-### Splitting the rows
-
-A case has to say which rows are streamed and which are flashed, and the two
-must be exact complements or the fit sees a row twice or not at all.
-`model.json`'s `training_sources` lists each contributing session and role in
-the order the rows appear in `training_rows.npy`, so a split is a set of
-contiguous ranges. Both subcommands read that breakdown and check it sums to the
-matrix it describes.
-
-```
-playback-host build-partition --model … --exclude-session <live session> --precision i8 --image training.bin
-playback-host fit --model … --session <live session> --precision f32 --static-rows
-```
-
-The image is int8 and the live store is f32 — different precisions on purpose,
-which is the canonical case.
-
-`build-partition` takes `--exclude-session` / `--exclude-role` (what stays out
-of flash because it is streamed); `fit` takes `--session` / `--role` (what is
-streamed). Both are repeatable, both refuse a name that matches no source — a
-typo silently selecting nothing is how a partition ends up empty and a fit looks
-like it worked — and both print the sources they selected.
-
-For the thumb-modifier model that split is the 750 command rows live and the
-8904 no_op and rest rows in flash; their label sets are disjoint (0–4 against
-5–11), which is a second check that the cut landed where it was meant to.
-`playback-host inspect --model <dir>` prints the whole breakdown with each
-source's flashed size at every precision, and the partition's capacity, so a
-case can be planned before anything is built.
-
-### Only int8 fits the whole set
-
-At 0xF0000 the partition holds 983040 bytes, 982496 of them rows:
-
-| Precision | Stride | Rows that fit | Full 9654-row set |
-| --- | --- | --- | --- |
-| `i8` | 69 | 14239 | fits, 666 KB |
-| `f16` | 133 | 7387 | does not fit, needs 1.28 MB |
-| `f32` | 261 | 3764 | does not fit, needs 2.5 MB |
-
-`build-partition` refuses an oversized image and names `--rows`, so the cut is a
-deliberate choice rather than a truncated flash write.
-
-Only the int8 column matters in practice: at int8 the full static set fits with
-room to spare, and the sweep varies the live buffer rather than the image. The
-other two rows are there because `build-partition` accepts them and the numbers
-should be visible if anyone reaches for one.
-
-The packing was verified against numpy over all 9654 rows at every precision:
-int8 codes byte-identical including the 69 that hit the ±127 clamp, `f16` and
-`f32` payloads bit-identical, labels and row weights bit-identical. Rounding is
-the part that drifts — the device uses `rintf` (ties to even) and IEEE half
-round-to-nearest-even, not Rust's `f32::round`, which breaks ties away from
-zero — so unit tests pin both against the boundary values.
+`FLASH-FORMATS.md` is the byte-level contract for the v2 header, rows, prior,
+slots, CRCs, and install sequence. The retired v1 `OPALROWS` format and
+`build-partition` command belong only to the phase-one bench history; a current
+device refuses those images.
 
 ## Orchestration sequences
 
@@ -561,10 +473,10 @@ playback-host --output DIR status
 playback-host --output DIR reset
 playback-host script --plan case.txt      # one step per line, one connection
 playback-host inspect --manifest … --model …   # no port; checks the fixtures
-playback-host build-partition --model … --precision i8 --image training.bin
+playback-host build-partition-v2 --model … --image training-v2.bin
 ```
 
-`inspect` and `build-partition` never open the port.
+`inspect` and `build-partition-v2` never open the port.
 
 Device state survives between invocations, so a case can be a sequence of calls
 or a single `script`. `inspect` does the real fixture loading — the same

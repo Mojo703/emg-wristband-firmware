@@ -1,12 +1,12 @@
-# ota-client
+# OTA client
 
 The ESP32-S3 OTA update client, built on `std` / `esp-idf-svc`. On boot it marks
 the running image valid (rollback protection), connects to WiFi, downloads a
 firmware image over HTTP, writes it to the inactive OTA slot, sets that slot as the
 boot partition, and reboots into it.
 
-Its toolchain setup is the one the other firmware projects (`ble-media`,
-`drv2605l`, `opal-firmware`) reuse.
+This is a deferred proof, not integrated Opal functionality. The active shared
+toolchain setup is in [`../../../FIRMWARE-SETUP.md`](../../../FIRMWARE-SETUP.md).
 
 ## Flash layout
 
@@ -49,33 +49,6 @@ between them on each reset; a version or manifest check (update only when the
 server is newer) is the fix. And `wifi::connect(...)?` propagates errors, so a
 failed association ends `app_main` rather than idling and retrying.
 
-## One-time toolchain setup
-
-The ESP32-S3 is an Xtensa core and needs the forked Rust toolchain. Run these in
-your shell (they are not committed, since they modify `~/.cargo` and `~/.rustup`):
-
-```sh
-cargo install espup --locked
-espup install
-cargo install espflash --locked
-cargo install ldproxy --locked
-. $HOME/export-esp.sh   # source in every shell that builds this project
-```
-
-On Arch, work around libxml2. Espressif's bundled `esp-clang` (an ESP-IDF tool)
-links against the old `libxml2.so.2` soname. Arch ships `libxml2.so.16`, so the IDF
-tool install aborts with `libxml2.so.2: cannot open shared object file`. After the
-first build downloads the toolchain into `.embuild/`, add a compat symlink; the ABI
-difference is harmless for the version check `esp-clang` performs.
-
-```sh
-ln -sf /usr/lib/libxml2.so.16 \
-  .embuild/espressif/tools/esp-clang/*/esp-clang/lib/libxml2.so.2
-```
-
-Then re-run `cargo build`. `.embuild/` is gitignored and re-created on a fresh
-checkout, so each machine needs this once after the initial download.
-
 ## Version stack
 
 Pinned to the current esp-rs line to match the installed Xtensa toolchain; older
@@ -113,7 +86,7 @@ The server serves a raw application image, not the ELF. Generate one with
 cargo build --release
 espflash save-image --chip esp32s3 \
   target/xtensa-esp32s3-espidf/release/ota-client \
-  ../ota-server/firmware/ota-client.bin
+  ../server/firmware/ota-client.bin
 ```
 
 ## End-to-end verification
@@ -121,7 +94,7 @@ espflash save-image --chip esp32s3 \
 This is the procedure used to confirm the system works on an ESP32-S3-Zero. It
 builds up in stages so a failure points at one layer.
 
-1. Start the server. From `../ota-server`, start it and leave `firmware/` empty:
+1. Start the server. From `../server`, start it and leave `firmware/` empty:
    ```sh
    rm -f firmware/*.bin && cargo run        # binds 0.0.0.0:8080
    ```
@@ -143,7 +116,7 @@ builds up in stages so a failure points at one layer.
    cargo build --release
    espflash save-image --chip esp32s3 \
      target/xtensa-esp32s3-espidf/release/ota-client \
-     ../ota-server/firmware/ota-client.bin
+     ../server/firmware/ota-client.bin
    ```
    Do not `cargo run`; leave the board on v1.0.0. Reset it (`CTRL+R`). It downloads
    the image, writes the inactive slot, and reboots. The proof is the banner going

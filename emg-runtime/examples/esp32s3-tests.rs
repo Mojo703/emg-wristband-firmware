@@ -3,10 +3,7 @@
 //! These tests must run on the device. Off target, the SIMD entry points resolve
 //! to scalar fallbacks and their comparisons prove nothing.
 
-#[cfg(not(all(target_arch = "xtensa", target_os = "espidf")))]
-compile_error!("emg-runtime-esp32s3-tests must compile for xtensa-esp32s3-espidf");
-
-#[cfg(test)]
+#[cfg(all(test, target_arch = "xtensa", target_os = "espidf"))]
 mod tests {
     use emg_runtime::model::{ForwardResult, Model, VerifyBatch};
     use emg_runtime::tensor::{AlignedI8, I8Activation, Rng};
@@ -16,12 +13,11 @@ mod tests {
     #[repr(align(16))]
     struct AlignedBlob<Bytes: ?Sized>(Bytes);
 
-    static FIXTURE_BLOB: &AlignedBlob<[u8]> = &AlignedBlob(*include_bytes!(
-        "../../emg-runtime/data/model_int8_verify.bin"
-    ));
+    static FIXTURE_BLOB: &AlignedBlob<[u8]> =
+        &AlignedBlob(*include_bytes!("../data/model_int8_verify.bin"));
 
-    /// Integer ratios, so the comparison never materialises a float constant: the Xtensa
-    /// backend mishandles float constant pools in the test profile.
+    /// Integer ratios avoid float constants because the Xtensa backend
+    /// mishandles their constant pools in the test profile.
     const TOP1_FLOOR_PERCENT: usize = 85;
     const AGREEMENT_FLOOR_PERCENT: usize = 90;
 
@@ -106,8 +102,8 @@ mod tests {
         }
     }
 
-    /// Top-1 says the model is still accurate; agreement says the int8 path still tracks
-    /// the float path it was quantized from. A bad quantization moves agreement first.
+    /// Top-1 checks model accuracy. Agreement checks that the int8 path still
+    /// tracks the float path from which it was quantized.
     #[test]
     fn device_forward_pass_matches_float_reference() {
         let (mut model, _) = Model::load(
@@ -140,4 +136,9 @@ mod tests {
             "agreement {agreements}/{total}"
         );
     }
+}
+
+#[cfg(not(test))]
+fn main() {
+    panic!("run with `cargo +esp test-device`");
 }

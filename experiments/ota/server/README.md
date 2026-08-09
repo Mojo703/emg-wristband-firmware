@@ -1,6 +1,6 @@
-# ota-server
+# OTA server
 
-A minimal `axum` server that hosts firmware images for [`ota-client`](../ota-client)
+A minimal `axum` server that hosts firmware images for the [`client`](../client)
 to download. It runs on your dev machine and needs no ESP toolchain. It is plain
 `x86_64` Rust.
 
@@ -11,9 +11,9 @@ OTA_SERVER_ADDR=0.0.0.0:9000 cargo run    # custom bind address
 
 Drop firmware images into `./firmware/`; they are served at
 `http://<host>:8080/firmware/<name>.bin`. Produce an image with `espflash
-save-image`; see [`../ota-client/README.md`](../ota-client/README.md). Find the
+save-image`; see [`../client/README.md`](../client/README.md). Find the
 address the ESP32 should hit (a LAN IP, not `127.0.0.1`) with `ip -4 addr show |
-grep inet`, and put it into `../ota-client/cfg.toml` as `ota_url`.
+grep inet`, and put it into `../client/cfg.toml` as `ota_url`.
 
 ## Firewall
 

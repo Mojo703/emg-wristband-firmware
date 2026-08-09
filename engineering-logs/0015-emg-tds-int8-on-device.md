@@ -6,8 +6,8 @@
 **`ml-bench` no longer exists (deleted 2026-08-04, 9a0d5ac).** Read every mention
 of it below as `emg-runtime`, which now holds the kernels and the blob format.
 `emg-tds export-int8` writes to `emg-runtime/data/model_int8.bin`, the kernel
-self-tests and the forward-pass verification now run from
-`emg-runtime-esp32s3-tests` (`cargo test-device`), and the latency numbers this entry
+self-tests and the forward-pass verification now run from the `emg-runtime`
+`esp32s3-tests` example (`cargo +esp test-device`), and the latency numbers this entry
 reports live come from the firmware's `inference` telemetry source instead. The
 measurements below stand as recorded.
 

@@ -1,4 +1,4 @@
-//! Serial bench for the BLE phone peripheral.
+//! Standalone serial bench for the BLE phone peripheral.
 //!
 //! Types a toggle and media keys into `ble_media::phone::Phone` over the real
 //! NimBLE radio, which is the one thing a laptop test cannot do. The wearer
@@ -75,5 +75,5 @@ fn main() -> anyhow::Result<()> {
 /// `ble_media::phone`, which `cargo test` runs on the host.
 #[cfg(not(target_os = "espidf"))]
 fn main() {
-    eprintln!("ble-media is firmware; build it for xtensa-esp32s3-espidf");
+    eprintln!("ble-media-bench is firmware; build it for xtensa-esp32s3-espidf");
 }

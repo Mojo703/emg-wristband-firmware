@@ -2,16 +2,19 @@
 
 Firmware for the Opal EMG wristband (ESP32-S3): two ADS1298s sample EMG, the int8
 model classifies each window, the reject pipeline smooths it into a wake-gate
-decision, and the frames stream to the dashboard over USB serial. Wi-Fi remains
-dormant until a future explicit wireless-mode transition selects it.
+decision, and the frames stream to the dashboard over USB serial. BLE HID sends
+committed media keys when the dashboard enables Phone BLE. Wi-Fi remains dormant
+until a future explicit wireless-mode transition selects it.
 `src/main.rs` has the module-level docs.
 
 The model wants 16 channels and the front end carries two 8-channel ADS1298 boards.
 "The two-device architecture" below records how they are clocked, started, and
 recovered, and why.
 
-The ADCs are the only source of EMG: if they do not come up, boot fails and says why.
-`BRINGUP.md` is the bench procedure for new hardware.
+The ADCs are the only live source of EMG. If they do not come up, the firmware
+keeps its links available for diagnostics but has no acquisition source. A
+`playback` build can substitute recorded input on a bare board. `BRINGUP.md` is
+the bench procedure for new hardware.
 
 ## The two-device architecture
 
@@ -92,14 +95,15 @@ breaking out to J11. The pin map block in `src/main.rs` is the authoritative
 wiring table.
 
 The feedback outputs sit on the pins the front end leaves free: the DRV2605L
-haptics breakout on GP17 (I2C data) and GP18 (I2C clock), and the Zero's onboard
+haptics breakout on GP16 (I2C data) and GP15 (I2C clock), and the Zero's onboard
 addressable LED on GP21. Both are optional at run time — a device with neither
 attached logs the failure and runs the same.
 
 ## Building and flashing
 
-This crate targets Xtensa and needs the esp toolchain; the one-time setup lives in
-`../ota-client/README.md`. Every shell must source the exports first:
+This crate targets Xtensa and needs the esp toolchain; follow the one-time setup
+in [`../FIRMWARE-SETUP.md`](../FIRMWARE-SETUP.md). Every shell must source the
+exports first:
 
 ```sh
 . ~/export-esp.sh
@@ -122,8 +126,8 @@ Xtensa:
 cargo test-device
 ```
 
-The Xtensa SIMD model checks live in `../emg-runtime-esp32s3-tests` so the runtime
-owns its arithmetic tests without adding ESP-IDF to the runtime library.
+The Xtensa SIMD model checks live in `../emg-runtime/examples/esp32s3-tests.rs`.
+Run them from `emg-runtime` with `cargo +esp test-device`.
 
 This is an alias (see `.cargo/config.toml`) for `cargo test` with
 `ESP_IDF_SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.test"`. The override

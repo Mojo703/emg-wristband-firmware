@@ -85,8 +85,8 @@ pub struct Constants {
     /// two rounds land in the pole-holding phase, which is also the phase a
     /// wearer is least able to hurry.
     pub thumb_down_round_floor: u32,
-    /// The announced still phase: slot erase, filter and amplitude settling,
-    /// reference gains, and the rest baseline.
+    /// The announced still phase: filter and amplitude settling, followed by
+    /// reference-gain estimation. The target slot was erased at boot.
     pub settling_milliseconds: u32,
     /// How much of the still phase passes before the gain estimate starts
     /// accumulating. The filters and the electrode amplitudes are still moving
@@ -125,9 +125,8 @@ pub struct Constants {
     /// labeling, rather than the fifteen-row labeling the earlier sweeps
     /// assumed. Halving the prior per pass is what this schedule can afford.
     pub prior_stride: usize,
-    /// Per-class window accuracy, in permille, at or above which a class is
-    /// holding. Provisional: the gate only extends and reports, so being wrong
-    /// here costs rounds, never a shortened collection.
+    /// Per-class window accuracy, in permille, at or above which the report
+    /// calls a class holding. The gate never changes the fixed round counts.
     pub holding_accuracy_permille: u32,
 }
 

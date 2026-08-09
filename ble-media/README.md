@@ -5,9 +5,9 @@ device, bonds with a host (iPhone, also macOS/Android/Windows), and sends media
 keys: play/pause, next, previous, volume, mute. Built on `std` / `esp-idf-svc`
 with the [`esp32-nimble`](https://github.com/taks/esp32-nimble) NimBLE wrapper.
 
-The keys are driven from the serial console here. The wearer firmware drives the
-same `Phone` state machine from its feedback thread, with a dashboard button in
-place of the console toggle.
+The `ble-media-bench` example drives the keys from the serial console. The wearer
+firmware drives the same `Phone` state machine from its feedback thread. A
+dashboard button replaces the console toggle.
 
 ## How it works
 
@@ -43,20 +43,21 @@ place of the console toggle.
 ## Build, flash, monitor
 
 This is firmware on an Xtensa core. It needs the one-time toolchain setup from
-[`../ota-client/README.md`](../ota-client/README.md) (espup, espflash, and on Arch
-the `libxml2` symlink). With the board on USB-C:
+[`../FIRMWARE-SETUP.md`](../FIRMWARE-SETUP.md) (espup, espflash, and on Arch the
+`libxml2` symlink). With the board on USB-C:
 
 ```sh
 . ~/export-esp.sh
-cargo run        # builds, flashes, opens the serial monitor
+cargo run --example ble-media-bench # builds, flashes, opens the serial monitor
 ```
 
-The flash runner passes `--partition-table partitions.csv` (required, same reason
-as `ota-client`). Rename the advertised device in `cfg.toml` (`device_name`).
+The flash runner passes `--partition-table partitions.csv` so the crate's
+explicit flash layout is used. Rename the advertised device in `cfg.toml`
+(`device_name`).
 
 ## Using it
 
-1. Flash and open the monitor (`cargo run`).
+1. Flash and open the monitor (`cargo run --example ble-media-bench`).
 2. On the iPhone: Settings → Bluetooth, tap "EMG Wristband", accept pairing.
    First-time pairing includes iOS reading the HID report map, so it can take a
    few seconds; reconnects are faster once bonded.

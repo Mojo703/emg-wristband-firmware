@@ -2,3 +2,4 @@ fixtures/cache/
 fixtures/**/*.npy
 fixtures/**/*.bin
 __pycache__/
+host/libdevice_kernels.so

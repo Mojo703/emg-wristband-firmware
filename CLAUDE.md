@@ -15,23 +15,23 @@ There is no shared Cargo workspace. Every Rust project has its own `Cargo.toml`
 with an empty `[workspace]` table so cargo treats it as its own root. Always build
 and run from inside the relevant subproject directory, never from the repo root.
 
-The subprojects are `ota-client`, `ota-server`, `ble-media`, `drv2605l`, and
-`opal-firmware` on the firmware side; `emg-tds`, `dashboard`, `pose-service`, and
-`protocol` on the host side; `emg-runtime`, which the firmware consumes but which
-also builds on the host; and `engineering-logs` for the written record. Prefer a
-module in an existing crate over a new crate.
+The active subprojects are `ble-media`, `drv2605l`, and `opal-firmware` on the
+firmware side; `emg-tds`, `dashboard`, `pose-service`, and `protocol` on the host
+side; `emg-runtime`, which the firmware consumes but which also builds on the
+host; and `engineering-logs` for the written record. The verified but deferred
+OTA client/server proof lives under `experiments/ota/`. Prefer a module in an
+existing active crate over a new crate.
 
 ## Two toolchains
 
-The firmware projects (`ota-client`, `ble-media`, `drv2605l`, `opal-firmware`)
-target the Xtensa
-ESP32-S3. Their `rust-toolchain.toml` pins `channel = "esp"`, and every build
-shell must first run `. ~/export-esp.sh`. The one-time setup (espup, espflash,
-ldproxy, and on Arch a `libxml2.so.2` compat symlink) is in
-`ota-client/README.md`; the other firmware projects depend on it. These projects
-build for real hardware over USB-Serial-JTAG, so you cannot run them on this host.
+The active firmware projects (`ble-media`, `drv2605l`, `opal-firmware`) target the
+Xtensa ESP32-S3. Their `rust-toolchain.toml` pins `channel = "esp"`, and every
+build shell must first run `. ~/export-esp.sh`. The one-time setup (espup,
+espflash, ldproxy, and on Arch a `libxml2.so.2` compat symlink) is in
+`FIRMWARE-SETUP.md`. These projects build for real hardware over
+USB-Serial-JTAG, so you cannot run them on this host.
 
-The host projects (`ota-server`, `emg-tds`, `dashboard`, `protocol`)
+The active host projects (`emg-tds`, `dashboard`, `protocol`)
 use ordinary stable or nightly Rust. `pose-service` is Python.
 
 ## Build and test commands
@@ -39,8 +39,8 @@ use ordinary stable or nightly Rust. `pose-service` is Python.
 For a host Rust project, run `cargo build`, `cargo run`, or `cargo test` from its
 directory. Unit tests live in `protocol` (`no_std` plus `alloc`; `cargo test` on
 the host) and in `opal-firmware`; `cargo test-device` runs the firmware tests on
-the board. `emg-runtime-esp32s3-tests` separately owns the device-only SIMD checks.
-Both device commands flash a libtest image and report through espflash. For ML training in `emg-tds` on GPU, build with
+the board. From `emg-runtime`, `cargo +esp test-device` runs its device-only SIMD
+example. Both device commands flash a libtest image and report through espflash. For ML training in `emg-tds` on GPU, build with
 `--features cuda` and set `CUDARC_CUDA_VERSION=13020`, since CUDA 13.3 is
 ABI-compatible with cudarc's 13.2 target but auto-detect rejects 13.3; CPU works
 without the feature. Firmware uses `cargo run` to flash and open the serial

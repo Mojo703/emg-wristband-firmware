@@ -65,8 +65,8 @@ Pick something you can stand hearing several times.
 
 ## 3. The firmware toolchain
 
-Only if you are flashing the band. The one-time setup lives in
-[`ota-client/README.md`](ota-client/README.md) and every firmware project here
+Only if you are flashing the band. The canonical one-time setup is
+[`FIRMWARE-SETUP.md`](FIRMWARE-SETUP.md), and every active firmware project
 shares it:
 
 ```sh
@@ -116,6 +116,11 @@ over the port while you chase a hardware fault that is not there.
 
 ## 4. Taking a turn with the band
 
+This section describes research collection. For the live media-control demo,
+use `firmware-bench/DONNING.md` and `firmware-bench/TESTING.md` Part 2. The demo
+prepares its model through calibration after donning; it does not train from a
+new collection session.
+
 Recording is a procedure and the order matters. The usual way to waste a session
 is to skip ahead to the game and find out afterwards that nothing was recordable.
 
@@ -132,6 +137,10 @@ Collect panel's band card with one row per channel, and the number that decides
 everything is the noise floor, which has to stay under 10 µV RMS. Surface EMG on
 this band runs 14–20 µV RMS, so a channel at the limit still puts its gestures
 above the noise. A channel well above the limit cannot show a gesture at all.
+
+Lead-off detection is currently unavailable. A missing lead-off value means
+unknown, not good contact, so use the waveform, rail, offset, headroom, and noise
+measurements together when deciding whether to continue.
 
 If the floor fails, stop and fix it before you go on. Re-prep the skin, re-seat
 the band, or unplug the laptop charger. A take recorded above the limit gives you
@@ -202,9 +211,11 @@ The backend reads `config/collection.json` once at startup, so editing the class
 list or adding a subject needs a restart. Someone very nearly recorded a session
 under stale labels this way.
 
-## The state of the rig, August 2026
+## Historical rig snapshot, before the current ADC fixes
 
-Read this before your first session so you know what you are looking at.
+This section records why the original collection campaign failed. It is not a
+description of the current driver or hardware and must not set present LOFF or
+front-end expectations.
 
 All nine recordings so far come back NOT USABLE, and the noise floor is usually
 why. Chip medians run from 5.6 to 219 µV against a 10 µV limit, and only two of

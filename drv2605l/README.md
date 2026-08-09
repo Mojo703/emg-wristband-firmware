@@ -1,12 +1,12 @@
 # drv2605l
 
-A driver for the TI DRV2605L haptic chip, plus a bench binary that plays candidate
-wristband feedback patterns on an ESP32-S3 dev board.
+A driver for the TI DRV2605L haptic chip, plus a named bench example that plays
+candidate wristband feedback patterns on an ESP32-S3 dev board.
 
 The library (`src/lib.rs`) is generic over `embedded_hal::i2c::I2c` and depends on
 nothing else, so `opal-firmware` can take it later without inheriting the bench setup.
-The binary (`src/main.rs`) is the only part that touches ESP-IDF, and it exists to
-answer one question: which haptic cues can a wrist tell apart?
+The `drv2605l-bench` example (`examples/drv2605l-bench.rs`) is the only part that
+touches ESP-IDF. It answers one question: which haptic cues can a wrist tell apart?
 
 Datasheet: TI SLOS854D.
 
@@ -57,16 +57,16 @@ the driver never touches an enable pin and uses the MODE register's standby bit 
 power state instead.
 
 IN/TRIG is wired but unused. Waveforms fire from the GO register, not from an edge on
-that pin. The bench binary drives GPIO4 low and leaves it there.
+that pin. The bench example drives GPIO4 low and leaves it there.
 
 ## Flashing
 
-```
-. ~/export-esp.sh && cargo run --release
+```sh
+. ~/export-esp.sh && cargo run --release --example drv2605l-bench
 ```
 
-`cargo run` flashes over USB-Serial-JTAG and opens the serial monitor. The one-time
-Xtensa toolchain setup is in `ota-client/README.md`.
+The named example flashes over USB-Serial-JTAG and opens the serial monitor. The
+one-time Xtensa toolchain setup is in [`../FIRMWARE-SETUP.md`](../FIRMWARE-SETUP.md).
 
 ## What the bench program does
 
@@ -92,5 +92,6 @@ second. Every ROM effect is tens of milliseconds of pulse-width-modulated output
 is awkward to catch on a scope. A flat second of it is not, so this is the segment to
 trigger on when measuring how hard the part is actually driving.
 
-The patterns are the `PATTERNS` table at the top of `src/main.rs`. They are meant to be
-edited: the point of the exercise is to find out which ten survive contact with a wrist.
+The patterns are the `PATTERNS` table at the top of
+`examples/drv2605l-bench.rs`. They are meant to be edited: the point of the
+exercise is to find out which ten survive contact with a wrist.

@@ -1,4 +1,8 @@
-# Bench results, 2026-08-08
+# Bench results, 2026-08-08: phase-one historical baseline
+
+This first section records the batch-fit architecture that established
+feasibility. The shipped on-don calibration replaced it. Its verdict and
+"still needs" list are historical, not the current demo checklist.
 
 Measured on the bare ESP32-S3-Zero over USB-Serial-JTAG, release build
 (opt-level 3), branch `firmware-pipeline-bench`. The board has no analog
@@ -138,7 +142,7 @@ Feasible, with the architecture this bench validated and one open cost:
 7. `Frame::Emg`'s wire path is untouched; the bench's frames are gated
    behind the `playback` feature and cost the normal build nothing.
 
-# Calibration system results, 2026-08-08 (second phase)
+# Calibration system results, 2026-08-08: phase-two historical run
 
 Everything below was measured on the bare board at branch tip through the
 scripted-wearer rehearsal (`playback-host calibrate`, both fixture sessions
@@ -146,7 +150,7 @@ spliced), after the review and fix cycle. `CALIBRATION-PLAN.md` is the
 design; `host/calibration_validation/VALIDATION.md` the constants' evidence;
 `host/collection_reduction/REPORT.md` the 50-rep follow-on recommendation.
 
-## The rehearsal's verdict at tip
+## The rehearsal's verdict at the measured revision
 
 All four phases traverse cleanly: settling (retimed to the recording's
 quiet head, 18.4 s), ten thumb-up rounds — 50 of 50 reps accepted, zero
@@ -158,6 +162,14 @@ as a tested limitation: the thumb-down session's cue order is randomized
 while the protocol prompts in fixed order. A canonical-order thumb-down
 recording (TESTING.md Part 3) makes the rehearsal complete; the full
 install and reboot verification belongs to the wearer test either way.
+
+That fixture-order limitation no longer applies to the current playback
+host. It now indexes cues by gesture, block, and per-gesture round, so a
+randomized recording can answer fixed-order prompts. The existing thumb-down
+fixture still has fewer than twelve cues per gesture, so it remains a short
+run for a different reason. This results section preserves what the
+2026-08-08 run measured; `TESTING.md` describes the current expectation and
+the replacement recording needed for a complete rehearsal.
 
 ## Measured numbers
 

@@ -41,7 +41,12 @@ impl Classifier {
                 }
             }
         }
-        Ok(Self { model, device, channels, num_classes })
+        Ok(Self {
+            model,
+            device,
+            channels,
+            num_classes,
+        })
     }
 
     pub fn channels(&self) -> usize {

@@ -35,10 +35,11 @@ sector, so a slot can be erased without touching the prior or the other slot.
 
 The split is driven by what each side has to hold. The prior is 7,704 rows —
 four base no-op sessions (6,264) and two rest sessions (1,440) — which is
-554,688 B of rows, and the region holds 8,078. A wearer collects up to 1,950
-rows (750 thumb-up commands, 1,200 thumb-down no-ops), and the quality gate may
-extend collection by two rounds, so the worst case is around 2,340; a slot holds
-2,559. The headroom is deliberately biased toward the slots: a prior that
+554,688 B of rows, and the region holds 8,078. A successful fixed schedule
+collects 990 rows: 450 thumb-up command rows and 540 thumb-down no-op rows.
+A slot holds 2,559. The format retains the original slot headroom without
+making collection length adaptive. The headroom is deliberately biased toward
+the slots: a prior that
 outgrows its region fails at build time with a message, while a slot that
 overflows fails during a wearer's calibration.
 
@@ -227,9 +228,9 @@ other core and blocks all non-IRAM code. The rules follow from that, and
 **scheduling them is the caller's job** — this layer exposes the operations and
 documents their cost, it does not decide when they run.
 
-1. **Erase once, before collection.** `erase_slot_region` erases the whole
-   target slot in a single call, during the announced ~30 s settling phase.
-   It is the only erase in a calibration. Nothing else may run during it.
+1. **Erase once, at boot.** `erase_slot_region` erases the next target slot
+   before acquisition starts. A calibration run only verifies that the region
+   is blank. This is the only slot erase before that run.
 2. **Buffer rows in RAM, flush between rounds.** One round is around 2 KB at 72
    bytes a row. `append_rows_buffered` costs nothing; `flush` writes the
    buffered rows into the pre-erased row area. **A flush stalls the other core

@@ -2,8 +2,8 @@
 
 The current gesture model: a depthwise-separable (TDS) conv encoder in Rust/candle
 with swappable classifier and pose heads. See `README.md` for build commands, the
-subcommands, and the architecture. The `dashboard` reuses this crate's
-`Classifier`.
+subcommands, and the architecture. The wristband performs deployed inference;
+the dashboard relays and displays its results rather than linking this crate.
 
 Agent notes:
 

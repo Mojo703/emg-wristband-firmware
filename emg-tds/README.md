@@ -5,8 +5,9 @@ gesture recognition, with swappable pose and classifier heads so a pose-pretrain
 encoder can be head-swapped into a classifier. It replaces the retired WaveFormer
 ceiling experiment; see
 [`../engineering-logs/0008`](../engineering-logs/0008-waveformer-dead-end-emg2pose-and-tds.md)
-for why. The [`dashboard`](../dashboard) reuses this crate's `Classifier` for
-inference.
+for why. This crate provides host-side training, scoring, and export. The
+[`dashboard`](../dashboard) relays predictions that the wristband has already
+made; it does not use this crate's `Classifier`.
 
 ## Build and run
 
@@ -53,8 +54,8 @@ out, as log 0007 records.
 `checkpoints/` is local training scratch (gitignored): every `train` run writes
 there. When a run is worth keeping, promote it into [`models/`](models) under a
 descriptive, versioned name — that directory holds the tracked releases that
-downstream defaults point at (the dashboard's `EMG_CHECKPOINT`, and the float
-source the int8 export quantizes).
+the scoring and export commands use by default. These checkpoints are also the
+float sources that the int8 export quantizes.
 
 `export-int8` loads the float checkpoint, folds BatchNorm into the pointwise
 convs, calibrates activation ranges on a balanced training subset, quantizes to
