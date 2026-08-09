@@ -38,9 +38,9 @@ use ordinary stable or nightly Rust. `pose-service` is Python.
 
 For a host Rust project, run `cargo build`, `cargo run`, or `cargo test` from its
 directory. Unit tests live in `protocol` (`no_std` plus `alloc`; `cargo test` on
-the host) and in `opal-firmware`'s `link_policy` and `model_checks` modules, which
-test on the device: `cargo test-device` flashes the libtest binary and reports on
-the espflash monitor (see `opal-firmware/README.md`). For ML training in `emg-tds` on GPU, build with
+the host) and in `opal-firmware`; `cargo test-device` runs the firmware tests on
+the board. `emg-runtime-esp32s3-tests` separately owns the device-only SIMD checks.
+Both device commands flash a libtest image and report through espflash. For ML training in `emg-tds` on GPU, build with
 `--features cuda` and set `CUDARC_CUDA_VERSION=13020`, since CUDA 13.3 is
 ABI-compatible with cudarc's 13.2 target but auto-detect rejects 13.3; CPU works
 without the feature. Firmware uses `cargo run` to flash and open the serial

@@ -8,10 +8,10 @@ version = "0.1.0"
 edition = "2021"
 resolver = "2"
 rust-version = "1.77"
-description = "ESP32-S3 EMG wristband device: fake provider → int8 inference → reject pipeline, streamed to the dashboard over wifi or serial"
+description = "ESP32-S3 EMG wristband: dual ADS1298 acquisition, int8 inference, feedback, USB serial, and BLE HID"
 
 # The default test harness stays on (the esp template disables it): `cargo test`
-# runs on the device via the espflash runner. See src/link_policy.rs for the
+# runs on the device via the espflash runner. See src/links/policy.rs for the
 # invocation.
 [[bin]]
 name = "opal-firmware"
@@ -24,9 +24,6 @@ name = "opal-firmware"
 # same image can be flashed to either. See `firmware-bench/PROTOCOL.md`.
 [features]
 playback = []
-# Mirror Rust log records to the ESP-IDF text console for startup diagnosis.
-# Pair with sdkconfig.diagnostic; production keeps the framed logger only.
-diagnostic-console = []
 
 [profile.release]
 opt-level = 3

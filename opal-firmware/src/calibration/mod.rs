@@ -25,11 +25,11 @@
 
 mod adapter_guard;
 mod gains;
+pub(crate) mod training_rows;
 mod wearer;
 
 use crate::config::Settings;
 use crate::feedback::{Calibrating, Prompt, RepNotice};
-use crate::training_rows::CalibrationPartition;
 use crate::transport::Control;
 use adapter_guard::{rows_ready_to_install, ActionGuard};
 use calibration_flow::{Action, Constants, LabeledSpan, RepEvidence, Run, RunOutcome};
@@ -49,6 +49,7 @@ use protocol::{
     CalibrationClassState, CalibrationGesture, CalibrationOutcome, CalibrationPhase,
     CalibrationQuality, Frame, GateStatus, InstalledSlot, RejectedRep, SlotProbe,
 };
+use training_rows::CalibrationPartition;
 
 /// How long before the recording's first cue a scripted still phase stops.
 ///

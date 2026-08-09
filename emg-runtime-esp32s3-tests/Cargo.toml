@@ -1,0 +1,22 @@
+[workspace]
+
+[package]
+name = "emg-runtime-esp32s3-tests"
+version = "0.1.0"
+edition = "2021"
+resolver = "2"
+publish = false
+
+[profile.dev]
+opt-level = 1
+debug = true
+
+[profile.release]
+opt-level = 3
+
+[dependencies]
+emg-runtime = { path = "../emg-runtime" }
+esp-idf-svc = "0.52"
+
+[build-dependencies]
+embuild = { version = "0.33", features = ["espidf"] }

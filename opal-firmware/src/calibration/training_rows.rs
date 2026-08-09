@@ -43,7 +43,7 @@ const ROWS_OFFSET: usize = HEADER_BYTES + QUANTIZATION_BYTES;
 
 /// A mapped training-row image. The mapping is released when this is dropped,
 /// so the borrow of [`Self::rows`] cannot outlive it.
-pub struct TrainingRows {
+pub(crate) struct TrainingRows {
     handle: esp_idf_svc::sys::esp_partition_mmap_handle_t,
     /// The mapped window, starting at the image's first byte.
     mapped: &'static [u8],
@@ -57,7 +57,7 @@ impl TrainingRows {
     /// Map the `training` partition's rows, or explain why not. A missing or
     /// unwritten partition is a plain absence, not a fault: a device with no
     /// image simply fits on live rows alone.
-    pub fn map() -> Result<Option<TrainingRows>> {
+    pub(crate) fn map() -> Result<Option<TrainingRows>> {
         let label = c"training";
         let partition = unsafe {
             esp_idf_svc::sys::esp_partition_find_first(
@@ -156,19 +156,19 @@ impl TrainingRows {
     }
 
     /// The packed rows, exactly a whole number of them.
-    pub fn rows(&self) -> &[u8] {
+    pub(crate) fn rows(&self) -> &[u8] {
         &self.mapped[ROWS_OFFSET..ROWS_OFFSET + self.row_count * self.row_bytes]
     }
 
-    pub fn row_count(&self) -> usize {
+    pub(crate) fn row_count(&self) -> usize {
         self.row_count
     }
 
-    pub fn precision(&self) -> FeaturePrecision {
+    pub(crate) fn precision(&self) -> FeaturePrecision {
         self.precision
     }
 
-    pub fn quantization(&self) -> Int8Quantization {
+    pub(crate) fn quantization(&self) -> Int8Quantization {
         self.quantization
     }
 
@@ -180,7 +180,7 @@ impl TrainingRows {
     /// what lets the wall time be attributed: multiply by the step count and
     /// whatever is left over is arithmetic. The accumulator is returned into a
     /// black box so the read cannot be optimized away.
-    pub fn walk_microseconds(&self) -> u32 {
+    pub(crate) fn walk_microseconds(&self) -> u32 {
         let started = crate::device_now_us();
         let mut checksum = 0u32;
         for byte in self.rows() {
@@ -243,7 +243,7 @@ fn find_partition() -> Option<*const esp_idf_svc::sys::esp_partition_t> {
 /// each**. Scheduling them between rounds, never inside a labeling window, is
 /// the caller's job — each method returns the microseconds it stalled for so
 /// telemetry can prove it happened where it was supposed to.
-pub struct CalibrationPartition {
+pub(super) struct CalibrationPartition {
     partition: *const esp_idf_svc::sys::esp_partition_t,
     handle: esp_idf_svc::sys::esp_partition_mmap_handle_t,
     mapped: &'static [u8],
@@ -260,7 +260,7 @@ impl CalibrationPartition {
     /// Map the partition and check the prior image. `None` when there is no
     /// partition or it holds no v2 prior — a plain absence, and the device
     /// simply has nothing to calibrate against.
-    pub fn map() -> Result<Option<CalibrationPartition>> {
+    pub(super) fn map() -> Result<Option<CalibrationPartition>> {
         let Some(partition) = find_partition() else {
             info!("no training partition; calibration has no prior");
             return Ok(None);
@@ -345,7 +345,7 @@ impl CalibrationPartition {
         }
     }
 
-    pub fn prior(&self) -> PriorImage<'_> {
+    pub(super) fn prior(&self) -> PriorImage<'_> {
         PriorImage::parse(self.mapped).expect("checked at map time")
     }
 
@@ -356,13 +356,13 @@ impl CalibrationPartition {
 
     /// Validate one slot against the mapped prior. Every failure is named, so a
     /// dead slot is reported as dead rather than skipped.
-    pub fn slot(&self, index: usize) -> Result<LiveSlot<'_>, ImageError> {
+    pub(super) fn slot(&self, index: usize) -> Result<LiveSlot<'_>, ImageError> {
         flash_image::parse_slot(index, self.slot_bytes(index), self.prior().hash())
     }
 
     /// The stored calibration to run, if any: the live slot with the highest
     /// sequence.
-    pub fn newest_slot(&self) -> Option<LiveSlot<'_>> {
+    pub(super) fn newest_slot(&self) -> Option<LiveSlot<'_>> {
         (0..SLOT_COUNT)
             .filter_map(|index| self.slot(index).ok())
             .max_by_key(|slot| slot.record.sequence)
@@ -371,7 +371,7 @@ impl CalibrationPartition {
     /// The sequence each slot carries, or `None` where the slot is empty or its
     /// record does not survive its CRC. Eviction and the next sequence number
     /// are both read off this, so both callers see one answer.
-    pub fn sequences(&self) -> [Option<u32>; flash_image::SLOT_COUNT] {
+    pub(super) fn sequences(&self) -> [Option<u32>; flash_image::SLOT_COUNT] {
         core::array::from_fn(|index| self.slot(index).ok().map(|slot| slot.record.sequence))
     }
 
@@ -384,7 +384,7 @@ impl CalibrationPartition {
     /// survivable with nothing else running and fatal beside a front end
     /// servicing DRDY at 2 kHz — the bench never saw it because the bench has
     /// no acquisition.
-    pub fn slot_is_erased(&self, index: usize) -> bool {
+    pub(super) fn slot_is_erased(&self, index: usize) -> bool {
         self.slot_bytes(index).iter().all(|byte| *byte == 0xFF)
     }
 
@@ -394,7 +394,7 @@ impl CalibrationPartition {
     /// 32 sectors of 4 KB. Nothing else may run during it, which is why the
     /// protocol puts it inside the announced settling phase. Returns the
     /// microseconds it took.
-    pub fn erase_slot_region(&mut self, index: usize) -> Result<u32> {
+    pub(super) fn erase_slot_region(&mut self, index: usize) -> Result<u32> {
         self.close();
         let started = crate::device_now_us();
         let result = EspError::convert(unsafe {
@@ -419,7 +419,7 @@ impl CalibrationPartition {
     /// caller owns the schedule: this must sit in the gap between rounds, with
     /// the fitter quiescent, because it stalls the other core. Returns the
     /// microseconds it stalled for.
-    pub fn append_rows_buffered(&mut self, index: usize, bytes: &[u8]) -> Result<u32> {
+    pub(super) fn append_rows_buffered(&mut self, index: usize, bytes: &[u8]) -> Result<u32> {
         if bytes.len() % ROW_STRIDE != 0 {
             bail!("{} bytes is not a whole number of rows", bytes.len());
         }
@@ -441,7 +441,7 @@ impl CalibrationPartition {
     }
 
     /// Rows flushed into a slot since it was erased.
-    pub fn flushed_row_count(&self, index: usize) -> usize {
+    pub(super) fn flushed_row_count(&self, index: usize) -> usize {
         self.flushed[index]
     }
 
@@ -462,7 +462,7 @@ impl CalibrationPartition {
     /// The borrow is what enforces the write discipline: this takes `&self` and
     /// every write takes `&mut self`, so a fit holding these rows across a
     /// flush does not compile.
-    pub fn flushed_rows(&self, index: usize) -> RowSource<'_> {
+    pub(super) fn flushed_rows(&self, index: usize) -> RowSource<'_> {
         let at = SLOT_OFFSETS[index] + SLOT_ROWS_OFFSET;
         let end = at + self.flushed[index] * ROW_STRIDE;
         RowSource::new(&self.mapped[at..end]).expect("whole rows by construction")
@@ -479,7 +479,7 @@ impl CalibrationPartition {
     /// many were — the CRC covers that many rows, so a count past the last
     /// flush would checksum erased bytes and validate on the way back in — so
     /// this refuses any count but [`CalibrationPartition::flushed_row_count`].
-    pub fn commit_record(
+    pub(super) fn commit_record(
         &mut self,
         index: usize,
         record: &SlotRecord,
@@ -540,7 +540,7 @@ impl Drop for CalibrationPartition {
 /// A failure to map is not a reason to refuse to boot: report it and fit on
 /// live rows. Returning the absence rather than the error keeps the one
 /// decision — join flash or not — in one place.
-pub fn map_or_warn() -> Option<TrainingRows> {
+pub(crate) fn map_or_warn() -> Option<TrainingRows> {
     match TrainingRows::map() {
         Ok(rows) => rows,
         Err(error) => {

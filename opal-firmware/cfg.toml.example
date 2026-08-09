@@ -4,8 +4,8 @@
 # Everything here is a first-boot fallback. Once the device is provisioned over
 # the serial link, the live values persist to NVS and override these.
 #
-# For recording sessions you can skip this file entirely. Leaving wifi_ssid empty
-# boots the device into the USB serial link, which is what the dashboard uses.
+# For recording sessions you can skip this file entirely. The current product
+# path starts on USB serial and keeps these credentials dormant.
 
 [opal-firmware]
 # A 2.4 GHz network. The ESP32-S3 has no 5 GHz radio.

@@ -20,10 +20,9 @@ place of the console toggle.
   `Standby` therefore mean *not advertising*, never *no stack*. Media keys go out
   only on an *encrypted* link, not merely a connected one: iOS reads the report
   map before it encrypts and discards anything sent in that window.
-- **The single radio is not arbitrated yet.** A wifi-provisioned device refuses
-  the toggle with a reason rather than half-enabling a phone that cannot work —
-  standing the wifi dialer down never released the radio, since the station stays
-  associated and only the dialling loop skips.
+- This standalone bench still models the old shared-radio policy: provisioned
+  Wi-Fi credentials make it refuse the phone toggle with a reason. Production
+  `opal-firmware` instead keeps Wi-Fi dormant unless a wireless mode selects it.
 - `src/nimble.rs` is the only file that touches esp32-nimble, behind the
   `phone::Radio` trait. Its dependencies are gated on `cfg(target_os = "espidf")`,
   so `cargo test --manifest-path ble-media/Cargo.toml` (from the repo root) runs

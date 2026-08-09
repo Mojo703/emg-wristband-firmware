@@ -11,10 +11,10 @@ The crate is `no_std` plus `alloc` and depends on nothing but
 the host as readily as on Xtensa. That is deliberate: the same code that runs on the
 device can be run, tested, and compared against a reference on a laptop.
 
-`cargo test` on the host runs the aligner's tests. The kernels are not testable
-here — off Xtensa the SIMD entry points resolve to the scalar oracle and the
-comparison is vacuous — so their tests live in `opal-firmware/src/model_checks.rs`
-and run on the device with `cargo test-device`.
+`cargo test` runs the host suite. Off Xtensa the SIMD entry points resolve to the
+scalar oracle, so their comparison would prove nothing. The separate
+`emg-runtime-esp32s3-tests` package runs those checks on the device with
+`cargo test-device`.
 
 ## The model
 

@@ -20,11 +20,12 @@ Firmware (ESP32-S3, Xtensa toolchain):
 
 | Path | What it is |
 |------|------------|
-| [`opal-firmware/`](opal-firmware) | The device. Two ADS1298s sample 16 channels, each chip's frame clocked out inside its own data-ready interrupt, the int8 model classifies each window, and the result streams to the dashboard over wifi or USB serial. `BRINGUP.md` is the bench procedure for new hardware. |
+| [`opal-firmware/`](opal-firmware) | The device. Two ADS1298s sample 16 channels, each chip's frame clocked out inside its own data-ready interrupt, the int8 model classifies each window, and the result streams to the dashboard over USB serial. Wi-Fi support remains available behind an explicit future mode transition. `BRINGUP.md` is the bench procedure for new hardware. |
 | [`drv2605l/`](drv2605l) | TI DRV2605L haptic driver over I2C, plus a bench binary that plays candidate wristband feedback patterns. The library is `embedded-hal` generic, so the firmware can take it without the bench setup. |
 | [`ota-client/`](ota-client) | OTA update client. Pulls a firmware image over HTTP and reboots into it. Not yet folded into `opal-firmware`, which still boots from a single app partition. |
 | [`ota-server/`](ota-server) | Dev-machine HTTP server that hosts firmware `.bin` images for the client. Plain host Rust, no ESP toolchain. |
 | [`ble-media/`](ble-media) | BLE HID media remote. Bonds with an iPhone and sends media keys. Serial-driven for bring-up, gesture-driven later. |
+| [`emg-runtime-esp32s3-tests/`](emg-runtime-esp32s3-tests) | Device-only checks for the runtime's Xtensa SIMD kernels and quantized model. |
 
 Machine learning and tooling (host, plain Rust or Python):
 

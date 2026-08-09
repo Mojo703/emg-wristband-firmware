@@ -105,10 +105,9 @@ cargo run          # builds, flashes over USB-Serial-JTAG, opens the monitor
 cargo test-device  # the unit tests, which run on the device
 ```
 
-Two things will confuse you otherwise. The first is `cfg.toml`, which holds wifi
-credentials. Git ignores it, so a fresh clone has none. It is optional:
-without it the defaults leave `wifi_ssid` empty, and an empty SSID boots the
-device into the USB serial link that you want for recording anyway.
+Two things will confuse you otherwise. The first is `cfg.toml`, which can hold
+Wi-Fi credentials for a future explicit wireless-mode transition. Git ignores it,
+and the current product path starts on USB serial with or without the file.
 
 The second is the serial port. Opening it resets the device, since the port
 asserts DTR, and the dashboard opens that same port. Stop the dashboard before

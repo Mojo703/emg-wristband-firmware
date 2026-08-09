@@ -43,7 +43,7 @@
 //! One lock-free single-producer single-consumer ring per chip, in DRAM,
 //! power-of-two sized, published through an atomic index. The handler writes
 //! raw FIFO words and a device-clock stamp; every decode, status check, health
-//! decision, and telemetry read stays on [`super::chip_pipeline`]'s thread.
+//! decision, and telemetry read stays on [`super::acquisition::pipeline`]'s thread.
 
 use anyhow::{anyhow, Result};
 use esp_idf_svc::sys::{

@@ -1,9 +1,9 @@
 //! The serial-claim decision spine: which link carries the data stream, decided from
 //! probes, heartbeats, write stalls, and time. Pure logic with the clock injected,
-//! so the flap-prevention rules are unit-tested; `links.rs` owns the I/O and feeds
+//! so the flap-prevention rules are unit-tested; the parent module owns the I/O and feeds
 //! events in.
 //!
-//! The rules (mirrored in `links.rs`'s module docs): a dashboard probing the serial
+//! The rules (mirrored in the parent module's docs): a dashboard probing the serial
 //! port claims it as the data link; heartbeats keep the claim alive; silence,
 //! unplug, or a stalled write releases it. After a stall, plain heartbeats sit out a
 //! cooldown before they may re-claim — the backend heartbeats whether or not it is

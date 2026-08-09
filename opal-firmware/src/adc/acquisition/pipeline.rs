@@ -2,7 +2,7 @@
 //! the chip alive, and hand timestamped frames to the combiner.
 //!
 //! Each chip gets one of these threads, and nothing in here knows the other chip
-//! exists. The read itself is not here — [`super::frame_reader`] clocks every frame
+//! exists. The read itself is not here — [`super::super::frame_reader`] clocks every frame
 //! out inside the DRDY interrupt, because the chip has no FIFO and a conversion left
 //! unread for one ~487 µs period is gone. What that buys this thread is the freedom
 //! to be late: frames sit in a lock-free ring roughly 32 ms deep, so a scheduling
@@ -33,12 +33,11 @@ use std::sync::Arc;
 
 use crate::device_now_us as now_us;
 
-use super::acquisition::HealthCounters;
-use super::ads1298::Ads1298FrontEnd;
-use super::convert::{code_to_voltage, GAIN, REFERENCE_VOLTS};
-use super::decode::{parse_sample, Sample};
-use super::frame_reader::FrameReader;
-use super::status::StatusWord;
+use super::super::ads1298::Ads1298FrontEnd;
+use super::super::decode::{parse_sample, Sample};
+use super::super::frame_reader::FrameReader;
+use super::super::status::StatusWord;
+use super::HealthCounters;
 
 /// Lead-off bits one chip contributes to the device-wide word: its eight
 /// channels, placed at `index * CHIP_LEAD_OFF_BITS`.
@@ -46,7 +45,7 @@ const CHIP_LEAD_OFF_BITS: usize = 8;
 
 /// Stack for a pipeline thread. It holds no large locals, but esp-idf's default is
 /// tight, and a stack overflow here presents as an unexplained reboot rather than an
-/// error. The TCP thread in `links.rs` hit exactly that.
+/// error. The TCP thread in `links` hit exactly that.
 const THREAD_STACK_BYTES: usize = 8192;
 
 /// Above the combiner and the main loop, below esp-idf's wifi and timer tasks.
@@ -276,12 +275,6 @@ struct Pipeline {
     consecutive_slow_periods: u32,
     last_status: u32,
     timing: EdgeTiming,
-    /// TEMP bench diagnostic: running mean of |input| in microvolts across this
-    /// chip's eight channels, reported and reset with each timing summary. Tells
-    /// shorted (µV-level noise floor) from open or driven inputs at a glance,
-    /// per chip, without the dashboard.
-    abs_microvolt_sum: f32,
-    abs_microvolt_frames: u32,
     /// Whether the combiner currently believes this chip is present. Guards the
     /// transitions so absence is announced exactly once per outage.
     announced_present: bool,
@@ -379,7 +372,7 @@ impl Pipeline {
         &mut self,
         edge_us: u64,
         read_us: u32,
-        raw: [u8; super::decode::FRAME_BYTES],
+        raw: [u8; super::super::decode::FRAME_BYTES],
     ) -> Result<bool, PipelineStopped> {
         let now = now_us();
         self.last_frame_us = now;
@@ -464,17 +457,6 @@ impl Pipeline {
         }
         self.consecutive_bad_status = 0;
 
-        // TEMP bench diagnostic (see the field), on the same reference and gain
-        // constants the conversion path uses.
-        let frame_mean_abs: f32 = frame
-            .channels
-            .iter()
-            .map(|&code| (code_to_voltage(code, REFERENCE_VOLTS, GAIN) * 1_000_000.0).abs())
-            .sum::<f32>()
-            / frame.channels.len() as f32;
-        self.abs_microvolt_sum += frame_mean_abs;
-        self.abs_microvolt_frames += 1;
-
         // Settling frames are consumed (the detectors above keep seeing a live
         // stream) but never leave the thread.
         if now < self.settling_until_us {
@@ -500,13 +482,6 @@ impl Pipeline {
         let Some(report) = self.timing.summary() else {
             return;
         };
-        let mean_abs_microvolts = if self.abs_microvolt_frames > 0 {
-            self.abs_microvolt_sum / self.abs_microvolt_frames as f32
-        } else {
-            0.0
-        };
-        self.abs_microvolt_sum = 0.0;
-        self.abs_microvolt_frames = 0;
         let interrupt = self.reader.counters();
         // The status word rides along because the lead-off bits in it track
         // LOFF_SENSP/N, which `configure` sets and reset clears — a chip that
@@ -538,7 +513,6 @@ impl Pipeline {
             // the only acceptable value; it is reported so that stays checkable.
             metric("frame_ring_overrun_count", interrupt.overruns as f64),
             metric("frame_read_fault_count", interrupt.read_faults as f64),
-            metric("mean_absolute_input_uv", mean_abs_microvolts as f64),
             metric("bad_status", self.bad_status as f64),
             metric(
                 "recoveries",
@@ -600,19 +574,12 @@ impl Pipeline {
         }
         info!("chip {} pipeline running", self.index);
 
-        let mut first_frame_logged = false;
         loop {
             let mut drained = false;
             // Bounded by the ring's capacity, so a chip converting faster than this
             // thread drains can lengthen a pass but not trap it.
             while let Some(frame) = self.reader.pop() {
                 drained = true;
-                if !first_frame_logged {
-                    first_frame_logged = true;
-                    // TEMP bring-up diagnostic: confirms the chip's interrupt fires
-                    // at all, without a log per frame at ~2 kHz.
-                    info!("chip {} frame #1", self.index);
-                }
                 match self.accept(frame.edge_us, frame.read_us, frame.bytes) {
                     Ok(false) => {}
                     // Recovered: everything else in the ring predates the reset.
@@ -678,8 +645,6 @@ pub(super) fn spawn(
                     consecutive_slow_periods: 0,
                     last_status: 0,
                     timing: EdgeTiming::default(),
-                    abs_microvolt_sum: 0.0,
-                    abs_microvolt_frames: 0,
                     announced_present: false,
                     bad_status: 0,
                     reported_read_faults: 0,

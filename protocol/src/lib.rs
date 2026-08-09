@@ -312,9 +312,9 @@ pub enum Frame {
     Probe {},
 
     /// Backend → device keepalive for a probed serial link, sent every couple of
-    /// seconds. Silence means the dashboard is gone (process died, port closed) and
-    /// the device falls back to wifi. The reply direction needs no heartbeat: the
-    /// data stream itself is the liveness signal.
+    /// seconds. Silence means the dashboard is gone (process died, port closed), so
+    /// the device releases the serial claim. The current runtime does not start
+    /// Wi-Fi automatically. The data stream itself is the reply-side liveness signal.
     Heartbeat {},
 
     // ------------------------------------------------------------------

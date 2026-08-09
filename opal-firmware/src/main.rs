@@ -25,19 +25,14 @@ mod config;
 mod cores;
 mod feedback;
 mod frames;
-mod link_policy;
 mod links;
 mod logger;
-#[cfg(test)]
-mod model_checks;
 #[cfg(feature = "playback")]
 mod playback;
 mod provenance;
 mod radio;
 mod telemetry;
-mod training_rows;
 mod transport;
-mod wifi;
 
 use adc::acquisition::AcquiredWindow;
 use adc::acquisition::AdcSource;
@@ -130,7 +125,7 @@ const STALL_WARNING_MS: u128 = 1000;
 ///
 /// Both the stall and the recovery are announced to the wearer, so a front end that
 /// flaps buzzes them through the pair every cycle — and it does flap:
-/// `adc::chip_pipeline` measured ~2 warm recoveries per second on the bench. This
+/// `adc::acquisition::pipeline` measured ~2 warm recoveries per second on the bench. This
 /// changes neither the ADC nor the log, only how long the device waits before saying
 /// the trouble is over.
 const RECOVERY_SETTLE_MS: u128 = 3000;
@@ -294,8 +289,9 @@ impl InferencePerformance {
             // actually fail here are large and contiguous — the 24 KB encode
             // buffer, a link thread's stack — and a heap with plenty free in small
             // pieces refuses them while the free total says nothing is wrong.
-            let free_heap_kilobytes = telemetry::heap_free_bytes() / 1024;
-            let largest_free_block_kilobytes = telemetry::largest_free_block_bytes() / 1024;
+            let heap = allocation::heap_snapshot();
+            let free_heap_kilobytes = heap.free_bytes / 1024;
+            let largest_free_block_kilobytes = heap.largest_free_block_bytes / 1024;
             let allocations =
                 allocation::take_interval(&mut self.allocation_requests_at_interval_start);
             let (inference_p50, inference_p95) = self.inference_latency.percentiles();
@@ -505,7 +501,7 @@ impl App {
                 .rx_buffer_size(SERIAL_RX_BUFFER_BYTES),
         )?);
 
-        let links = Links::new(serial, peripherals.modem, sysloop, nvs_partition, &settings)?;
+        let links = Links::serial_only(serial, peripherals.modem, sysloop, nvs_partition);
 
         let pipelines = DecisionPipelines::new(settings.sensitivity.tau());
 
@@ -731,7 +727,6 @@ impl App {
     }
 
     fn run(mut self: Box<Self>) -> anyhow::Result<()> {
-        let mut stack_headroom_logged = false;
         loop {
             // SAFETY: feeds the task watchdog timer for the current task only.
             unsafe {
@@ -747,10 +742,6 @@ impl App {
             match self.take_window() {
                 Some(window) => self.process_window(window, config_changed),
                 None => self.handle_idle_iteration(),
-            }
-            if !stack_headroom_logged {
-                cores::log_stack_headroom("main loop after first iteration");
-                stack_headroom_logged = true;
             }
         }
     }

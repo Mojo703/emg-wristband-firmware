@@ -1,7 +1,7 @@
 # 0018 — The frame read moved into the DRDY interrupt
 
 **Date:** 2026-08-04
-**Crates:** `opal-firmware` (`adc::frame_reader` (new), `adc::chip_pipeline`, `adc::mod`, `adc::ads1298`, `cores`).
+**Crates:** `opal-firmware` (`adc::frame_reader` (new), `adc::acquisition::pipeline`, `adc`, `adc::ads1298`, `cores`).
 
 ## Purpose
 

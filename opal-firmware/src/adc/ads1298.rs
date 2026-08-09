@@ -27,7 +27,14 @@ use super::registers::{
     RespirationPhase, RightLegDriveSenseNegative, RightLegDriveSensePositive, TestSignalAmplitude,
     TestSignalFrequency, WilsonCenterTerminalOneOff, WilsonCenterTerminalTwoOff,
 };
-use super::spi_commands;
+
+const COMMAND_WAKEUP: u8 = 0x02;
+const COMMAND_STANDBY: u8 = 0x04;
+const COMMAND_RESET: u8 = 0x06;
+const COMMAND_RDATAC: u8 = 0x10;
+const COMMAND_SDATAC: u8 = 0x11;
+const COMMAND_RREG_BASE: u8 = 0x20;
+const COMMAND_WREG_BASE: u8 = 0x40;
 
 /// The SPI handle for one chip. Both chips share one `SpiDriver` through an `Arc`
 /// rather than borrowing it, so the whole driver is `'static` and can move into the
@@ -369,28 +376,28 @@ impl Ads1298Device {
 
     #[allow(dead_code)] // Datasheet command set, kept whole for bring-up.
     pub(super) fn software_reset(&mut self) -> Result<()> {
-        self.send_command(spi_commands::RESET)
+        self.send_command(COMMAND_RESET)
     }
 
     #[allow(dead_code)] // Datasheet command set, kept whole for bring-up.
     pub(super) fn wakeup(&mut self) -> Result<()> {
-        self.send_command(spi_commands::WAKEUP)
+        self.send_command(COMMAND_WAKEUP)
     }
 
     #[allow(dead_code)] // Datasheet command set, kept whole for bring-up.
     pub(super) fn standby(&mut self) -> Result<()> {
-        self.send_command(spi_commands::STANDBY)
+        self.send_command(COMMAND_STANDBY)
     }
 
     /// Disables read data continuous mode so that registers can be configured
     pub(super) fn stop_read_data_continuous(&mut self) -> Result<()> {
-        self.send_command(spi_commands::SDATAC)
+        self.send_command(COMMAND_SDATAC)
     }
 
     /// Enables read data continuous mode. Once started, each DRDY
     /// falling edge means a frame is ready to clock out
     pub(super) fn read_data_continuous(&mut self) -> Result<()> {
-        self.send_command(spi_commands::RDATAC)
+        self.send_command(COMMAND_RDATAC)
     }
 
     /// Writes one typed register value. The address comes from the value's type, so
@@ -418,7 +425,7 @@ impl Ads1298Device {
         // the whole command, decode gaps between the bytes.
         self.with_selection(|device| {
             device.command_spi.transaction(&mut [
-                Operation::Write(&[spi_commands::WREG_BASE | reg.addr()]),
+                Operation::Write(&[COMMAND_WREG_BASE | reg.addr()]),
                 Operation::DelayNs(COMMAND_DECODE_GAP_NANOSECONDS),
                 Operation::Write(&[0x00]),
                 Operation::DelayNs(COMMAND_DECODE_GAP_NANOSECONDS),
@@ -433,7 +440,7 @@ impl Ads1298Device {
         self.with_selection(|device| {
             let mut rx = [0u8; 1];
             device.command_spi.transaction(&mut [
-                Operation::Write(&[spi_commands::RREG_BASE | reg.addr()]),
+                Operation::Write(&[COMMAND_RREG_BASE | reg.addr()]),
                 Operation::DelayNs(COMMAND_DECODE_GAP_NANOSECONDS),
                 Operation::Write(&[0x00]),
                 Operation::DelayNs(COMMAND_DECODE_GAP_NANOSECONDS),

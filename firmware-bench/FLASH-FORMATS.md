@@ -3,7 +3,7 @@
 Every byte the `training` partition holds, and the rules that make a torn write
 detectable. This file is the contract between the host builder
 (`playback-host build-partition-v2`), the device reader
-(`opal-firmware/src/training_rows.rs`) and the fitter
+(`opal-firmware/src/calibration/training_rows.rs`) and the fitter
 (`emg-runtime/src/streaming_fit.rs`). A disagreement between any two of them is
 a bug in whichever one does not match this file.
 

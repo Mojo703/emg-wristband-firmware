@@ -4,7 +4,7 @@
 //! Parsing lives here rather than in the firmware so that every rule this file
 //! states — a torn slot is dead, a slot built against another prior is dead,
 //! an unwritten region is an absence and not a fault — is provable on the host.
-//! `opal-firmware/src/training_rows.rs` owns the mapping, the erase and the
+//! `opal-firmware/src/calibration/training_rows.rs` owns the mapping, erase, and
 //! writes; it owns no layout knowledge.
 //!
 //! `firmware-bench/FLASH-FORMATS.md` is the authority on every offset below,

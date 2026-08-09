@@ -1,7 +1,7 @@
 # 0017 — Missed DRDY edges: where the sample period went, and what to do about the holes
 
 **Date:** 2026-08-03
-**Crates:** `opal-firmware` (`cores`, `adc::chip_pipeline`, `adc::mod`, `adc::acquisition`, `telemetry`), `protocol`, `emg-runtime` (read-only), `dashboard`.
+**Crates:** `opal-firmware` (`cores`, `adc::acquisition::pipeline`, `adc`, `adc::acquisition`, `telemetry`), `protocol`, `emg-runtime` (read-only), `dashboard`.
 
 ## Purpose
 

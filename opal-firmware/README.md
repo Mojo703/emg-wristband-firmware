@@ -2,7 +2,8 @@
 
 Firmware for the Opal EMG wristband (ESP32-S3): two ADS1298s sample EMG, the int8
 model classifies each window, the reject pipeline smooths it into a wake-gate
-decision, and the frames stream to the dashboard over wifi or USB serial.
+decision, and the frames stream to the dashboard over USB serial. Wi-Fi remains
+dormant until a future explicit wireless-mode transition selects it.
 `src/main.rs` has the module-level docs.
 
 The model wants 16 channels and the front end carries two 8-channel ADS1298 boards.
@@ -108,17 +109,21 @@ cargo run    # builds, flashes over USB-Serial-JTAG, opens the serial monitor
 Compile-time defaults (wifi credentials, server address) come from `cfg.toml`,
 which stays out of version control; copy `cfg.toml.example` and fill it in.
 Values the dashboard persists to NVS override it. The file is optional for
-recording, since an empty `wifi_ssid` boots the device into the USB serial link.
+recording because the current product path starts on USB serial regardless of
+stored Wi-Fi credentials.
 
 ## On-device tests
 
-The unit tests (`link_policy`, `feedback`, and the ADC decode, lead-off, conversion
+The unit tests (`links::policy`, `feedback`, and the ADC decode, lead-off, conversion
 and preprocessing modules) run on the device, because the crate only builds for
 Xtensa:
 
 ```sh
 cargo test-device
 ```
+
+The Xtensa SIMD model checks live in `../emg-runtime-esp32s3-tests` so the runtime
+owns its arithmetic tests without adding ESP-IDF to the runtime library.
 
 This is an alias (see `.cargo/config.toml`) for `cargo test` with
 `ESP_IDF_SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.test"`. The override

@@ -22,7 +22,7 @@
 //! clocks each frame out inside the chip's DRDY interrupt, because a conversion
 //! not read within one ~487 µs period is gone and no scheduling policy can
 //! promise that. What the threads do is everything after the bytes are safe.
-//! [`acquisition::start`] spawns one [`chip_pipeline`] thread per chip — draining
+//! [`acquisition::start`] spawns one [`acquisition::pipeline`] thread per chip — draining
 //! that chip's frame ring, validating it, and owning its health — plus a combiner
 //! thread that places both streams onto one time grid
 //! ([`emg_runtime::alignment`]) and builds the model and wire windows. Everything
@@ -31,14 +31,12 @@
 pub(crate) mod acquisition;
 pub(crate) mod ads1298;
 pub(crate) mod channel;
-mod chip_pipeline;
 mod conditioning;
 mod convert;
 mod decode;
 mod frame_reader;
 mod preprocess;
 mod registers;
-mod spi_commands;
 mod status;
 
 pub(crate) use channel::Channel;

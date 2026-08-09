@@ -3,7 +3,7 @@
 //!
 //! Acquisition is three threads and two interrupts. Each chip's frames are clocked
 //! out inside its DRDY interrupt ([`super::frame_reader`]); each chip then has a
-//! [`super::chip_pipeline`] thread that drains that ring, owns the chip's health,
+//! [`pipeline`] thread that drains that ring, owns the chip's health,
 //! and emits batches of timestamped 8-channel frames. This module's combiner drains both
 //! pipelines into an [`emg_runtime::alignment::GridAligner`], which places the two
 //! independently clocked streams onto one 2 kHz grid on the device clock, with the
@@ -44,12 +44,14 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
 
+mod pipeline;
+
 use super::ads1298::{self, SAMPLE_RATE_HZ};
 use super::channel::{Board, DEVICE_COUNT};
-use super::chip_pipeline::{self, ChipEvent};
 use super::decode::Sample;
 use super::preprocess::{wire_time_step, InputStage};
 use super::FrontEnds;
+use pipeline::ChipEvent;
 
 /// Windows the channel will hold.
 ///
@@ -303,7 +305,7 @@ pub(crate) fn start(
         .zip(power_down)
         .zip(Board::ALL)
     {
-        chip_pipeline::spawn(
+        pipeline::spawn(
             board.device_index(),
             crate::cores::front_end_core(board),
             chip,

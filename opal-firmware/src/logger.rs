@@ -117,8 +117,6 @@ impl Log for FrameLogger {
         if !self.enabled(record.metadata()) {
             return;
         }
-        #[cfg(feature = "diagnostic-console")]
-        println!("[{}] {}", record.level(), record.args());
         let level = match record.level() {
             Level::Error => LogLevel::Error,
             Level::Warn => LogLevel::Warn,

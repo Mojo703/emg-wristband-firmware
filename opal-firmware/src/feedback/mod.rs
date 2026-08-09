@@ -21,19 +21,18 @@
 //! what makes a cue visible: against a lit indicator, a flash in the colour already
 //! showing is no change.
 
-mod cue;
 mod haptics;
-mod indicator_led;
+mod led;
 
-pub(crate) use cue::{Calibrating, DeviceState, FrontEnd, Prompt, RepNotice};
+pub(crate) use feedback_vocabulary::{Calibrating, DeviceState, FrontEnd, Prompt, RepNotice};
 
 use crate::cores;
-use cue::Cue;
 use esp_idf_svc::hal::delay::FreeRtos;
 use esp_idf_svc::hal::gpio::{AnyIOPin, AnyOutputPin};
 use esp_idf_svc::hal::i2c::I2C0;
+use feedback_vocabulary::Cue;
 use haptics::{Haptics, Playback};
-use indicator_led::{Color, IndicatorLed, Shape};
+use led::{Color, IndicatorLed, Shape};
 use log::{info, warn};
 use std::sync::{Arc, Mutex};
 

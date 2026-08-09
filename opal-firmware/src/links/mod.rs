@@ -2,22 +2,24 @@
 //! recently established link wins. A dashboard probing the serial port claims it
 //! (heartbeats keep the claim alive; silence, unplug, or a stalled write releases
 //! it), and TCP carries the stream otherwise. The claim/stall/cooldown decisions
-//! live in the `link_policy` module, tested on-device; this module owns the
+//! live in the [`policy`] module, tested on-device; this module owns the
 //! transports and the wifi dialer thread and applies those decisions.
 
+mod policy;
+mod wifi;
+
 use crate::config::Settings;
-use crate::link_policy::{ClaimOutcome, SerialClaimPolicy};
 use crate::logger;
 use crate::transport::{
     Control, SerialTransport, TcpTransport, Transport, SERIAL_CLAIM_TIMEOUT,
     SERIAL_HOST_ABSENCE_GRACE, SERIAL_RECLAIM_COOLDOWN,
 };
-use crate::wifi;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::delay::FreeRtos;
 use esp_idf_svc::hal::modem::Modem;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use log::{info, warn};
+use policy::{ClaimOutcome, SerialClaimPolicy};
 use protocol::Frame;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -103,18 +105,6 @@ impl core::fmt::Display for WifiShutdownError {
 impl std::error::Error for WifiShutdownError {}
 
 impl Links {
-    /// Compatibility constructor for the current composition root. Wifi is no longer
-    /// started here; the runtime must call [`Self::start_wifi`] explicitly.
-    pub fn new(
-        serial: SerialTransport,
-        modem: Modem<'static>,
-        sysloop: EspSystemEventLoop,
-        nvs: EspDefaultNvsPartition,
-        _settings: &Settings,
-    ) -> anyhow::Result<Self> {
-        Ok(Self::serial_only(serial, modem, sysloop, nvs))
-    }
-
     /// Construct the primary serial + BLE mode while retaining the modem lease.
     pub fn serial_only(
         serial: SerialTransport,

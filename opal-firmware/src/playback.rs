@@ -35,8 +35,7 @@ use emg_runtime::pipeline::RejectPipeline;
 use log::{info, warn};
 use protocol::{BenchDecision, Frame, PLAYBACK_MAX_CHUNK_SAMPLES};
 
-use crate::telemetry::{heap_free_bytes, largest_free_block_bytes};
-use crate::training_rows::TrainingRows;
+use crate::calibration::training_rows::TrainingRows;
 use crate::transport::Control;
 
 /// Command slots between the serve loop and the worker. Deeper than the credit
@@ -312,7 +311,7 @@ impl Bench {
             store: None,
             fit_class_count: 0,
             stored_rows: 0,
-            flash_rows: crate::training_rows::map_or_warn(),
+            flash_rows: crate::calibration::training_rows::map_or_warn(),
             decisions: Vec::with_capacity(DECISION_BATCH_WINDOWS),
             probabilities: Vec::new(),
             published_samples: 0,
@@ -832,18 +831,16 @@ impl Bench {
             .map(StaticFeatureRows::len)
             .unwrap_or(0) as u32;
 
-        let heap_free_before_bytes = heap_free_bytes();
-        let largest_free_block_before_bytes = largest_free_block_bytes();
+        let heap_before = crate::allocation::heap_snapshot();
         let started = Instant::now();
         let model = fit_calibration(store, static_rows.as_ref(), self.fit_class_count);
         let wall_milliseconds = started.elapsed().as_millis() as u32;
-        let heap_free_after_bytes = heap_free_bytes();
-        let largest_free_block_after_bytes = largest_free_block_bytes();
+        let heap_after = crate::allocation::heap_snapshot();
         let bits = model.to_bits();
         info!(
             "calibration fit: {} live rows + {flash_row_count} flash rows, {wall_milliseconds} ms \
-             ({flash_walk_microseconds} us per flash pass), heap {heap_free_before_bytes} -> {heap_free_after_bytes}",
-            self.stored_rows
+             ({flash_walk_microseconds} us per flash pass), heap {} -> {}",
+            self.stored_rows, heap_before.free_bytes, heap_after.free_bytes
         );
         self.probabilities = vec![0.0; model.class_count];
         let class_count = model.class_count as u32;
@@ -856,10 +853,10 @@ impl Bench {
             flash_rows: flash_row_count,
             flash_walk_microseconds,
             class_count,
-            heap_free_before_bytes,
-            heap_free_after_bytes,
-            largest_free_block_before_bytes,
-            largest_free_block_after_bytes,
+            heap_free_before_bytes: heap_before.free_bytes,
+            heap_free_after_bytes: heap_after.free_bytes,
+            largest_free_block_before_bytes: heap_before.largest_free_block_bytes,
+            largest_free_block_after_bytes: heap_after.largest_free_block_bytes,
             model: bits,
         });
     }
@@ -935,6 +932,7 @@ impl Bench {
             ),
             None => (String::new(), 0, 0, 0, (0, 0, 0)),
         };
+        let heap = crate::allocation::heap_snapshot();
         self.send(Frame::BenchStatus {
             mode: self.mode.into(),
             session: identifier,
@@ -943,8 +941,8 @@ impl Bench {
             feature_minimum_microseconds: compute.0,
             feature_mean_microseconds: compute.1,
             feature_maximum_microseconds: compute.2,
-            heap_free_bytes: heap_free_bytes(),
-            largest_free_block_bytes: largest_free_block_bytes(),
+            heap_free_bytes: heap.free_bytes,
+            largest_free_block_bytes: heap.largest_free_block_bytes,
             dropped_chunks: self.refused.load(Ordering::Relaxed),
             sequence_gaps: gaps,
             stored_rows: self.stored_rows,
