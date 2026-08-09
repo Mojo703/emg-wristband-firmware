@@ -1,0 +1,1915 @@
+{
+  "full_data_weight_0.4": {
+    "2026-08-07T22-08-47_Matthew": [
+      {
+        "window": 85,
+        "sample": 43000,
+        "command": 0
+      },
+      {
+        "window": 103,
+        "sample": 52000,
+        "command": 1
+      },
+      {
+        "window": 123,
+        "sample": 62000,
+        "command": 2
+      },
+      {
+        "window": 143,
+        "sample": 72000,
+        "command": 3
+      },
+      {
+        "window": 166,
+        "sample": 83500,
+        "command": 4
+      },
+      {
+        "window": 186,
+        "sample": 93500,
+        "command": 0
+      },
+      {
+        "window": 203,
+        "sample": 102000,
+        "command": 1
+      },
+      {
+        "window": 224,
+        "sample": 112500,
+        "command": 2
+      },
+      {
+        "window": 242,
+        "sample": 121500,
+        "command": 3
+      },
+      {
+        "window": 262,
+        "sample": 131500,
+        "command": 4
+      },
+      {
+        "window": 284,
+        "sample": 142500,
+        "command": 0
+      },
+      {
+        "window": 303,
+        "sample": 152000,
+        "command": 1
+      },
+      {
+        "window": 319,
+        "sample": 160000,
+        "command": 3
+      },
+      {
+        "window": 324,
+        "sample": 162500,
+        "command": 2
+      },
+      {
+        "window": 344,
+        "sample": 172500,
+        "command": 3
+      },
+      {
+        "window": 363,
+        "sample": 182000,
+        "command": 4
+      },
+      {
+        "window": 384,
+        "sample": 192500,
+        "command": 0
+      },
+      {
+        "window": 397,
+        "sample": 199000,
+        "command": 4
+      },
+      {
+        "window": 403,
+        "sample": 202000,
+        "command": 1
+      },
+      {
+        "window": 422,
+        "sample": 211500,
+        "command": 2
+      },
+      {
+        "window": 443,
+        "sample": 222000,
+        "command": 3
+      },
+      {
+        "window": 464,
+        "sample": 232500,
+        "command": 4
+      },
+      {
+        "window": 485,
+        "sample": 243000,
+        "command": 0
+      },
+      {
+        "window": 504,
+        "sample": 252500,
+        "command": 1
+      },
+      {
+        "window": 523,
+        "sample": 262000,
+        "command": 2
+      },
+      {
+        "window": 542,
+        "sample": 271500,
+        "command": 3
+      },
+      {
+        "window": 564,
+        "sample": 282500,
+        "command": 4
+      },
+      {
+        "window": 584,
+        "sample": 292500,
+        "command": 0
+      },
+      {
+        "window": 603,
+        "sample": 302000,
+        "command": 1
+      },
+      {
+        "window": 623,
+        "sample": 312000,
+        "command": 2
+      },
+      {
+        "window": 643,
+        "sample": 322000,
+        "command": 3
+      },
+      {
+        "window": 652,
+        "sample": 326500,
+        "command": 4
+      },
+      {
+        "window": 662,
+        "sample": 331500,
+        "command": 4
+      },
+      {
+        "window": 683,
+        "sample": 342000,
+        "command": 0
+      },
+      {
+        "window": 694,
+        "sample": 347500,
+        "command": 4
+      },
+      {
+        "window": 704,
+        "sample": 352500,
+        "command": 1
+      },
+      {
+        "window": 742,
+        "sample": 371500,
+        "command": 3
+      },
+      {
+        "window": 763,
+        "sample": 382000,
+        "command": 4
+      },
+      {
+        "window": 775,
+        "sample": 388000,
+        "command": 3
+      },
+      {
+        "window": 784,
+        "sample": 392500,
+        "command": 0
+      },
+      {
+        "window": 803,
+        "sample": 402000,
+        "command": 1
+      },
+      {
+        "window": 823,
+        "sample": 412000,
+        "command": 2
+      },
+      {
+        "window": 843,
+        "sample": 422000,
+        "command": 3
+      },
+      {
+        "window": 868,
+        "sample": 434500,
+        "command": 4
+      },
+      {
+        "window": 885,
+        "sample": 443000,
+        "command": 0
+      },
+      {
+        "window": 903,
+        "sample": 452000,
+        "command": 1
+      },
+      {
+        "window": 923,
+        "sample": 462000,
+        "command": 2
+      },
+      {
+        "window": 943,
+        "sample": 472000,
+        "command": 3
+      },
+      {
+        "window": 964,
+        "sample": 482500,
+        "command": 4
+      },
+      {
+        "window": 984,
+        "sample": 492500,
+        "command": 0
+      },
+      {
+        "window": 1004,
+        "sample": 502500,
+        "command": 1
+      },
+      {
+        "window": 1022,
+        "sample": 511500,
+        "command": 2
+      },
+      {
+        "window": 1031,
+        "sample": 516000,
+        "command": 3
+      },
+      {
+        "window": 1044,
+        "sample": 522500,
+        "command": 3
+      },
+      {
+        "window": 1065,
+        "sample": 533000,
+        "command": 4
+      }
+    ],
+    "2026-08-07T22-16-46_Matthew": [
+      {
+        "window": 214,
+        "sample": 107500,
+        "command": 4
+      },
+      {
+        "window": 347,
+        "sample": 174000,
+        "command": 4
+      },
+      {
+        "window": 742,
+        "sample": 371500,
+        "command": 0
+      },
+      {
+        "window": 781,
+        "sample": 391000,
+        "command": 1
+      },
+      {
+        "window": 921,
+        "sample": 461000,
+        "command": 4
+      }
+    ],
+    "2026-08-07T21-22-54_Matthew": [],
+    "2026-08-07T21-28-08_Matthew": []
+  },
+  "measurement3_fold0": {
+    "2026-08-07T22-08-47_Matthew": [
+      {
+        "window": 85,
+        "sample": 43000,
+        "command": 0
+      },
+      {
+        "window": 103,
+        "sample": 52000,
+        "command": 1
+      },
+      {
+        "window": 123,
+        "sample": 62000,
+        "command": 2
+      },
+      {
+        "window": 143,
+        "sample": 72000,
+        "command": 3
+      },
+      {
+        "window": 164,
+        "sample": 82500,
+        "command": 4
+      },
+      {
+        "window": 186,
+        "sample": 93500,
+        "command": 0
+      },
+      {
+        "window": 203,
+        "sample": 102000,
+        "command": 1
+      },
+      {
+        "window": 224,
+        "sample": 112500,
+        "command": 2
+      },
+      {
+        "window": 242,
+        "sample": 121500,
+        "command": 3
+      },
+      {
+        "window": 262,
+        "sample": 131500,
+        "command": 4
+      },
+      {
+        "window": 277,
+        "sample": 139000,
+        "command": 4
+      },
+      {
+        "window": 284,
+        "sample": 142500,
+        "command": 0
+      },
+      {
+        "window": 303,
+        "sample": 152000,
+        "command": 1
+      },
+      {
+        "window": 324,
+        "sample": 162500,
+        "command": 2
+      },
+      {
+        "window": 345,
+        "sample": 173000,
+        "command": 3
+      },
+      {
+        "window": 362,
+        "sample": 181500,
+        "command": 4
+      },
+      {
+        "window": 384,
+        "sample": 192500,
+        "command": 0
+      },
+      {
+        "window": 397,
+        "sample": 199000,
+        "command": 4
+      },
+      {
+        "window": 403,
+        "sample": 202000,
+        "command": 1
+      },
+      {
+        "window": 422,
+        "sample": 211500,
+        "command": 2
+      },
+      {
+        "window": 433,
+        "sample": 217000,
+        "command": 4
+      },
+      {
+        "window": 438,
+        "sample": 219500,
+        "command": 4
+      },
+      {
+        "window": 444,
+        "sample": 222500,
+        "command": 3
+      },
+      {
+        "window": 464,
+        "sample": 232500,
+        "command": 4
+      },
+      {
+        "window": 485,
+        "sample": 243000,
+        "command": 0
+      },
+      {
+        "window": 504,
+        "sample": 252500,
+        "command": 1
+      },
+      {
+        "window": 511,
+        "sample": 256000,
+        "command": 4
+      },
+      {
+        "window": 523,
+        "sample": 262000,
+        "command": 2
+      },
+      {
+        "window": 542,
+        "sample": 271500,
+        "command": 3
+      },
+      {
+        "window": 564,
+        "sample": 282500,
+        "command": 4
+      },
+      {
+        "window": 584,
+        "sample": 292500,
+        "command": 0
+      },
+      {
+        "window": 603,
+        "sample": 302000,
+        "command": 1
+      },
+      {
+        "window": 623,
+        "sample": 312000,
+        "command": 2
+      },
+      {
+        "window": 643,
+        "sample": 322000,
+        "command": 3
+      },
+      {
+        "window": 652,
+        "sample": 326500,
+        "command": 4
+      },
+      {
+        "window": 662,
+        "sample": 331500,
+        "command": 4
+      },
+      {
+        "window": 683,
+        "sample": 342000,
+        "command": 0
+      },
+      {
+        "window": 689,
+        "sample": 345000,
+        "command": 4
+      },
+      {
+        "window": 704,
+        "sample": 352500,
+        "command": 1
+      },
+      {
+        "window": 742,
+        "sample": 371500,
+        "command": 3
+      },
+      {
+        "window": 763,
+        "sample": 382000,
+        "command": 4
+      },
+      {
+        "window": 784,
+        "sample": 392500,
+        "command": 0
+      },
+      {
+        "window": 803,
+        "sample": 402000,
+        "command": 1
+      },
+      {
+        "window": 823,
+        "sample": 412000,
+        "command": 2
+      },
+      {
+        "window": 831,
+        "sample": 416000,
+        "command": 4
+      },
+      {
+        "window": 843,
+        "sample": 422000,
+        "command": 3
+      },
+      {
+        "window": 868,
+        "sample": 434500,
+        "command": 4
+      },
+      {
+        "window": 885,
+        "sample": 443000,
+        "command": 0
+      },
+      {
+        "window": 904,
+        "sample": 452500,
+        "command": 1
+      },
+      {
+        "window": 923,
+        "sample": 462000,
+        "command": 2
+      },
+      {
+        "window": 943,
+        "sample": 472000,
+        "command": 3
+      },
+      {
+        "window": 964,
+        "sample": 482500,
+        "command": 4
+      },
+      {
+        "window": 984,
+        "sample": 492500,
+        "command": 0
+      },
+      {
+        "window": 1004,
+        "sample": 502500,
+        "command": 1
+      },
+      {
+        "window": 1022,
+        "sample": 511500,
+        "command": 2
+      },
+      {
+        "window": 1044,
+        "sample": 522500,
+        "command": 3
+      },
+      {
+        "window": 1067,
+        "sample": 534000,
+        "command": 4
+      }
+    ]
+  },
+  "measurement3_fold1": {
+    "2026-08-07T22-08-47_Matthew": [
+      {
+        "window": 85,
+        "sample": 43000,
+        "command": 0
+      },
+      {
+        "window": 103,
+        "sample": 52000,
+        "command": 1
+      },
+      {
+        "window": 123,
+        "sample": 62000,
+        "command": 2
+      },
+      {
+        "window": 143,
+        "sample": 72000,
+        "command": 3
+      },
+      {
+        "window": 186,
+        "sample": 93500,
+        "command": 0
+      },
+      {
+        "window": 203,
+        "sample": 102000,
+        "command": 1
+      },
+      {
+        "window": 224,
+        "sample": 112500,
+        "command": 2
+      },
+      {
+        "window": 242,
+        "sample": 121500,
+        "command": 3
+      },
+      {
+        "window": 263,
+        "sample": 132000,
+        "command": 4
+      },
+      {
+        "window": 284,
+        "sample": 142500,
+        "command": 0
+      },
+      {
+        "window": 303,
+        "sample": 152000,
+        "command": 1
+      },
+      {
+        "window": 317,
+        "sample": 159000,
+        "command": 3
+      },
+      {
+        "window": 324,
+        "sample": 162500,
+        "command": 2
+      },
+      {
+        "window": 344,
+        "sample": 172500,
+        "command": 3
+      },
+      {
+        "window": 363,
+        "sample": 182000,
+        "command": 4
+      },
+      {
+        "window": 367,
+        "sample": 184000,
+        "command": 4
+      },
+      {
+        "window": 384,
+        "sample": 192500,
+        "command": 0
+      },
+      {
+        "window": 403,
+        "sample": 202000,
+        "command": 1
+      },
+      {
+        "window": 422,
+        "sample": 211500,
+        "command": 2
+      },
+      {
+        "window": 445,
+        "sample": 223000,
+        "command": 3
+      },
+      {
+        "window": 463,
+        "sample": 232000,
+        "command": 4
+      },
+      {
+        "window": 485,
+        "sample": 243000,
+        "command": 0
+      },
+      {
+        "window": 504,
+        "sample": 252500,
+        "command": 1
+      },
+      {
+        "window": 523,
+        "sample": 262000,
+        "command": 2
+      },
+      {
+        "window": 542,
+        "sample": 271500,
+        "command": 3
+      },
+      {
+        "window": 564,
+        "sample": 282500,
+        "command": 4
+      },
+      {
+        "window": 583,
+        "sample": 292000,
+        "command": 0
+      },
+      {
+        "window": 600,
+        "sample": 300500,
+        "command": 3
+      },
+      {
+        "window": 603,
+        "sample": 302000,
+        "command": 1
+      },
+      {
+        "window": 623,
+        "sample": 312000,
+        "command": 2
+      },
+      {
+        "window": 643,
+        "sample": 322000,
+        "command": 3
+      },
+      {
+        "window": 653,
+        "sample": 327000,
+        "command": 4
+      },
+      {
+        "window": 662,
+        "sample": 331500,
+        "command": 4
+      },
+      {
+        "window": 683,
+        "sample": 342000,
+        "command": 0
+      },
+      {
+        "window": 694,
+        "sample": 347500,
+        "command": 4
+      },
+      {
+        "window": 704,
+        "sample": 352500,
+        "command": 1
+      },
+      {
+        "window": 742,
+        "sample": 371500,
+        "command": 3
+      },
+      {
+        "window": 759,
+        "sample": 380000,
+        "command": 3
+      },
+      {
+        "window": 763,
+        "sample": 382000,
+        "command": 4
+      },
+      {
+        "window": 775,
+        "sample": 388000,
+        "command": 3
+      },
+      {
+        "window": 784,
+        "sample": 392500,
+        "command": 0
+      },
+      {
+        "window": 794,
+        "sample": 397500,
+        "command": 3
+      },
+      {
+        "window": 803,
+        "sample": 402000,
+        "command": 1
+      },
+      {
+        "window": 824,
+        "sample": 412500,
+        "command": 2
+      },
+      {
+        "window": 832,
+        "sample": 416500,
+        "command": 3
+      },
+      {
+        "window": 843,
+        "sample": 422000,
+        "command": 3
+      },
+      {
+        "window": 864,
+        "sample": 432500,
+        "command": 4
+      },
+      {
+        "window": 885,
+        "sample": 443000,
+        "command": 0
+      },
+      {
+        "window": 903,
+        "sample": 452000,
+        "command": 1
+      },
+      {
+        "window": 923,
+        "sample": 462000,
+        "command": 2
+      },
+      {
+        "window": 943,
+        "sample": 472000,
+        "command": 3
+      },
+      {
+        "window": 964,
+        "sample": 482500,
+        "command": 4
+      },
+      {
+        "window": 984,
+        "sample": 492500,
+        "command": 0
+      },
+      {
+        "window": 1004,
+        "sample": 502500,
+        "command": 1
+      },
+      {
+        "window": 1022,
+        "sample": 511500,
+        "command": 2
+      },
+      {
+        "window": 1031,
+        "sample": 516000,
+        "command": 3
+      },
+      {
+        "window": 1039,
+        "sample": 520000,
+        "command": 3
+      },
+      {
+        "window": 1044,
+        "sample": 522500,
+        "command": 3
+      },
+      {
+        "window": 1063,
+        "sample": 532000,
+        "command": 4
+      }
+    ]
+  },
+  "measurement3_fold2": {
+    "2026-08-07T22-08-47_Matthew": [
+      {
+        "window": 85,
+        "sample": 43000,
+        "command": 0
+      },
+      {
+        "window": 103,
+        "sample": 52000,
+        "command": 1
+      },
+      {
+        "window": 123,
+        "sample": 62000,
+        "command": 2
+      },
+      {
+        "window": 129,
+        "sample": 65000,
+        "command": 4
+      },
+      {
+        "window": 143,
+        "sample": 72000,
+        "command": 3
+      },
+      {
+        "window": 164,
+        "sample": 82500,
+        "command": 4
+      },
+      {
+        "window": 186,
+        "sample": 93500,
+        "command": 0
+      },
+      {
+        "window": 203,
+        "sample": 102000,
+        "command": 1
+      },
+      {
+        "window": 224,
+        "sample": 112500,
+        "command": 2
+      },
+      {
+        "window": 242,
+        "sample": 121500,
+        "command": 3
+      },
+      {
+        "window": 264,
+        "sample": 132500,
+        "command": 4
+      },
+      {
+        "window": 285,
+        "sample": 143000,
+        "command": 0
+      },
+      {
+        "window": 303,
+        "sample": 152000,
+        "command": 1
+      },
+      {
+        "window": 324,
+        "sample": 162500,
+        "command": 2
+      },
+      {
+        "window": 344,
+        "sample": 172500,
+        "command": 3
+      },
+      {
+        "window": 365,
+        "sample": 183000,
+        "command": 4
+      },
+      {
+        "window": 384,
+        "sample": 192500,
+        "command": 0
+      },
+      {
+        "window": 397,
+        "sample": 199000,
+        "command": 4
+      },
+      {
+        "window": 403,
+        "sample": 202000,
+        "command": 1
+      },
+      {
+        "window": 422,
+        "sample": 211500,
+        "command": 2
+      },
+      {
+        "window": 433,
+        "sample": 217000,
+        "command": 4
+      },
+      {
+        "window": 437,
+        "sample": 219000,
+        "command": 3
+      },
+      {
+        "window": 443,
+        "sample": 222000,
+        "command": 3
+      },
+      {
+        "window": 465,
+        "sample": 233000,
+        "command": 4
+      },
+      {
+        "window": 485,
+        "sample": 243000,
+        "command": 0
+      },
+      {
+        "window": 504,
+        "sample": 252500,
+        "command": 1
+      },
+      {
+        "window": 523,
+        "sample": 262000,
+        "command": 2
+      },
+      {
+        "window": 535,
+        "sample": 268000,
+        "command": 3
+      },
+      {
+        "window": 542,
+        "sample": 271500,
+        "command": 3
+      },
+      {
+        "window": 565,
+        "sample": 283000,
+        "command": 4
+      },
+      {
+        "window": 584,
+        "sample": 292500,
+        "command": 0
+      },
+      {
+        "window": 603,
+        "sample": 302000,
+        "command": 1
+      },
+      {
+        "window": 623,
+        "sample": 312000,
+        "command": 2
+      },
+      {
+        "window": 643,
+        "sample": 322000,
+        "command": 3
+      },
+      {
+        "window": 663,
+        "sample": 332000,
+        "command": 4
+      },
+      {
+        "window": 683,
+        "sample": 342000,
+        "command": 0
+      },
+      {
+        "window": 692,
+        "sample": 346500,
+        "command": 4
+      },
+      {
+        "window": 704,
+        "sample": 352500,
+        "command": 1
+      },
+      {
+        "window": 723,
+        "sample": 362000,
+        "command": 2
+      },
+      {
+        "window": 742,
+        "sample": 371500,
+        "command": 3
+      },
+      {
+        "window": 765,
+        "sample": 383000,
+        "command": 4
+      },
+      {
+        "window": 775,
+        "sample": 388000,
+        "command": 3
+      },
+      {
+        "window": 784,
+        "sample": 392500,
+        "command": 0
+      },
+      {
+        "window": 794,
+        "sample": 397500,
+        "command": 3
+      },
+      {
+        "window": 803,
+        "sample": 402000,
+        "command": 1
+      },
+      {
+        "window": 823,
+        "sample": 412000,
+        "command": 2
+      },
+      {
+        "window": 833,
+        "sample": 417000,
+        "command": 3
+      },
+      {
+        "window": 842,
+        "sample": 421500,
+        "command": 3
+      },
+      {
+        "window": 885,
+        "sample": 443000,
+        "command": 0
+      },
+      {
+        "window": 904,
+        "sample": 452500,
+        "command": 1
+      },
+      {
+        "window": 923,
+        "sample": 462000,
+        "command": 2
+      },
+      {
+        "window": 942,
+        "sample": 471500,
+        "command": 3
+      },
+      {
+        "window": 964,
+        "sample": 482500,
+        "command": 4
+      },
+      {
+        "window": 980,
+        "sample": 490500,
+        "command": 3
+      },
+      {
+        "window": 984,
+        "sample": 492500,
+        "command": 0
+      },
+      {
+        "window": 1004,
+        "sample": 502500,
+        "command": 1
+      },
+      {
+        "window": 1022,
+        "sample": 511500,
+        "command": 2
+      },
+      {
+        "window": 1031,
+        "sample": 516000,
+        "command": 3
+      },
+      {
+        "window": 1043,
+        "sample": 522000,
+        "command": 3
+      },
+      {
+        "window": 1065,
+        "sample": 533000,
+        "command": 4
+      }
+    ]
+  },
+  "measurement3_fold3": {
+    "2026-08-07T22-08-47_Matthew": [
+      {
+        "window": 85,
+        "sample": 43000,
+        "command": 0
+      },
+      {
+        "window": 103,
+        "sample": 52000,
+        "command": 1
+      },
+      {
+        "window": 123,
+        "sample": 62000,
+        "command": 2
+      },
+      {
+        "window": 164,
+        "sample": 82500,
+        "command": 4
+      },
+      {
+        "window": 186,
+        "sample": 93500,
+        "command": 0
+      },
+      {
+        "window": 203,
+        "sample": 102000,
+        "command": 1
+      },
+      {
+        "window": 224,
+        "sample": 112500,
+        "command": 2
+      },
+      {
+        "window": 243,
+        "sample": 122000,
+        "command": 3
+      },
+      {
+        "window": 262,
+        "sample": 131500,
+        "command": 4
+      },
+      {
+        "window": 284,
+        "sample": 142500,
+        "command": 0
+      },
+      {
+        "window": 303,
+        "sample": 152000,
+        "command": 1
+      },
+      {
+        "window": 317,
+        "sample": 159000,
+        "command": 3
+      },
+      {
+        "window": 324,
+        "sample": 162500,
+        "command": 2
+      },
+      {
+        "window": 344,
+        "sample": 172500,
+        "command": 3
+      },
+      {
+        "window": 362,
+        "sample": 181500,
+        "command": 4
+      },
+      {
+        "window": 384,
+        "sample": 192500,
+        "command": 0
+      },
+      {
+        "window": 403,
+        "sample": 202000,
+        "command": 1
+      },
+      {
+        "window": 422,
+        "sample": 211500,
+        "command": 2
+      },
+      {
+        "window": 445,
+        "sample": 223000,
+        "command": 3
+      },
+      {
+        "window": 465,
+        "sample": 233000,
+        "command": 4
+      },
+      {
+        "window": 485,
+        "sample": 243000,
+        "command": 0
+      },
+      {
+        "window": 504,
+        "sample": 252500,
+        "command": 1
+      },
+      {
+        "window": 523,
+        "sample": 262000,
+        "command": 2
+      },
+      {
+        "window": 542,
+        "sample": 271500,
+        "command": 3
+      },
+      {
+        "window": 564,
+        "sample": 282500,
+        "command": 4
+      },
+      {
+        "window": 578,
+        "sample": 289500,
+        "command": 3
+      },
+      {
+        "window": 584,
+        "sample": 292500,
+        "command": 0
+      },
+      {
+        "window": 598,
+        "sample": 299500,
+        "command": 3
+      },
+      {
+        "window": 603,
+        "sample": 302000,
+        "command": 1
+      },
+      {
+        "window": 623,
+        "sample": 312000,
+        "command": 2
+      },
+      {
+        "window": 643,
+        "sample": 322000,
+        "command": 3
+      },
+      {
+        "window": 662,
+        "sample": 331500,
+        "command": 4
+      },
+      {
+        "window": 683,
+        "sample": 342000,
+        "command": 0
+      },
+      {
+        "window": 694,
+        "sample": 347500,
+        "command": 4
+      },
+      {
+        "window": 704,
+        "sample": 352500,
+        "command": 1
+      },
+      {
+        "window": 742,
+        "sample": 371500,
+        "command": 3
+      },
+      {
+        "window": 759,
+        "sample": 380000,
+        "command": 3
+      },
+      {
+        "window": 763,
+        "sample": 382000,
+        "command": 4
+      },
+      {
+        "window": 775,
+        "sample": 388000,
+        "command": 3
+      },
+      {
+        "window": 784,
+        "sample": 392500,
+        "command": 0
+      },
+      {
+        "window": 803,
+        "sample": 402000,
+        "command": 1
+      },
+      {
+        "window": 823,
+        "sample": 412000,
+        "command": 2
+      },
+      {
+        "window": 833,
+        "sample": 417000,
+        "command": 3
+      },
+      {
+        "window": 843,
+        "sample": 422000,
+        "command": 3
+      },
+      {
+        "window": 885,
+        "sample": 443000,
+        "command": 0
+      },
+      {
+        "window": 903,
+        "sample": 452000,
+        "command": 1
+      },
+      {
+        "window": 923,
+        "sample": 462000,
+        "command": 2
+      },
+      {
+        "window": 943,
+        "sample": 472000,
+        "command": 3
+      },
+      {
+        "window": 964,
+        "sample": 482500,
+        "command": 4
+      },
+      {
+        "window": 984,
+        "sample": 492500,
+        "command": 0
+      },
+      {
+        "window": 1004,
+        "sample": 502500,
+        "command": 1
+      },
+      {
+        "window": 1022,
+        "sample": 511500,
+        "command": 2
+      },
+      {
+        "window": 1031,
+        "sample": 516000,
+        "command": 3
+      },
+      {
+        "window": 1039,
+        "sample": 520000,
+        "command": 3
+      },
+      {
+        "window": 1044,
+        "sample": 522500,
+        "command": 3
+      },
+      {
+        "window": 1065,
+        "sample": 533000,
+        "command": 4
+      }
+    ]
+  },
+  "measurement3_fold4": {
+    "2026-08-07T22-08-47_Matthew": [
+      {
+        "window": 85,
+        "sample": 43000,
+        "command": 0
+      },
+      {
+        "window": 103,
+        "sample": 52000,
+        "command": 1
+      },
+      {
+        "window": 123,
+        "sample": 62000,
+        "command": 2
+      },
+      {
+        "window": 143,
+        "sample": 72000,
+        "command": 3
+      },
+      {
+        "window": 166,
+        "sample": 83500,
+        "command": 4
+      },
+      {
+        "window": 186,
+        "sample": 93500,
+        "command": 0
+      },
+      {
+        "window": 203,
+        "sample": 102000,
+        "command": 1
+      },
+      {
+        "window": 224,
+        "sample": 112500,
+        "command": 2
+      },
+      {
+        "window": 242,
+        "sample": 121500,
+        "command": 3
+      },
+      {
+        "window": 263,
+        "sample": 132000,
+        "command": 4
+      },
+      {
+        "window": 285,
+        "sample": 143000,
+        "command": 0
+      },
+      {
+        "window": 303,
+        "sample": 152000,
+        "command": 1
+      },
+      {
+        "window": 324,
+        "sample": 162500,
+        "command": 2
+      },
+      {
+        "window": 344,
+        "sample": 172500,
+        "command": 3
+      },
+      {
+        "window": 363,
+        "sample": 182000,
+        "command": 4
+      },
+      {
+        "window": 384,
+        "sample": 192500,
+        "command": 0
+      },
+      {
+        "window": 403,
+        "sample": 202000,
+        "command": 1
+      },
+      {
+        "window": 422,
+        "sample": 211500,
+        "command": 2
+      },
+      {
+        "window": 438,
+        "sample": 219500,
+        "command": 4
+      },
+      {
+        "window": 443,
+        "sample": 222000,
+        "command": 3
+      },
+      {
+        "window": 462,
+        "sample": 231500,
+        "command": 4
+      },
+      {
+        "window": 485,
+        "sample": 243000,
+        "command": 0
+      },
+      {
+        "window": 504,
+        "sample": 252500,
+        "command": 1
+      },
+      {
+        "window": 523,
+        "sample": 262000,
+        "command": 2
+      },
+      {
+        "window": 542,
+        "sample": 271500,
+        "command": 3
+      },
+      {
+        "window": 564,
+        "sample": 282500,
+        "command": 4
+      },
+      {
+        "window": 584,
+        "sample": 292500,
+        "command": 0
+      },
+      {
+        "window": 603,
+        "sample": 302000,
+        "command": 1
+      },
+      {
+        "window": 623,
+        "sample": 312000,
+        "command": 2
+      },
+      {
+        "window": 643,
+        "sample": 322000,
+        "command": 3
+      },
+      {
+        "window": 652,
+        "sample": 326500,
+        "command": 4
+      },
+      {
+        "window": 662,
+        "sample": 331500,
+        "command": 4
+      },
+      {
+        "window": 683,
+        "sample": 342000,
+        "command": 0
+      },
+      {
+        "window": 694,
+        "sample": 347500,
+        "command": 4
+      },
+      {
+        "window": 704,
+        "sample": 352500,
+        "command": 1
+      },
+      {
+        "window": 742,
+        "sample": 371500,
+        "command": 3
+      },
+      {
+        "window": 763,
+        "sample": 382000,
+        "command": 4
+      },
+      {
+        "window": 775,
+        "sample": 388000,
+        "command": 3
+      },
+      {
+        "window": 784,
+        "sample": 392500,
+        "command": 0
+      },
+      {
+        "window": 798,
+        "sample": 399500,
+        "command": 4
+      },
+      {
+        "window": 803,
+        "sample": 402000,
+        "command": 1
+      },
+      {
+        "window": 823,
+        "sample": 412000,
+        "command": 2
+      },
+      {
+        "window": 843,
+        "sample": 422000,
+        "command": 3
+      },
+      {
+        "window": 868,
+        "sample": 434500,
+        "command": 4
+      },
+      {
+        "window": 885,
+        "sample": 443000,
+        "command": 0
+      },
+      {
+        "window": 903,
+        "sample": 452000,
+        "command": 1
+      },
+      {
+        "window": 923,
+        "sample": 462000,
+        "command": 2
+      },
+      {
+        "window": 943,
+        "sample": 472000,
+        "command": 3
+      },
+      {
+        "window": 964,
+        "sample": 482500,
+        "command": 4
+      },
+      {
+        "window": 984,
+        "sample": 492500,
+        "command": 0
+      },
+      {
+        "window": 1004,
+        "sample": 502500,
+        "command": 1
+      },
+      {
+        "window": 1022,
+        "sample": 511500,
+        "command": 2
+      },
+      {
+        "window": 1044,
+        "sample": 522500,
+        "command": 3
+      },
+      {
+        "window": 1063,
+        "sample": 532000,
+        "command": 4
+      }
+    ]
+  },
+  "measurement4b_fold0": {
+    "2026-08-07T22-16-46_Matthew": [
+      {
+        "window": 214,
+        "sample": 107500,
+        "command": 4
+      },
+      {
+        "window": 347,
+        "sample": 174000,
+        "command": 4
+      },
+      {
+        "window": 742,
+        "sample": 371500,
+        "command": 0
+      },
+      {
+        "window": 781,
+        "sample": 391000,
+        "command": 1
+      },
+      {
+        "window": 921,
+        "sample": 461000,
+        "command": 4
+      }
+    ]
+  },
+  "measurement4b_fold1": {
+    "2026-08-07T22-16-46_Matthew": [
+      {
+        "window": 148,
+        "sample": 74500,
+        "command": 0
+      },
+      {
+        "window": 214,
+        "sample": 107500,
+        "command": 4
+      },
+      {
+        "window": 347,
+        "sample": 174000,
+        "command": 4
+      },
+      {
+        "window": 742,
+        "sample": 371500,
+        "command": 0
+      },
+      {
+        "window": 781,
+        "sample": 391000,
+        "command": 1
+      },
+      {
+        "window": 921,
+        "sample": 461000,
+        "command": 4
+      }
+    ]
+  },
+  "measurement4b_fold2": {
+    "2026-08-07T22-16-46_Matthew": [
+      {
+        "window": 148,
+        "sample": 74500,
+        "command": 0
+      },
+      {
+        "window": 214,
+        "sample": 107500,
+        "command": 4
+      },
+      {
+        "window": 347,
+        "sample": 174000,
+        "command": 4
+      },
+      {
+        "window": 742,
+        "sample": 371500,
+        "command": 0
+      },
+      {
+        "window": 781,
+        "sample": 391000,
+        "command": 1
+      },
+      {
+        "window": 921,
+        "sample": 461000,
+        "command": 4
+      }
+    ]
+  },
+  "measurement4b_fold3": {
+    "2026-08-07T22-16-46_Matthew": [
+      {
+        "window": 214,
+        "sample": 107500,
+        "command": 4
+      },
+      {
+        "window": 347,
+        "sample": 174000,
+        "command": 4
+      },
+      {
+        "window": 742,
+        "sample": 371500,
+        "command": 0
+      },
+      {
+        "window": 781,
+        "sample": 391000,
+        "command": 1
+      },
+      {
+        "window": 921,
+        "sample": 461000,
+        "command": 4
+      }
+    ]
+  },
+  "measurement4b_fold4": {
+    "2026-08-07T22-16-46_Matthew": [
+      {
+        "window": 214,
+        "sample": 107500,
+        "command": 4
+      },
+      {
+        "window": 347,
+        "sample": 174000,
+        "command": 4
+      },
+      {
+        "window": 742,
+        "sample": 371500,
+        "command": 0
+      },
+      {
+        "window": 781,
+        "sample": 391000,
+        "command": 1
+      },
+      {
+        "window": 921,
+        "sample": 461000,
+        "command": 4
+      }
+    ]
+  }
+}

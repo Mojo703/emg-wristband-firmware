@@ -1,0 +1,4 @@
+fixtures/cache/
+fixtures/**/*.npy
+fixtures/**/*.bin
+__pycache__/

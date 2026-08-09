@@ -1,0 +1,72 @@
+
+=== a. float32 device features vs float64 reference (log10 units) ===
+  2026-08-07T22-08-47_Matthew
+    replay windows  max 7.337e-02  rms 1.441e-03  p99 4.183e-03  p99.9 2.025e-02
+    per band rms    2.14e-03  1.69e-03  8.31e-04  4.41e-04
+    per band max    6.47e-02  7.34e-02  2.65e-02  1.21e-02
+  2026-08-07T22-16-46_Matthew
+    replay windows  max 3.349e-01  rms 3.785e-03  p99 7.138e-03  p99.9 3.547e-02
+    per band rms    6.89e-03  2.74e-03  1.38e-03  5.93e-04
+    per band max    3.35e-01  1.12e-01  5.60e-02  1.69e-02
+  2026-08-07T21-22-54_Matthew
+    replay windows  max 1.735e-01  rms 3.644e-03  p99 1.460e-02  p99.9 4.040e-02
+    per band rms    7.02e-03  1.73e-03  8.17e-04  4.12e-04
+    per band max    1.74e-01  3.40e-02  2.54e-02  7.24e-03
+  2026-08-07T21-28-08_Matthew
+    replay windows  max 2.644e-01  rms 2.151e-03  p99 6.155e-03  p99.9 2.352e-02
+    per band rms    1.38e-03  3.33e-03  1.91e-03  1.37e-03
+    per band max    3.89e-02  2.64e-01  5.45e-02  4.60e-02
+
+=== a2. float32 kernel vs scipy's own float32 filters ===
+  2026-08-07T22-08-47_Matthew: max 1.059e-01  rms 1.833e-03  p99 5.665e-03  p99.9 2.392e-02
+
+=== a3. commit sequences under a second float32 implementation ===
+  2026-08-07T22-08-47_Matthew: 55 vs 55 commits, identical True
+  2026-08-07T22-16-46_Matthew: 5 vs 5 commits, identical True
+  2026-08-07T21-22-54_Matthew: 0 vs 0 commits, identical True
+  2026-08-07T21-28-08_Matthew: 0 vs 0 commits, identical True
+
+=== c. fixed-gain referencing vs the spec's recomputed projection ===
+  2026-08-07T22-08-47_Matthew: float64 fixed-gain identical to spec True, float32 relative rms 4.72e-08
+  2026-08-07T22-16-46_Matthew: float64 fixed-gain identical to spec True, float32 relative rms 4.87e-08
+  2026-08-07T21-22-54_Matthew: float64 fixed-gain identical to spec True, float32 relative rms 9.61e-08
+  2026-08-07T21-28-08_Matthew: float64 fixed-gain identical to spec True, float32 relative rms 6.99e-08
+
+=== b. the four numbers through the device path ===
+  reference features, float64 fit    FN 4/50  misclass 0/50  same-don 3/80  rest 0/0
+  device features, float64 fit       FN 4/50  misclass 0/50  same-don 3/80  rest 0/0
+  device features, float32 fit       FN 4/50  misclass 0/50  same-don 3/80  rest 0/0
+
+=== d. quantized calibration rows (device features, float32 fit) ===
+  training rows at float16           FN 4/50  misclass 0/50  same-don 3/80  rest 0/0
+  training rows at int8              FN 4/50  misclass 0/50  same-don 3/80  rest 0/0
+
+  quantization error on the feature rows themselves (log10 units)
+    2026-08-07T22-08-47_Matthew  float16 rms 3.66e-04 max 1.95e-03   int8 rms 7.46e-03 max 1.99e-02
+    2026-08-07T22-16-46_Matthew  float16 rms 4.04e-04 max 1.95e-03   int8 rms 9.36e-03 max 1.02e+00
+    2026-08-07T21-22-54_Matthew  float16 rms 2.31e-04 max 1.90e-03   int8 rms 7.74e-03 max 3.37e-01
+    2026-08-07T21-28-08_Matthew  float16 rms 5.15e-04 max 1.95e-03   int8 rms 7.99e-03 max 4.39e-01
+
+=== e. training matrices per fit ===
+  measurement 3 fold fit (4/5 of modifier cues): 9504 rows x 64 features, 12 classes
+      command  2026-08-07T22-08-47_Matthew  600 rows
+      no_op    2026-08-07T16-38-35_Matthew  1200 rows
+      no_op    2026-08-07T16-51-04_Matthew  1200 rows
+      no_op    2026-08-07T17-14-43_Matthew  2652 rows
+      no_op    2026-08-07T17-23-35_Matthew  1212 rows
+      no_op    2026-08-07T22-16-46_Matthew  1200 rows
+      rest     2026-08-07T21-22-54_Matthew  720 rows
+      rest     2026-08-07T21-28-08_Matthew  720 rows
+      float32 2376.0 KiB   float16 1188.0 KiB   int8 594.5 KiB
+  full-data model (all modifier cues): 9654 rows x 64 features, 12 classes
+      command  2026-08-07T22-08-47_Matthew  750 rows
+      no_op    2026-08-07T16-38-35_Matthew  1200 rows
+      no_op    2026-08-07T16-51-04_Matthew  1200 rows
+      no_op    2026-08-07T17-14-43_Matthew  2652 rows
+      no_op    2026-08-07T17-23-35_Matthew  1212 rows
+      no_op    2026-08-07T22-16-46_Matthew  1200 rows
+      rest     2026-08-07T21-22-54_Matthew  720 rows
+      rest     2026-08-07T21-28-08_Matthew  720 rows
+      float32 2413.5 KiB   float16 1206.8 KiB   int8 603.9 KiB
+
+wrote /home/matthewg/Documents/Projects/EMG-Wristband-bench/firmware-bench/fixtures/precision_study.json

@@ -1,0 +1,4 @@
+cache/
+*.npy
+*.bin
+__pycache__/
