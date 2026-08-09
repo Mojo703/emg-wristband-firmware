@@ -194,8 +194,10 @@ impl<'a> ModelFileCursor<'a> {
         v
     }
     fn i8_slice(&mut self, n: usize) -> &'a [i8] {
-        let s =
-            unsafe { core::slice::from_raw_parts(self.data[self.pos..].as_ptr() as *const i8, n) };
+        let bytes = &self.data[self.pos..self.pos + n];
+        // SAFETY: the checked range is exactly `n` initialized bytes, and every
+        // byte pattern is valid for `i8`, whose alignment is one.
+        let s = unsafe { core::slice::from_raw_parts(bytes.as_ptr().cast::<i8>(), bytes.len()) };
         self.pos += n;
         s
     }
@@ -385,6 +387,14 @@ mod tests {
 
     static MODEL: Aligned<{ include_bytes!("../data/model_int8.bin").len() }> =
         Aligned(*include_bytes!("../data/model_int8.bin"));
+
+    #[test]
+    #[should_panic]
+    fn truncated_i8_slice_panics_before_forming_slice() {
+        let mut cursor = ModelFileCursor::new(&[0]);
+
+        let _ = cursor.i8_slice(2);
+    }
 
     #[test]
     fn repeated_forward_calls_do_not_allocate() {

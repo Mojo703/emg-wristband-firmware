@@ -249,7 +249,9 @@ impl<T: Clone, const SOURCES: usize> GridAligner<T, SOURCES> {
     /// as `rejected` and ignored rather than corrupting the grid.
     pub fn push(&mut self, source: usize, at_us: u64, payload: T) {
         let state = &mut self.sources[source];
-        let monotonic = state.newest_accepted_us.is_none_or(|newest| at_us > newest);
+        let monotonic = state
+            .newest_accepted_us
+            .map_or(true, |newest| at_us > newest);
         if !state.present || !monotonic {
             state.counters.rejected += 1;
             return;

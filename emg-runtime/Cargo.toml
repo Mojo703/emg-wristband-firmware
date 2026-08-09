@@ -18,7 +18,8 @@ protocol = { path = "../protocol" }
 # Float math (expf for the softmax) without std, which no_std forbids.
 libm = "0.2"
 # IEEE half, for the two-byte calibration row payload. no_std: no default features.
-half = { version = "2", default-features = false }
+# 2.5 raised its MSRV to 1.81; keep this crate's declared Rust 1.77 floor.
+half = { version = "=2.4.1", default-features = false }
 
 # Speed, not size: this is the compute the firmware's latency budget rides on.
 [profile.release]
