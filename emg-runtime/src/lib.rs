@@ -18,10 +18,14 @@
 extern crate alloc;
 
 pub mod alignment;
+pub mod band_features;
+pub mod calibration;
+pub mod flash_image;
 pub mod layers;
 pub mod mac;
 pub mod model;
 pub mod pipeline;
+pub mod streaming_fit;
 pub mod tensor;
 
 pub use model::{ForwardResult, Model, VerifyBatch, VerifyWindow};

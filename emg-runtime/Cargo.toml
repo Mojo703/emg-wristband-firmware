@@ -17,7 +17,12 @@ description = "On-device EMG gesture inference (int8 + ESP32-S3 SIMD) and the re
 protocol = { path = "../protocol" }
 # Float math (expf for the softmax) without std, which no_std forbids.
 libm = "0.2"
+# IEEE half, for the two-byte calibration row payload. no_std: no default features.
+half = { version = "2", default-features = false }
 
 # Speed, not size: this is the compute the firmware's latency budget rides on.
 [profile.release]
 opt-level = 3
+
+[dev-dependencies]
+serde_json = "1.0.151"
