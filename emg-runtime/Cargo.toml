@@ -25,4 +25,5 @@ half = { version = "2", default-features = false }
 opt-level = 3
 
 [dev-dependencies]
+ciborium = "0.2"
 serde_json = "1.0.151"

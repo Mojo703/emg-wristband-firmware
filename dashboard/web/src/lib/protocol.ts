@@ -18,6 +18,14 @@ export const MediaKey = {
 
 export type MediaKey = (typeof MediaKey)[keyof typeof MediaKey];
 
+export type PhoneStatus =
+  | { readonly state: 'dormant' }
+  | { readonly state: 'standby' }
+  | { readonly state: 'advertising' }
+  | { readonly state: 'connecting' }
+  | { readonly state: 'paired' }
+  | { readonly state: 'unavailable'; readonly reason: string };
+
 export const WakeState = {
   Idle: 'idle',
   Arming: 'arming',
@@ -48,6 +56,8 @@ export const FrameType = {
   SetKeymap: 'set_keymap',
   SetWifi: 'set_wifi',
   SetServer: 'set_server',
+  SetPhone: 'set_phone',
+  PhoneState: 'phone_state',
   CollectionCatalog: 'collection_catalog',
   StartCollection: 'start_collection',
   StartTrack: 'start_track',
@@ -552,6 +562,18 @@ export interface SetServerFrame {
   readonly addr: string;
 }
 
+/** Browser → device: hand the shared radio to the BLE phone peripheral or take it back. */
+export interface SetPhoneFrame {
+  readonly type: 'set_phone';
+  readonly enabled: boolean;
+}
+
+/** Device → browser: the current BLE phone-peripheral state. */
+export interface PhoneStateFrame {
+  readonly type: 'phone_state';
+  readonly status: PhoneStatus;
+}
+
 /** Browser → backend: remember which board and harness a device is soldered to. */
 export interface SetBoardRevisionFrame {
   readonly type: 'set_board_revision';
@@ -961,6 +983,7 @@ export type OutgoingFrame =
   | SetKeymapFrame
   | SetWifiFrame
   | SetServerFrame
+  | SetPhoneFrame
   | SetBoardRevisionFrame
   | StartCollectionFrame
   | StartTrackFrame
@@ -1087,6 +1110,7 @@ export type IncomingFrame =
   | LogFrame
   | TelemetryFrame
   | SignalQualityFrame
+  | PhoneStateFrame
   | CollectionCatalogFrame
   | CollectionStateFrame
   | BeatmapFrame
@@ -1132,6 +1156,26 @@ function isBoolean(value: unknown): value is boolean {
 
 function isString(value: unknown): value is string {
   return typeof value === 'string';
+}
+
+export function isPhoneStatus(value: unknown): value is PhoneStatus {
+  if (!isObject(value)) return false;
+  switch (value['state']) {
+    case 'dormant':
+    case 'standby':
+    case 'advertising':
+    case 'connecting':
+    case 'paired':
+      return true;
+    case 'unavailable':
+      return isString(value['reason']);
+    default:
+      return false;
+  }
+}
+
+export function isPhoneStateFrame(value: unknown): value is PhoneStateFrame {
+  return hasType(value, 'phone_state') && isObject(value) && isPhoneStatus(value['status']);
 }
 
 function isOptionalString(value: unknown): value is string | null | undefined {
@@ -1679,6 +1723,8 @@ export function isOutgoingFrame(value: unknown): value is OutgoingFrame {
       return isString(value['ssid']) && isString(value['psk']);
     case 'set_server':
       return isString(value['addr']);
+    case 'set_phone':
+      return isBoolean(value['enabled']);
     case 'set_board_revision':
       return isString(value['device_id']) && isBoardRevision(value['revision']);
     case 'start_collection':
@@ -1961,6 +2007,7 @@ export function asIncomingFrame(value: unknown): IncomingFrame | null {
   if (isLogFrame(value)) return value;
   if (isTelemetryFrame(value)) return value;
   if (isSignalQualityFrame(value)) return value;
+  if (isPhoneStateFrame(value)) return value;
   if (isCollectionCatalogFrame(value)) return value;
   if (isCollectionStateFrame(value)) return value;
   if (isBeatmapFrame(value)) return value;

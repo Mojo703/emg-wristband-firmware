@@ -9,7 +9,7 @@
 //! because that is what a person reading the file needs.
 
 use anyhow::{Context, Result};
-use protocol::{CalibrationOutcome, Frame, BENCH_FEATURE_COUNT};
+use protocol::{CalibrationOutcome, CalibrationPhase, Frame, BENCH_FEATURE_COUNT};
 use serde::Serialize;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -90,6 +90,7 @@ pub struct Capture {
     calibration_states: Vec<Frame>,
     calibration_probe: Option<Frame>,
     calibration_result: Option<Frame>,
+    calibration_result_count: usize,
     /// The most recent credit grant, which the streaming loop reads.
     pub credit: Option<(u32, u32)>,
 }
@@ -108,6 +109,7 @@ impl Capture {
             calibration_states: Vec::new(),
             calibration_probe: None,
             calibration_result: None,
+            calibration_result_count: 0,
             credit: None,
         }
     }
@@ -158,6 +160,51 @@ impl Capture {
         match self.calibration_result {
             Some(Frame::CalibrationResult { outcome, .. }) => Some(outcome),
             _ => None,
+        }
+    }
+
+    /// Fit progress reports received from the firmware adapter, in order.
+    pub fn calibration_fit_progress(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = (CalibrationPhase, u32, u32)> + '_ {
+        self.calibration_states
+            .iter()
+            .filter_map(|frame| match frame {
+                Frame::CalibrationState {
+                    phase,
+                    fit_passes_done,
+                    fit_passes_planned,
+                    ..
+                } => Some((*phase, *fit_passes_done, *fit_passes_planned)),
+                _ => None,
+            })
+    }
+
+    /// Require the terminal report produced by the abort-validation path.
+    pub fn assert_aborted_calibration(&self) -> Result<()> {
+        if self.calibration_result_count != 1 {
+            anyhow::bail!(
+                "expected exactly one calibration result, received {}",
+                self.calibration_result_count
+            );
+        }
+        match self.calibration_result.as_ref() {
+            Some(Frame::CalibrationResult {
+                outcome: CalibrationOutcome::Aborted,
+                installed: None,
+                previous_retained: true,
+                ..
+            }) => Ok(()),
+            Some(Frame::CalibrationResult {
+                outcome,
+                installed,
+                previous_retained,
+                ..
+            }) => anyhow::bail!(
+                "abort validation reported outcome {outcome:?}, installed {installed:?}, \
+                 previous_retained {previous_retained}"
+            ),
+            _ => anyhow::bail!("abort validation received no calibration result"),
         }
     }
 
@@ -291,6 +338,7 @@ impl Capture {
                         "calibration finished {outcome:?} (slot {installed:?},                          {fit_wall_milliseconds} ms of fitting)"
                     );
                 }
+                self.calibration_result_count += 1;
                 self.calibration_result = Some(frame);
             }
             Frame::Log { level, message, .. } => eprintln!("device {level:?}: {message}"),
@@ -337,6 +385,7 @@ impl Capture {
                     "states": self.calibration_states,
                     "probe": self.calibration_probe,
                     "result": self.calibration_result,
+                    "result_count": self.calibration_result_count,
                 }),
             )?;
         }
@@ -361,4 +410,67 @@ fn write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     file.write_all(bytes)
         .with_context(|| format!("write {}", path.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Capture;
+    use protocol::{CalibrationOutcome, Frame, InstalledSlot};
+
+    fn result(outcome: CalibrationOutcome, previous_retained: bool) -> Frame {
+        Frame::CalibrationResult {
+            outcome,
+            installed: None,
+            rounds_completed: 1,
+            rows_stored: 45,
+            accepted_reps: 5,
+            rejected_reps: 0,
+            quality: None,
+            weak_pair: None,
+            classes: Vec::new(),
+            fit_wall_milliseconds: 600,
+            previous_retained,
+        }
+    }
+
+    #[test]
+    fn abort_validation_requires_one_uninstalled_retained_result() {
+        let mut capture = Capture::new("unused");
+        capture.accept(result(CalibrationOutcome::Aborted, true));
+
+        assert!(capture.assert_aborted_calibration().is_ok());
+    }
+
+    #[test]
+    fn abort_validation_rejects_duplicate_results() {
+        let mut capture = Capture::new("unused");
+        capture.accept(result(CalibrationOutcome::Aborted, true));
+        capture.accept(result(CalibrationOutcome::Aborted, true));
+
+        assert!(capture.assert_aborted_calibration().is_err());
+    }
+
+    #[test]
+    fn abort_validation_requires_previous_calibration_retention() {
+        let mut capture = Capture::new("unused");
+        capture.accept(result(CalibrationOutcome::Aborted, false));
+
+        assert!(capture.assert_aborted_calibration().is_err());
+    }
+
+    #[test]
+    fn abort_validation_rejects_an_installed_slot() {
+        let mut frame = result(CalibrationOutcome::Aborted, true);
+        let Frame::CalibrationResult { installed, .. } = &mut frame else {
+            unreachable!()
+        };
+        *installed = Some(InstalledSlot {
+            slot: 1,
+            sequence: 2,
+        });
+        let mut capture = Capture::new("unused");
+        capture.accept(frame);
+
+        assert!(capture.assert_aborted_calibration().is_err());
+    }
 }

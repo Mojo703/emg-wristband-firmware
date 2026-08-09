@@ -467,6 +467,35 @@ pub struct Fitter {
     class_weight: Vec<f32>,
 }
 
+pub struct FitterBuffers {
+    gradient: Vec<f32>,
+    probabilities: Vec<f32>,
+    class_rows: Vec<u32>,
+    class_scale: Vec<f32>,
+    class_weight: Vec<f32>,
+}
+
+impl FitterBuffers {
+    pub fn reserve(class_capacity: usize) -> Self {
+        Self {
+            gradient: vec![0.0; INPUT_COUNT * class_capacity],
+            probabilities: vec![0.0; class_capacity],
+            class_rows: vec![0; class_capacity],
+            class_scale: vec![0.0; class_capacity],
+            class_weight: vec![0.0; class_capacity],
+        }
+    }
+
+    pub fn allocated_bytes(&self) -> usize {
+        (self.gradient.capacity()
+            + self.probabilities.capacity()
+            + self.class_scale.capacity()
+            + self.class_weight.capacity())
+            * core::mem::size_of::<f32>()
+            + self.class_rows.capacity() * core::mem::size_of::<u32>()
+    }
+}
+
 impl Fitter {
     pub fn new(class_count: usize) -> Fitter {
         let mut design = [0.0f32; INPUT_COUNT];
@@ -479,6 +508,29 @@ impl Fitter {
             class_rows: vec![0; class_count],
             class_scale: vec![0.0; class_count],
             class_weight: vec![0.0; class_count],
+        }
+    }
+
+    pub fn with_buffers(class_count: usize, mut buffers: FitterBuffers) -> Fitter {
+        assert!(
+            class_count <= buffers.probabilities.len(),
+            "fitter class count exceeds reserved capacity"
+        );
+        buffers.gradient.truncate(INPUT_COUNT * class_count);
+        buffers.probabilities.truncate(class_count);
+        buffers.class_rows.truncate(class_count);
+        buffers.class_scale.truncate(class_count);
+        buffers.class_weight.truncate(class_count);
+        let mut design = [0.0f32; INPUT_COUNT];
+        design[FEATURE_COUNT] = 1.0;
+        Fitter {
+            class_count,
+            gradient: buffers.gradient,
+            probabilities: buffers.probabilities,
+            design,
+            class_rows: buffers.class_rows,
+            class_scale: buffers.class_scale,
+            class_weight: buffers.class_weight,
         }
     }
 

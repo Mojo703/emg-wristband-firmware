@@ -8,7 +8,7 @@
 //! reconnects. Device ids are not guaranteed stable across power cycles, so a
 //! reconnect under the same id replaces the entry — fresh session, fresh logs.
 
-use protocol::{DeviceConfig, DeviceInfo, DeviceProvenance, DeviceTransport, Frame};
+use protocol::{DeviceConfig, DeviceInfo, DeviceProvenance, DeviceTransport, Frame, PhoneStatus};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -35,6 +35,9 @@ struct DeviceEntry {
     /// starts with the current values. Only the newest: telemetry is loss-tolerant
     /// and its history accumulates in the browser session, not here.
     telemetry: HashMap<String, Frame>,
+    /// Current phone-peripheral state. Unlike commands, device-origin state may be
+    /// replayed so a late browser does not wait for the next transition.
+    phone_state: Option<Frame>,
     /// Identifies this connection, so a reconnect under the same id can't be evicted by
     /// the old session. See [`Registry::deregister`].
     token: u64,
@@ -112,6 +115,7 @@ impl Registry {
                 control,
                 logs: VecDeque::new(),
                 telemetry: HashMap::new(),
+                phone_state: None,
                 token,
                 connected: true,
             },
@@ -248,6 +252,23 @@ impl Registry {
             .unwrap_or_default()
     }
 
+    /// Retain the latest device-origin phone state for late browser subscribers.
+    pub fn push_phone_state(&self, id: &str, token: u64, status: PhoneStatus) {
+        if let Some(entry) = self.devices.lock().unwrap().get_mut(id) {
+            if entry.token == token {
+                entry.phone_state = Some(Frame::PhoneState { status });
+            }
+        }
+    }
+
+    pub fn phone_state_of(&self, id: &str) -> Option<Frame> {
+        self.devices
+            .lock()
+            .unwrap()
+            .get(id)
+            .and_then(|entry| entry.phone_state.clone())
+    }
+
     /// The retained log frames of a device, oldest first.
     pub fn logs_of(&self, id: &str) -> Vec<Frame> {
         self.devices
@@ -258,7 +279,9 @@ impl Registry {
             .unwrap_or_default()
     }
 
-    /// Forward a control frame to a device (no-op if it has disconnected).
+    /// Forward a one-shot control frame to the current device connection. Commands
+    /// are never retained: an offline command is dropped rather than replayed into a
+    /// later connection, where intents such as `CalibrationStart` would be unsafe.
     pub fn send_control(&self, id: &str, frame: Frame) {
         if let Some(entry) = self
             .devices

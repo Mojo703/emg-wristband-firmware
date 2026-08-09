@@ -7,14 +7,14 @@
 //! on the device, along with [`console`].
 //!
 //! The `ble-media` binary is a bench for the two: a serial console drives the
-//! toggle and the keys. The wearer firmware consumes the same [`phone::Phone`]
-//! from its feedback thread, which already ticks at 5 ms and already knows
-//! which key was committed.
+//! toggle and the keys. The wearer firmware gives the same [`phone::Phone`] to a
+//! supervised BLE worker, which ticks independently of inference and link writes.
 
 pub mod command;
 pub mod config;
 pub mod hid;
 pub mod phone;
+pub mod session;
 
 #[cfg(target_os = "espidf")]
 pub mod console;

@@ -38,6 +38,24 @@ pub(crate) struct WearerFeatures {
     unpacked: Vec<u8>,
 }
 
+pub(crate) struct WearerFeatureBuffers {
+    unpacked: Vec<u8>,
+}
+
+impl WearerFeatureBuffers {
+    pub(crate) const UNPACKED_BYTES: usize = CHANNEL_COUNT * WINDOW_SAMPLES * 2;
+
+    pub(crate) fn reserve() -> Self {
+        Self {
+            unpacked: Vec::with_capacity(Self::UNPACKED_BYTES),
+        }
+    }
+
+    pub(crate) fn reserved_bytes(&self) -> usize {
+        self.unpacked.capacity()
+    }
+}
+
 impl WearerFeatures {
     /// Reserve the pipeline and its window buffer, at unity gains.
     ///
@@ -47,7 +65,7 @@ impl WearerFeatures {
     /// has never been calibrated would be inventing a measurement. A device
     /// with a stored calibration replaces them through
     /// [`adopt_gains`](Self::adopt_gains) as soon as the store is readable.
-    pub fn new() -> Self {
+    pub fn new(buffers: WearerFeatureBuffers) -> Self {
         Self {
             pipeline: BandFeaturePipeline::new(MICROVOLTS_PER_WIRE_COUNT, [1.0; CHANNEL_COUNT]),
             instant: [0; CHANNEL_COUNT],
@@ -55,7 +73,7 @@ impl WearerFeatures {
             // At boot, while the heap is still whole. Asking for these 16 KB
             // later — with wifi up and the heap fragmented — is the request
             // that used to abort the firmware on a calibration's second window.
-            unpacked: Vec::with_capacity(CHANNEL_COUNT * WINDOW_SAMPLES * 2),
+            unpacked: buffers.unpacked,
         }
     }
 

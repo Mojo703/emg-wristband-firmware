@@ -97,6 +97,13 @@ enum Step {
         /// polish passes happen in this window, so it has to cover them.
         #[arg(long, default_value_t = 120)]
         finish_seconds: u64,
+        /// Request an abort as soon as the first fit checkpoint has begun.
+        #[arg(long, conflicts_with = "abort_after_fit_passes")]
+        abort_after_fit_start: bool,
+        /// Request an abort after a fit checkpoint reports at least this many
+        /// completed passes.
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+        abort_after_fit_passes: Option<u32>,
     },
     /// Install a host-fitted calibration model.
     LoadModel {
@@ -226,6 +233,63 @@ enum Step {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CalibrationAbort {
+    FitStarted,
+    FitPasses(u32),
+}
+
+impl CalibrationAbort {
+    fn from_args(after_start: bool, after_passes: Option<u32>) -> Option<Self> {
+        if after_start {
+            Some(Self::FitStarted)
+        } else {
+            after_passes.map(Self::FitPasses)
+        }
+    }
+
+    fn reached(self, fit_passes_done: u32, fit_passes_planned: u32) -> bool {
+        if fit_passes_planned == 0 {
+            return false;
+        }
+        match self {
+            Self::FitStarted => true,
+            Self::FitPasses(threshold) => fit_passes_done >= threshold,
+        }
+    }
+}
+
+struct AbortController {
+    policy: CalibrationAbort,
+    requested: bool,
+}
+
+impl AbortController {
+    fn new(policy: CalibrationAbort) -> Self {
+        Self {
+            policy,
+            requested: false,
+        }
+    }
+
+    fn request_if_due(&mut self, link: &mut Link, capture: &Capture) -> Result<()> {
+        if self.requested || capture.has_calibration_result() {
+            return Ok(());
+        }
+        let Some((phase, done, planned)) = capture
+            .calibration_fit_progress()
+            .rev()
+            .find(|(_, done, planned)| self.policy.reached(*done, *planned))
+        else {
+            return Ok(());
+        };
+        eprintln!("requesting calibration abort in {phase:?} after {done}/{planned} fit passes");
+        link.send(&Frame::CalibrationAbort {})?;
+        self.requested = true;
+        Ok(())
+    }
+}
+
 fn main() -> Result<()> {
     let arguments = Arguments::parse();
     if let Step::BuildPartition {
@@ -350,12 +414,22 @@ fn run(step: &Step, link: &mut Link, capture: &mut Capture) -> Result<()> {
             raw.as_deref(),
             *chunk_samples,
             *windows,
+            None,
         ),
         Step::Calibrate {
             manifest,
             chunk_samples,
             finish_seconds,
-        } => calibrate(link, capture, manifest, *chunk_samples, *finish_seconds),
+            abort_after_fit_start,
+            abort_after_fit_passes,
+        } => calibrate(
+            link,
+            capture,
+            manifest,
+            *chunk_samples,
+            *finish_seconds,
+            CalibrationAbort::from_args(*abort_after_fit_start, *abort_after_fit_passes),
+        ),
         Step::LoadModel { model } => load_model(link, capture, model),
         Step::Replay { rows, first_window } => replay(link, capture, rows, *first_window),
         Step::Fit {
@@ -942,6 +1016,7 @@ fn stream(
     raw_override: Option<&Path>,
     chunk_samples: usize,
     window_limit: Option<usize>,
+    mut abort: Option<&mut AbortController>,
 ) -> Result<()> {
     let manifest = read_manifest(manifest_path)?;
     if chunk_samples == 0 || chunk_samples > PLAYBACK_MAX_CHUNK_SAMPLES {
@@ -978,6 +1053,9 @@ fn stream(
         constants: manifest.constants.clone(),
     })?;
     let (mut next_sequence, mut free_chunks) = await_credit(link, capture)?;
+    if let Some(controller) = abort.as_deref_mut() {
+        controller.request_if_due(link, capture)?;
+    }
 
     eprintln!(
         "streaming {} : {records} records, {sample_count} samples, chunks of {chunk_samples}",
@@ -1021,6 +1099,9 @@ fn stream(
             for frame in link.drain() {
                 capture.accept(frame);
             }
+            if let Some(controller) = abort.as_deref_mut() {
+                controller.request_if_due(link, capture)?;
+            }
             if let Some((sequence, chunks)) = capture.credit.take() {
                 next_sequence = sequence;
                 free_chunks = chunks;
@@ -1035,6 +1116,9 @@ fn stream(
     // The final status is the device saying it has drained everything, so it is
     // what "the stream is done" means here rather than the last write returning.
     await_status(link, capture)?;
+    if let Some(controller) = abort.as_deref_mut() {
+        controller.request_if_due(link, capture)?;
+    }
 
     if capture.dropped_chunks().unwrap_or(0) != 0 {
         bail!(
@@ -1466,6 +1550,7 @@ fn calibrate(
     manifest_paths: &[PathBuf],
     chunk_samples: usize,
     finish_seconds: u64,
+    abort: Option<CalibrationAbort>,
 ) -> Result<()> {
     // Both ends count from zero. The device's calibration sample space spans
     // sessions but resets here, so the reset has to come before the run
@@ -1545,8 +1630,20 @@ fn calibrate(
     // space in the middle of the run. Each `playback_begin` still builds a
     // fresh filter pipeline, which is right — filters carry state across a
     // session and must start from zero for the next one.
+    let mut abort_controller = abort.map(AbortController::new);
     for path in manifest_paths {
-        stream(link, capture, path, None, chunk_samples, None)?;
+        stream(
+            link,
+            capture,
+            path,
+            None,
+            chunk_samples,
+            None,
+            abort_controller.as_mut(),
+        )?;
+        if capture.has_calibration_result() {
+            break;
+        }
     }
 
     // The last samples are not the end of the run: the polish passes and the
@@ -1560,10 +1657,15 @@ fn calibrate(
             continue;
         };
         capture.accept(frame);
+        if let Some(controller) = abort_controller.as_mut() {
+            controller.request_if_due(link, capture)?;
+        }
     }
     // Leave nothing running on the device for the next step to trip over.
     // Before the verdict, so a device mid-run is stopped either way.
-    link.send(&Frame::CalibrationAbort {})?;
+    if abort_controller.is_none() {
+        link.send(&Frame::CalibrationAbort {})?;
+    }
     settle(link, capture, SETTLE);
 
     // The verdict. A run that aborted, failed its fit, lost its front end or
@@ -1571,11 +1673,36 @@ fn calibrate(
     // `bench_error` — so reading only the error list exits zero on every one
     // of them, and an orchestration cannot tell a calibration that installed
     // from one that gave up in round three.
+    if let Some(controller) = abort_controller {
+        if !controller.requested {
+            bail!("the calibration ended before the configured fit abort milestone was reached");
+        }
+        return capture.assert_aborted_calibration();
+    }
     match capture.calibration_outcome() {
         Some(CalibrationOutcome::Installed) => Ok(()),
         Some(outcome) => bail!("the calibration ended {outcome:?} without installing"),
         // The states collected so far still carry the pass timing, and they
         // are already written; the run is still a failure.
         None => bail!("no result frame inside {finish_seconds}s"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CalibrationAbort;
+
+    #[test]
+    fn fit_started_waits_for_a_planned_checkpoint() {
+        assert!(!CalibrationAbort::FitStarted.reached(0, 0));
+        assert!(CalibrationAbort::FitStarted.reached(0, 16));
+    }
+
+    #[test]
+    fn fit_pass_abort_waits_for_the_threshold() {
+        let abort = CalibrationAbort::FitPasses(3);
+        assert!(!abort.reached(2, 16));
+        assert!(abort.reached(3, 16));
+        assert!(abort.reached(4, 16));
     }
 }

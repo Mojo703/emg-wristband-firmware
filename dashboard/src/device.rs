@@ -122,6 +122,9 @@ async fn device_session(
                     // with current values instead of waiting out an interval.
                     registry.push_telemetry(&device_id, token, source.clone(), other.clone());
                 }
+                if let Frame::PhoneState { status } = &other {
+                    registry.push_phone_state(&device_id, token, status.clone());
+                }
                 let _ = frames.send(other);
             }
         }

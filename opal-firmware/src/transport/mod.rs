@@ -37,6 +37,10 @@ pub enum Control {
     SetServer {
         addr: String,
     },
+    /// Runtime-only and float-free. Off remains the default after every boot.
+    SetPhone {
+        enabled: bool,
+    },
     /// A dashboard opened the serial link: announce and make serial the data link.
     Probe {},
     /// Serial-link keepalive; silence for a few seconds means the dashboard is gone.
@@ -162,31 +166,82 @@ impl Control {
 
 /// One end of a dashboard link.
 pub trait Transport {
-    /// Send one frame, encoding it through `scratch` — the caller-owned reusable
-    /// buffer ([`Links`](crate::links::Links) holds the one instance). A bulk EMG
-    /// frame encodes to ~24 KB, an ask the fragmented steady-state heap cannot
-    /// promise per frame, so the buffer is reserved once at boot and reused. Its
-    /// contents do not survive the call.
-    fn send(&mut self, frame: &Frame, scratch: &mut Vec<u8>) -> Result<()>;
+    /// Send one frame without staging the complete encoded payload in heap memory.
+    fn send(&mut self, frame: &Frame) -> Result<()>;
     /// Non-blocking: the next control frame from the dashboard, if any is ready.
     fn poll(&mut self) -> Option<Control>;
 }
 
-/// Encode a frame ready for the wire into `scratch`: magic + length + CBOR in one
-/// buffer, so each frame is a single write (with `TCP_NODELAY`, a separate header
-/// write would cost a tiny extra packet per frame). Reuses `scratch`'s allocation;
-/// returns the encoded bytes.
-fn encode_into<'a>(frame: &Frame, scratch: &'a mut Vec<u8>) -> &'a [u8] {
-    const HEADER_BYTES: usize = protocol::FRAME_MAGIC.len() + 4;
-    scratch.clear();
-    scratch.extend_from_slice(&protocol::FRAME_MAGIC);
-    scratch.extend_from_slice(&[0u8; 4]);
-    ciborium::into_writer(frame, &mut *scratch).expect("CBOR encode");
-    let length = (scratch.len() - HEADER_BYTES) as u32;
-    scratch[protocol::FRAME_MAGIC.len()..HEADER_BYTES].copy_from_slice(&length.to_le_bytes());
-    scratch
+struct CountingWriter(usize);
+
+impl std::io::Write for CountingWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_add(bytes.len())
+            .ok_or_else(|| std::io::Error::other("encoded frame length overflow"))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn frame_header(frame: &Frame) -> Result<[u8; 6]> {
+    let mut counter = CountingWriter(0);
+    ciborium::into_writer(frame, &mut counter)
+        .map_err(|error| anyhow::anyhow!("CBOR size pass: {error}"))?;
+    let length = u32::try_from(counter.0)
+        .map_err(|_| anyhow::anyhow!("encoded frame is too large: {} bytes", counter.0))?;
+    let mut header = [0; 6];
+    header[..protocol::FRAME_MAGIC.len()].copy_from_slice(&protocol::FRAME_MAGIC);
+    header[protocol::FRAME_MAGIC.len()..].copy_from_slice(&length.to_le_bytes());
+    Ok(header)
+}
+
+fn encode_to(frame: &Frame, writer: impl std::io::Write) -> Result<()> {
+    ciborium::into_writer(frame, writer).map_err(|error| anyhow::anyhow!("CBOR encode: {error}"))
 }
 
 fn decode(bytes: &[u8]) -> Option<Control> {
     ciborium::from_reader(bytes).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_phone_decodes_through_the_float_free_control_mirror() {
+        for enabled in [false, true] {
+            let mut bytes = Vec::new();
+            ciborium::into_writer(&Frame::SetPhone { enabled }, &mut bytes).unwrap();
+            assert!(matches!(
+                decode(&bytes),
+                Some(Control::SetPhone { enabled: decoded }) if decoded == enabled
+            ));
+        }
+    }
+
+    #[test]
+    fn size_pass_matches_encoded_payload() {
+        let frame = Frame::Emg {
+            seq: u32::MAX,
+            t0_us: u64::MAX,
+            channels: 16,
+            sample_rate: 2000,
+            scale_uv: f32::MAX,
+            samples: vec![0xff; protocol::max_packed_sample_bytes(8000)],
+            missing: vec![0xff; 2 * protocol::missing_plane_stride(500)],
+        };
+
+        let mut encoded = Vec::new();
+        encode_to(&frame, &mut encoded).unwrap();
+        let header = frame_header(&frame).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(header[protocol::FRAME_MAGIC.len()..].try_into().unwrap()) as usize,
+            encoded.len()
+        );
+    }
 }

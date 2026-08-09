@@ -13,7 +13,7 @@
 //! and the exporter pads each section to the alignment asserted here.
 
 use crate::layers::{self, Requantize};
-use crate::tensor::I8Activation;
+use crate::tensor::{AlignedI8, I8Activation};
 use alloc::vec::Vec;
 
 pub const INPUT_CH: usize = 16;
@@ -47,7 +47,26 @@ pub struct Model<'a> {
     scratch: ForwardScratch,
 }
 
-/// The three activation buffers one forward pass needs, allocated once with the
+/// Inference working buffers reserved before the model becomes operational.
+/// Loading still allocates the small four-entry block descriptor vector; it moves
+/// these hot-path buffers into [`Model`] and returns the persistent input activation
+/// to the caller.
+pub struct ModelBuffers {
+    scratch: ForwardScratch,
+    input: I8Activation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelBufferSizes {
+    pub padded: usize,
+    pub depthwise: usize,
+    pub pointwise: usize,
+    pub pooled: usize,
+    pub logits: usize,
+    pub input: usize,
+}
+
+/// The activation and output buffers one forward pass needs, allocated once with the
 /// model and reused every inference. The buffer roles are fixed: each block's
 /// depthwise reads the previous pointwise output (or the caller's input) and writes
 /// `depthwise_out` via `padded`; its pointwise reads `depthwise_out` and writes
@@ -59,30 +78,78 @@ struct ForwardScratch {
     padded: I8Activation,
     depthwise_out: I8Activation,
     pointwise_out: I8Activation,
+    pooled: AlignedI8,
+    logits: [i32; NUM_CLASSES],
 }
 
 impl ForwardScratch {
     /// Sizes every buffer to its worst case across the block walk, so `reuse` never
     /// grows them afterwards.
-    fn sized_for(input_len: usize, kernel: usize, blocks: &[Block<'_>]) -> Self {
+    fn sized_for(input_len: usize, kernel: usize) -> Self {
         let pad = kernel / 2;
         let mut t = input_len;
         let mut c = INPUT_CH;
         let mut padded_max = 0usize;
         let mut depthwise_max = 0usize;
         let mut pointwise_max = 0usize;
-        for block in blocks {
+        for (in_ch, out_ch) in BLOCKS {
+            debug_assert_eq!(c, in_ch);
             padded_max = padded_max.max((t + 2 * pad) * c);
             t = t.div_ceil(STRIDE);
             depthwise_max = depthwise_max.max(t * c);
-            c = block.out_ch;
+            c = out_ch;
             pointwise_max = pointwise_max.max(t * c);
         }
         Self {
             padded: I8Activation::zeros(padded_max.max(1), 1),
             depthwise_out: I8Activation::zeros(depthwise_max.max(1), 1),
             pointwise_out: I8Activation::zeros(pointwise_max.max(1), 1),
+            pooled: AlignedI8::zeroed(FEATURE_DIM),
+            logits: [0; NUM_CLASSES],
         }
+    }
+
+    fn sizes(&self) -> ModelBufferSizes {
+        ModelBufferSizes {
+            padded: self.padded.allocated_bytes(),
+            depthwise: self.depthwise_out.allocated_bytes(),
+            pointwise: self.pointwise_out.allocated_bytes(),
+            pooled: self.pooled.allocated_bytes(),
+            logits: core::mem::size_of_val(&self.logits),
+            input: 0,
+        }
+    }
+}
+
+impl ModelBuffers {
+    /// Reserve the reusable activations and outputs required by this model blob.
+    pub fn reserve(blob: &[u8]) -> Self {
+        assert_eq!(
+            blob.as_ptr() as usize % 16,
+            0,
+            "model blob base address is not 16-byte aligned"
+        );
+        let mut cursor = ModelFileCursor::new(blob);
+        assert_eq!(cursor.u32(), MAGIC, "bad magic in model blob");
+        let version = cursor.u32();
+        assert_eq!(version, VERSION, "unsupported model blob version {version}");
+        let input_len = cursor.u32() as usize;
+        assert_eq!(cursor.u32() as usize, INPUT_CH);
+        let kernel = cursor.u32() as usize;
+        Self {
+            scratch: ForwardScratch::sized_for(input_len, kernel),
+            input: I8Activation::zeros(input_len, INPUT_CH),
+        }
+    }
+
+    pub fn sizes(&self) -> ModelBufferSizes {
+        let mut sizes = self.scratch.sizes();
+        sizes.input = self.input.allocated_bytes();
+        sizes
+    }
+
+    pub fn input_len(&self) -> usize {
+        self.input.as_slice().len() / INPUT_CH
     }
 }
 
@@ -184,7 +251,7 @@ impl<'a> ModelFileCursor<'a> {
 impl<'a> Model<'a> {
     /// Load BN-folded int8 weights from an `emg-tds export-int8` blob, borrowing the
     /// tensors in place (see the module docs). `blob` must be 16-byte aligned.
-    pub fn load(blob: &'a [u8]) -> Self {
+    pub fn load(blob: &'a [u8], buffers: ModelBuffers) -> (Self, I8Activation) {
         assert_eq!(
             blob.as_ptr() as usize % 16,
             0,
@@ -206,7 +273,7 @@ impl<'a> Model<'a> {
         assert_eq!(num_classes, NUM_CLASSES);
         let input_scale = c.f32();
 
-        let mut blocks = Vec::new();
+        let mut blocks = Vec::with_capacity(BLOCKS.len());
         for _ in 0..n_blocks {
             let in_ch = c.u32() as usize;
             let out_ch = c.u32() as usize;
@@ -247,20 +314,21 @@ impl<'a> Model<'a> {
         let head_b = c.i32_slice(NUM_CLASSES);
         let logit_scale = c.f32();
 
-        let scratch = ForwardScratch::sized_for(input_len, kernel, &blocks);
-        Model {
+        let model = Model {
             blocks,
             head: (head_w, head_b),
             input_len,
             kernel,
             logit_scale,
             input_scale,
-            scratch,
-        }
+            scratch: buffers.scratch,
+        };
+        assert_eq!(buffers.input.as_slice().len(), input_len * INPUT_CH);
+        (model, buffers.input)
     }
 
     /// One inference. `&mut` because the pass runs through the model's own
-    /// [`ForwardScratch`] buffers rather than allocating activations.
+    /// [`ForwardScratch`] buffers and returns fixed-size logits without allocating.
     pub fn forward(&mut self, input: &I8Activation) -> ForwardResult {
         let Self {
             blocks,
@@ -273,6 +341,8 @@ impl<'a> Model<'a> {
             padded,
             depthwise_out,
             pointwise_out,
+            pooled,
+            logits,
         } = scratch;
         for (index, blk) in blocks.iter().enumerate() {
             let xin: &I8Activation = if index == 0 { input } else { pointwise_out };
@@ -295,15 +365,39 @@ impl<'a> Model<'a> {
                 pointwise_out,
             );
         }
-        let pooled = layers::global_avg_pool(pointwise_out);
+        layers::global_avg_pool_into(pointwise_out, pooled);
         let (hw, hb) = head;
-        let logits = layers::linear_i32(pooled.as_slice(), hw, hb, NUM_CLASSES);
-        ForwardResult::Logits(logits)
+        layers::linear_i32_into(pooled.as_slice(), hw, hb, logits);
+        ForwardResult::Logits(*logits)
     }
 }
 
 pub enum ForwardResult {
-    Logits(Vec<i32>),
+    Logits([i32; NUM_CLASSES]),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[repr(align(16))]
+    struct Aligned<const N: usize>([u8; N]);
+
+    static MODEL: Aligned<{ include_bytes!("../data/model_int8.bin").len() }> =
+        Aligned(*include_bytes!("../data/model_int8.bin"));
+
+    #[test]
+    fn repeated_forward_calls_do_not_allocate() {
+        let buffers = ModelBuffers::reserve(&MODEL.0);
+        let (mut model, input) = Model::load(&MODEL.0, buffers);
+        let allocations = crate::test_alloc::count(|| {
+            for _ in 0..1_000 {
+                let ForwardResult::Logits(logits) = model.forward(&input);
+                core::hint::black_box(logits);
+            }
+        });
+        assert_eq!(allocations, 0);
+    }
 }
 
 impl<'a> VerifyBatch<'a> {

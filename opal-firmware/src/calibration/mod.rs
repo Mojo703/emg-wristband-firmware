@@ -23,6 +23,7 @@
 //! and the `flash_operation_overlap` rejection reason are the two halves of
 //! that invariant reporting on itself.
 
+mod adapter_guard;
 mod gains;
 mod wearer;
 
@@ -30,6 +31,7 @@ use crate::config::Settings;
 use crate::feedback::{Calibrating, Prompt, RepNotice};
 use crate::training_rows::CalibrationPartition;
 use crate::transport::Control;
+use adapter_guard::{rows_ready_to_install, ActionGuard};
 use calibration_flow::{Action, Constants, LabeledSpan, RepEvidence, Run, RunOutcome};
 use calibration_flow::{
     ScheduleError, ScriptedPoll, ScriptedWearer, THUMB_DOWN_BLOCK, THUMB_UP_BLOCK,
@@ -38,7 +40,9 @@ use core::num::NonZeroU32;
 use emg_runtime::band_features::{CHANNEL_COUNT, FEATURE_COUNT};
 use emg_runtime::calibration::CalibrationModel;
 use emg_runtime::flash_image::{self, SlotRecord};
-use emg_runtime::streaming_fit::{FitCheckpoint, Fitter, RowBuffer, RowSource, Schedule};
+use emg_runtime::streaming_fit::{
+    FitCheckpoint, Fitter, FitterBuffers, RowBuffer, RowSource, Schedule,
+};
 use gains::GainEstimator;
 use log::{info, warn};
 use protocol::{
@@ -61,6 +65,7 @@ const SCRIPTED_SETTLE_MARGIN_MILLISECONDS: u32 = 2000;
 /// block is about a hundred kilobytes. Rows live in flash; RAM buffers the
 /// round in front of the next flush and nothing more.
 const ROUND_ROW_CAPACITY: usize = 128;
+const CALIBRATION_CLASS_CAPACITY: usize = 12;
 
 /// A round has to fit, and the two numbers that decide whether it does live
 /// somewhere else — the gesture count in `protocol`, the windows per rep in
@@ -186,7 +191,29 @@ struct OpenRep {
 }
 
 /// The device's calibration, running or not.
-pub(crate) use wearer::WearerFeatures;
+pub(crate) use wearer::{WearerFeatureBuffers, WearerFeatures};
+
+pub(crate) struct CalibrationBuffers {
+    rows: RowBuffer,
+    rep_rows: Vec<[f32; FEATURE_COUNT]>,
+    fitter: FitterBuffers,
+}
+
+impl CalibrationBuffers {
+    pub(crate) fn reserve(constants: Constants) -> Self {
+        Self {
+            rows: RowBuffer::with_capacity(ROUND_ROW_CAPACITY),
+            rep_rows: Vec::with_capacity(constants.labeled_windows as usize),
+            fitter: FitterBuffers::reserve(CALIBRATION_CLASS_CAPACITY),
+        }
+    }
+
+    pub(crate) fn reserved_bytes(&self) -> usize {
+        self.rows.allocated_bytes()
+            + self.rep_rows.capacity() * core::mem::size_of::<[f32; FEATURE_COUNT]>()
+            + self.fitter.allocated_bytes()
+    }
+}
 
 pub(crate) struct Calibration {
     constants: Constants,
@@ -204,6 +231,7 @@ pub(crate) struct Calibration {
     /// The current round's rows, waiting for the flush at the end of it.
     /// Emptied by every flush; never the whole calibration.
     rows: RowBuffer,
+    rep_rows: Vec<[f32; FEATURE_COUNT]>,
     slot: usize,
     sequence: u32,
 
@@ -211,11 +239,11 @@ pub(crate) struct Calibration {
     checkpoint: Option<FitCheckpoint>,
     /// The checkpoint in flight, if the machine has asked for one. The passes
     /// still owed, and nothing else — whether the fit may be started at all is
-    /// [`Calibration::in_flight`]'s to say.
+    /// [`Calibration::action_guard`]'s to say.
     pending_fit: Option<PendingFit>,
     /// The step this module owes the machine a report for. No action is asked
     /// for while one is outstanding.
-    in_flight: Option<Step>,
+    action_guard: ActionGuard<Step>,
     /// The model the wake gate should be running once a calibration installs
     /// one. Taken by the serve loop, which owns what inference uses.
     installed: Option<CalibrationModel>,
@@ -276,7 +304,7 @@ impl Calibration {
     /// Map the partition and stand ready. Infallible for the same reason the
     /// feedback outputs are: the device's job is EMG, and a partition that will
     /// not map costs calibration, not the pipeline.
-    pub fn start(constants: Constants) -> Self {
+    pub fn start(constants: Constants, buffers: CalibrationBuffers) -> Self {
         let mut partition = match CalibrationPartition::map() {
             Ok(partition) => partition,
             Err(error) => {
@@ -311,13 +339,14 @@ impl Calibration {
             scripted: false,
             gains: GainEstimator::new(),
             open: None,
-            rows: RowBuffer::with_capacity(ROUND_ROW_CAPACITY),
+            rows: buffers.rows,
+            rep_rows: buffers.rep_rows,
             slot: 0,
             sequence: 1,
-            fitter: Fitter::new(class_count),
+            fitter: Fitter::with_buffers(class_count, buffers.fitter),
             checkpoint: None,
             pending_fit: None,
-            in_flight: None,
+            action_guard: ActionGuard::default(),
             installed: None,
             flash_microseconds: 0,
             probe: Vec::new(),
@@ -444,7 +473,7 @@ impl Calibration {
             self.acquisition_sample = 0;
         }
         self.pending_fit = None;
-        self.in_flight = None;
+        self.action_guard.cancel();
         self.gains_reported = false;
         self.gains_latched = false;
         self.probe = self.probe_targets();
@@ -648,6 +677,7 @@ impl Calibration {
         let (Some(open), Some(run)) = (self.open.take(), self.run.take()) else {
             return;
         };
+        let mut rows = open.rows;
         let mut evidence = open.evidence;
         evidence.flash_operation = self.flash_microseconds != open.flash_microseconds_at_open;
         // Only the phase with a rep open can judge one, which is what makes the
@@ -660,20 +690,24 @@ impl Calibration {
                     other.phase()
                 );
                 self.run = Some(other);
+                rows.clear();
+                self.rep_rows = rows;
                 return;
             }
         };
         match outcome {
             calibration_flow::RepOutcome::Accepted { label, .. } => {
                 self.notice = None;
-                for features in &open.rows {
+                for features in &rows {
                     if !self.push_row(features, label) {
                         warn!("calibration row buffer full; the slot cannot hold this run");
                         self.run = Some(run.stop(CalibrationOutcome::StorageFailed));
+                        rows.clear();
+                        self.rep_rows = rows;
                         return;
                     }
                 }
-                self.score_held_out(&mut run, open.gesture, &open.rows);
+                self.score_held_out(&mut run, open.gesture, &rows);
             }
             calibration_flow::RepOutcome::Rejected(rejection) => {
                 self.notice = Some(RepNotice::Rejected);
@@ -697,6 +731,8 @@ impl Calibration {
                 warn!("calibration gave up on {gesture:?} this round ({rejection:?})");
             }
         }
+        rows.clear();
+        self.rep_rows = rows;
         self.run = Some(run);
         self.post_state();
     }
@@ -792,7 +828,7 @@ impl Calibration {
         // reported. The machine would answer with the same action — it
         // describes the phase rather than announcing an event — and this is
         // called per window, so the answer would be acted on again.
-        if self.in_flight.is_some() {
+        if !self.action_guard.is_ready() {
             return false;
         }
         let now = self.now_sample();
@@ -822,7 +858,7 @@ impl Calibration {
         // its to report when it has. The prompt is the one that is not: issuing
         // it consumed the phase that owed it, so the machine has already moved
         // on and the rep is the driver's own business.
-        self.in_flight = match action {
+        let dispatched = match action {
             Some(Action::EraseSlot) => Some(Step::Erase),
             Some(Action::FlushRows) => Some(Step::Flush),
             Some(Action::FitRound { .. }) => Some(Step::Fit),
@@ -830,6 +866,12 @@ impl Calibration {
             Some(Action::Install) => Some(Step::Install),
             _ => None,
         };
+        if let Some(step) = dispatched {
+            if let Err(in_flight) = self.action_guard.dispatch(step) {
+                warn!("calibration tried to dispatch {step:?} while {in_flight:?} was in flight");
+                return false;
+            }
+        }
         match action {
             None => return false,
             Some(Action::EraseSlot) => self.erase(),
@@ -880,7 +922,10 @@ impl Calibration {
     /// for, which is worth a line in the log rather than a quiet nothing: that
     /// silence is exactly what the old machine did, and what cost three runs.
     fn completed(&mut self, step: Step) {
-        self.in_flight = None;
+        if let Err(in_flight) = self.action_guard.complete(step) {
+            warn!("calibration reported {step:?} while {in_flight:?} was in flight");
+            return;
+        }
         let Some(run) = self.run.take() else { return };
         if run.outcome().is_some() {
             // The run ended while this was in hand — an abort during a fit is
@@ -912,7 +957,8 @@ impl Calibration {
     /// hold the run open with nothing left to poll it.
     fn stop_run(&mut self, outcome: RunOutcome) {
         let Some(run) = self.run.take() else { return };
-        self.in_flight = None;
+        self.pending_fit = None;
+        self.action_guard.cancel();
         self.run = Some(run.stop(outcome));
     }
 
@@ -998,10 +1044,12 @@ impl Calibration {
             span.first_window + span.window_count,
             self.acquisition_sample
         );
+        let mut rows = core::mem::take(&mut self.rep_rows);
+        rows.clear();
         self.open = Some(OpenRep {
             gesture,
             span,
-            rows: Vec::with_capacity(self.constants.labeled_windows as usize),
+            rows,
             evidence: RepEvidence {
                 windows_expected: self.constants.labeled_windows,
                 ..RepEvidence::default()
@@ -1024,12 +1072,11 @@ impl Calibration {
         }
         // The buffer holds only this round, so its whole contents go out at the
         // cumulative offset. No copy: `as_bytes` is exactly the rows to write.
-        let bytes = self.rows.as_bytes().to_vec();
-        match self
+        let result = self
             .partition
             .as_mut()
-            .map(|p| p.append_rows_buffered(slot, &bytes))
-        {
+            .map(|partition| partition.append_rows_buffered(slot, self.rows.as_bytes()));
+        match result {
             Some(Ok(microseconds)) => {
                 self.flash_microseconds += microseconds;
                 self.rows.clear();
@@ -1183,23 +1230,29 @@ impl Calibration {
         // its CRC on read-back and the fit would train on 0xFF rows. Refusing
         // to commit leaves the previous calibration installed, which is the
         // outcome Rule 2 promises anyway.
-        let rows = self.rows_flushed();
-        if !self.rows.is_empty() {
-            // F1's one unenforced invariant, enforced here. A round still in
-            // RAM at install time means the committed count would cover bytes
-            // that were never written — and erased flash is stable, so the
-            // slot would pass its CRC on read-back and the next fit would
-            // train on 0xFF rows.
-            self.fail(
-                CalibrationOutcome::StorageFailed,
-                "a round was buffered but never flushed; the slot would checksum erased bytes",
-            );
-            return;
-        }
+        let rows = match rows_ready_to_install(self.rows.len(), self.rows_flushed()) {
+            Ok(rows) => rows,
+            Err(buffered) => {
+                // F1's one unenforced invariant, enforced here. A round still in
+                // RAM at install time means the committed count would cover bytes
+                // that were never written — and erased flash is stable, so the
+                // slot would pass its CRC on read-back and the next fit would
+                // train on 0xFF rows.
+                warn!(
+                    "calibration install blocked with {} buffered rows",
+                    buffered.0
+                );
+                self.fail(
+                    CalibrationOutcome::StorageFailed,
+                    "a round was buffered but never flushed; the slot would checksum erased bytes",
+                );
+                return;
+            }
+        };
         match self
             .partition
             .as_mut()
-            .map(|p| p.commit_record(slot, &record, rows))
+            .map(|p| p.commit_record(slot, &record, rows.count()))
         {
             Some(Ok(microseconds)) => {
                 self.flash_microseconds += microseconds;
@@ -1254,7 +1307,7 @@ impl Calibration {
 
     fn finish(&mut self, outcome: RunOutcome) {
         self.pending_fit = None;
-        self.in_flight = None;
+        self.action_guard.cancel();
         let Some(run) = self.run.take() else { return };
         let classes = class_states(&run);
         let quality = quality_estimate(&run);

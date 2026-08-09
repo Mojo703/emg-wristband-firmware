@@ -30,7 +30,7 @@ const OUTBOUND_CAP: usize = 256;
 /// browser falls behind: the device emits each EMG window immediately followed by its
 /// prediction, so a single "latest live frame" slot would race the pair and near-always
 /// discard the EMG half of the stream.
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum LiveKind {
     Emg,
     Prediction,
@@ -92,16 +92,49 @@ enum Out {
     Live(LiveKind, Message),
 }
 
-/// The browser's socket has closed; the session loop should end. This is the
-/// *only* failure `send` reports — a full channel intentionally drops the frame
-/// (rare for reliable, the intended backpressure for live) and is not an error.
+#[derive(Debug, PartialEq, Eq)]
+enum Delivery {
+    Reliable,
+    Live(LiveKind),
+}
+
+fn delivery_for(frame: &Frame) -> Delivery {
+    match frame {
+        // Discrete records and state updates use the bounded reliable path.
+        Frame::Event { .. } | Frame::Log { .. } | Frame::PhoneState { .. } => Delivery::Reliable,
+        // A calibration run narrates itself in edges. Coalescing can erase the
+        // transition that explains the state currently on screen.
+        Frame::CalibrationState { .. }
+        | Frame::CalibrationResult { .. }
+        | Frame::CalibrationRowsDump { .. }
+        | Frame::CalibrationProbe { .. }
+        | Frame::BenchError { .. } => Delivery::Reliable,
+        Frame::Emg { .. } => Delivery::Live(LiveKind::Emg),
+        Frame::Prediction { .. } => Delivery::Live(LiveKind::Prediction),
+        Frame::Telemetry { source, .. } => Delivery::Live(LiveKind::Telemetry(source.clone())),
+        _ => Delivery::Live(LiveKind::Other),
+    }
+}
+
+/// The browser's socket has closed; the session loop should end.
 struct BrowserGone;
 
-fn send(tx: &mpsc::Sender<Out>, out: Out) -> Result<(), BrowserGone> {
-    match tx.try_send(out) {
+/// Live frames stay loss-tolerant: a full bounded queue means a newer frame can
+/// supersede this one rather than growing browser memory without limit.
+fn send_live(tx: &mpsc::Sender<Out>, kind: LiveKind, message: Message) -> Result<(), BrowserGone> {
+    match tx.try_send(Out::Live(kind, message)) {
         Ok(()) | Err(TrySendError::Full(_)) => Ok(()),
         Err(TrySendError::Closed(_)) => Err(BrowserGone),
     }
+}
+
+/// Reliable frames apply bounded backpressure instead of treating a full queue
+/// as delivery. If this stalls device consumption enough to lag, `next_frame`
+/// restores the registry's retained current state before streaming resumes.
+async fn send_reliable(tx: &mpsc::Sender<Out>, message: Message) -> Result<(), BrowserGone> {
+    tx.send(Out::Reliable(message))
+        .await
+        .map_err(|_| BrowserGone)
 }
 
 /// The complete browser view: device list plus, when a device is selected, one
@@ -179,21 +212,25 @@ fn server_suggestions(port: u16) -> Vec<String> {
 
 /// Send a device's retained logs to a browser that just started (or switched to)
 /// viewing it, so the log panel has scrollback instead of starting empty. The
-/// newest retained telemetry per source rides along, so current values show
-/// before the next report interval.
-fn replay_logs(registry: &Registry, selected: Option<&str>, tx: &mpsc::Sender<Out>) {
+/// newest retained telemetry per source and current phone state ride along, so
+/// controls show current values before the next device update.
+async fn replay_retained(
+    registry: &Registry,
+    selected: Option<&str>,
+    tx: &mpsc::Sender<Out>,
+) -> Result<(), BrowserGone> {
     if let Some(id) = selected {
         for frame in registry
             .logs_of(id)
             .into_iter()
             .chain(registry.telemetry_of(id))
+            .chain(registry.phone_state_of(id))
         {
             let msg = Message::Binary(frame::encode(&frame));
-            if send(tx, Out::Reliable(msg)).is_err() {
-                return;
-            }
+            send_reliable(tx, msg).await?;
         }
     }
+    Ok(())
 }
 
 /// What device this browser session is viewing. Three states, not two parallel
@@ -271,12 +308,16 @@ fn follow_selection(
 /// live (a `changed` notification drives reselection instead). A closed
 /// broadcast downgrades `Streaming` to `Selected` — the preference outlives
 /// the stream.
-async fn next_frame(selection: &mut DeviceSelection) -> Frame {
+async fn next_frame(selection: &mut DeviceSelection, registry: &Registry) -> Frame {
     loop {
         match selection {
             DeviceSelection::Streaming { device_id, frames } => match frames.recv().await {
                 Ok(frame) => return frame,
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    if let Some(frame) = registry.phone_state_of(device_id) {
+                        return frame;
+                    }
+                }
                 Err(broadcast::error::RecvError::Closed) => {
                     *selection = DeviceSelection::Selected {
                         device_id: std::mem::take(device_id),
@@ -363,20 +404,23 @@ pub async fn handle_browser(
         selection.device_id(),
         device_port,
     )));
-    if send(&browser_tx, Out::Reliable(hello)).is_err() {
+    if send_reliable(&browser_tx, hello).await.is_err() {
         return;
     }
-    replay_logs(&registry, selection.device_id(), &browser_tx);
+    if replay_retained(&registry, selection.device_id(), &browser_tx)
+        .await
+        .is_err()
+    {
+        return;
+    }
 
     // Collection: catch this browser up on the current session reality, then
     // stream every later collection frame it broadcasts.
     let mut collection_rx = collection.subscribe();
     for frame in collection.connect_frames() {
-        if send(
-            &browser_tx,
-            Out::Reliable(Message::Binary(frame::encode(&frame))),
-        )
-        .is_err()
+        if send_reliable(&browser_tx, Message::Binary(frame::encode(&frame)))
+            .await
+            .is_err()
         {
             return;
         }
@@ -401,10 +445,12 @@ pub async fn handle_browser(
                             reconcile(&registry, &mut selection);
                             follow_selection(&mut signal_quality, &mut viewing, &selection);
                             let hello = Message::Binary(frame::encode(&view(&registry, &collection, selection.device_id(), device_port)));
-                            if send(&browser_tx, Out::Reliable(hello)).is_err() {
+                            if send_reliable(&browser_tx, hello).await.is_err() {
                                 break;
                             }
-                            replay_logs(&registry, selection.device_id(), &browser_tx);
+                            if replay_retained(&registry, selection.device_id(), &browser_tx).await.is_err() {
+                                break;
+                            }
                         }
                         Frame::DismissDevice { device_id } => {
                             // Removal notifies every browser (this one included), and
@@ -418,7 +464,7 @@ pub async fn handle_browser(
                         Frame::SetBoardRevision { device_id, revision } => {
                             collection.set_board_revision(&device_id, revision);
                             let hello = Message::Binary(frame::encode(&view(&registry, &collection, selection.device_id(), device_port)));
-                            if send(&browser_tx, Out::Reliable(hello)).is_err() {
+                            if send_reliable(&browser_tx, hello).await.is_err() {
                                 break;
                             }
                         }
@@ -430,6 +476,7 @@ pub async fn handle_browser(
                         | Frame::SetKeymap { .. }
                         | Frame::SetWifi { .. }
                         | Frame::SetServer { .. }
+                        | Frame::SetPhone { .. }
                         | Frame::CalibrationStart { .. }
                         | Frame::CalibrationAbort {}
                         | Frame::CalibrationRowsRequest { .. }) => {
@@ -465,7 +512,7 @@ pub async fn handle_browser(
                 Some(Err(_)) => break,
                 _ => {}
             },
-            frame = next_frame(&mut selection) => {
+            frame = next_frame(&mut selection, &registry) => {
                 // Mirror EMG frames into the pose queue before forwarding.
                 if let (Frame::Emg { .. }, Some((queue, notify, _))) = (&frame, &pose) {
                     let mut q = queue.lock().await;
@@ -482,7 +529,7 @@ pub async fn handle_browser(
                     Frame::Emg { .. } => {
                         if let Some(report) = signal_quality.accept_emg(&frame) {
                             let msg = Message::Binary(frame::encode(&report));
-                            if send(&browser_tx, Out::Live(LiveKind::SignalQuality, msg)).is_err() {
+                            if send_live(&browser_tx, LiveKind::SignalQuality, msg).is_err() {
                                 break;
                             }
                         }
@@ -498,33 +545,12 @@ pub async fn handle_browser(
                 if matches!(frame, Frame::Emg { .. }) && !emg_stream {
                     continue;
                 }
-                // Discrete events must not be coalesced away; the timeseries may be.
                 let msg = Message::Binary(frame::encode(&frame));
-                let out = match &frame {
-                    // Discrete records must arrive complete and ordered.
-                    Frame::Event { .. } | Frame::Log { .. } => Out::Reliable(msg),
-                    // A calibration run narrates itself in edges — a prompt, a
-                    // rejection, a phase boundary — and a run happens once. Coalescing
-                    // would drop the rejection the wearer needs to see between two
-                    // states that both look fine, and a rows dump is a reply to a
-                    // request, not a timeseries.
-                    Frame::CalibrationState { .. }
-                    | Frame::CalibrationResult { .. }
-                    | Frame::CalibrationRowsDump { .. } => Out::Reliable(msg),
-                    // The probe is sent once per run and never superseded; a
-                    // bench error is a one-shot diagnostic. Neither survives
-                    // sharing the coalescing slot with a status frame.
-                    Frame::CalibrationProbe { .. } | Frame::BenchError { .. } => {
-                        Out::Reliable(msg)
-                    }
-                    Frame::Emg { .. } => Out::Live(LiveKind::Emg, msg),
-                    Frame::Prediction { .. } => Out::Live(LiveKind::Prediction, msg),
-                    Frame::Telemetry { source, .. } => {
-                        Out::Live(LiveKind::Telemetry(source.clone()), msg)
-                    }
-                    _ => Out::Live(LiveKind::Other, msg),
+                let result = match delivery_for(&frame) {
+                    Delivery::Reliable => send_reliable(&browser_tx, msg).await,
+                    Delivery::Live(kind) => send_live(&browser_tx, kind, msg),
                 };
-                if send(&browser_tx, out).is_err() {
+                if result.is_err() {
                     break;
                 }
             }
@@ -533,7 +559,7 @@ pub async fn handle_browser(
                 // beatmap, per-note verdicts): reliable, never coalesced.
                 Ok(frame) => {
                     let msg = Message::Binary(frame::encode(&frame));
-                    if send(&browser_tx, Out::Reliable(msg)).is_err() {
+                    if send_reliable(&browser_tx, msg).await.is_err() {
                         break;
                     }
                 }
@@ -546,11 +572,13 @@ pub async fn handle_browser(
                 reconcile(&registry, &mut selection);
                 follow_selection(&mut signal_quality, &mut viewing, &selection);
                 let hello = Message::Binary(frame::encode(&view(&registry, &collection, selection.device_id(), device_port)));
-                if send(&browser_tx, Out::Reliable(hello)).is_err() {
+                if send_reliable(&browser_tx, hello).await.is_err() {
                     break;
                 }
                 // The browser clears its log panel on every hello; refill it.
-                replay_logs(&registry, selection.device_id(), &browser_tx);
+                if replay_retained(&registry, selection.device_id(), &browser_tx).await.is_err() {
+                    break;
+                }
             }
         }
     }
@@ -606,10 +634,7 @@ async fn run_pose_proxy(
                 while let Some(Ok(msg)) = stream.next().await {
                     if let WsMessage::Binary(bytes) = msg {
                         if let Ok(Frame::Pose { .. }) = frame::decode(&bytes) {
-                            let _ = send(
-                                &browser_tx,
-                                Out::Live(LiveKind::Pose, Message::Binary(bytes)),
-                            );
+                            let _ = send_live(&browser_tx, LiveKind::Pose, Message::Binary(bytes));
                         }
                     }
                 }
@@ -622,5 +647,162 @@ async fn run_pose_proxy(
         }
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_secs(30));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        delivery_for, next_frame, replay_retained, send_live, send_reliable, Delivery,
+        DeviceSelection, LiveKind, Out,
+    };
+    use crate::frame;
+    use crate::registry::Registry;
+    use axum::extract::ws::Message;
+    use protocol::{
+        DeviceConfig, DeviceProvenance, DeviceTransport, FirmwareBuild, Frame, PhoneStatus,
+    };
+    use tokio::sync::{broadcast, mpsc};
+
+    fn register_device(registry: &Registry) -> u64 {
+        registry
+            .register(
+                "opal-test".to_string(),
+                "Test device".to_string(),
+                DeviceTransport::Serial,
+                DeviceConfig {
+                    gestures: 0,
+                    keymap: Vec::new(),
+                    wifi_ssid: None,
+                    sensitivity: String::new(),
+                    sensitivity_levels: Vec::new(),
+                    tau: 0.0,
+                    needed: 0,
+                },
+                DeviceProvenance {
+                    firmware: FirmwareBuild {
+                        crate_version: String::new(),
+                        git_commit: String::new(),
+                        working_tree_modified: false,
+                        built_at: String::new(),
+                    },
+                    analog_front_ends: Vec::new(),
+                },
+            )
+            .token
+    }
+
+    fn emg() -> Frame {
+        Frame::Emg {
+            seq: 1,
+            t0_us: 0,
+            channels: 1,
+            sample_rate: 1,
+            scale_uv: 1.0,
+            samples: Vec::new(),
+            missing: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn every_phone_transition_is_reliable() {
+        let statuses = [
+            PhoneStatus::Dormant,
+            PhoneStatus::Standby,
+            PhoneStatus::Advertising,
+            PhoneStatus::Connecting,
+            PhoneStatus::Paired,
+            PhoneStatus::Unavailable {
+                reason: "wifi owns the radio".to_string(),
+            },
+        ];
+
+        for status in statuses {
+            assert_eq!(
+                delivery_for(&Frame::PhoneState { status }),
+                Delivery::Reliable
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn full_queue_waits_then_delivers_reliable_state() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let live = Message::Binary(frame::encode(&emg()));
+        assert!(send_live(&tx, LiveKind::Emg, live).is_ok());
+        let reliable = tokio::spawn(async move {
+            send_reliable(
+                &tx,
+                Message::Binary(frame::encode(&Frame::PhoneState {
+                    status: PhoneStatus::Paired,
+                })),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!reliable.is_finished());
+
+        assert!(matches!(rx.recv().await, Some(Out::Live(LiveKind::Emg, _))));
+        assert!(reliable.await.unwrap().is_ok());
+        let Some(Out::Reliable(Message::Binary(bytes))) = rx.recv().await else {
+            panic!("expected reliable phone state");
+        };
+        assert!(matches!(
+            frame::decode(&bytes).unwrap(),
+            Frame::PhoneState {
+                status: PhoneStatus::Paired
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn lag_replays_current_phone_state() {
+        let registry = Registry::new();
+        let token = register_device(&registry);
+        registry.push_phone_state("opal-test", token, PhoneStatus::Paired);
+        let (frames, receiver) = broadcast::channel(1);
+        let mut selection = DeviceSelection::Streaming {
+            device_id: "opal-test".to_string(),
+            frames: receiver,
+        };
+        frames
+            .send(Frame::PhoneState {
+                status: PhoneStatus::Paired,
+            })
+            .unwrap();
+        frames.send(emg()).unwrap();
+
+        assert!(matches!(
+            next_frame(&mut selection, &registry).await,
+            Frame::PhoneState {
+                status: PhoneStatus::Paired
+            }
+        ));
+        assert!(matches!(
+            next_frame(&mut selection, &registry).await,
+            Frame::Emg { seq: 1, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn browser_reconnect_receives_current_phone_state() {
+        let registry = Registry::new();
+        let token = register_device(&registry);
+        registry.push_phone_state("opal-test", token, PhoneStatus::Advertising);
+        let (tx, mut rx) = mpsc::channel(1);
+
+        assert!(replay_retained(&registry, Some("opal-test"), &tx)
+            .await
+            .is_ok());
+
+        let Out::Reliable(Message::Binary(bytes)) = rx.recv().await.unwrap() else {
+            panic!("expected retained phone state");
+        };
+        assert!(matches!(
+            frame::decode(&bytes).unwrap(),
+            Frame::PhoneState {
+                status: PhoneStatus::Advertising
+            }
+        ));
     }
 }

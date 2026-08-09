@@ -14,7 +14,7 @@ use esp32_nimble::{
     utilities::mutex::Mutex,
     BLEAdvertisementData, BLEAdvertising, BLECharacteristic, BLEDevice, BLEHIDDevice,
 };
-use log::info;
+use log::{error, info};
 
 use crate::hid;
 use crate::phone::{Peer, Radio};
@@ -23,28 +23,55 @@ use crate::phone::{Peer, Radio};
 /// media-capable input device.
 const APPEARANCE_HID_KEYBOARD: u16 = 0x03C1;
 
+/// Rolls back a partially configured stack unless bring-up completes.
+struct InitializationGuard {
+    armed: bool,
+}
+
+impl InitializationGuard {
+    fn new() -> Self {
+        BLEDevice::init();
+        Self { armed: true }
+    }
+
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for InitializationGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Err(err) = BLEDevice::deinit_full() {
+                error!("failed to roll back BLE initialization: {err}");
+            }
+        }
+    }
+}
+
 /// Owns the HID input characteristic and the peer state the NimBLE host task
-/// writes from its callbacks.
+/// writes from its callbacks. Dropping it performs full teardown; use
+/// [`NimbleRadio::tear_down`] when the caller must receive a teardown error.
 pub struct NimbleRadio {
-    input: Arc<Mutex<BLECharacteristic>>,
-    advertising: &'static Mutex<BLEAdvertising>,
+    input: Option<Arc<Mutex<BLECharacteristic>>>,
+    advertising: Option<&'static Mutex<BLEAdvertising>>,
     peer: Arc<PeerState>,
-    server: &'static mut esp32_nimble::BLEServer,
+    server: Option<&'static mut esp32_nimble::BLEServer>,
+    // Cleared before deinit so Drop never retries a partially completed call.
+    active: bool,
 }
 
 impl NimbleRadio {
     /// Initialize the stack, register the HID service, and stand ready to
-    /// advertise under `device_name`. Called once, at boot, before the toggle
-    /// exists — `BLEDevice::take()` is a singleton claim with no second chance,
-    /// and doing it here means the one large allocation lands on a fresh heap
-    /// rather than at a button press after hours of fragmentation. The cost is
-    /// that every boot pays NimBLE's resident footprint whether the wearer uses
-    /// the phone or not; the benefit is that when it cannot be paid, the device
-    /// says so at boot instead of mid-demo.
+    /// advertise under `device_name`. Calling [`BLEDevice::init`] explicitly is
+    /// important: `take()` initializes only while its `Lazy` value is first
+    /// forced, whereas a bring-up after [`Self::tear_down`] must initialize the
+    /// already-forced singleton again.
     ///
     /// Advertising is *not* started here. A resident stack is not a discoverable
     /// one, which is what lets the toggle default to off.
     pub fn bring_up(device_name: &str) -> Result<Self> {
+        let initialization = InitializationGuard::new();
         let device = BLEDevice::take();
 
         // Set the GAP device name (the 0x2A00 characteristic). Without this it
@@ -143,38 +170,79 @@ impl NimbleRadio {
             )
             .context("setting the advertisement data")?;
 
-        Ok(Self {
-            input,
-            advertising,
+        let radio = Self {
+            input: Some(input),
+            advertising: Some(advertising),
             peer,
-            server,
-        })
+            server: Some(server),
+            active: true,
+        };
+        initialization.disarm();
+        Ok(radio)
+    }
+
+    /// Consume this adapter and fully deinitialize the NimBLE stack/controller.
+    ///
+    /// All handles into esp32-nimble's resettable globals are invalidated before
+    /// `deinit_full()` resets them. A deinitialization error is returned without
+    /// a retry from [`Drop`], because the stack may already be partly torn down.
+    /// A subsequent bring-up starts from `BLEDevice::init()`.
+    pub fn tear_down(mut self) -> Result<()> {
+        self.deinitialize()
+    }
+
+    fn deinitialize(&mut self) -> Result<()> {
+        self.input.take();
+        self.advertising.take();
+        self.server.take();
+        self.peer.set(Peer::Absent);
+
+        if !std::mem::replace(&mut self.active, false) {
+            return Ok(());
+        }
+        BLEDevice::deinit_full().context("fully deinitializing BLE")
+    }
+}
+
+impl Drop for NimbleRadio {
+    fn drop(&mut self) {
+        if let Err(err) = self.deinitialize() {
+            error!("BLE teardown during drop failed: {err:#}");
+        }
     }
 }
 
 impl Radio for NimbleRadio {
     fn start_advertising(&mut self) -> Result<()> {
         self.advertising
+            .context("BLE advertising handle is unavailable")?
             .lock()
             .start()
             .context("starting advertising")
     }
 
     fn stop_advertising(&mut self) -> Result<()> {
-        self.advertising
-            .lock()
-            .stop()
-            .context("stopping advertising")
+        let advertising = self
+            .advertising
+            .context("BLE advertising handle is unavailable")?
+            .lock();
+        if advertising.is_advertising() {
+            advertising.stop().context("stopping advertising")?;
+        }
+        Ok(())
     }
 
     fn disconnect_peer(&mut self) -> Result<()> {
-        let connections: Vec<u16> = self
+        let server = self
             .server
+            .as_deref_mut()
+            .context("BLE server handle is unavailable")?;
+        let connections: Vec<u16> = server
             .connections()
             .map(|desc| desc.conn_handle())
             .collect();
         for handle in connections {
-            self.server
+            server
                 .disconnect(handle)
                 .with_context(|| format!("disconnecting peer {handle}"))?;
         }
@@ -186,7 +254,11 @@ impl Radio for NimbleRadio {
     }
 
     fn notify(&self, report: [u8; 2]) -> Result<()> {
-        let mut input = self.input.lock();
+        let mut input = self
+            .input
+            .as_ref()
+            .context("BLE input handle is unavailable")?
+            .lock();
         // `notify` walks the subscribed list and returns nothing, so an empty
         // list is a silent success — the key is dropped on the floor and the
         // caller is told it was sent. A host subscribes to the input report
@@ -200,7 +272,8 @@ impl Radio for NimbleRadio {
     }
 
     fn is_advertising(&self) -> bool {
-        self.advertising.lock().is_advertising()
+        self.advertising
+            .is_some_and(|advertising| advertising.lock().is_advertising())
     }
 }
 

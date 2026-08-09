@@ -259,8 +259,8 @@ struct EdgeTimingReport {
 /// line to the combiner.
 struct Pipeline {
     index: usize,
-    chip: Ads1298FrontEnd,
     reader: FrameReader,
+    chip: Ads1298FrontEnd,
     events: SyncSender<(usize, ChipEvent)>,
     counters: Arc<HealthCounters>,
     /// Device-clock time the last frame was drained. Seeded with the thread's

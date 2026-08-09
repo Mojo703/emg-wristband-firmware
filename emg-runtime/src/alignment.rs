@@ -123,7 +123,7 @@ impl<T> SourceState<T> {
     fn new() -> Self {
         Self {
             present: false,
-            queue: VecDeque::new(),
+            queue: VecDeque::with_capacity(MAX_QUEUED_FRAMES),
             newest_accepted_us: None,
             counters: SourceCounters::default(),
         }
@@ -221,6 +221,14 @@ impl<T: Clone, const SOURCES: usize> GridAligner<T, SOURCES> {
             consecutive_empty: 0,
             sources: core::array::from_fn(|_| SourceState::new()),
         }
+    }
+
+    /// Heap bytes reserved by the bounded per-source queues.
+    pub fn reserved_queue_bytes(&self) -> usize {
+        self.sources
+            .iter()
+            .map(|source| source.queue.capacity() * core::mem::size_of::<QueuedFrame<T>>())
+            .sum()
     }
 
     /// Announce or retract a source. Sources start absent; an absent source never

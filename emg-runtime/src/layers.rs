@@ -6,7 +6,6 @@
 
 use crate::mac;
 use crate::tensor::{AlignedI8, I8Activation};
-use alloc::vec::Vec;
 
 #[derive(Clone, Copy)]
 pub struct Requantize {
@@ -227,21 +226,20 @@ pub fn pointwise(
     }
 }
 
-/// Global average pool over time: `[T, C] -> [C]`.
-pub fn global_avg_pool(x: &I8Activation) -> AlignedI8 {
-    let mut v = AlignedI8::zeroed(x.c);
-    let vs = v.as_mut_slice();
+/// Global average pool over time: `[T, C] -> [C]`, reusing `out`.
+pub fn global_avg_pool_into(x: &I8Activation, out: &mut AlignedI8) {
+    out.reset_zeroed(x.c);
+    let vs = out.as_mut_slice();
     for (ch, value) in vs.iter_mut().enumerate().take(x.c) {
         let s: i32 = (0..x.t).map(|ti| x.at(ti, ch) as i32).sum();
         *value = (s / x.t as i32).clamp(-128, 127) as i8;
     }
-    v
 }
 
-/// Fully-connected `cin -> out` returning raw i32 logits (final head).
-pub fn linear_i32(v: &[i8], w: &[i8], bias: &[i32], out: usize) -> Vec<i32> {
+/// Fully-connected `cin -> out.len()` raw i32 logits (final head).
+pub fn linear_i32_into(v: &[i8], w: &[i8], bias: &[i32], out: &mut [i32]) {
     let cin = v.len();
-    (0..out)
-        .map(|oc| bias[oc] + mac::dot_i8(&w[oc * cin..(oc + 1) * cin], v))
-        .collect()
+    for (oc, value) in out.iter_mut().enumerate() {
+        *value = bias[oc] + mac::dot_i8(&w[oc * cin..(oc + 1) * cin], v);
+    }
 }

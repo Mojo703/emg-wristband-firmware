@@ -25,7 +25,7 @@ mod cue;
 mod haptics;
 mod indicator_led;
 
-pub(crate) use cue::{Calibrating, DeviceState, FrontEnd, Phone, Prompt, RepNotice};
+pub(crate) use cue::{Calibrating, DeviceState, FrontEnd, Prompt, RepNotice};
 
 use crate::cores;
 use cue::Cue;
@@ -96,7 +96,6 @@ pub(crate) struct Feedback {
 /// The handoff. A mutex rather than packed atomics: it is held for two field
 /// assignments and never across a bus transaction or a sleep, and encoding a cue and
 /// its payload into a `u32` would need rewriting every time a cue gains a field.
-#[derive(Default)]
 struct Mailbox {
     /// Level: whatever was last observed. Overwriting is correct.
     state: Option<DeviceState>,
@@ -107,6 +106,15 @@ struct Mailbox {
     pending_cue: Option<Cue>,
 }
 
+impl Mailbox {
+    fn new() -> Self {
+        Self {
+            state: None,
+            pending_cue: None,
+        }
+    }
+}
+
 impl Feedback {
     /// Starts the outputs and returns the handle.
     ///
@@ -114,7 +122,7 @@ impl Feedback {
     /// spawn, an unplugged haptics board or an unclaimable RMT channel is logged and
     /// stepped over. The two outputs fail independently.
     pub fn start(wiring: FeedbackWiring) -> Self {
-        let mailbox = Arc::new(Mutex::new(Mailbox::default()));
+        let mailbox = Arc::new(Mutex::new(Mailbox::new()));
         let thread_mailbox = Arc::clone(&mailbox);
         let spawned = cores::spawn_pinned(cores::FEEDBACK_CORE, || {
             std::thread::Builder::new()
@@ -124,8 +132,12 @@ impl Feedback {
         });
         match spawned {
             Ok(Ok(_)) => {}
-            Ok(Err(error)) => warn!("feedback thread failed to spawn ({error}); no cues this boot"),
-            Err(error) => warn!("feedback thread placement failed ({error}); no cues this boot"),
+            Ok(Err(error)) => {
+                warn!("feedback thread failed to spawn ({error}); no physical cues this boot");
+            }
+            Err(error) => {
+                warn!("feedback thread placement failed ({error}); no physical cues this boot");
+            }
         }
         Self {
             mailbox,
@@ -214,7 +226,7 @@ fn run(mailbox: Arc<Mutex<Mailbox>>, wiring: FeedbackWiring) {
     info!(
         "feedback ready: haptics {}, indicator {}",
         present(haptics.is_some()),
-        present(indicator.is_some())
+        present(indicator.is_some()),
     );
     // Past both driver installs, which is as deep as this thread goes.
     cores::log_stack_headroom("feedback thread");
@@ -234,7 +246,6 @@ fn run(mailbox: Arc<Mutex<Mailbox>>, wiring: FeedbackWiring) {
     let mut was_playing = false;
     // What the counters above advance by: how long the last pass slept.
     let mut tick = TICK_MILLISECONDS;
-
     loop {
         let (state, cue) = match mailbox.lock() {
             Ok(mut mailbox) => (mailbox.state.take(), mailbox.pending_cue.take()),
@@ -360,7 +371,7 @@ mod tests {
 
     fn detached() -> Feedback {
         Feedback {
-            mailbox: Arc::new(Mutex::new(Mailbox::default())),
+            mailbox: Arc::new(Mutex::new(Mailbox::new())),
             previous: DeviceState::BOOTING,
         }
     }
@@ -435,6 +446,27 @@ mod tests {
     }
 
     #[test]
+    fn a_physical_fault_cue_outranks_a_committed_key() {
+        let mut feedback = detached();
+        feedback.observe(running());
+        taken(&feedback);
+
+        feedback.observe(DeviceState {
+            committed: Some(MediaKey::VolumeUp),
+            ..running()
+        });
+        feedback.observe(running());
+        feedback.observe(DeviceState {
+            front_end: FrontEnd::Stalled,
+            committed: Some(MediaKey::VolumeDown),
+            ..running()
+        });
+
+        let (_, cue) = taken(&feedback);
+        assert_eq!(cue, Some(Cue::FrontEndStalled));
+    }
+
+    #[test]
     fn the_first_of_two_cues_wins_when_it_outranks_the_second() {
         // Boot-ready arrives just before the link comes up, and they share one
         // motor. Precedence decides, not arrival order.
@@ -460,7 +492,8 @@ mod tests {
             committed: Some(MediaKey::Mute),
             ..stalled
         });
-        assert_eq!(taken(&feedback).1, Some(Cue::FrontEndStalled));
+        let (_, cue) = taken(&feedback);
+        assert_eq!(cue, Some(Cue::FrontEndStalled));
     }
 
     #[test]

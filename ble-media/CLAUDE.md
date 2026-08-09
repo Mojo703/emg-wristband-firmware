@@ -24,9 +24,10 @@ Agent notes:
   feedback thread. Keep those stable. `tick` must be called unconditionally, not
   only when there is something to send: it also restarts advertising after a peer
   leaves.
-- `NimbleRadio::bring_up` runs once, at boot, and is deliberately not a `Radio`
-  trait method — `BLEDevice::take()` is a singleton claim with no second chance.
-  `Phone::state` is the per-tick question and must stay allocation-free;
+- `NimbleRadio::bring_up` and consuming `NimbleRadio::tear_down` bracket a radio
+  lifecycle and deliberately are not `Radio` trait methods. Bring-up explicitly
+  initializes NimBLE before taking its singleton, so it works again after full
+  deinit. `Phone::state` is the per-tick question and must stay allocation-free;
   `Phone::status` owns a `String` and is for building a frame only.
 - `src/console.rs` installs the USB-Serial-JTAG stdin driver at startup because
   esp-idf delivers nothing on that path by default. Don't remove it.

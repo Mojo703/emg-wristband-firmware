@@ -1,10 +1,11 @@
 //! The serial link: framed CBOR over the USB-Serial-JTAG CDC channel.
 
-use super::{decode, encode_into, Control, Transport};
+use super::{decode, encode_to, frame_header, Control, Transport};
 use anyhow::Result;
 use esp_idf_svc::hal::delay;
 use esp_idf_svc::hal::usb_serial::UsbSerialDriver;
 use protocol::{Frame, FrameScanner};
+use std::io::Write;
 use std::time::Duration;
 
 /// A probed serial link stays the data link as long as dashboard heartbeats keep
@@ -78,20 +79,11 @@ impl SerialTransport {
 }
 
 impl Transport for SerialTransport {
-    fn send(&mut self, frame: &Frame, scratch: &mut Vec<u8>) -> Result<()> {
-        let mut remaining = encode_into(frame, scratch);
-        while !remaining.is_empty() {
-            let chunk_len = remaining.len().min(SERIAL_WRITE_CHUNK_BYTES);
-            let written = self.driver.write(
-                &remaining[..chunk_len],
-                delay::TickType::new_millis(SERIAL_WRITE_TIMEOUT_MS as u64).ticks(),
-            )?;
-            if written == 0 {
-                anyhow::bail!("serial write stalled (no host reading)");
-            }
-            remaining = &remaining[written..];
-        }
-        Ok(())
+    fn send(&mut self, frame: &Frame) -> Result<()> {
+        let header = frame_header(frame)?;
+        let mut writer = SerialWriter(&mut self.driver);
+        writer.write_all(&header)?;
+        encode_to(frame, &mut writer)
     }
 
     fn poll(&mut self) -> Option<Control> {
@@ -108,5 +100,31 @@ impl Transport for SerialTransport {
             }
         }
         None
+    }
+}
+
+struct SerialWriter<'a>(&'a mut UsbSerialDriver<'static>);
+
+impl Write for SerialWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let chunk_len = bytes.len().min(SERIAL_WRITE_CHUNK_BYTES);
+        let written = self
+            .0
+            .write(
+                &bytes[..chunk_len],
+                delay::TickType::new_millis(SERIAL_WRITE_TIMEOUT_MS as u64).ticks(),
+            )
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        if written == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "serial write stalled (no host reading)",
+            ));
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }

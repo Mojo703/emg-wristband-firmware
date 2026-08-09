@@ -49,6 +49,7 @@ use anyhow::{anyhow, Result};
 use esp_idf_svc::sys::{
     esp, esp_rom_delay_us, esp_timer_get_time, gpio_int_type_t_GPIO_INTR_NEGEDGE,
     gpio_intr_disable, gpio_intr_enable, gpio_isr_handler_add, gpio_set_intr_type,
+    spi_device_acquire_bus, spi_device_handle_t, spi_device_release_bus,
     spi_host_device_t_SPI2_HOST, spi_host_device_t_SPI3_HOST, DR_REG_GPIO_BASE, DR_REG_SPI2_BASE,
     DR_REG_SPI3_BASE,
 };
@@ -92,6 +93,9 @@ const DIN_MODE: usize = 9;
 const DIN_NUM: usize = 10;
 const DOUT_MODE: usize = 11;
 const DMA_CONF: usize = 12;
+const DMA_INT_ENA: usize = 13;
+const DMA_INT_CLR: usize = 14;
+const DMA_INT_SET: usize = 17;
 const DATA_BUF: usize = 38;
 const SLAVE: usize = 56;
 const CLK_GATE: usize = 58;
@@ -101,6 +105,13 @@ const CLK_GATE: usize = 58;
 /// transfer and self-clears when it completes.
 const CMD_UPDATE: u32 = 1 << 23;
 const CMD_USR: u32 = 1 << 24;
+const TRANS_DONE_INT: u32 = 1 << 12;
+
+const OWNER_DRIVER: u32 = 0;
+const OWNER_RAW: u32 = 1;
+const HANDLER_GATE_OPEN: u32 = 1;
+const HANDLER_ACTIVE_INCREMENT: u32 = 2;
+const HANDOFF_TIMEOUT_US: i64 = 10_000;
 
 /// Spins a register poll is allowed before the handler gives up and counts a
 /// read fault. A 27-byte transfer at 8 MHz completes in ~27 µs; this bound is
@@ -257,6 +268,9 @@ unsafe impl<T> Sync for InterruptShared<T> {}
 static READERS: InterruptShared<[ChipReader; DEVICE_COUNT]> =
     InterruptShared(UnsafeCell::new([ChipReader::EMPTY; DEVICE_COUNT]));
 static RINGS: [FrameRing; DEVICE_COUNT] = [FrameRing::new(), FrameRing::new()];
+static OWNERS: [AtomicU32; DEVICE_COUNT] =
+    [AtomicU32::new(OWNER_DRIVER), AtomicU32::new(OWNER_DRIVER)];
+static HANDLER_GATES: [AtomicU32; DEVICE_COUNT] = [AtomicU32::new(0), AtomicU32::new(0)];
 
 /// Writes one 32-bit peripheral register.
 ///
@@ -385,9 +399,27 @@ unsafe fn read_frame_into_ring(index: usize) {
 #[link_section = ".iram1.adc_data_ready"]
 unsafe extern "C" fn data_ready_handler(argument: *mut core::ffi::c_void) {
     let index = argument as usize;
-    if index < DEVICE_COUNT {
-        read_frame_into_ring(index);
+    if index >= DEVICE_COUNT {
+        return;
     }
+    let gate = &HANDLER_GATES[index];
+    let mut state = gate.load(Ordering::Acquire);
+    loop {
+        if state & HANDLER_GATE_OPEN == 0 {
+            return;
+        }
+        match gate.compare_exchange_weak(
+            state,
+            state + HANDLER_ACTIVE_INCREMENT,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => break,
+            Err(current) => state = current,
+        }
+    }
+    read_frame_into_ring(index);
+    gate.fetch_sub(HANDLER_ACTIVE_INCREMENT, Ordering::Release);
 }
 
 /// Installs the GPIO interrupt dispatcher the DRDY handlers hang off.
@@ -426,9 +458,42 @@ pub(super) fn install_interrupt_dispatcher() -> Result<()> {
 pub(crate) struct FrameReader {
     index: usize,
     data_ready_pin: u8,
+    frame_device: usize,
+    interrupt_enable: u32,
 }
 
 impl FrameReader {
+    fn hand_back_to_driver(&self) -> Result<()> {
+        if OWNERS[self.index].load(Ordering::Acquire) != OWNER_RAW {
+            return Ok(());
+        }
+        let deadline = unsafe { esp_timer_get_time() } + HANDOFF_TIMEOUT_US;
+        while HANDLER_GATES[self.index].load(Ordering::Acquire) != 0 {
+            if unsafe { esp_timer_get_time() } >= deadline {
+                return Err(anyhow!("DRDY handler did not quiesce before SPI handoff"));
+            }
+            std::hint::spin_loop();
+        }
+        let reader = unsafe { (*READERS.0.get())[self.index] };
+        while unsafe { read_register(reader.spi_base, CMD) } & (CMD_UPDATE | CMD_USR) != 0 {
+            if unsafe { esp_timer_get_time() } >= deadline {
+                return Err(anyhow!(
+                    "SPI host did not become idle before driver handoff"
+                ));
+            }
+            std::hint::spin_loop();
+        }
+        unsafe {
+            std::ptr::write_volatile(reader.chip_select_set as *mut u32, reader.chip_select_mask);
+            write_register(reader.spi_base, DMA_INT_CLR, TRANS_DONE_INT);
+            write_register(reader.spi_base, DMA_INT_ENA, self.interrupt_enable);
+            write_register(reader.spi_base, DMA_INT_SET, TRANS_DONE_INT);
+            spi_device_release_bus(self.frame_device as spi_device_handle_t);
+        }
+        OWNERS[self.index].store(OWNER_DRIVER, Ordering::Release);
+        Ok(())
+    }
+
     /// Takes ownership of chip `index`'s SPI host for interrupt-side reads.
     ///
     /// The chip must already be streaming (RDATAC, START high) and the SPI
@@ -439,6 +504,7 @@ impl FrameReader {
     pub(super) fn claim(
         index: usize,
         spi_host: esp_idf_svc::sys::spi_host_device_t,
+        frame_device: spi_device_handle_t,
         chip_select_pin: u8,
         data_ready_pin: u8,
     ) -> Result<Self> {
@@ -457,6 +523,12 @@ impl FrameReader {
         } else {
             (0x14, 0x18, chip_select_pin - 32)
         };
+        esp!(unsafe { spi_device_acquire_bus(frame_device, u32::MAX) })?;
+        let interrupt_enable = unsafe { read_register(spi_base, DMA_INT_ENA) };
+        unsafe {
+            write_register(spi_base, DMA_INT_ENA, interrupt_enable & !TRANS_DONE_INT);
+            write_register(spi_base, DMA_INT_CLR, TRANS_DONE_INT);
+        }
         let reader = ChipReader {
             spi_base,
             chip_select_set: DR_REG_GPIO_BASE + set_offset,
@@ -481,9 +553,12 @@ impl FrameReader {
         // The interrupt for this chip has never been enabled, so nothing else
         // can be looking at this slot.
         unsafe { (*READERS.0.get())[index] = reader };
+        OWNERS[index].store(OWNER_RAW, Ordering::Release);
         Ok(Self {
             index,
             data_ready_pin,
+            frame_device: frame_device as usize,
+            interrupt_enable,
         })
     }
 
@@ -526,6 +601,21 @@ impl FrameReader {
     /// it runs handlers, so an edge landing during a read is latched and served
     /// next, and there is no re-arm to lose an edge in.
     pub(super) fn enable(&self) -> Result<()> {
+        let reader = unsafe { (*READERS.0.get())[self.index] };
+        if OWNERS[self.index].load(Ordering::Acquire) == OWNER_DRIVER {
+            let frame_device = self.frame_device as spi_device_handle_t;
+            esp!(unsafe { spi_device_acquire_bus(frame_device, u32::MAX) })?;
+            unsafe {
+                write_register(
+                    reader.spi_base,
+                    DMA_INT_ENA,
+                    self.interrupt_enable & !TRANS_DONE_INT,
+                );
+                write_register(reader.spi_base, DMA_INT_CLR, TRANS_DONE_INT);
+            }
+            OWNERS[self.index].store(OWNER_RAW, Ordering::Release);
+        }
+        HANDLER_GATES[self.index].store(HANDLER_GATE_OPEN, Ordering::Release);
         esp!(unsafe { gpio_intr_enable(self.data_ready_pin as i32) })?;
         Ok(())
     }
@@ -533,13 +623,13 @@ impl FrameReader {
     /// Closes the interrupt window and waits out any read still in flight, so
     /// the SPI driver can safely take the host back.
     ///
-    /// The wait is a tick rather than a handshake: `gpio_intr_disable` stops new
-    /// edges but says nothing about a handler already running, and one whole
-    /// frame read is ~40 µs against the 1 ms tick.
+    /// The atomic gate closes admission before the GPIO source is disabled and
+    /// counts every admitted handler, including one executing on the other core.
     pub(super) fn disable(&self) -> Result<()> {
-        esp!(unsafe { gpio_intr_disable(self.data_ready_pin as i32) })?;
-        esp_idf_svc::hal::delay::FreeRtos::delay_ms(1);
-        Ok(())
+        HANDLER_GATES[self.index].fetch_and(!HANDLER_GATE_OPEN, Ordering::AcqRel);
+        let disabled = esp!(unsafe { gpio_intr_disable(self.data_ready_pin as i32) });
+        self.hand_back_to_driver()?;
+        disabled.map_err(Into::into)
     }
 
     /// The oldest frame the interrupt has captured, or `None` when the ring is
@@ -579,6 +669,16 @@ impl FrameReader {
             edges: ring.edges.load(Ordering::Relaxed),
             overruns: ring.overruns.load(Ordering::Relaxed),
             read_faults: ring.read_faults.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl Drop for FrameReader {
+    fn drop(&mut self) {
+        HANDLER_GATES[self.index].fetch_and(!HANDLER_GATE_OPEN, Ordering::AcqRel);
+        let _ = unsafe { gpio_intr_disable(self.data_ready_pin as i32) };
+        if self.hand_back_to_driver().is_err() {
+            std::process::abort();
         }
     }
 }

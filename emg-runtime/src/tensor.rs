@@ -70,6 +70,10 @@ impl AlignedI8 {
         }
         self.len = len;
     }
+
+    pub(crate) fn allocated_bytes(&self) -> usize {
+        self.blocks.len() * 16
+    }
 }
 
 /// Deterministic PRNG for repeatable synthetic data.
@@ -116,6 +120,11 @@ impl I8Activation {
     #[inline]
     pub fn as_slice(&self) -> &[i8] {
         self.data.as_slice()
+    }
+
+    /// Bytes reserved by the aligned backing allocation.
+    pub fn allocated_bytes(&self) -> usize {
+        self.data.allocated_bytes()
     }
 
     /// Channels at time step `ti` (a contiguous, 16-aligned `[c]` slice).

@@ -24,6 +24,9 @@ name = "opal-firmware"
 # same image can be flashed to either. See `firmware-bench/PROTOCOL.md`.
 [features]
 playback = []
+# Mirror Rust log records to the ESP-IDF text console for startup diagnosis.
+# Pair with sdkconfig.diagnostic; production keeps the framed logger only.
+diagnostic-console = []
 
 [profile.release]
 opt-level = 3
@@ -36,6 +39,7 @@ debug = true
 emg-runtime = { path = "../emg-runtime" }
 calibration-flow = { path = "../calibration-flow" }
 feedback-vocabulary = { path = "../feedback-vocabulary" }
+ble-media = { path = "../ble-media" }
 protocol = { path = "../protocol" }
 # Default features are the crate's own bench binary and its esp-idf-svc/log/anyhow
 # dependencies; the driver itself is no_std over embedded-hal and wants none of them.

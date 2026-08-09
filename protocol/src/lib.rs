@@ -29,6 +29,69 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
+mod test_alloc {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    thread_local! {
+        static ACTIVE: Cell<bool> = const { Cell::new(false) };
+        static REQUESTS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub struct TestAllocator;
+
+    #[global_allocator]
+    static ALLOCATOR: TestAllocator = TestAllocator;
+
+    unsafe impl GlobalAlloc for TestAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            record();
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            record();
+            unsafe { System.alloc_zeroed(layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            record();
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+    }
+
+    fn record() {
+        ACTIVE.with(|active| {
+            if active.get() {
+                REQUESTS.with(|requests| requests.set(requests.get() + 1));
+            }
+        });
+    }
+
+    pub fn count(operation: impl FnOnce()) -> usize {
+        struct ActiveGuard;
+        impl Drop for ActiveGuard {
+            fn drop(&mut self) {
+                ACTIVE.with(|active| active.set(false));
+            }
+        }
+
+        REQUESTS.with(|requests| requests.set(0));
+        ACTIVE.with(|active| {
+            assert!(!active.replace(true), "allocation counter cannot nest");
+        });
+        let guard = ActiveGuard;
+        operation();
+        drop(guard);
+        REQUESTS.with(Cell::get)
+    }
+}
+
 /// One message in either direction over the dashboard socket.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -168,37 +231,34 @@ pub enum Frame {
         revision: BoardRevision,
     },
 
-    /// Set WiFi credentials (browser → backend → device). The device persists them
-    /// and uses them to reach the backend over wifi on the next boot.
+    /// Set WiFi credentials (browser → backend → device). The device persists them,
+    /// but the serial + BLE demo runtime does not automatically activate Wi-Fi.
+    /// A future explicit wireless-mode command may consume them.
     SetWifi { ssid: String, psk: String },
 
     /// Set the dashboard address the device dials over wifi (browser → backend →
-    /// device), e.g. `"10.42.0.1:9000"`. The device persists it and connects there on
-    /// the next boot. The server address is otherwise a compile-time default, so this
-    /// is the only way to retarget a device without reflashing — needed when the
-    /// dashboard host's IP is not portable across networks (a laptop hotspot, say).
+    /// device), e.g. `"10.42.0.1:9000"`. The device persists it for a future explicit
+    /// Wi-Fi mode; the serial + BLE demo runtime does not dial it automatically.
     SetServer { addr: String },
 
-    /// Hand the phone the radio, or take it back (browser → backend → device).
+    /// Enable or disable BLE phone advertising (browser → backend → device).
     ///
     /// Not persisted. Off at boot is the requirement, so a stored `true` would
     /// contradict it — the device treats this like `Probe` and `Heartbeat` rather
     /// than like a setting: no NVS write, no re-announce, and no flash wear from a
     /// button someone is clicking. The device answers with [`Frame::PhoneState`].
     ///
-    /// The ESP32-S3 has one 2.4 GHz radio and no coexistence configuration, and
-    /// nothing yet arbitrates who owns it: standing the wifi dialer down does
-    /// not release the radio, because the station stays associated and only the
-    /// dialling loop skips. So a wifi-provisioned device *refuses* this and
-    /// answers with `unavailable` and a reason, rather than half-enabling a
-    /// phone that will not work.
+    /// Stored Wi-Fi credentials do not affect this control: Wi-Fi is dormant in
+    /// the demo runtime, so enabling starts advertising on the resident NimBLE
+    /// stack and disabling leaves that stack initialized for a cheap re-enable.
     SetPhone { enabled: bool },
 
     /// What the phone peripheral is doing (device → backend → browser).
     ///
     /// Its own frame rather than a telemetry metric: a button needs feedback
     /// sooner than the ~4 s telemetry interval, and `unavailable` carries a reason
-    /// a numeric metric cannot. Sent on every transition, not on a schedule.
+    /// a numeric metric cannot. Sent on every transition and replayed after a
+    /// dashboard reconnect until the device observes a successful write.
     PhoneState { status: PhoneStatus },
 
     /// A device log record (device → backend → browser). Replaces the serial text
@@ -664,7 +724,7 @@ pub enum Frame {
     /// Device → host: features for a run of completed windows. Little-endian
     /// `f32` bits, `window_count * BENCH_FEATURE_COUNT` values, band-major and
     /// channel-minor per `firmware-bench/ARITHMETIC.md`. Batched because the
-    /// device's one encode buffer is 18 KB.
+    /// device's one encode buffer is 24 KB.
     BenchFeatures {
         first_window: u32,
         window_count: u32,
@@ -2018,6 +2078,13 @@ pub fn pack_sample_stream(samples: impl Iterator<Item = i16> + Clone) -> Vec<u8>
     out
 }
 
+/// Maximum bytes delta-varint packing can produce for `sample_count` i16 values.
+/// A delta spans -65535..=65535; zigzag therefore needs at most 17 bits, or three
+/// seven-bit varint bytes.
+pub const fn max_packed_sample_bytes(sample_count: usize) -> usize {
+    sample_count * 3
+}
+
 /// [`pack_sample_stream`] into a caller-owned buffer, reusing its allocation — for
 /// producers that pack at a steady rate and recycle the payload buffer instead of
 /// allocating one per window. The buffer is cleared first and reserved to the priced
@@ -2172,6 +2239,27 @@ mod tests {
                 "the buffer grew, so it asked the fragmented heap for another one"
             );
         }
+    }
+
+    #[test]
+    fn worst_case_eight_thousand_sample_pack_reuses_the_reserved_buffer() {
+        let values: Vec<i16> = (0..8000)
+            .map(|index| if index % 2 == 0 { i16::MIN } else { i16::MAX })
+            .collect();
+        let mut packed = Vec::with_capacity(max_packed_sample_bytes(values.len()));
+        let capacity = packed.capacity();
+        let pointer = packed.as_ptr();
+
+        let allocations = crate::test_alloc::count(|| {
+            for _ in 0..1000 {
+                pack_sample_stream_into(&mut packed, values.iter().copied());
+                assert_eq!(packed.capacity(), capacity);
+                assert!(packed.len() <= capacity);
+            }
+        });
+        assert_eq!(allocations, 0);
+        assert_eq!(capacity, 24_000);
+        assert_eq!(packed.as_ptr(), pointer);
     }
 
     #[test]
@@ -3022,6 +3110,24 @@ mod tests {
                 status: PhoneStatus::Unavailable { reason },
             } => assert!(reason.contains("no memory")),
             other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unavailable_reasons_remain_distinct_wire_values() {
+        let initialization = PhoneStatus::Unavailable {
+            reason: "BLE initialization failed: no memory".into(),
+        };
+        let advertising = PhoneStatus::Unavailable {
+            reason: "starting advertising: busy".into(),
+        };
+
+        assert_ne!(initialization, advertising);
+        for status in [initialization, advertising] {
+            let mut encoded = Vec::new();
+            ciborium::into_writer(&status, &mut encoded).unwrap();
+            let decoded: PhoneStatus = ciborium::from_reader(encoded.as_slice()).unwrap();
+            assert_eq!(decoded, status);
         }
     }
 

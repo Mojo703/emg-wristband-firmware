@@ -41,13 +41,13 @@ pub const KEY_HOLD: Duration = Duration::from_millis(20);
 /// Every judgement about what those mean lives in [`Phone`], on this side of
 /// the seam, where a test can reach it.
 ///
-/// Bringing the stack up is not here. It happens once, at boot, before a
-/// `Phone` exists — `BLEDevice::take()` is a singleton claim with no second
-/// chance, and a trait method that could be called twice would be an invitation
-/// to find out what the second call does.
+/// Bringing the stack up and fully tearing it down are not here. They bracket a
+/// `Phone` at the concrete radio boundary; [`Phone::shutdown`] returns the radio
+/// so its owner can perform that device-specific teardown.
 pub trait Radio {
     fn start_advertising(&mut self) -> anyhow::Result<()>;
 
+    /// Stop advertising. Already inactive is a successful no-op.
     fn stop_advertising(&mut self) -> anyhow::Result<()>;
 
     /// Hang up on the peer, if there is one. Disconnecting nothing succeeds.
@@ -127,9 +127,9 @@ pub enum Phone<R> {
         hold: KeyHold,
     },
     /// The stack refused at boot. Terminal for this boot and deliberately so:
-    /// `BLEDevice::take()` happens once, so there is nothing here to retry and
-    /// a button that appeared to retry would be claiming the singleton twice.
-    /// The panel says to reboot.
+    /// this value owns no radio to retry. A lifecycle owner may construct a new
+    /// phone after resolving the failure, but this toggle only reports its boot
+    /// failure. The panel says to reboot.
     Unavailable(String),
 }
 
@@ -209,6 +209,55 @@ pub enum Delivery {
     /// The link was there and the notify failed anyway.
     Failed(String),
 }
+
+/// Why a consuming [`Phone::shutdown`] could not return a cleanly shut-down
+/// radio.
+///
+/// The radio remains owned here because failures from releasing a key, stopping
+/// advertising, or disconnecting do not invalidate a generic [`Radio`]. Call
+/// [`Self::into_radio`] to recover it for a retry or device-specific teardown.
+#[must_use]
+pub enum ShutdownError<R> {
+    /// Logical cleanup failed; the radio remains valid and recoverable.
+    Logical { radio: R, reason: String },
+    /// This phone was constructed without a radio after bring-up failed.
+    Unavailable(String),
+}
+
+impl<R> ShutdownError<R> {
+    /// All shutdown failures, in operation order, flattened for logging.
+    pub fn reason(&self) -> &str {
+        match self {
+            Self::Logical { reason, .. } | Self::Unavailable(reason) => reason,
+        }
+    }
+
+    /// Recover the radio after a logical shutdown failure. An unavailable phone
+    /// never owned one, so that variant returns `None`.
+    pub fn into_radio(self) -> Option<R> {
+        match self {
+            Self::Logical { radio, .. } => Some(radio),
+            Self::Unavailable(_) => None,
+        }
+    }
+}
+
+impl<R> core::fmt::Debug for ShutdownError<R> {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("ShutdownError")
+            .field("reason", &self.reason())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<R> core::fmt::Display for ShutdownError<R> {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str(self.reason())
+    }
+}
+
+impl<R> std::error::Error for ShutdownError<R> {}
 
 impl<R: Radio> Phone<R> {
     /// The stack is up. Off, but resident.
@@ -356,11 +405,46 @@ impl<R: Radio> Phone<R> {
         }
     }
 
+    /// Consume the phone, release any held key, stop advertising, disconnect,
+    /// and return its radio.
+    ///
+    /// Every operation is attempted in that order even if an earlier one fails.
+    /// Failures are aggregated in [`ShutdownError`], which retains ownership of
+    /// the radio. A phone whose bring-up failed returns
+    /// [`ShutdownError::Unavailable`] because it has no radio to return.
+    pub fn shutdown(self) -> Result<R, ShutdownError<R>> {
+        let (mut radio, hold) = match self {
+            Phone::Ready { radio, hold, .. } => (radio, hold),
+            Phone::Unavailable(reason) => return Err(ShutdownError::Unavailable(reason)),
+        };
+
+        let mut errors = Vec::new();
+        if hold.is_armed() {
+            if let Err(err) = radio.notify(hid::RELEASE_REPORT) {
+                errors.push(format!("releasing held key: {err:#}"));
+            }
+        }
+        if let Err(err) = radio.stop_advertising() {
+            errors.push(format!("stopping advertising: {err:#}"));
+        }
+        if let Err(err) = radio.disconnect_peer() {
+            errors.push(format!("disconnecting peer: {err:#}"));
+        }
+
+        if errors.is_empty() {
+            Ok(radio)
+        } else {
+            Err(ShutdownError::Logical {
+                radio,
+                reason: errors.join("; "),
+            })
+        }
+    }
+
     fn enable(&mut self, claim: RadioClaim) {
         let Phone::Ready { radio, link, .. } = self else {
-            // Nothing to retry: the stack never came up and `take()` does not
-            // come round again. Leaving the boot reason in place is the honest
-            // answer to a second press.
+            // This value has no radio to retry. Leaving the boot reason in place
+            // is the honest answer to a second press.
             return;
         };
         if claim == RadioClaim::HeldByWifi {
@@ -410,6 +494,7 @@ fn reason(err: &anyhow::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::SESSION_TICK;
 
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
@@ -420,10 +505,13 @@ mod tests {
     struct Bench {
         peer: Cell<Peer>,
         reports: RefCell<Vec<[u8; 2]>>,
+        operations: RefCell<Vec<&'static str>>,
         advertising: Cell<bool>,
         disconnects: Cell<u32>,
+        drops: Cell<u32>,
         refuse_advertising: Cell<bool>,
         refuse_stop: Cell<bool>,
+        refuse_disconnect: Cell<bool>,
         refuse_notify: Cell<bool>,
     }
 
@@ -451,6 +539,12 @@ mod tests {
         bench: Rc<Bench>,
     }
 
+    impl Drop for FakeRadio {
+        fn drop(&mut self) {
+            self.bench.drops.set(self.bench.drops.get() + 1);
+        }
+    }
+
     impl Radio for FakeRadio {
         fn start_advertising(&mut self) -> anyhow::Result<()> {
             if self.bench.refuse_advertising.get() {
@@ -461,6 +555,14 @@ mod tests {
         }
 
         fn stop_advertising(&mut self) -> anyhow::Result<()> {
+            if !self.bench.advertising.get() {
+                self.bench
+                    .operations
+                    .borrow_mut()
+                    .push("stop already inactive");
+                return Ok(());
+            }
+            self.bench.operations.borrow_mut().push("stop");
             if self.bench.refuse_stop.get() {
                 anyhow::bail!("stop refused");
             }
@@ -469,7 +571,11 @@ mod tests {
         }
 
         fn disconnect_peer(&mut self) -> anyhow::Result<()> {
+            self.bench.operations.borrow_mut().push("disconnect");
             self.bench.disconnects.set(self.bench.disconnects.get() + 1);
+            if self.bench.refuse_disconnect.get() {
+                anyhow::bail!("disconnect refused");
+            }
             self.bench.peer.set(Peer::Absent);
             Ok(())
         }
@@ -483,6 +589,14 @@ mod tests {
         }
 
         fn notify(&self, report: [u8; 2]) -> anyhow::Result<()> {
+            self.bench
+                .operations
+                .borrow_mut()
+                .push(if report == hid::RELEASE_REPORT {
+                    "release"
+                } else {
+                    "press"
+                });
             if self.bench.refuse_notify.get() {
                 anyhow::bail!("peer gone");
             }
@@ -568,7 +682,8 @@ mod tests {
     /// band that believed it had hung up.
     #[test]
     fn a_refused_stop_still_drops_the_peer() {
-        let (mut phone, bench) = paired();
+        let (mut phone, bench) = booted();
+        phone.set_enabled(true, RadioClaim::Free);
         bench.refuse_stop.set(true);
 
         phone.set_enabled(false, RadioClaim::Free);
@@ -578,11 +693,101 @@ mod tests {
         assert!(phone.reason().unwrap().contains("stop refused"));
     }
 
-    /// T2. A stack that refused at boot is terminal: `BLEDevice::take()` does
-    /// not come round again, so pressing the button twice must not reach for
-    /// the singleton a second time.
     #[test]
-    fn a_boot_failure_is_terminal_and_does_not_retry_the_singleton() {
+    fn shutdown_treats_nimble_already_stopped_as_success_and_returns_the_radio() {
+        let (mut phone, bench) = paired();
+        assert_eq!(phone.press(MediaKey::VolumeUp), Delivery::Sent);
+        bench.operations.borrow_mut().clear();
+
+        let radio = phone.shutdown().expect("shutdown should succeed");
+
+        assert_eq!(
+            bench.operations.borrow().as_slice(),
+            ["release", "stop already inactive", "disconnect"]
+        );
+        assert!(Rc::ptr_eq(&radio.bench, &bench));
+    }
+
+    #[test]
+    fn shutdown_stops_active_advertising_before_disconnect() {
+        let (mut phone, bench) = booted();
+        phone.set_enabled(true, RadioClaim::Free);
+        assert!(bench.advertising.get());
+
+        let radio = phone.shutdown().expect("shutdown should succeed");
+
+        assert_eq!(bench.operations.borrow().as_slice(), ["stop", "disconnect"]);
+        assert!(Rc::ptr_eq(&radio.bench, &bench));
+    }
+
+    #[test]
+    fn disabling_after_nimble_stopped_advertising_is_standby_not_unavailable() {
+        let (mut phone, bench) = paired();
+
+        phone.set_enabled(false, RadioClaim::Free);
+
+        assert_eq!(phone.state(), PhoneState::Standby);
+        assert_eq!(
+            bench.operations.borrow().as_slice(),
+            ["stop already inactive", "disconnect"]
+        );
+    }
+
+    #[test]
+    fn shutdown_surfaces_every_error_and_preserves_the_radio() {
+        let (mut phone, bench) = paired();
+        assert_eq!(phone.press(MediaKey::Mute), Delivery::Sent);
+        bench.operations.borrow_mut().clear();
+        bench.refuse_notify.set(true);
+        bench.refuse_disconnect.set(true);
+
+        let error = match phone.shutdown() {
+            Err(error) => error,
+            Ok(_) => panic!("every teardown step refused"),
+        };
+
+        assert_eq!(
+            bench.operations.borrow().as_slice(),
+            ["release", "stop already inactive", "disconnect"]
+        );
+        assert!(error.reason().contains("peer gone"));
+        assert!(error.reason().contains("disconnect refused"));
+        let radio = error
+            .into_radio()
+            .expect("logical failures must preserve the radio");
+        assert!(Rc::ptr_eq(&radio.bench, &bench));
+    }
+
+    #[test]
+    fn shutting_down_an_unavailable_phone_surfaces_its_reason_without_a_radio() {
+        let phone: Phone<FakeRadio> = Phone::unavailable("boot failed".into());
+
+        let error = match phone.shutdown() {
+            Err(error) => error,
+            Ok(_) => panic!("there is no radio to return"),
+        };
+
+        assert_eq!(error.reason(), "boot failed");
+        assert!(error.into_radio().is_none());
+    }
+
+    #[test]
+    fn replacing_a_phone_disposes_its_owned_radio_once() {
+        let (phone, bench) = booted();
+        let mut slot = phone;
+        assert_eq!(slot.state(), PhoneState::Dormant);
+
+        slot = Phone::Unavailable("replaced".into());
+
+        assert_eq!(bench.drops.get(), 1);
+        drop(slot);
+        assert_eq!(bench.drops.get(), 1, "the old radio was disposed twice");
+    }
+
+    /// A stack that refused at boot leaves this phone terminal: pressing the
+    /// button cannot manufacture the radio that this value never received.
+    #[test]
+    fn a_boot_failure_is_terminal_for_that_phone_value() {
         let mut phone: Phone<FakeRadio> = Phone::unavailable("no memory for the controller".into());
 
         phone.set_enabled(true, RadioClaim::Free);
@@ -692,18 +897,18 @@ mod tests {
 
         assert_eq!(phone.press(MediaKey::VolumeUp), Delivery::Sent);
         for _ in 0..3 {
-            phone.tick(Duration::from_millis(5));
+            phone.tick(SESSION_TICK);
         }
         assert_eq!(bench.reports.borrow().len(), 1, "released early");
 
-        phone.tick(Duration::from_millis(5));
+        phone.tick(SESSION_TICK);
         assert_eq!(
             bench.reports.borrow().as_slice(),
             [MediaKey::VolumeUp.press_report(), hid::RELEASE_REPORT]
         );
 
         // And exactly once: a tick after the hold has run out is not a release.
-        phone.tick(Duration::from_millis(5));
+        phone.tick(SESSION_TICK);
         assert_eq!(bench.reports.borrow().len(), 2);
     }
 

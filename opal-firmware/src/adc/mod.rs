@@ -97,11 +97,11 @@ pub(crate) struct AdcChipWiring {
 /// The configured, streaming pair, plus both PWDN lines kept alive (and high)
 /// for as long as the front end exists.
 pub(crate) struct FrontEnds {
-    pub(super) chips: [Ads1298FrontEnd; DEVICE_COUNT],
     /// Each chip's interrupt-side frame path, claimed and proven against the
     /// driver path in [`bring_up`] but not yet enabled: the pipeline thread that
     /// drains a ring is the thing that opens its interrupt window.
     pub(super) readers: [frame_reader::FrameReader; DEVICE_COUNT],
+    pub(super) chips: [Ads1298FrontEnd; DEVICE_COUNT],
     pub(super) _power_down: [PinDriver<'static, Output>; DEVICE_COUNT],
 }
 
@@ -328,8 +328,8 @@ pub(crate) fn bring_up<SpiA: SpiAnyPins + 'static, SpiB: SpiAnyPins + 'static>(
         .map_err(|_| anyhow::anyhow!("one frame reader per chip"))?;
 
     Ok(FrontEnds {
-        chips,
         readers,
+        chips,
         _power_down: power_down,
     })
 }
@@ -358,6 +358,7 @@ fn claim_frame_reader(
     let reader = frame_reader::FrameReader::claim(
         index,
         spi_host,
+        chip.device.frame_spi_handle(),
         chip.device.chip_select_pin(),
         chip.device.data_ready_pin(),
     )?;

@@ -23,7 +23,7 @@
 //!   wifi link-management thread, TCP transport readers, and esp-idf's
 //!   housekeeping tasks (timers, events), which default there.
 //! - **Core 0**, continued: the combiner (below the pipelines in priority), the
-//!   feedback thread, and chip A's SPI host completion interrupt — allocated
+//!   feedback and BLE session threads, and chip A's SPI host completion interrupt — allocated
 //!   wherever `build_front_end` runs, which for chip A is the main task.
 //! - **Core 1**: the shared GPIO interrupt dispatcher — both chips' frame reads —
 //!   plus chip B's pipeline thread and chip B's SPI host completion interrupt,
@@ -82,11 +82,18 @@ pub(crate) const PLAYBACK_WORKER_CORE: Core = Core::Core1;
 /// is the dispatcher's edge-service latency.
 pub(crate) const FEEDBACK_CORE: Core = Core::Core0;
 
+/// The BLE owner. Kept off core 1 so its 5 ms deadline and NimBLE calls cannot
+/// add latency to the ADC interrupt dispatcher.
+pub(crate) const BLE_SESSION_CORE: Core = Core::Core0;
+
 /// Above the main loop so a cue is not stuck behind a 126 ms inference, far below
 /// the combiner's 9. Both ends were assumptions until measured — `ESP_TASK_MAIN_PRIO`
 /// is 1, the pthread default is 5 — so [`log_thread_priority`] prints the real
 /// numbers every boot.
 pub(crate) const FEEDBACK_THREAD_PRIORITY: u8 = 5;
+
+/// Above the blocking main loop so key release timing is independent of link writes.
+pub(crate) const BLE_SESSION_THREAD_PRIORITY: u8 = 5;
 
 /// Raises the calling thread's FreeRTOS priority.
 pub(crate) fn set_current_thread_priority(priority: u8) {
@@ -122,6 +129,10 @@ pub(crate) fn log_stack_headroom(role: &str) {
 /// allocates while running also lands on `core`, which is how the interrupt
 /// placements above are enforced.
 ///
+/// An error is returned only before `spawn` is invoked. Once ownership has entered
+/// that closure this function returns its value or aborts, so callers can never lose
+/// a successfully created worker because restoring the global configuration failed.
+///
 /// The configuration is process-global, so concurrent callers would race each
 /// other's settings. Spawns happen either during single-threaded start-up or
 /// from the one link-management thread, never concurrently.
@@ -132,6 +143,9 @@ pub(crate) fn spawn_pinned<T>(core: Core, spawn: impl FnOnce() -> T) -> anyhow::
     }
     .set()?;
     let spawned = spawn();
-    ThreadSpawnConfiguration::default().set()?;
+    if let Err(error) = ThreadSpawnConfiguration::default().set() {
+        log::error!("failed to restore thread spawn configuration ({error}); aborting");
+        std::process::abort();
+    }
     Ok(spawned)
 }

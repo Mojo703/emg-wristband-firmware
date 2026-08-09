@@ -251,6 +251,22 @@ impl AdcSource {
         drained
     }
 
+    /// The next complete window without allocating a temporary backlog vector.
+    pub(crate) fn poll_window(&self) -> Option<AcquiredWindow> {
+        loop {
+            let window = self.windows.try_recv().ok()?;
+            let expected = self.window_length * INPUT_CH;
+            if window.samples.len() == expected {
+                return Some(window);
+            }
+            warn!(
+                "discarding malformed window: {} model samples, expected {expected}",
+                window.samples.len(),
+            );
+            self.recycle(window.samples, window.packed_wire, window.missing);
+        }
+    }
+
     /// Hand a spent window's buffers back for reuse: its model-input samples, its
     /// packed wire payload, and its missing-mask planes (the latter two reclaimed
     /// from the sent frame). Fire-and-forget: a full pool just lets the buffers

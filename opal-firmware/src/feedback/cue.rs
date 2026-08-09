@@ -10,6 +10,4 @@
 //! One definition, consumed here: the drivers that render a [`CueResponse`] stay
 //! in this module's siblings.
 
-pub(crate) use feedback_vocabulary::{
-    Calibrating, Cue, DeviceState, FrontEnd, Phone, Prompt, RepNotice,
-};
+pub(crate) use feedback_vocabulary::{Calibrating, Cue, DeviceState, FrontEnd, Prompt, RepNotice};

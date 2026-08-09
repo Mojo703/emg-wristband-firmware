@@ -7,6 +7,7 @@
   import { theme, type ThemeChoice } from './lib/theme.svelte';
   import Icon from './lib/Icon.svelte';
   import DeviceList from './lib/DeviceList.svelte';
+  import PhoneToggle from './lib/PhoneToggle.svelte';
   import StreamMonitor from './lib/StreamMonitor.svelte';
 
   const firstPanel = panels[0]!;
@@ -50,6 +51,7 @@
       <div class="device">
         <DeviceList />
       </div>
+      <PhoneToggle />
       <Tabs.List class="nav">
         {#each panels as panel (panel.id)}
           <Tabs.Trigger value={panel.id} class="nav-item">

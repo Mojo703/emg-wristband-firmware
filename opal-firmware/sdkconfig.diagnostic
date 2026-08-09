@@ -1,0 +1,5 @@
+# Layer after sdkconfig.defaults to expose failures that occur before Rust main.
+CONFIG_ESP_CONSOLE_NONE=n
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_SYSTEM_PANIC_PRINT_REBOOT=y
+CONFIG_ESP_SYSTEM_PANIC_SILENT_REBOOT=n

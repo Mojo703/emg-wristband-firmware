@@ -111,7 +111,10 @@ fn simd_depthwise_matches_scalar_oracle() {
 /// the float path it was quantized from. A bad quantization moves agreement first.
 #[test]
 fn device_forward_pass_matches_float_reference() {
-    let mut model = Model::load(&FIXTURE_BLOB.0);
+    let (mut model, _) = Model::load(
+        &FIXTURE_BLOB.0,
+        emg_runtime::model::ModelBuffers::reserve(&FIXTURE_BLOB.0),
+    );
     let mut batch = VerifyBatch::new(&FIXTURE_BLOB.0);
     let total = batch.total;
     assert!(total > 0, "fixture blob carries no verification windows");

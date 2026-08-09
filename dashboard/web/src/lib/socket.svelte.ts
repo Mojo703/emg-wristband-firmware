@@ -35,6 +35,7 @@ import {
   type OutgoingFrame,
   type AudioSettingsFrame,
   type PlaybackPositionFrame,
+  type PhoneStateFrame,
   type PoseFrame,
   type PredictionFrame,
   type SessionMetadata,
@@ -122,6 +123,7 @@ class LiveStateManager {
   // outlives the run's own cards because it describes the don rather than the
   // run, and a run that ends is still the don the probe measured.
   #calibrationProbe = $state<CalibrationProbeFrame | null>(null);
+  #phoneState = $state<PhoneStateFrame | null>(null);
 
   get hello(): HelloFrame | null {
     return this.status === 'online' ? this.#hello : null;
@@ -163,6 +165,10 @@ class LiveStateManager {
     return this.status === 'online' ? this.#signalQuality : null;
   }
 
+  get phoneState(): PhoneStateFrame | null {
+    return this.status === 'online' ? this.#phoneState : null;
+  }
+
   get emg(): DecodedEmg | null {
     return this.status === 'online' ? this.#emg : null;
   }
@@ -188,6 +194,7 @@ class LiveStateManager {
       this.#calibrationState = null;
       this.#calibrationResult = null;
       this.#calibrationProbe = null;
+      this.#phoneState = null;
     }
     if (this.status === 'handshake') {
       this.status = 'online';
@@ -244,6 +251,10 @@ class LiveStateManager {
 
   setSignalQuality(value: SignalQualityFrame): void {
     this.#signalQuality = value;
+  }
+
+  setPhoneState(value: PhoneStateFrame): void {
+    this.#phoneState = value;
   }
 
   setCatalog(value: CollectionCatalogFrame): void {
@@ -314,6 +325,7 @@ class LiveStateManager {
     this.#calibrationState = null;
     this.#calibrationResult = null;
     this.#calibrationProbe = null;
+    this.#phoneState = null;
     this.logs = [];
     this.fps = 0;
     this.#emgSinceTick = 0;
@@ -333,6 +345,7 @@ class LiveStateManager {
     this.#calibrationState = null;
     this.#calibrationResult = null;
     this.#calibrationProbe = null;
+    this.#phoneState = null;
     this.logs = [];
     this.fps = 0;
     this.#emgSinceTick = 0;
@@ -491,6 +504,8 @@ export function connect(): void {
       live.appendTelemetry(frame);
     } else if (frame.type === 'signal_quality') {
       live.setSignalQuality(frame);
+    } else if (frame.type === 'phone_state') {
+      live.setPhoneState(frame);
     } else if (frame.type === 'collection_catalog') {
       live.setCatalog(frame);
     } else if (frame.type === 'collection_state') {
@@ -517,7 +532,10 @@ export function connect(): void {
   };
 }
 
-function send(frame: OutgoingFrame): void {
+// Commands are deliberately fire-and-forget on the current socket. There is no
+// retained outbox: reconnecting must never replay one-shot intents such as a
+// calibration start into a later device session.
+function sendOneShot(frame: OutgoingFrame): void {
   assertOutgoingFrame(frame);
   if (socket !== null && socket.readyState === WebSocket.OPEN) {
     // Copy to a plain Uint8Array backed by an ArrayBuffer so the DOM WebSocket
@@ -528,26 +546,28 @@ function send(frame: OutgoingFrame): void {
 
 export const api = {
   selectDevice: (deviceId: string) =>
-    send({ type: 'select_device', device_id: deviceId }),
+    sendOneShot({ type: 'select_device', device_id: deviceId }),
   dismissDevice: (deviceId: string) =>
-    send({ type: 'dismiss_device', device_id: deviceId }),
+    sendOneShot({ type: 'dismiss_device', device_id: deviceId }),
   sensitivity: (level: string) =>
-    send({ type: 'set_sensitivity', level }),
+    sendOneShot({ type: 'set_sensitivity', level }),
   keymap: (bindings: readonly Binding[]) =>
-    send({ type: 'set_keymap', bindings }),
+    sendOneShot({ type: 'set_keymap', bindings }),
   wifi: (ssid: string, psk: string) =>
-    send({ type: 'set_wifi', ssid, psk }),
+    sendOneShot({ type: 'set_wifi', ssid, psk }),
   server: (addr: string) =>
-    send({ type: 'set_server', addr }),
+    sendOneShot({ type: 'set_server', addr }),
+  setPhone: (enabled: boolean) =>
+    sendOneShot({ type: 'set_phone', enabled }),
   boardRevision: (deviceId: string, revision: BoardRevision) =>
-    send({ type: 'set_board_revision', device_id: deviceId, revision }),
+    sendOneShot({ type: 'set_board_revision', device_id: deviceId, revision }),
   startCollection: (
     metadata: SessionMetadata,
     trackId: string,
     difficulty: DifficultyLevel,
     recordVideo: boolean,
   ) =>
-    send({
+    sendOneShot({
       type: 'start_collection',
       metadata,
       track_id: trackId,
@@ -557,37 +577,37 @@ export const api = {
   // The three playback intents. The backend plays the audio and owns the
   // timeline, so each of these is a command with nothing to report back.
   startTrack: () =>
-    send({ type: 'start_track' }),
+    sendOneShot({ type: 'start_track' }),
   pauseTrack: () =>
-    send({ type: 'pause_track' }),
+    sendOneShot({ type: 'pause_track' }),
   resumeTrack: () =>
-    send({ type: 'resume_track' }),
+    sendOneShot({ type: 'resume_track' }),
   // Whether this browser needs the raw EMG stream. Sent whenever the visible
   // panel changes, so a session spends its length not shipping sixteen
   // channels to a page that draws none of them.
   setEmgStream: (enabled: boolean) => {
     live.emgStream = enabled;
-    send({ type: 'set_emg_stream', enabled });
+    sendOneShot({ type: 'set_emg_stream', enabled });
   },
   // Both take effect on a running session, not just the next one.
   setAudioVolume: (volumePermille: number) =>
-    send({ type: 'set_audio_volume', volume_permille: Math.round(volumePermille) }),
-  setAudioOutput: (output: string | null) => send({ type: 'set_audio_output', output }),
+    sendOneShot({ type: 'set_audio_volume', volume_permille: Math.round(volumePermille) }),
+  setAudioOutput: (output: string | null) => sendOneShot({ type: 'set_audio_output', output }),
   finishCollection: () =>
-    send({ type: 'finish_collection' }),
+    sendOneShot({ type: 'finish_collection' }),
   stopCollection: (save: boolean) =>
-    send({ type: 'stop_collection', save }),
+    sendOneShot({ type: 'stop_collection', save }),
   capturePlacementPhoto: () =>
-    send({ type: 'capture_placement_photo' }),
+    sendOneShot({ type: 'capture_placement_photo' }),
   // Calibration: the whole of the panel's authority over a run. `scripted_wearer`
   // is always false from a browser — a scripted schedule is the bench host's, and
   // it owns the serial port directly when it drives one.
   startCalibration: () =>
-    send({ type: 'calibration_start', scripted_wearer: false }),
+    sendOneShot({ type: 'calibration_start', scripted_wearer: false }),
   abortCalibration: () =>
-    send({ type: 'calibration_abort' }),
+    sendOneShot({ type: 'calibration_abort' }),
   requestCalibrationRows: (slot: number, firstRow: number, maxRows: number) =>
-    send({
+    sendOneShot({
       type: 'calibration_rows_request',
       slot,
       first_row: firstRow,
@@ -610,6 +630,8 @@ export type {
   CollectionStateFrame,
   NoteResultFrame,
   PlaybackPositionFrame,
+  PhoneStateFrame,
+  PhoneStatus,
   SignalQualityFrame,
   SessionMetadata,
 } from './protocol';

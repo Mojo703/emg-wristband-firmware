@@ -275,6 +275,10 @@ pub(super) struct Ads1298Device {
 }
 
 impl Ads1298Device {
+    pub(super) fn frame_spi_handle(&self) -> esp_idf_svc::sys::spi_device_handle_t {
+        self.frame_spi.device()
+    }
+
     pub(super) fn new(
         command_spi: SpiDevice,
         frame_spi: SpiDevice,
