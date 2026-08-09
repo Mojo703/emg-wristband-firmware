@@ -1335,34 +1335,34 @@ impl Calibration {
         };
         let source = partition.flushed_rows(self.slot);
         let class_count = record.class_count;
-        let mut counts = vec![0u32; class_count];
-        let mut sums = vec![0.0f64; class_count * FEATURE_COUNT];
-        let mut squares = vec![0.0f64; class_count * FEATURE_COUNT];
-        for index in 0..source.len() {
-            let Some((codes, label, _)) = row_at(&source, index) else {
-                continue;
-            };
-            let class = label as usize;
-            if class >= class_count {
-                continue;
-            }
-            counts[class] += 1;
-            for (feature, &code) in codes.iter().enumerate() {
-                let value = code as f64;
-                sums[class * FEATURE_COUNT + feature] += value;
-                squares[class * FEATURE_COUNT + feature] += value * value;
-            }
-        }
         for class in 0..class_count {
-            let count = counts[class] as f64;
+            let mut count = 0u32;
+            let mut sums = [0.0f64; FEATURE_COUNT];
+            let mut squares = [0.0f64; FEATURE_COUNT];
+            for index in 0..source.len() {
+                let Some((codes, label, _)) = row_at(&source, index) else {
+                    continue;
+                };
+                if label as usize != class {
+                    continue;
+                }
+                count += 1;
+                for (feature, &code) in codes.iter().enumerate() {
+                    let value = code as f64;
+                    sums[feature] += value;
+                    squares[feature] += value * value;
+                }
+            }
+            let count = count as f64;
             if count == 0.0 {
                 continue;
             }
             for feature in 0..FEATURE_COUNT {
                 let at = class * FEATURE_COUNT + feature;
-                let mean = sums[at] / count;
+                let mean = sums[feature] / count;
                 record.centroids[at] = mean as f32;
-                record.spreads[at] = ((squares[at] / count - mean * mean).max(0.0) as f32).sqrt();
+                record.spreads[at] =
+                    ((squares[feature] / count - mean * mean).max(0.0) as f32).sqrt();
             }
         }
     }

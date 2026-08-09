@@ -408,6 +408,7 @@ struct AppMemory {
     model_input: I8Activation,
     band_features: Box<WearerFeatures>,
     calibration: CalibrationBuffers,
+    acquisition: adc::acquisition::AcquisitionBuffers,
     reserved_bytes: usize,
 }
 
@@ -420,18 +421,21 @@ impl AppMemory {
         let wearer_bytes = wearer_buffers.reserved_bytes();
         let band_features = Box::new(WearerFeatures::new(wearer_buffers));
         let calibration = CalibrationBuffers::reserve(calibration_flow::Constants::DEFAULT);
+        let acquisition = adc::acquisition::AcquisitionBuffers::reserve(model.input_len);
         let reserved_bytes = model_sizes.padded
             + model_sizes.depthwise
             + model_sizes.pointwise
             + model_sizes.pooled
             + model_sizes.input
             + wearer_bytes
-            + calibration.reserved_bytes();
+            + calibration.reserved_bytes()
+            + acquisition.reserved_bytes();
         Self {
             model,
             model_input,
             band_features,
             calibration,
+            acquisition,
             reserved_bytes,
         }
     }
@@ -478,6 +482,7 @@ impl App {
             model_input,
             mut band_features,
             calibration: calibration_buffers,
+            acquisition: acquisition_buffers,
             ..
         } = memory;
 
@@ -639,7 +644,14 @@ impl App {
             ADC_FRAME_SPI_BAUD_RATE_HZ,
             ADC_TEST_SIGNAL_CHANNEL,
         )
-        .and_then(|front_ends| adc::acquisition::start(front_ends, model.input_len, input_scale));
+        .and_then(|front_ends| {
+            adc::acquisition::start(
+                front_ends,
+                model.input_len,
+                input_scale,
+                acquisition_buffers,
+            )
+        });
         let source = match adc_result {
             Ok(source) => Some(source),
             Err(error) => {

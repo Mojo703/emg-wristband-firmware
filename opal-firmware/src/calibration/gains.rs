@@ -33,6 +33,9 @@ const CHIP_SLOTS: usize = 8;
 /// estimate must project onto the reference the pipeline will actually
 /// subtract, not onto a differently scaled one.
 const REFERENCE_DIVISOR: f32 = 8.0;
+/// Keep software-emulated f64 arithmetic off the 2 kHz sample path. Products
+/// accumulate in f32 for a short block, then fold into the stable f64 totals.
+const ACCUMULATION_BLOCK: u32 = 32;
 
 /// Running projection sums for all sixteen slots.
 #[derive(Debug, Clone)]
@@ -46,6 +49,11 @@ pub(crate) struct GainEstimator {
     value_total: [f64; CHANNEL_COUNT],
     reference_total: [f64; CHANNEL_COUNT],
     instants: u32,
+    block_cross: [f32; CHANNEL_COUNT],
+    block_reference_energy: [f32; CHANNEL_COUNT],
+    block_value_total: [f32; CHANNEL_COUNT],
+    block_reference_total: [f32; CHANNEL_COUNT],
+    block_instants: u32,
     frozen: Option<[f32; CHANNEL_COUNT]>,
 }
 
@@ -57,6 +65,11 @@ impl GainEstimator {
             value_total: [0.0; CHANNEL_COUNT],
             reference_total: [0.0; CHANNEL_COUNT],
             instants: 0,
+            block_cross: [0.0; CHANNEL_COUNT],
+            block_reference_energy: [0.0; CHANNEL_COUNT],
+            block_value_total: [0.0; CHANNEL_COUNT],
+            block_reference_total: [0.0; CHANNEL_COUNT],
+            block_instants: 0,
             frozen: None,
         }
     }
@@ -68,17 +81,35 @@ impl GainEstimator {
             return;
         }
         self.instants += 1;
+        self.block_instants += 1;
         for (chip, values) in microvolts.chunks_exact(CHIP_SLOTS).enumerate() {
             let total: f32 = values.iter().sum();
             for (slot, &value) in values.iter().enumerate() {
                 let reference = (total - value) / REFERENCE_DIVISOR;
                 let index = chip * CHIP_SLOTS + slot;
-                self.cross[index] += (value * reference) as f64;
-                self.reference_energy[index] += (reference * reference) as f64;
-                self.value_total[index] += value as f64;
-                self.reference_total[index] += reference as f64;
+                self.block_cross[index] += value * reference;
+                self.block_reference_energy[index] += reference * reference;
+                self.block_value_total[index] += value;
+                self.block_reference_total[index] += reference;
             }
         }
+        if self.block_instants == ACCUMULATION_BLOCK {
+            self.flush_block();
+        }
+    }
+
+    fn flush_block(&mut self) {
+        for index in 0..CHANNEL_COUNT {
+            self.cross[index] += self.block_cross[index] as f64;
+            self.reference_energy[index] += self.block_reference_energy[index] as f64;
+            self.value_total[index] += self.block_value_total[index] as f64;
+            self.reference_total[index] += self.block_reference_total[index] as f64;
+        }
+        self.block_cross.fill(0.0);
+        self.block_reference_energy.fill(0.0);
+        self.block_value_total.fill(0.0);
+        self.block_reference_total.fill(0.0);
+        self.block_instants = 0;
     }
 
     /// Close the window and keep what it measured.
@@ -93,6 +124,7 @@ impl GainEstimator {
         if let Some(gains) = self.frozen {
             return gains;
         }
+        self.flush_block();
         let instants = self.instants as f64;
         let gains = core::array::from_fn(|index| {
             if instants == 0.0 {
@@ -120,5 +152,34 @@ impl GainEstimator {
 
     pub fn instants(&self) -> u32 {
         self.instants
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn partial_blocks_are_included_when_the_estimate_freezes() {
+        let mut estimator = GainEstimator::new();
+        for instant in 0..(ACCUMULATION_BLOCK + 7) {
+            let t = instant as f32 - 12.0;
+            let values = core::array::from_fn(|slot| {
+                let local_slot = slot % CHIP_SLOTS;
+                (local_slot + 1) as f32 * t + slot as f32 * 0.25
+            });
+            estimator.observe(&values);
+        }
+
+        let gains = estimator.freeze();
+        assert_eq!(estimator.instants(), ACCUMULATION_BLOCK + 7);
+        for (slot, gain) in gains.iter().enumerate() {
+            let slope = (slot % CHIP_SLOTS + 1) as f32;
+            let expected = REFERENCE_DIVISOR * slope / (36.0 - slope);
+            assert!(
+                (gain - expected).abs() < 1e-4,
+                "slot {slot}: {gain} != {expected}"
+            );
+        }
     }
 }

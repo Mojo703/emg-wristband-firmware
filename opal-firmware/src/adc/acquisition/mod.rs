@@ -78,8 +78,16 @@ const EVENT_QUEUE_DEPTH: usize = 64;
 /// reuses pooled buffers and the window path performs no recurring multi-kilobyte
 /// allocation. Each pooled set parks ~24 KB of capacity, and heap headroom (TCP's
 /// link threads need two 8 KB contiguous stacks at dial time) outranks covering the
-/// rare pool miss, which just falls back to a fresh allocation.
+/// rare cold-start pool miss, which falls back to a fresh allocation. A window
+/// rejected by the output queue is reclaimed directly by the combiner instead
+/// of being freed and reallocated; calibration makes that overflow path common
+/// enough for large-buffer churn to fragment the heap.
 const RECYCLE_POOL_DEPTH: usize = 1;
+
+/// Empty chip-frame batches returned from the combiner to each chip pipeline.
+/// One returned batch plus the pipeline's active batch forms a steady double
+/// buffer, removing the two pipelines' ~256 allocations per second.
+const BATCH_RECYCLE_DEPTH: usize = 1;
 
 /// Stack for the combiner thread. The window buffers live on the heap; esp-idf's
 /// default stack is tight and an overflow presents as an unexplained reboot.
@@ -105,12 +113,12 @@ const STEP_DISCONTINUITY_US: u64 = 3 * 1_000_000 / (2 * SAMPLE_RATE_HZ as u64);
 /// The wire stream travels already packed: the raw i16 counts live in a buffer the
 /// combiner owns permanently, and what leaves it is the delta+varint payload
 /// ([`protocol::pack_sample_stream`]) that goes onto the wire verbatim — sized
-/// exactly, allocated once, and freed when the frame has been sent. The conditioned
-/// model input rides alongside because the conditioning is stateful and not
-/// invertible; its buffer returns to the combiner through the recycle pool rather
-/// than being reallocated per window. Both choices serve the same constraint: the
-/// device heap's out-of-memory margin is spent on multi-kilobyte transients, so a
-/// window contributes exactly one — its packed payload, which *is* the product.
+/// exactly, allocated once, and returned for reuse after the frame has been sent.
+/// The conditioned model input rides alongside because the conditioning is stateful
+/// and not invertible; its buffer returns through the recycle pool rather than being
+/// reallocated per window. Both choices serve the same constraint: the
+/// device heap's out-of-memory margin is spent on multi-kilobyte buffers, so both
+/// allocations cycle through the bounded queue and recycle paths rather than churn.
 pub(crate) struct AcquiredWindow {
     /// Device-clock microseconds at the first time step of this window. This is the
     /// window's place on the real timeline — *not* a count of windows times a
@@ -129,6 +137,42 @@ pub(crate) struct AcquiredWindow {
     /// the wire stream from measurements. The model input needs no equivalent:
     /// zero already means "no signal" there.
     pub(crate) missing: Vec<u8>,
+}
+
+/// All large acquisition buffers, reserved while the boot heap is still whole.
+/// The live path may move these buffers between threads but never creates a
+/// replacement: if backpressure withholds the spare set, that window is dropped.
+pub(crate) struct AcquisitionBuffers {
+    building: Vec<i8>,
+    next_building: Vec<i8>,
+    building_wire: Vec<i16>,
+    packed_wire: Vec<u8>,
+    building_missing: Vec<u8>,
+    next_missing: Vec<u8>,
+}
+
+impl AcquisitionBuffers {
+    pub(crate) fn reserve(window_length: usize) -> Self {
+        let samples_per_window = window_length * INPUT_CH;
+        let missing_mask_len = DEVICE_COUNT * protocol::missing_plane_stride(window_length);
+        Self {
+            building: Vec::with_capacity(samples_per_window),
+            next_building: Vec::with_capacity(samples_per_window),
+            building_wire: Vec::with_capacity(samples_per_window),
+            packed_wire: Vec::with_capacity(protocol::max_packed_sample_bytes(samples_per_window)),
+            building_missing: vec![0; missing_mask_len],
+            next_missing: vec![0; missing_mask_len],
+        }
+    }
+
+    pub(crate) fn reserved_bytes(&self) -> usize {
+        self.building.capacity()
+            + self.next_building.capacity()
+            + self.building_wire.capacity() * core::mem::size_of::<i16>()
+            + self.packed_wire.capacity()
+            + self.building_missing.capacity()
+            + self.next_missing.capacity()
+    }
 }
 
 /// Health totals across the front end. These outlive any single window, so they sit
@@ -287,9 +331,19 @@ pub(crate) fn start(
     front_ends: FrontEnds,
     window_length: usize,
     input_scale: f32,
+    buffers: AcquisitionBuffers,
 ) -> Result<AdcSource> {
     let (window_sender, windows) = sync_channel::<AcquiredWindow>(WINDOW_QUEUE_DEPTH);
     let (event_sender, events) = sync_channel::<(usize, ChipEvent)>(EVENT_QUEUE_DEPTH);
+    let (chip0_batch_sender, chip0_batches) = sync_channel(BATCH_RECYCLE_DEPTH);
+    let (chip1_batch_sender, chip1_batches) = sync_channel(BATCH_RECYCLE_DEPTH);
+    for sender in [&chip0_batch_sender, &chip1_batch_sender] {
+        sender
+            .try_send(Vec::with_capacity(pipeline::FRAMES_PER_BATCH))
+            .expect("a new batch recycler has room for its initial spare");
+    }
+    let batch_senders = [chip0_batch_sender, chip1_batch_sender];
+    let mut batch_receivers = [Some(chip0_batches), Some(chip1_batches)];
     let (recycle_sender, recycled) =
         sync_channel::<(Vec<i8>, Vec<u8>, Vec<u8>)>(RECYCLE_POOL_DEPTH);
     let counters = Arc::new(HealthCounters::default());
@@ -305,13 +359,17 @@ pub(crate) fn start(
         .zip(power_down)
         .zip(Board::ALL)
     {
+        let index = board.device_index();
         pipeline::spawn(
-            board.device_index(),
+            index,
             crate::cores::front_end_core(board),
             chip,
             reader,
             power_down,
             event_sender.clone(),
+            batch_receivers[index]
+                .take()
+                .expect("each chip owns one batch recycler"),
             counters.clone(),
         )?;
     }
@@ -327,11 +385,13 @@ pub(crate) fn start(
                 info!("combiner running");
                 combine(
                     events,
+                    batch_senders,
                     window_sender,
                     recycled,
                     combiner_counters,
                     window_length,
                     input_scale,
+                    buffers,
                 );
             })
     })??;
@@ -349,25 +409,33 @@ pub(crate) fn start(
 /// window send disconnects).
 fn combine(
     events: Receiver<(usize, ChipEvent)>,
+    batch_recyclers: [SyncSender<Vec<(u64, Sample)>>; DEVICE_COUNT],
     windows: SyncSender<AcquiredWindow>,
     recycled: Receiver<(Vec<i8>, Vec<u8>, Vec<u8>)>,
     counters: Arc<HealthCounters>,
     window_length: usize,
     input_scale: f32,
+    buffers: AcquisitionBuffers,
 ) {
     let samples_per_window = window_length * INPUT_CH;
     let mut aligner = GridAligner::<Sample, DEVICE_COUNT>::new(SAMPLE_RATE_HZ);
     // Owned here rather than shared: the conditioning carries per-channel filter
     // state across time steps, and this thread is the only writer.
     let mut input_stage = InputStage::new(input_scale, SAMPLE_RATE_HZ as f32);
-    let mut building: Vec<i8> = Vec::with_capacity(samples_per_window);
+    let AcquisitionBuffers {
+        mut building,
+        next_building,
+        mut building_wire,
+        packed_wire,
+        mut building_missing,
+        next_missing,
+    } = buffers;
     // The wire stream, filled in lockstep with `building`; the two are always the
     // same length and are cleared together.
-    let mut building_wire: Vec<i16> = Vec::with_capacity(samples_per_window);
     // The window's missing-mask bit planes (`Frame::Emg::missing`), set in
     // lockstep with the buffers above and zeroed whenever they are cleared.
     let missing_mask_len = DEVICE_COUNT * protocol::missing_plane_stride(window_length);
-    let mut building_missing: Vec<u8> = vec![0u8; missing_mask_len];
+    let mut spare_buffers = Some((next_building, packed_wire, next_missing));
     // Device-clock time of the first time step in `building`; stamped when the
     // first step lands, cleared with the buffer.
     let mut building_started_us: u64 = 0;
@@ -398,9 +466,12 @@ fn combine(
                 building_missing.fill(0);
             }
             ChipEvent::Frames(frames) => {
-                for (at_us, frame) in frames {
+                for &(at_us, frame) in &frames {
                     aligner.push(chip, at_us, frame);
                 }
+                let mut frames = frames;
+                frames.clear();
+                let _ = batch_recyclers[chip].try_send(frames);
                 while let Some(step) = aligner.poll() {
                     // Skipped ticks mean the emitted timeline has a hole (every
                     // present source gapped at once); a window must not span it.
@@ -428,16 +499,18 @@ fn combine(
 
                     if building.len() >= samples_per_window {
                         // Both outgoing buffers cycle through the pool: whatever the
-                        // main loop has returned is reused, and only an empty pool
-                        // (cold start, or a dropped window) costs fresh allocations.
-                        let (mut next_building, mut packed_wire, mut next_missing) =
-                            recycled.try_recv().unwrap_or_else(|_| {
-                                (
-                                    Vec::with_capacity(samples_per_window),
-                                    Vec::new(),
-                                    Vec::new(),
-                                )
-                            });
+                        // main loop has returned is reused. A rejected output is
+                        // reclaimed locally; only cold start costs fresh allocations.
+                        let available = spare_buffers.take().or_else(|| recycled.try_recv().ok());
+                        let Some((mut next_building, mut packed_wire, mut next_missing)) =
+                            available
+                        else {
+                            counters.dropped.fetch_add(1, Ordering::Relaxed);
+                            building.clear();
+                            building_wire.clear();
+                            building_missing.fill(0);
+                            continue;
+                        };
                         next_building.clear();
                         next_missing.clear();
                         next_missing.resize(missing_mask_len, 0);
@@ -461,8 +534,10 @@ fn combine(
                         };
                         match windows.try_send(full) {
                             Ok(()) => {}
-                            Err(TrySendError::Full(_)) => {
+                            Err(TrySendError::Full(window)) => {
                                 counters.dropped.fetch_add(1, Ordering::Relaxed);
+                                spare_buffers =
+                                    Some((window.samples, window.packed_wire, window.missing));
                             }
                             Err(TrySendError::Disconnected(_)) => {
                                 // The main loop is gone, so there is nobody left

@@ -187,12 +187,6 @@ fn read_features(bytes: &[u8], offset: usize) -> [f32; FEATURE_COUNT] {
     out
 }
 
-fn write_f32s(image: &mut Vec<u8>, values: &[f32]) {
-    for value in values {
-        image.extend_from_slice(&value.to_le_bytes());
-    }
-}
-
 /// Which statistics standardize the live rows. V's first experiment; recorded
 /// in the image so a device can say which recipe it is running.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -388,25 +382,130 @@ impl SlotRecord {
     /// one aligned write and the CRC covers a fixed prefix.
     pub fn to_metadata_block(&self, live_row_count: usize) -> Vec<u8> {
         let mut image = Vec::with_capacity(SLOT_ROWS_OFFSET);
-        image.extend_from_slice(&SLOT_MAGIC);
-        image.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
-        image.extend_from_slice(&self.sequence.to_le_bytes());
-        image.extend_from_slice(&self.prior_hash.to_le_bytes());
-        image.extend_from_slice(&(self.class_count as u32).to_le_bytes());
-        image.extend_from_slice(&(live_row_count as u32).to_le_bytes());
-        image.extend_from_slice(&(ROW_STRIDE as u32).to_le_bytes());
-        image.extend_from_slice(&(covered_bytes(live_row_count) as u32).to_le_bytes());
-        image.extend_from_slice(&0u32.to_le_bytes()); // flags
-        image.resize(HEADER_BYTES, 0);
-        write_f32s(&mut image, &self.reference_gains);
-        write_f32s(&mut image, &self.centroids);
-        write_f32s(&mut image, &self.spreads);
-        write_f32s(&mut image, &self.mean);
-        write_f32s(&mut image, &self.deviation);
-        write_f32s(&mut image, &self.weights);
-        debug_assert_eq!(image.len(), slot_metadata_bytes(self.class_count));
-        image.resize(SLOT_ROWS_OFFSET, 0);
+        let result: Result<(), core::convert::Infallible> =
+            self.write_metadata_chunks(live_row_count, |_, chunk| {
+                image.extend_from_slice(chunk);
+                Ok(())
+            });
+        match result {
+            Ok(()) => {}
+            Err(never) => match never {},
+        }
         image
+    }
+
+    /// Emit the fixed metadata image in small chunks without allocating the
+    /// 12 KiB block. Offsets are relative to the start of the slot.
+    pub fn write_metadata_chunks<E>(
+        &self,
+        live_row_count: usize,
+        mut emit: impl FnMut(usize, &[u8]) -> Result<(), E>,
+    ) -> Result<(), E> {
+        const CHUNK_BYTES: usize = 512;
+
+        fn push<E>(
+            mut bytes: &[u8],
+            chunk: &mut [u8; CHUNK_BYTES],
+            used: &mut usize,
+            offset: &mut usize,
+            emit: &mut impl FnMut(usize, &[u8]) -> Result<(), E>,
+        ) -> Result<(), E> {
+            while !bytes.is_empty() {
+                let count = bytes.len().min(CHUNK_BYTES - *used);
+                chunk[*used..*used + count].copy_from_slice(&bytes[..count]);
+                *used += count;
+                bytes = &bytes[count..];
+                if *used == CHUNK_BYTES {
+                    emit(*offset, chunk)?;
+                    *offset += CHUNK_BYTES;
+                    *used = 0;
+                }
+            }
+            Ok(())
+        }
+
+        fn push_f32s<E>(
+            values: &[f32],
+            chunk: &mut [u8; CHUNK_BYTES],
+            used: &mut usize,
+            offset: &mut usize,
+            emit: &mut impl FnMut(usize, &[u8]) -> Result<(), E>,
+        ) -> Result<(), E> {
+            for value in values {
+                push(&value.to_le_bytes(), chunk, used, offset, emit)?;
+            }
+            Ok(())
+        }
+
+        let mut chunk = [0u8; CHUNK_BYTES];
+        let zeroes = [0u8; CHUNK_BYTES];
+        let mut used = 0;
+        let mut offset = 0;
+        push(&SLOT_MAGIC, &mut chunk, &mut used, &mut offset, &mut emit)?;
+        for word in [
+            FORMAT_VERSION,
+            self.sequence,
+            self.prior_hash,
+            self.class_count as u32,
+            live_row_count as u32,
+            ROW_STRIDE as u32,
+            covered_bytes(live_row_count) as u32,
+            0,
+        ] {
+            push(
+                &word.to_le_bytes(),
+                &mut chunk,
+                &mut used,
+                &mut offset,
+                &mut emit,
+            )?;
+        }
+        let header_written = offset + used;
+        push(
+            &zeroes[..HEADER_BYTES - header_written],
+            &mut chunk,
+            &mut used,
+            &mut offset,
+            &mut emit,
+        )?;
+        push_f32s(
+            &self.reference_gains,
+            &mut chunk,
+            &mut used,
+            &mut offset,
+            &mut emit,
+        )?;
+        push_f32s(
+            &self.centroids,
+            &mut chunk,
+            &mut used,
+            &mut offset,
+            &mut emit,
+        )?;
+        push_f32s(&self.spreads, &mut chunk, &mut used, &mut offset, &mut emit)?;
+        push_f32s(&self.mean, &mut chunk, &mut used, &mut offset, &mut emit)?;
+        push_f32s(
+            &self.deviation,
+            &mut chunk,
+            &mut used,
+            &mut offset,
+            &mut emit,
+        )?;
+        push_f32s(&self.weights, &mut chunk, &mut used, &mut offset, &mut emit)?;
+        debug_assert_eq!(offset + used, slot_metadata_bytes(self.class_count));
+        while offset + used < SLOT_ROWS_OFFSET {
+            let count = (SLOT_ROWS_OFFSET - offset - used).min(CHUNK_BYTES);
+            push(
+                &zeroes[..count],
+                &mut chunk,
+                &mut used,
+                &mut offset,
+                &mut emit,
+            )?;
+        }
+        debug_assert_eq!(used, 0);
+        debug_assert_eq!(offset, SLOT_ROWS_OFFSET);
+        Ok(())
     }
 }
 
@@ -546,6 +645,12 @@ pub fn next_sequence(sequences: [Option<u32>; SLOT_COUNT]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_f32s(image: &mut Vec<u8>, values: &[f32]) {
+        for value in values {
+            image.extend_from_slice(&value.to_le_bytes());
+        }
+    }
 
     fn prior_bytes(class_count: usize, row_count: usize) -> Vec<u8> {
         let mut image = Vec::with_capacity(PRIOR_ROWS_OFFSET + row_count * ROW_STRIDE);

@@ -491,11 +491,23 @@ impl CalibrationPartition {
                 self.flushed[index]
             );
         }
-        let metadata = record.to_metadata_block(live_row_count);
         let at = SLOT_OFFSETS[index];
-        let mut elapsed = self
-            .write(at, &metadata)
-            .with_context(|| format!("write calibration slot {index} metadata"))?;
+        self.close();
+        let started = crate::device_now_us();
+        let partition = self.partition;
+        let write_result = record.write_metadata_chunks(live_row_count, |offset, chunk| {
+            EspError::convert(unsafe {
+                esp_idf_svc::sys::esp_partition_write(
+                    partition,
+                    at + offset,
+                    chunk.as_ptr().cast(),
+                    chunk.len(),
+                )
+            })
+        });
+        let mut elapsed = (crate::device_now_us() - started) as u32;
+        self.open()?;
+        write_result.with_context(|| format!("write calibration slot {index} metadata"))?;
 
         let covered = flash_image::covered_bytes(live_row_count);
         let crc = {

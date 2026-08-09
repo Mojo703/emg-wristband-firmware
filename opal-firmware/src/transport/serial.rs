@@ -108,6 +108,12 @@ struct SerialWriter<'a>(&'a mut UsbSerialDriver<'static>);
 impl Write for SerialWriter<'_> {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         let chunk_len = bytes.len().min(SERIAL_WRITE_CHUNK_BYTES);
+        // A window spans several bounded writes. Feed between chunks so their
+        // aggregate time cannot trip the watchdog; one hung call still can.
+        // SAFETY: serial sends run on the registered main task.
+        unsafe {
+            esp_idf_svc::sys::esp_task_wdt_reset();
+        }
         let written = self
             .0
             .write(

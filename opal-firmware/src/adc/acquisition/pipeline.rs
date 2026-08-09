@@ -28,7 +28,7 @@ use esp_idf_svc::hal::delay::FreeRtos;
 use esp_idf_svc::hal::gpio::{Output, PinDriver};
 use log::{info, warn};
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::SyncSender;
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError};
 use std::sync::Arc;
 
 use crate::device_now_us as now_us;
@@ -56,7 +56,7 @@ const THREAD_PRIORITY: u8 = 10;
 /// Frames per batch handed to the combiner: 16 frames is ~8 ms of latency against a
 /// ~250 ms window, and it cuts the cross-thread handoff from ~2 kHz per chip to
 /// ~128 Hz.
-const FRAMES_PER_BATCH: usize = 16;
+pub(super) const FRAMES_PER_BATCH: usize = 16;
 
 /// How long the thread sleeps between drains. At the ~2 kHz conversion rate each
 /// wake finds about two frames, so the batch above still fills in ~8 ms. Sleeping
@@ -261,6 +261,7 @@ struct Pipeline {
     reader: FrameReader,
     chip: Ads1298FrontEnd,
     events: SyncSender<(usize, ChipEvent)>,
+    recycled_batches: Receiver<Vec<(u64, Sample)>>,
     counters: Arc<HealthCounters>,
     /// Device-clock time the last frame was drained. Seeded with the thread's
     /// start so a chip that never produces a first frame is declared dead by the
@@ -286,6 +287,9 @@ struct Pipeline {
     /// Interrupt-side read faults already folded into
     /// [`HealthCounters::read_errors`], so only the new ones are added.
     reported_read_faults: u32,
+    /// Frames discarded because the combiner still owns every spare batch.
+    /// Backpressure costs signal, never a heap allocation in this hot path.
+    backpressure_dropped_frames: u32,
 }
 
 /// This chip's pipeline must end: either the combiner hung up and there is
@@ -306,7 +310,19 @@ impl Pipeline {
         if self.batch.is_empty() {
             return Ok(());
         }
-        let batch = std::mem::replace(&mut self.batch, Vec::with_capacity(FRAMES_PER_BATCH));
+        let mut next = match self.recycled_batches.try_recv() {
+            Ok(batch) => batch,
+            Err(TryRecvError::Empty) => {
+                self.backpressure_dropped_frames = self
+                    .backpressure_dropped_frames
+                    .saturating_add(self.batch.len() as u32);
+                self.batch.clear();
+                return Ok(());
+            }
+            Err(TryRecvError::Disconnected) => return Err(PipelineStopped),
+        };
+        next.clear();
+        let batch = std::mem::replace(&mut self.batch, next);
         self.send(ChipEvent::Frames(batch))
     }
 
@@ -512,6 +528,10 @@ impl Pipeline {
             // Frames the interrupt read and this thread had no room for. Zero is
             // the only acceptable value; it is reported so that stays checkable.
             metric("frame_ring_overrun_count", interrupt.overruns as f64),
+            metric(
+                "batch_backpressure_dropped_frames",
+                self.backpressure_dropped_frames as f64,
+            ),
             metric("frame_read_fault_count", interrupt.read_faults as f64),
             metric("bad_status", self.bad_status as f64),
             metric(
@@ -622,6 +642,7 @@ pub(super) fn spawn(
     reader: FrameReader,
     power_down: PinDriver<'static, Output>,
     events: SyncSender<(usize, ChipEvent)>,
+    recycled_batches: Receiver<Vec<(u64, Sample)>>,
     counters: Arc<HealthCounters>,
 ) -> anyhow::Result<()> {
     crate::cores::spawn_pinned(core, || {
@@ -637,6 +658,7 @@ pub(super) fn spawn(
                     chip,
                     reader,
                     events,
+                    recycled_batches,
                     counters,
                     last_frame_us: started_us,
                     settling_until_us: started_us + COLD_START_SETTLE_US,
@@ -648,6 +670,7 @@ pub(super) fn spawn(
                     announced_present: false,
                     bad_status: 0,
                     reported_read_faults: 0,
+                    backpressure_dropped_frames: 0,
                     batch: Vec::with_capacity(FRAMES_PER_BATCH),
                 }
                 .run();
