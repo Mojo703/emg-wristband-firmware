@@ -4,9 +4,10 @@
 //! default `stdin` over that link does not deliver bytes, so we install the
 //! USB-Serial-JTAG driver and read from it directly.
 //!
-//! For bring-up the media keys are driven by single characters typed into the
-//! serial monitor. Later the gesture classifier produces [`MediaKey`]s directly
-//! and this module can be dropped or kept as a debug input.
+//! The toggle and the media keys are single characters typed into the serial
+//! monitor. On the wearer firmware the dashboard button and the gesture
+//! classifier drive the same state machine, and this module has no counterpart
+//! there.
 
 use core::ffi::c_void;
 
@@ -14,7 +15,8 @@ use anyhow::Result;
 use esp_idf_svc::sys;
 
 /// One-line usage shown at boot and on `h`/`?`.
-pub const HELP: &str = "keys: p=play/pause  n=next  b=back  +=vol up  -=vol down  m=mute  h=help";
+pub const HELP: &str = "keys: e=phone on  d=phone off  p=play/pause  n=next  b=back  \
+                        +=vol up  -=vol down  m=mute  h=help";
 
 /// Install the USB-Serial-JTAG driver so [`read_byte`] receives console input.
 /// Must be called once before reading.
@@ -36,7 +38,7 @@ pub fn init() -> Result<()> {
 ///
 /// A FreeRTOS tick is 1 ms here (`CONFIG_FREERTOS_HZ=1000`), so `timeout_ms`
 /// doubles as the tick count.
-pub(crate) fn read_byte_blocking(timeout_ms: u32) -> Option<u8> {
+pub fn read_byte_blocking(timeout_ms: u32) -> Option<u8> {
     let mut byte = 0u8;
     let read = unsafe {
         sys::usb_serial_jtag_read_bytes(&mut byte as *mut u8 as *mut c_void, 1, timeout_ms)

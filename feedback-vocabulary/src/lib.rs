@@ -21,7 +21,7 @@
 extern crate alloc;
 
 use drv2605l::{LibraryEffect, SequenceStep};
-use protocol::{CalibrationGesture, CalibrationPhase, MediaKey};
+use protocol::{CalibrationGesture, CalibrationPhase, MediaKey, PhoneStatus};
 
 /// Which link is carrying the stream, as far as anything facing the wearer cares.
 ///
@@ -157,6 +157,16 @@ impl Color {
     /// colour they have never seen it wear.
     pub const CYAN: Self = Self::new(0, 255, 255);
     pub const VIOLET: Self = Self::new(160, 0, 255);
+    /// Phone mode's hue, and nothing else's — the same trick [`Self::CYAN`] plays
+    /// for calibration: a hue with no prior meaning is what lets a wearer read
+    /// "the band is talking to my phone" off a colour they have never seen it wear.
+    ///
+    /// Red-dominant on purpose. True magenta would put blue at full and sit on top
+    /// of [`Self::VIOLET`] on a diffused pixel; holding blue near half keeps the
+    /// two apart while staying clear of [`Self::RED`], which has no blue at all.
+    /// This is the tightest pair in the palette and the one worth confirming on a
+    /// real pixel rather than in a hex triple.
+    pub const MAGENTA: Self = Self::new(255, 0, 144);
 
     pub const fn new(red: u8, green: u8, blue: u8) -> Self {
         Self { red, green, blue }
@@ -174,6 +184,50 @@ pub enum FrontEnd {
     Failed,
     /// Came up, then went quiet. Recoverable.
     Stalled,
+}
+
+/// What the phone radio is doing, as far as the wearer is concerned.
+///
+/// A projection of [`protocol::PhoneStatus`], not a second copy of it. The wire
+/// carries six states because a panel has room to explain them; the band has one
+/// pixel and one motor, and three of the six are the same news to a wearer.
+/// `Dormant` and `Standby` both mean *not advertising* and differ only in whether
+/// the toggle has ever been pressed — history, which a light cannot show and a
+/// wearer cannot act on. `Connecting` is "not usable yet", which is what waiting
+/// already means, because a half-open link silently discards media keys.
+///
+/// None of the off states is a claim about memory: the stack is resident from boot
+/// whatever the toggle says, so that its one large allocation lands on a fresh heap
+/// rather than at a button press after hours of fragmentation. Which is to say the
+/// three off-ish states differ by *why*, never by *what the band can do* — so the
+/// band shows one thing and the panel explains it.
+///
+/// The collapse lives in the [`From`] impl below rather than at the call site, so
+/// the firmware cannot render a state this vocabulary never decided how to show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phone {
+    /// Not advertising: never asked for, or asked for and switched back off. The
+    /// band says nothing about a radio that is not listening for anyone.
+    Off,
+    /// Enabled and waiting: advertising with no phone yet, or one part-way through
+    /// pairing. Either way no gesture is reaching anybody.
+    Listening,
+    /// A phone is bonded and encrypted. Commits reach it.
+    Paired,
+    /// Enabling was asked for and the radio refused. Distinct from [`Self::Off`]
+    /// because the wearer asked and did not get it; the panel carries the reason.
+    Unavailable,
+}
+
+impl From<&PhoneStatus> for Phone {
+    fn from(status: &PhoneStatus) -> Self {
+        match status {
+            PhoneStatus::Dormant | PhoneStatus::Standby => Phone::Off,
+            PhoneStatus::Advertising | PhoneStatus::Connecting => Phone::Listening,
+            PhoneStatus::Paired => Phone::Paired,
+            PhoneStatus::Unavailable { .. } => Phone::Unavailable,
+        }
+    }
 }
 
 /// Everything the outputs react to, as one value. The serve loop posts it every
@@ -194,6 +248,10 @@ pub struct DeviceState {
     /// under way. Present as a level like everything else here: the state machine
     /// posts where it is, and the edges between two of those are worked out below.
     pub calibration: Option<Calibrating>,
+    /// Whether a phone is receiving this wearer's gestures. A plain value rather
+    /// than an `Option`: [`Phone::Off`] is a real answer and the common one, and
+    /// giving it a variant keeps "switched off" from reading like "not known".
+    pub phone: Phone,
 }
 
 /// A calibration run's contribution to what the wearer should be told.
@@ -239,15 +297,25 @@ impl DeviceState {
         committed: None,
         config_generation: 0,
         calibration: None,
+        phone: Phone::Off,
     };
 
     /// The one cue worth playing for the change from `previous`, if any.
     ///
-    /// Only one: there is a single motor and a single LED. The order is what a wearer
-    /// needs first — the front end outranks calibration, which outranks the link,
-    /// which outranks the last gesture. Calibration sits there because a wearer
-    /// mid-run is being asked to do something on the device's schedule, and a link
-    /// coming and going is not a reason to interrupt that.
+    /// Only one: there is a single motor and a single LED. The order is what a
+    /// wearer needs first — the front end outranks calibration, which outranks the
+    /// phone, which outranks the link, which outranks the last gesture.
+    /// Calibration sits above both radios because a wearer mid-run is being asked
+    /// to do something on the device's schedule, and neither a link nor a phone
+    /// arriving is a reason to interrupt that — commits are suppressed for the
+    /// whole run, so a phone that just paired can do nothing until it ends.
+    ///
+    /// The phone sits above the dashboard link because of who is waiting on it.
+    /// Pairing is a thing the wearer does with their hands and then stands there
+    /// expecting; a dashboard link coming up is something that happens near them.
+    /// [`ActiveLink`] says a wearer only ever has wifi and cannot act on knowing
+    /// which link is carrying the stream — the phone is the opposite, and it is
+    /// the one that decides whether their gestures reach their music.
     pub fn transition_from(&self, previous: Self) -> Option<Cue> {
         if self.front_end != previous.front_end {
             match self.front_end {
@@ -260,6 +328,9 @@ impl DeviceState {
             }
         }
         if let Some(cue) = self.calibration_transition_from(previous.calibration) {
+            return Some(cue);
+        }
+        if let Some(cue) = self.phone_transition_from(previous.phone) {
             return Some(cue);
         }
         // Connected or not, rather than which link: cueing a bench handover would
@@ -326,6 +397,42 @@ impl DeviceState {
         None
     }
 
+    /// The cue for the phone radio's move from `previous`.
+    ///
+    /// Losing a phone and opening the window both end at [`Phone::Listening`], and
+    /// they get different cues on purpose: afterwards the device is doing the same
+    /// thing, but "your phone went away" is news and "I am waiting for one" is an
+    /// answer to something the wearer just asked for. The motor carries that; the
+    /// light does not, because what a wearer does about either is identical.
+    ///
+    /// Switching off is never cued. The wearer did it deliberately from a panel
+    /// that already says so, and the indicator handing the light back to the link
+    /// is the confirmation.
+    fn phone_transition_from(&self, previous: Phone) -> Option<Cue> {
+        if self.phone == previous {
+            return None;
+        }
+        match (previous, self.phone) {
+            (_, Phone::Off) => None,
+            (Phone::Paired, Phone::Listening) => Some(Cue::PhoneLost),
+            (_, Phone::Listening) => Some(Cue::PhoneListening),
+            (_, Phone::Paired) => Some(Cue::PhonePaired),
+            (_, Phone::Unavailable) => Some(Cue::PhoneUnavailable),
+        }
+    }
+
+    /// Whether the phone is what the indicator is currently reporting.
+    ///
+    /// Checked in one place because the colour and the shape both read it and a
+    /// disagreement between them would be a cue in its own right: a cyan stutter
+    /// is "that rep did not count", so a phone waiting to pair during a
+    /// calibration must not be allowed to stutter the run's own hue.
+    fn phone_owns_indicator(&self) -> bool {
+        matches!(self.front_end, FrontEnd::Running)
+            && !self.is_calibrating()
+            && matches!(self.phone, Phone::Listening | Phone::Paired)
+    }
+
     /// Whether a calibration run is under way, which is what the indicator holds
     /// its own level for.
     pub fn is_calibrating(&self) -> bool {
@@ -361,28 +468,41 @@ impl DeviceState {
 
     /// A healthy device breathes, a broken one blinks — so a fault reads as one
     /// across a room, without resolving the colour.
+    ///
+    /// A phone that has not arrived yet stutters instead. Waiting and paired share
+    /// a hue, so the shape is the only thing left to carry the difference, and it
+    /// is the difference the wearer is standing there watching for. Guarded by
+    /// [`Self::phone_owns_indicator`] so the stutter can never land on a colour
+    /// that already means something else with it.
     pub fn indicator_shape(&self) -> Shape {
         if self.needs_attention() {
             Shape::Snap
+        } else if self.phone_owns_indicator() && matches!(self.phone, Phone::Listening) {
+            Shape::Stutter
         } else {
             Shape::Swell
         }
     }
 
-    /// Health outranks calibration outranks the link: a dead front end is not
-    /// helped by being told the wifi is fine, and neither is a wearer halfway
-    /// through a calibration — the run continues standalone when the link drops,
-    /// so a colour change there would report something they cannot act on and
-    /// hide the thing they can.
+    /// Health outranks calibration outranks the phone outranks the link: a dead
+    /// front end is not helped by being told the wifi is fine, and neither is a
+    /// wearer halfway through a calibration — the run continues standalone when the
+    /// link drops, so a colour change there would report something they cannot act
+    /// on and hide the thing they can.
     ///
-    /// This is a deliberate change to what the indicator ranked before, and the
-    /// only one: calibration was inserted between the two, and health kept the
-    /// top.
+    /// The phone sits above the link for the same reason it does among the cues,
+    /// and more so on a held level than on an edge: in phone mode the dashboard
+    /// link is a bench fact, while whether a phone is listening is the whole of
+    /// what the band is for. [`Phone::Off`] and [`Phone::Unavailable`] hold no
+    /// level at all — both mean "no phone here", the light says that by showing
+    /// the link instead, and which of the two it is belongs on the panel that
+    /// asked.
     pub fn indicator_color(&self) -> Color {
         match self.front_end {
             FrontEnd::Starting => Color::WHITE,
             FrontEnd::Failed | FrontEnd::Stalled => Color::RED,
             FrontEnd::Running if self.is_calibrating() => Color::CYAN,
+            FrontEnd::Running if self.phone_owns_indicator() => Color::MAGENTA,
             FrontEnd::Running if self.link.is_connected() => Color::BLUE,
             FrontEnd::Running => Color::AMBER,
         }
@@ -406,6 +526,14 @@ pub enum Cue {
     RepRejected,
     GestureFailed(CalibrationGesture),
     CalibrationComplete,
+    /// The pairing window is open and nothing has taken it.
+    PhoneListening,
+    /// A phone is bonded; gestures reach it from here.
+    PhonePaired,
+    /// The phone that had it is gone, and the window is open again.
+    PhoneLost,
+    /// The radio would not start. Not a hardware fault — the band still does EMG.
+    PhoneUnavailable,
 }
 
 impl Cue {
@@ -504,6 +632,44 @@ impl Cue {
                 flash: Some(Color::GREEN),
                 shape: Shape::Swell,
             },
+
+            // The phone, in one hue, the same way calibration is — and for the
+            // same reason: it is a mode the wearer is inside rather than a thing
+            // that happened. The shape says which of three moments this is, and
+            // the rhythms are the only place in this vocabulary that mix a click
+            // with a tick, so nothing about a phone can be confused for a command
+            // (clicks or ticks alone) or for a calibration (bump-led).
+            Cue::PhoneListening => CueResponse {
+                haptic: Some(patterns::TICK_THEN_CLICK),
+                flash: Some(Color::MAGENTA),
+                shape: Shape::Swell,
+            },
+            // A snap, because unlike the rest of this family it happened at an
+            // instant: the wearer was waiting and now they are not.
+            Cue::PhonePaired => CueResponse {
+                haptic: Some(patterns::CLICK_TICK_CLICK),
+                flash: Some(Color::MAGENTA),
+                shape: Shape::Snap,
+            },
+            // The reverse of the rhythm that opened the window, the way
+            // `CLICK_THEN_BUMP` reverses `BUMP_THEN_CLICK` to bookend a run. Same
+            // look as listening: both leave the wearer waiting on a phone, and
+            // what they do about it is identical.
+            Cue::PhoneLost => CueResponse {
+                haptic: Some(patterns::CLICK_THEN_TICK),
+                flash: Some(Color::MAGENTA),
+                shape: Shape::Swell,
+            },
+            // No buzz, like `ConfigChanged` and for the same reason: the wearer
+            // pressed a button on a panel and is looking at it, and the panel
+            // carries the reason a radio would not start. The blink is for when
+            // they are looking at the band. A stutter because that is already what
+            // "that did not take" reads as here.
+            Cue::PhoneUnavailable => CueResponse {
+                haptic: None,
+                flash: Some(Color::MAGENTA),
+                shape: Shape::Stutter,
+            },
         }
     }
 
@@ -519,6 +685,16 @@ impl Cue {
                 | Cue::RepRejected
                 | Cue::GestureFailed(_)
                 | Cue::CalibrationComplete
+        )
+    }
+
+    /// Whether this cue is about the phone radio. The collision tests use it the
+    /// same way they use [`Self::is_calibration`]: to hold one family to its own
+    /// rules rather than restating the list.
+    pub fn is_phone(self) -> bool {
+        matches!(
+            self,
+            Cue::PhoneListening | Cue::PhonePaired | Cue::PhoneLost | Cue::PhoneUnavailable
         )
     }
 }
@@ -584,6 +760,19 @@ pub mod patterns {
     pub const TRIPLE_BUMP: &[SequenceStep] = &[BUMP, GAP, BUMP, GAP, BUMP];
     pub const BUMP_THEN_TICKS: &[SequenceStep] = &[BUMP, GAP, TICK, SHORT_GAP, TICK];
     pub const TICKS_THEN_BUMP: &[SequenceStep] = &[TICK, SHORT_GAP, TICK, GAP, BUMP];
+
+    /// The phone's own rhythms, and the only ones that mix a click with a tick.
+    /// Commands are clicks or ticks alone and calibration is bump-led, so the
+    /// mixture is what keeps a phone cue from landing like either — which matters
+    /// more here than anywhere else in this vocabulary, because phone mode is the
+    /// state a wearer fires bound commands in.
+    pub const TICK_THEN_CLICK: &[SequenceStep] = &[TICK, GAP, CLICK];
+    /// The reverse, for the phone going away: light after firm rather than before.
+    pub const CLICK_THEN_TICK: &[SequenceStep] = &[CLICK, GAP, TICK];
+    /// Firm, light, firm — a phone landing. Three events where the other two are
+    /// two, so the pairing moment is the one that counts differently as well as
+    /// reading differently.
+    pub const CLICK_TICK_CLICK: &[SequenceStep] = &[CLICK, GAP, TICK, GAP, CLICK];
 
     /// Long and unmistakable: the only pattern that should ever worry anyone.
     pub const ALARM: &[SequenceStep] =
@@ -758,7 +947,7 @@ mod tests {
 
     /// One of each kind. `Committed` and `RepPrompt` appear once because every key
     /// looks the same; `every_key_has_its_own_rhythm` is what separates them.
-    const EVERY_KIND_OF_CUE: [Cue; 14] = [
+    const EVERY_KIND_OF_CUE: [Cue; 18] = [
         Cue::ReadyToUse,
         Cue::FrontEndFailed,
         Cue::FrontEndStalled,
@@ -776,6 +965,10 @@ mod tests {
         Cue::RepRejected,
         Cue::GestureFailed(CalibrationGesture::WristPronation),
         Cue::CalibrationComplete,
+        Cue::PhoneListening,
+        Cue::PhonePaired,
+        Cue::PhoneLost,
+        Cue::PhoneUnavailable,
     ];
 
     fn is_fault(cue: Cue) -> bool {
@@ -791,6 +984,11 @@ mod tests {
         // Calibration is one mode wearing one hue on purpose, held to being
         // readable inside that hue by its own tests below.
         if cue.is_calibration() && other.is_calibration() {
+            return true;
+        }
+        // So is the phone, for the same reason and under the same obligation —
+        // `phone_mode_is_readable_on_the_indicator_alone` is what holds it.
+        if cue.is_phone() && other.is_phone() {
             return true;
         }
         // Finishing a calibration *is* "you can use this now", and a wearer
@@ -1130,6 +1328,291 @@ mod tests {
         };
         assert_eq!(finished.indicator_color(), Color::BLUE);
     }
+    fn with_phone(phone: Phone) -> DeviceState {
+        DeviceState { phone, ..running() }
+    }
+
+    #[test]
+    fn every_wire_state_projects_onto_something_the_band_can_show() {
+        // The collapse, asserted rather than described. Exhaustive by construction:
+        // a new `PhoneStatus` variant fails the `From` impl's match, which is the
+        // point of putting the mapping here instead of in the serve loop.
+        let cases = [
+            (PhoneStatus::Dormant, Phone::Off),
+            (PhoneStatus::Standby, Phone::Off),
+            (PhoneStatus::Advertising, Phone::Listening),
+            (PhoneStatus::Connecting, Phone::Listening),
+            (PhoneStatus::Paired, Phone::Paired),
+            (
+                PhoneStatus::Unavailable {
+                    reason: "no radio".into(),
+                },
+                Phone::Unavailable,
+            ),
+        ];
+        for (status, expected) in &cases {
+            assert_eq!(Phone::from(status), *expected, "{status:?} projected wrong");
+        }
+    }
+
+    #[test]
+    fn a_half_open_link_does_not_read_as_paired() {
+        // The defect this projection exists to prevent: iOS reads the report map
+        // before encryption finishes, and a key sent in that window is discarded.
+        // If `Connecting` reached the band as `Paired`, the light would promise a
+        // phone that cannot hear anything.
+        assert_ne!(Phone::from(&PhoneStatus::Connecting), Phone::Paired);
+        assert_eq!(
+            with_phone(Phone::from(&PhoneStatus::Connecting)).indicator_shape(),
+            Shape::Stutter,
+            "a half-open link should still read as waiting"
+        );
+    }
+
+    #[test]
+    fn opening_the_pairing_window_is_cued() {
+        assert_eq!(
+            with_phone(Phone::Listening).transition_from(with_phone(Phone::Off)),
+            Some(Cue::PhoneListening)
+        );
+    }
+
+    #[test]
+    fn a_phone_arriving_is_its_own_cue() {
+        assert_eq!(
+            with_phone(Phone::Paired).transition_from(with_phone(Phone::Listening)),
+            Some(Cue::PhonePaired)
+        );
+    }
+
+    #[test]
+    fn a_phone_leaving_is_not_the_same_as_the_window_opening() {
+        // Both end at `Listening`, and the motor is what separates them: the
+        // wearer needs "your phone went away" told apart from "I am waiting for
+        // one", even though the device is doing the same thing afterwards.
+        let lost = with_phone(Phone::Listening).transition_from(with_phone(Phone::Paired));
+        let opened = with_phone(Phone::Listening).transition_from(with_phone(Phone::Off));
+        assert_eq!(lost, Some(Cue::PhoneLost));
+        assert_ne!(lost, opened);
+    }
+
+    #[test]
+    fn a_refused_radio_says_so() {
+        assert_eq!(
+            with_phone(Phone::Unavailable).transition_from(with_phone(Phone::Off)),
+            Some(Cue::PhoneUnavailable)
+        );
+    }
+
+    #[test]
+    fn turning_the_phone_off_is_not_worth_the_motor() {
+        // The wearer did it on purpose from a panel that already says so, and the
+        // indicator handing the light back to the link is the confirmation.
+        assert_eq!(
+            with_phone(Phone::Off).transition_from(with_phone(Phone::Paired)),
+            None
+        );
+        assert_eq!(
+            with_phone(Phone::Off).transition_from(with_phone(Phone::Listening)),
+            None
+        );
+        // Nor is giving up on a radio that already refused.
+        assert_eq!(
+            with_phone(Phone::Off).transition_from(with_phone(Phone::Unavailable)),
+            None
+        );
+    }
+
+    #[test]
+    fn the_phone_outranks_the_link_but_not_a_calibration() {
+        // A phone pairing is something the wearer just did with their hands and is
+        // waiting on; a dashboard link coming up is not.
+        let linked_and_paired = DeviceState {
+            link: ActiveLink::Wifi,
+            phone: Phone::Paired,
+            ..running()
+        };
+        assert_eq!(
+            linked_and_paired.transition_from(with_phone(Phone::Listening)),
+            Some(Cue::PhonePaired)
+        );
+        // But a run outranks it: commits are suppressed for the whole run, so a
+        // phone that just arrived can do nothing until the run ends.
+        let paired_mid_run = DeviceState {
+            calibration: calibrating(CalibrationPhase::Settling).calibration,
+            phone: Phone::Paired,
+            ..running()
+        };
+        assert_eq!(
+            paired_mid_run.transition_from(with_phone(Phone::Listening)),
+            Some(Cue::CalibrationBegins)
+        );
+    }
+
+    #[test]
+    fn a_paired_phone_owns_the_indicator_over_the_link() {
+        let linked = DeviceState {
+            link: ActiveLink::Wifi,
+            ..running()
+        };
+        assert_eq!(linked.indicator_color(), Color::BLUE);
+        let paired = DeviceState {
+            phone: Phone::Paired,
+            ..linked
+        };
+        assert_eq!(paired.indicator_color(), Color::MAGENTA);
+        // Calibration still outranks it, and health still outranks that.
+        let paired_mid_run = DeviceState {
+            calibration: calibrating(CalibrationPhase::ThumbUpRounds).calibration,
+            ..paired
+        };
+        assert_eq!(paired_mid_run.indicator_color(), Color::CYAN);
+        let stalled = DeviceState {
+            front_end: FrontEnd::Stalled,
+            ..paired_mid_run
+        };
+        assert_eq!(stalled.indicator_color(), Color::RED);
+        // Phone off hands the light straight back to the link.
+        assert_eq!(
+            with_phone(Phone::Off).indicator_color(),
+            running().indicator_color()
+        );
+    }
+
+    #[test]
+    fn waiting_for_a_phone_reads_differently_from_having_one() {
+        // The two states a wearer has to tell apart with the light alone, and the
+        // hue is the same for both — so the shape has to carry it.
+        let listening = with_phone(Phone::Listening);
+        let paired = with_phone(Phone::Paired);
+        assert_eq!(listening.indicator_color(), Color::MAGENTA);
+        assert_eq!(paired.indicator_color(), Color::MAGENTA);
+        assert_ne!(listening.indicator_shape(), paired.indicator_shape());
+    }
+
+    #[test]
+    fn a_phone_waiting_during_a_run_cannot_stutter_the_run_s_hue() {
+        // The collision this whole crate exists to catch. A stuttering cyan is
+        // already "that rep did not count"; if the phone's shape were read
+        // independently of whose colour is showing, a wearer mid-calibration with
+        // an unpaired phone would see every rep rejected.
+        let listening_mid_run = DeviceState {
+            calibration: calibrating(CalibrationPhase::ThumbUpRounds).calibration,
+            phone: Phone::Listening,
+            ..running()
+        };
+        assert_eq!(listening_mid_run.indicator_color(), Color::CYAN);
+        assert_eq!(listening_mid_run.indicator_shape(), Shape::Swell);
+        // Same guard on the other side: a stalled front end owns the light, and a
+        // waiting phone must not restyle a fault into something softer.
+        let listening_while_stalled = DeviceState {
+            front_end: FrontEnd::Stalled,
+            phone: Phone::Listening,
+            ..running()
+        };
+        assert_eq!(listening_while_stalled.indicator_color(), Color::RED);
+        assert_eq!(listening_while_stalled.indicator_shape(), Shape::Snap);
+    }
+
+    #[test]
+    fn a_refused_radio_is_not_a_hardware_fault() {
+        // Red is hardware faults only, and a radio that would not start still
+        // leaves a band that does EMG. The panel carries the reason.
+        let refused = with_phone(Phone::Unavailable);
+        assert!(!refused.needs_attention());
+        assert_ne!(refused.indicator_color(), Color::RED);
+        // It holds no level of its own either: "no phone here" is what `Off`
+        // already looks like, and why is the panel's job.
+        assert_eq!(
+            refused.indicator_color(),
+            with_phone(Phone::Off).indicator_color()
+        );
+    }
+
+    #[test]
+    fn no_phone_cue_can_be_mistaken_for_a_commit() {
+        // The commit cue is what proves the whole feature works, and phone mode is
+        // the state it fires in — so nothing about a phone may land like one.
+        for cue in EVERY_KIND_OF_CUE.iter().filter(|cue| cue.is_phone()) {
+            let response = cue.response();
+            assert_ne!(
+                (response.flash, response.shape),
+                (Some(Color::WHITE), Shape::Snap),
+                "{cue:?} looks like a commit"
+            );
+            for key in MediaKey::ALL {
+                assert_ne!(
+                    response.haptic,
+                    Some(patterns::for_key(key)),
+                    "{cue:?} feels like committing {key:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn phone_mode_is_readable_on_the_indicator_alone() {
+        // Three meanings on the light: waiting for a phone, a phone is here, that
+        // did not take. The haptics board is optional, so this has to hold without
+        // it — and the pairing flow is the one a wearer runs while looking at a
+        // phone rather than at a dashboard.
+        let looks = |cue: Cue| (cue.response().flash, cue.response().shape);
+        let waiting = looks(Cue::PhoneListening);
+        let here = looks(Cue::PhonePaired);
+        let refused = looks(Cue::PhoneUnavailable);
+        let meanings = [waiting, here, refused];
+        for (index, meaning) in meanings.iter().enumerate() {
+            for other in &meanings[index + 1..] {
+                assert_ne!(meaning, other, "two phone meanings share a look");
+            }
+        }
+        // Losing a phone lands on "waiting" — which is what the device is doing
+        // afterwards, and what the wearer has to act on. The motor carries the
+        // difference; see `a_phone_leaving_is_not_the_same_as_the_window_opening`.
+        assert_eq!(looks(Cue::PhoneLost), waiting);
+    }
+
+    #[test]
+    fn phone_cues_stay_out_of_the_shipped_hues() {
+        // Same rule the calibration family is held to: red is hardware faults,
+        // amber is the link, violet is config, cyan is a calibration run.
+        for cue in EVERY_KIND_OF_CUE.iter().filter(|cue| cue.is_phone()) {
+            for forbidden in [Color::RED, Color::AMBER, Color::VIOLET, Color::CYAN] {
+                assert_ne!(
+                    cue.response().flash,
+                    Some(forbidden),
+                    "{cue:?} took a shipped hue"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_phone_rhythm_is_its_own() {
+        // Inside phone mode there is one hue, so the motor carries the identity —
+        // and it has to hold against every command the keymap can bind, because a
+        // wearer in phone mode is committing those constantly.
+        let phone: Vec<Cue> = EVERY_KIND_OF_CUE
+            .iter()
+            .copied()
+            .filter(|cue| cue.is_phone())
+            .collect();
+        let commands: Vec<Cue> = MediaKey::ALL.iter().copied().map(Cue::Committed).collect();
+        let all: Vec<Cue> = phone.iter().copied().chain(commands).collect();
+        for (index, cue) in all.iter().enumerate() {
+            for other in &all[index + 1..] {
+                if cue.response().haptic.is_none() && other.response().haptic.is_none() {
+                    continue;
+                }
+                assert_ne!(
+                    cue.response().haptic,
+                    other.response().haptic,
+                    "{cue:?} and {other:?} feel identical"
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_swell_rises_from_dark_and_returns_to_it() {
         let duration = Shape::Swell.duration_milliseconds();

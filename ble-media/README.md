@@ -5,20 +5,41 @@ device, bonds with a host (iPhone, also macOS/Android/Windows), and sends media
 keys: play/pause, next, previous, volume, mute. Built on `std` / `esp-idf-svc`
 with the [`esp32-nimble`](https://github.com/taks/esp32-nimble) NimBLE wrapper.
 
-During bring-up the keys are driven from the serial console. Later the gesture
-classifier will call `MediaController::press` directly instead.
+The keys are driven from the serial console here. The wearer firmware drives the
+same `Phone` state machine from its feedback thread, with a dashboard button in
+place of the console toggle.
 
 ## How it works
 
+- **`src/phone.rs` is the state machine, and it runs on a laptop.** The BLE stack
+  comes up at boot and stays resident; the toggle only starts and stops
+  advertising. Every boot pays NimBLE's footprint whether the phone is used or
+  not, and that is the point: the one large allocation lands on a fresh heap
+  rather than at a button press after hours of fragmentation, so a device that
+  cannot afford it fails at boot, visibly, instead of mid-session. `Dormant` and
+  `Standby` therefore mean *not advertising*, never *no stack*. Media keys go out
+  only on an *encrypted* link, not merely a connected one: iOS reads the report
+  map before it encrypts and discards anything sent in that window.
+- **The single radio is not arbitrated yet.** A wifi-provisioned device refuses
+  the toggle with a reason rather than half-enabling a phone that cannot work —
+  standing the wifi dialer down never released the radio, since the station stays
+  associated and only the dialling loop skips.
+- `src/nimble.rs` is the only file that touches esp32-nimble, behind the
+  `phone::Radio` trait. Its dependencies are gated on `cfg(target_os = "espidf")`,
+  so `cargo test --manifest-path ble-media/Cargo.toml` (from the repo root) runs
+  the state machine's tests on the host.
 - A HID service (`0x1812`) exposes one Consumer Control input report carrying a
-  16-bit usage code (`src/media.rs`). Sending a usage = press; sending `0x0000` =
-  release.
+  16-bit usage code (`src/hid.rs`). Sending a usage = press; sending `0x0000` =
+  release. The release rides a later `Phone::tick` rather than a 20 ms sleep, so
+  no thread blocks on it.
 - The device advertises with a HID-keyboard appearance and bonds on first
   connect. iOS only delivers HID input over an encrypted/bonded link, so bonding
-  (`AuthReq::all`, "just works" pairing) is required. Bonding keys are persisted
-  in NVS, so the pairing survives reboots.
-- Media usages: Play/Pause `0xCD`, Next `0xB5`, Prev `0xB6`, Vol+ `0xE9`,
-  Vol− `0xEA`, Mute `0xE2`.
+  (`Bond | Sc`, "just works" pairing — the band has no display or keypad, so it
+  does not ask for MITM protection it cannot deliver) is required. Bonding keys
+  are persisted in NVS, so the pairing survives reboots. Anything in range can
+  bond and nothing can forget a bonded phone yet.
+- The media keys themselves are `protocol::MediaKey`: Play/Pause `0xCD`, Next
+  `0xB5`, Prev `0xB6`, Vol+ `0xE9`, Vol− `0xEA`, Mute `0xE2`.
 
 ## Build, flash, monitor
 

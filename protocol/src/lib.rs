@@ -179,6 +179,28 @@ pub enum Frame {
     /// dashboard host's IP is not portable across networks (a laptop hotspot, say).
     SetServer { addr: String },
 
+    /// Hand the phone the radio, or take it back (browser → backend → device).
+    ///
+    /// Not persisted. Off at boot is the requirement, so a stored `true` would
+    /// contradict it — the device treats this like `Probe` and `Heartbeat` rather
+    /// than like a setting: no NVS write, no re-announce, and no flash wear from a
+    /// button someone is clicking. The device answers with [`Frame::PhoneState`].
+    ///
+    /// The ESP32-S3 has one 2.4 GHz radio and no coexistence configuration, and
+    /// nothing yet arbitrates who owns it: standing the wifi dialer down does
+    /// not release the radio, because the station stays associated and only the
+    /// dialling loop skips. So a wifi-provisioned device *refuses* this and
+    /// answers with `unavailable` and a reason, rather than half-enabling a
+    /// phone that will not work.
+    SetPhone { enabled: bool },
+
+    /// What the phone peripheral is doing (device → backend → browser).
+    ///
+    /// Its own frame rather than a telemetry metric: a button needs feedback
+    /// sooner than the ~4 s telemetry interval, and `unavailable` carries a reason
+    /// a numeric metric cannot. Sent on every transition, not on a schedule.
+    PhoneState { status: PhoneStatus },
+
     /// A device log record (device → backend → browser). Replaces the serial text
     /// console: the USB byte pipe carries only frames, so logs ride the protocol and
     /// land in the dashboard's log panel instead of a terminal.
@@ -1791,6 +1813,42 @@ pub struct Binding {
     pub key: MediaKey,
 }
 
+/// Where the phone peripheral stands, as one value the panel can render.
+///
+/// Flat rather than nested because the panel draws one badge. The distinctions
+/// that earn their place are the ones a wearer can act on: `unavailable` and
+/// `connecting` must not read as `standby` or as `paired` — a button that looks
+/// off when the stack refused is a lie, and so is one that looks connected while
+/// the link is still unencrypted.
+/// Serializes internally tagged on `state` (`{"state": "advertising"}`).
+///
+/// None of the off states is a claim about memory. The BLE stack comes up at
+/// boot and stays resident whatever the toggle says, so that its one large
+/// allocation lands on a fresh heap rather than at a button press after hours of
+/// fragmentation — a device that cannot afford the stack says so at boot rather
+/// than mid-session. `dormant` and `standby` both mean *not advertising*.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum PhoneStatus {
+    /// Enabling has not been asked for this boot.
+    Dormant,
+    /// Asked for once, currently switched off: not advertising, no peer.
+    /// Distinct from `dormant` only in history.
+    Standby,
+    Advertising,
+    /// Connected but not yet encrypted. iOS reads the report map first and the
+    /// window takes seconds; HID input sent in it is silently discarded, so this
+    /// must not read as connected.
+    Connecting,
+    /// Bonded and encrypted. The only state in which media keys reach the phone.
+    Paired,
+    /// Enabling was asked for and the stack refused. Carried so the panel can say
+    /// why rather than the button appearing to do nothing.
+    Unavailable {
+        reason: String,
+    },
+}
+
 /// HID Consumer-Page media action. Mirrors the firmware's BLE output keys; lives
 /// here so `ble-media`, the dashboard, and the device agree on one definition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1998,6 +2056,26 @@ pub fn pack_sample_stream_into(out: &mut Vec<u8>, samples: impl Iterator<Item = 
 /// of `packed`; a truncated trailing varint is simply ignored.
 pub fn unpack_samples(packed: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(packed.len() * 2);
+    unpack_samples_into(&mut out, packed);
+    out
+}
+
+/// [`unpack_samples`] into a caller-owned buffer, reusing its allocation — the
+/// mirror of [`pack_sample_stream_into`], and for the same reason. A window
+/// unpacks to 16 KB, and on the device that is one contiguous block asked for
+/// four times a second: with wifi and lwIP up, the heap has run at 21 KB free
+/// but only 7.7 KB in its largest block, so the request cannot be met however
+/// much is free in total. Allocating this buffer once, at boot, is the
+/// difference between a calibration that runs and one that aborts on its second
+/// window.
+///
+/// The reservation is the caller's, deliberately: `packed.len() * 2` is an upper
+/// bound that a well-compressed window overshoots by half, and reserving it here
+/// would grow a buffer sized for the real window past the block it was given —
+/// asking the fragmented heap for a bigger one, which is the failure this exists
+/// to avoid.
+pub fn unpack_samples_into(out: &mut Vec<u8>, packed: &[u8]) {
+    out.clear();
     let mut prev = 0i32;
     let mut bytes = packed.iter();
     'samples: loop {
@@ -2017,7 +2095,6 @@ pub fn unpack_samples(packed: &[u8]) -> Vec<u8> {
         prev += delta;
         out.extend_from_slice(&(prev as i16).to_le_bytes());
     }
-    out
 }
 
 /// Bytes one source's bit plane occupies in [`Frame::Emg`]'s `missing` field,
@@ -2053,6 +2130,48 @@ mod tests {
         // reserved at the priced size and never grows.
         assert_eq!(packed.capacity(), packed.len(), "pricing missed");
         assert_eq!(unpack_samples(&packed), raw);
+    }
+
+    #[test]
+    fn unpacking_into_a_sized_buffer_reuses_its_allocation() {
+        // The device reserves one window buffer at boot and unpacks every window
+        // into it, because the heap it runs on cannot promise a second contiguous
+        // 16 KB once wifi is up. If this ever reallocates, that reservation is
+        // worthless and the firmware aborts on a calibration's second window.
+        //
+        // The data alternates between the extremes on purpose. Output size is
+        // always two bytes a sample, but `packed.len() * 2` — the obvious
+        // reservation — is an upper bound that only holds when packing wins,
+        // and here every delta needs a three-byte varint. A reservation made
+        // from the packed length would therefore ask for three times the
+        // buffer that is already big enough, and grow a boot-sized block for a
+        // window that fits it. Compressible data hides this; that is why this
+        // test does not use any.
+        let values: Vec<i16> = (0..8000)
+            .map(|v| if v % 2 == 0 { -20_000 } else { 20_000 })
+            .collect();
+        let raw: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let packed = pack_sample_stream(values.iter().copied());
+        assert!(
+            packed.len() * 2 > raw.len(),
+            "the data compressed, so this test no longer exercises the bound"
+        );
+
+        let mut buffer = Vec::with_capacity(raw.len());
+        let reserved = buffer.capacity();
+        for _ in 0..4 {
+            unpack_samples_into(&mut buffer, &packed);
+            assert_eq!(buffer, raw);
+            // Capacity, not the base pointer: a growing `realloc` often keeps
+            // its address when the block above it happens to be free, so a
+            // pointer that held still proves nothing. Capacity moves whenever
+            // the allocator was asked for more, which is the question.
+            assert_eq!(
+                buffer.capacity(),
+                reserved,
+                "the buffer grew, so it asked the fragmented heap for another one"
+            );
+        }
     }
 
     #[test]
@@ -2247,6 +2366,41 @@ mod tests {
         ] {
             assert_eq!(unpack_samples(&pack_samples(&raw)), raw);
         }
+    }
+
+    /// The device unpacks into a buffer it allocated at boot, and the dashboard
+    /// unpacks into a fresh one. They decode the same bytes or the two ends of
+    /// the same recording disagree, so this holds the pair together.
+    #[test]
+    fn both_unpack_forms_agree_byte_for_byte() {
+        let cases = [
+            Vec::new(),
+            42i16.to_le_bytes().to_vec(),
+            [i16::MIN, i16::MAX, 0, -1, 1, i16::MAX, i16::MIN]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<u8>>(),
+            (-200..200i16)
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<u8>>(),
+        ];
+
+        // One buffer across every case, which is how the device uses it: a
+        // longer decode followed by a shorter one must not leave the tail of
+        // the longer one behind.
+        let mut reused = Vec::new();
+        for raw in &cases {
+            let packed = pack_samples(raw);
+            unpack_samples_into(&mut reused, &packed);
+            assert_eq!(reused, unpack_samples(&packed));
+            assert_eq!(&reused, raw);
+        }
+
+        // And a truncated trailing varint is ignored identically by both.
+        let packed = pack_samples(&cases[3]);
+        let truncated = &packed[..packed.len() - 1];
+        unpack_samples_into(&mut reused, truncated);
+        assert_eq!(reused, unpack_samples(truncated));
     }
 
     #[test]
@@ -2837,6 +2991,58 @@ mod tests {
         let decoded: PauseCause = ciborium::from_reader(encoded.as_slice()).unwrap();
         assert_eq!(decoded, PauseCause::BrowserGone);
         assert_ne!(decoded, PauseCause::Operator);
+    }
+
+    /// The phone toggle is a control frame like any other, and it must stay
+    /// float-free so the device's decoder never instantiates ciborium's float
+    /// path — a `bool` gets that by construction.
+    #[test]
+    fn the_phone_toggle_roundtrips_in_both_positions() {
+        match roundtrip(&Frame::SetPhone { enabled: true }) {
+            Frame::SetPhone { enabled } => assert!(enabled),
+            other => panic!("wrong variant: {other:?}"),
+        }
+        match roundtrip(&Frame::SetPhone { enabled: false }) {
+            Frame::SetPhone { enabled } => assert!(!enabled),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// `unavailable` has to reach the panel with its reason attached; the whole
+    /// point of the variant is that the button can say why it did nothing.
+    #[test]
+    fn a_refused_phone_carries_its_reason_to_the_panel() {
+        let frame = Frame::PhoneState {
+            status: PhoneStatus::Unavailable {
+                reason: "BLEDevice::take failed: no memory".into(),
+            },
+        };
+        match roundtrip(&frame) {
+            Frame::PhoneState {
+                status: PhoneStatus::Unavailable { reason },
+            } => assert!(reason.contains("no memory")),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// Each link state is distinct on the wire. `connecting` decoding as
+    /// `paired` would put the panel back in the lie this frame exists to end.
+    #[test]
+    fn every_phone_link_state_roundtrips_distinctly() {
+        let states = [
+            PhoneStatus::Dormant,
+            PhoneStatus::Standby,
+            PhoneStatus::Advertising,
+            PhoneStatus::Connecting,
+            PhoneStatus::Paired,
+        ];
+        for state in &states {
+            let mut encoded = Vec::new();
+            ciborium::into_writer(state, &mut encoded).unwrap();
+            let decoded: PhoneStatus = ciborium::from_reader(encoded.as_slice()).unwrap();
+            assert_eq!(&decoded, state);
+        }
+        assert_ne!(PhoneStatus::Connecting, PhoneStatus::Paired);
     }
 
     #[test]

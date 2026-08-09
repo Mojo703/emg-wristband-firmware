@@ -10,6 +10,9 @@ resolver = "2"
 rust-version = "1.77"
 description = "ESP32-S3 BLE HID consumer-control media remote (serial-driven for now)"
 
+[lib]
+name = "ble_media"
+
 [[bin]]
 name = "ble-media"
 harness = false
@@ -23,13 +26,27 @@ opt-level = "z"
 
 [dependencies]
 log = "0.4"
+anyhow = "1"
+toml-cfg = "0.2"
+protocol = { path = "../protocol" }
+
+# The radio half only. Held here rather than in [dependencies] so `src/phone.rs`
+# — the whole decision surface — builds and tests for the host, which is what
+# lets the link state machine fail on a laptop instead of on a bench slot:
+#
+#   cargo test --manifest-path ble-media/Cargo.toml    # from the repo root
+#
+# Run from the repo root deliberately: `ble-media/.cargo/config.toml` pins the
+# Xtensa target and the esp toolchain for anything run inside the crate, and
+# cargo reads that file relative to the working directory.
+[target.'cfg(target_os = "espidf")'.dependencies]
 esp-idf-svc = "0.52"
 # Pulls esp-idf-svc 0.52 itself, so the single `esp-idf-sys` (a `links` crate)
 # stays consistent across the graph.
 esp32-nimble = "0.12"
-anyhow = "1"
-toml-cfg = "0.2"
 
 [build-dependencies]
-embuild = "0.33"
+# `espidf` was previously reached through esp-idf-sys's feature unification; that
+# dependency is target-gated now, so the build script asks for it directly.
+embuild = { version = "0.33", features = ["espidf"] }
 toml-cfg = "0.2"

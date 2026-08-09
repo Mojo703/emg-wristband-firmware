@@ -51,6 +51,8 @@ it and forwards browser control frames back to the selected device.
 | `SetKeymap` | browser → backend → device | The gesture → media-key `bindings`. |
 | `SetWifi` | browser → backend → device | `ssid` and `psk`. The device persists them and uses them on the next boot. |
 | `SetServer` | browser → backend → device | The dashboard address the device dials over wifi, e.g. `"10.42.0.1:9000"`. The server address is otherwise a compile-time default, so this is the only way to retarget a device without reflashing. |
+| `SetPhone` | browser → backend → device | Start or stop advertising the BLE HID peripheral. Not persisted — off at boot is the requirement, so the device treats it like `Probe` rather than like a setting: no NVS write, no re-announce. Nothing arbitrates the single radio yet, so a wifi-provisioned device refuses and says why. |
+| `PhoneState` | device → backend → browser | What the phone peripheral is doing, as one `PhoneStatus`: `dormant`, `standby`, `advertising`, `connecting`, `paired`, or `unavailable` with a reason. Sent on every transition rather than on the telemetry interval, because a button needs prompt feedback. `connecting` is a connected but unencrypted link, in which HID input is silently discarded — it must not render as connected. The off states say nothing about memory: the stack is resident from boot. |
 | `SetBoardRevision` | browser → backend | Which board and harness a device is soldered to. The firmware cannot know this, so the backend remembers it per device id and stamps it into every later session manifest. It goes no further than the backend. |
 
 ### The collection game
