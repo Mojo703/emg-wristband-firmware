@@ -30,11 +30,10 @@
       state.classes.find((entry) => entry.gesture === gesture),
   );
   const fitting = $derived(state.fit_passes_planned > 0);
-  // The floor is this block's validated cue count, and the gate may only add to
-  // it. More planned than the floor is therefore exactly "the gate asked for
-  // more rounds", which is worth saying rather than leaving as a number that
-  // quietly grew.
-  const extended = $derived(state.rounds_planned > state.round_floor);
+  const collecting = $derived(
+    state.phase === CalibrationPhase.ThumbUpRounds ||
+      state.phase === CalibrationPhase.ThumbDownRounds,
+  );
 </script>
 
 <section class="card">
@@ -52,6 +51,12 @@
   {#if state.phase === CalibrationPhase.Stopped}
     <p class="warn">The run stopped before it finished.</p>
   {/if}
+  <p class="muted">
+    Elapsed {formatMilliseconds(state.elapsed_milliseconds)}.
+    {#if state.phase_remaining_milliseconds !== null}
+      About {formatMilliseconds(state.phase_remaining_milliseconds)} remaining in this phase.
+    {/if}
+  </p>
 </section>
 
 <section class="card">
@@ -64,12 +69,19 @@
     {#key state.prompt_generation}
       {#if state.prompt !== null}
         <p class="prompt">{gestureLabel(state.prompt)}</p>
+        <p class="hold">Hold for {formatMilliseconds(state.prompt_hold_milliseconds)}.</p>
       {/if}
       <p class="instruction">
-        Round {state.round} of {state.rounds_planned}{extended
-          ? ` (extended from ${state.round_floor})`
-          : ''}. {phaseInstruction(state.phase)}
+        {#if collecting && state.prompt !== null}
+          Round {Math.min(state.round + 1, state.rounds_planned)} of {state.rounds_planned}.
+        {:else if collecting}
+          {state.round} of {state.rounds_planned} rounds complete.
+        {/if}
+        {phaseInstruction(state.phase)}
       </p>
+      {#if state.prompt !== null}
+        <p class="muted">Silence from the band means the rep counted.</p>
+      {/if}
       {#if state.last_rejection !== null}
         <!-- Which gesture the rejected rep was for, because after a handover the
              prompt has often moved on by the time anyone reads this. Its round
@@ -123,8 +135,8 @@
     </tbody>
   </table>
   <p class="muted">
-    Reps: {state.accepted_reps} accepted, {state.rejected_reps} rejected. The gate only
-    extends collection; it never ends it early.
+    Reps: {state.accepted_reps} accepted, {state.rejected_reps} rejected. The quality
+    check reports weak classes but never changes the fixed round count.
   </p>
   <!-- Not a statistic: flushes are scheduled strictly between rounds, so this
        count and the flash-overlap rejection reason are how a labeled window
@@ -192,6 +204,10 @@
   .prompt {
     font-size: 22px;
     font-weight: 600;
+  }
+
+  .hold {
+    color: var(--brand-tint-foreground);
   }
 
   table {

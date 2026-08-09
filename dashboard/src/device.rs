@@ -125,6 +125,12 @@ async fn device_session(
                 if let Frame::PhoneState { status } = &other {
                     registry.push_phone_state(&device_id, token, status.clone());
                 }
+                if matches!(
+                    other,
+                    Frame::CalibrationState { .. } | Frame::CalibrationResult { .. }
+                ) {
+                    registry.push_calibration_frame(&device_id, token, other.clone());
+                }
                 let _ = frames.send(other);
             }
         }

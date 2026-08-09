@@ -565,6 +565,9 @@ pub enum Frame {
         /// on whichever reps happened to land badly, and nothing downstream
         /// could tell that from a gesture performed poorly.
         prompt_hold_milliseconds: u32,
+        /// Device-clock time left in a timed phase. Present for settling and
+        /// handover; absent where progress is counted in reps or optimizer passes.
+        phase_remaining_milliseconds: Option<u32>,
         /// One entry per gesture, in the canonical prompt order.
         classes: Vec<CalibrationClassState>,
         accepted_reps: u32,
@@ -918,10 +921,10 @@ impl CalibrationGesture {
     }
 }
 
-/// Where a calibration run stands. `Settling` covers the slot erase, the filter
-/// and amplitude settling, the reference-gain estimate, and the rest baseline;
-/// the two round blocks are separated by `Handover`, when the pole changes
-/// hands.
+/// Where a calibration run stands. `Settling` verifies the slot prepared at boot,
+/// then covers filter and amplitude settling, the reference-gain estimate, and
+/// the rest baseline. `Handover` separates thumb-extended rounds from gripping
+/// the pole with the same hand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CalibrationPhase {
@@ -3280,6 +3283,7 @@ mod tests {
             prompt: Some(CalibrationGesture::WristRadialDeviation),
             prompt_generation: 37,
             prompt_hold_milliseconds: 1500,
+            phase_remaining_milliseconds: None,
             classes: class_states(),
             accepted_reps: 30,
             rejected_reps: 5,
@@ -3300,6 +3304,7 @@ mod tests {
                 prompt,
                 prompt_generation,
                 prompt_hold_milliseconds,
+                phase_remaining_milliseconds,
                 classes,
                 last_rejection,
                 flash_flushes,
@@ -3309,6 +3314,7 @@ mod tests {
                 assert_eq!(prompt, Some(CalibrationGesture::WristRadialDeviation));
                 assert_eq!(prompt_generation, 37);
                 assert_eq!(prompt_hold_milliseconds, 1500);
+                assert_eq!(phase_remaining_milliseconds, None);
                 assert_eq!(classes, class_states());
                 let rejection = last_rejection.expect("a rejection");
                 assert_eq!(rejection.reason, RepRejection::AtRestBaseline);

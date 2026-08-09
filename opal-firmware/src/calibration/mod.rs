@@ -49,6 +49,7 @@ use protocol::{
     CalibrationClassState, CalibrationGesture, CalibrationOutcome, CalibrationPhase,
     CalibrationQuality, Frame, GateStatus, InstalledSlot, RejectedRep, SlotProbe,
 };
+use std::time::{Duration, Instant};
 use training_rows::CalibrationPartition;
 
 /// How long before the recording's first cue a scripted still phase stops.
@@ -98,7 +99,7 @@ const LIVE_ROW_WEIGHT: f32 = 1.0;
 
 /// How often the state frame goes out while nothing has changed, so a panel
 /// that joined mid-run is not left with a blank phase until the next prompt.
-const STATE_HEARTBEAT_MILLISECONDS: u32 = 1000;
+const STATE_HEARTBEAT: Duration = Duration::from_secs(1);
 
 /// Rows one `calibration_rows_dump` carries, whatever the host asked for. Four
 /// hundred rows at the v2 stride is ~29 KB, well past the device's one encode
@@ -189,6 +190,61 @@ struct OpenRep {
     /// which the flush schedule is supposed to make impossible, and which is
     /// therefore checked rather than assumed.
     flash_microseconds_at_open: u32,
+}
+
+/// The calibration truth a newly connected dashboard may need. A terminal
+/// result cannot exist without the terminal state that gives it context.
+enum Narration {
+    None,
+    Running {
+        revision: u32,
+    },
+    Finished {
+        revision: u32,
+        terminal_state: Box<Frame>,
+        result: Box<Frame>,
+        feedback: Option<Calibrating>,
+    },
+}
+
+impl Narration {
+    fn revision(&self) -> u32 {
+        match self {
+            Self::None => 0,
+            Self::Running { revision, .. } | Self::Finished { revision, .. } => *revision,
+        }
+    }
+
+    fn terminal_frames(&self) -> Option<Vec<Frame>> {
+        match self {
+            Self::None | Self::Running { .. } => None,
+            Self::Finished {
+                terminal_state,
+                result,
+                ..
+            } => Some(vec![(**terminal_state).clone(), (**result).clone()]),
+        }
+    }
+}
+
+pub(crate) enum PendingNarration {
+    Running { revision: u32, state: Frame },
+    Finished { revision: u32, frames: Vec<Frame> },
+}
+
+impl PendingNarration {
+    pub(crate) fn revision(&self) -> u32 {
+        match self {
+            Self::Running { revision, .. } | Self::Finished { revision, .. } => *revision,
+        }
+    }
+
+    pub(crate) fn frames(&self) -> &[Frame] {
+        match self {
+            Self::Running { state, .. } => std::slice::from_ref(state),
+            Self::Finished { frames, .. } => frames,
+        }
+    }
 }
 
 /// The device's calibration, running or not.
@@ -298,7 +354,9 @@ pub(crate) struct Calibration {
     prompt: Option<Prompt>,
     notice: Option<RepNotice>,
     outbound: Vec<Frame>,
-    since_state_milliseconds: u32,
+    narration: Narration,
+    narration_delivered: Option<(u32, u32)>,
+    state_posted_at: Instant,
 }
 
 impl Calibration {
@@ -361,7 +419,9 @@ impl Calibration {
             prompt: None,
             notice: None,
             outbound: Vec::new(),
-            since_state_milliseconds: 0,
+            narration: Narration::None,
+            narration_delivered: None,
+            state_posted_at: Instant::now(),
         }
     }
 
@@ -512,8 +572,10 @@ impl Calibration {
             self.scripted_settle_end = None;
             Run::start(self.constants, self.acquisition_sample)
         };
+        self.run = Some(run);
+        self.post_state();
         info!(
-            "calibration starting: slot {}, sequence {}, {}",
+            "calibration started: slot {}, sequence {}, {}",
             self.slot,
             self.sequence,
             if scripted_wearer {
@@ -522,8 +584,6 @@ impl Calibration {
                 "wearer-paced"
             }
         );
-        self.run = Some(run);
-        self.post_state();
     }
 
     /// The stored calibrations worth probing: every live slot, each with its
@@ -787,19 +847,17 @@ impl Calibration {
     /// Do whatever the state machine asks for next. Called once per serve-loop
     /// iteration; at most one action moves per call, because every one of them
     /// stalls something.
-    pub fn poll(&mut self, elapsed_milliseconds: u32, settings: &Settings) {
+    pub fn poll(&mut self, settings: &Settings) {
         // A checkpoint's passes come first and one at a time. The machine will
         // not move past FitRound or Polish until they are all in, so nothing
         // else is waiting on this; what the loop gets back between them is the
         // link, the feedback outputs, and the frame stream.
         if self.advance_fit() {
-            self.since_state_milliseconds += elapsed_milliseconds;
             self.post_state();
             return;
         }
         let acted = self.poll_actions(settings);
-        self.since_state_milliseconds += elapsed_milliseconds;
-        if !acted && self.since_state_milliseconds >= STATE_HEARTBEAT_MILLISECONDS {
+        if !acted && self.run.is_some() && self.state_posted_at.elapsed() >= STATE_HEARTBEAT {
             self.post_state();
         }
     }
@@ -883,7 +941,10 @@ impl Calibration {
             Some(Action::FitRound { round }) => self.fit_round(round),
             Some(Action::Polish) => self.polish(),
             Some(Action::Install) => self.install(),
-            Some(Action::Finish { outcome }) => self.finish(outcome),
+            Some(Action::Finish { outcome }) => {
+                self.finish(outcome);
+                return true;
+            }
         }
         self.post_state();
         true
@@ -1310,9 +1371,17 @@ impl Calibration {
         self.pending_fit = None;
         self.action_guard.cancel();
         let Some(run) = self.run.take() else { return };
+        let terminal_state = Box::new(self.state_frame(&run));
+        let terminal_feedback = Calibrating {
+            phase: run.phase(),
+            prompt: self.prompt,
+            prompt_generation: run.prompt_generation(),
+            notice: self.notice,
+            notice_generation: run.notice_generation(),
+        };
         let classes = class_states(&run);
         let quality = quality_estimate(&run);
-        self.outbound.push(Frame::CalibrationResult {
+        let result = Box::new(Frame::CalibrationResult {
             outcome,
             installed: (outcome == CalibrationOutcome::Installed).then_some(InstalledSlot {
                 slot: self.slot as u32,
@@ -1331,6 +1400,14 @@ impl Calibration {
             // device comes back running.
             previous_retained: outcome != CalibrationOutcome::Installed,
         });
+        let revision = self.next_narration_revision();
+        self.narration = Narration::Finished {
+            revision,
+            terminal_state,
+            result,
+            feedback: Some(terminal_feedback),
+        };
+        self.state_posted_at = Instant::now();
         self.prompt = None;
         self.notice = None;
         self.open = None;
@@ -1349,10 +1426,20 @@ impl Calibration {
     }
 
     fn post_state(&mut self) {
-        let Some(run) = self.run.as_ref() else { return };
-        self.since_state_milliseconds = 0;
+        if self.run.is_none() {
+            return;
+        }
+        let revision = self.next_narration_revision();
+        self.narration = Narration::Running { revision };
+        self.state_posted_at = Instant::now();
+    }
+
+    fn state_frame(&self, run: &Run) -> Frame {
         let (fit_passes_done, fit_passes_planned, pass_milliseconds) = run.fit_progress();
-        self.outbound.push(Frame::CalibrationState {
+        let phase_remaining_milliseconds = run
+            .phase_remaining_samples()
+            .map(|samples| (samples * 1000 / self.constants.sample_rate_hz as u64) as u32);
+        Frame::CalibrationState {
             phase: run.phase(),
             round: run.round(),
             rounds_planned: run.rounds_planned(),
@@ -1360,6 +1447,7 @@ impl Calibration {
             prompt: run.prompt(),
             prompt_generation: run.prompt_generation(),
             prompt_hold_milliseconds: self.constants.prompt_hold_milliseconds,
+            phase_remaining_milliseconds,
             classes: class_states(run),
             accepted_reps: run.accepted_reps(),
             rejected_reps: run.rejected_reps(),
@@ -1376,7 +1464,11 @@ impl Calibration {
             flash_flushes: run.flash_flushes(),
             elapsed_milliseconds: (run.elapsed_samples() * 1000
                 / self.constants.sample_rate_hz as u64) as u32,
-        });
+        }
+    }
+
+    fn next_narration_revision(&self) -> u32 {
+        self.narration.revision().wrapping_add(1)
     }
 
     /// Name the channels rather than the fact. "Re-seat the band" is not
@@ -1470,17 +1562,23 @@ impl Calibration {
         self.outbound.push(frame);
     }
 
-    /// What the feedback outputs should show. `None` when no run is under way,
-    /// which is what puts the indicator back on the link.
-    pub fn feedback(&self) -> Option<Calibrating> {
-        let run = self.run.as_ref()?;
-        Some(Calibrating {
-            phase: run.phase(),
-            prompt: self.prompt,
-            prompt_generation: run.prompt_generation(),
-            notice: self.notice,
-            notice_generation: run.notice_generation(),
-        })
+    /// What the feedback outputs should show. A terminal transition is consumed
+    /// once so the feedback worker observes completion before returning to link
+    /// state, even though the finished run has already left `self.run`.
+    pub fn feedback(&mut self) -> Option<Calibrating> {
+        match self.run.as_ref() {
+            Some(run) => Some(Calibrating {
+                phase: run.phase(),
+                prompt: self.prompt,
+                prompt_generation: run.prompt_generation(),
+                notice: self.notice,
+                notice_generation: run.notice_generation(),
+            }),
+            None => match &mut self.narration {
+                Narration::Finished { feedback, .. } => feedback.take(),
+                Narration::None | Narration::Running { .. } => None,
+            },
+        }
     }
 
     /// Whether commits and media keys are suppressed. True for the whole run:
@@ -1523,6 +1621,37 @@ impl Calibration {
 
     pub fn drain_outbound(&mut self) -> Vec<Frame> {
         core::mem::take(&mut self.outbound)
+    }
+
+    /// Current state and terminal result, replayed until this link generation
+    /// confirms delivery. Commands remain one-shot; narration is current value.
+    pub fn pending_narration(&self, link_generation: u32) -> Option<PendingNarration> {
+        let revision = self.narration.revision();
+        if matches!(self.narration, Narration::None)
+            || self.narration_delivered == Some((link_generation, revision))
+        {
+            return None;
+        }
+        match &self.narration {
+            Narration::None => return None,
+            Narration::Running { .. } => {
+                let run = self.run.as_ref()?;
+                Some(PendingNarration::Running {
+                    revision,
+                    state: self.state_frame(run),
+                })
+            }
+            Narration::Finished { .. } => Some(PendingNarration::Finished {
+                revision,
+                frames: self.narration.terminal_frames()?,
+            }),
+        }
+    }
+
+    pub fn mark_narration_delivered(&mut self, link_generation: u32, revision: u32) {
+        if revision == self.narration.revision() {
+            self.narration_delivered = Some((link_generation, revision));
+        }
     }
 
     /// Rows the slot holds. The partition's own count rather than a second

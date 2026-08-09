@@ -41,8 +41,8 @@ const PHASE_LABELS: Record<CalibrationPhase, string> = {
   [CalibrationPhase.ThumbUpRounds]: 'Thumb up',
   [CalibrationPhase.Handover]: 'Handover',
   [CalibrationPhase.ThumbDownRounds]: 'Thumb down',
-  [CalibrationPhase.Polish]: 'Polish',
-  [CalibrationPhase.Install]: 'Install',
+  [CalibrationPhase.Polish]: 'Final fit',
+  [CalibrationPhase.Install]: 'Installing',
   [CalibrationPhase.Complete]: 'Done',
   [CalibrationPhase.Stopped]: 'Stopped',
 };
@@ -54,12 +54,12 @@ export function phaseLabel(phase: CalibrationPhase): string {
 /** What the wearer is doing in each phase, shown under the prompt. */
 const PHASE_INSTRUCTIONS: Record<CalibrationPhase, string> = {
   [CalibrationPhase.Idle]: 'No run in progress.',
-  [CalibrationPhase.Settling]: 'Hold still. The device is erasing its slot and measuring gains.',
-  [CalibrationPhase.ThumbUpRounds]: 'Pole in hand, thumb extended clear of the grip.',
-  [CalibrationPhase.Handover]: 'Change the pole to the other hand.',
+  [CalibrationPhase.Settling]: 'Support your arm and hold completely still while the device measures its baseline and gains.',
+  [CalibrationPhase.ThumbUpRounds]: 'Perform each wrist gesture with your thumb extended, clear of the grip.',
+  [CalibrationPhase.Handover]: 'Grip the pole with the same hand. Thumb-down rounds begin when the countdown ends.',
   [CalibrationPhase.ThumbDownRounds]: 'Pole in hand, thumb gripping.',
-  [CalibrationPhase.Polish]: 'Collection is done. The device is finishing the fit.',
-  [CalibrationPhase.Install]: 'Writing the model.',
+  [CalibrationPhase.Polish]: 'Collection is complete. The device is finishing the model fit.',
+  [CalibrationPhase.Install]: 'The device is committing the completed calibration.',
   [CalibrationPhase.Complete]: 'Calibration installed.',
   [CalibrationPhase.Stopped]: 'The run ended early.',
 };
@@ -68,13 +68,11 @@ export function phaseInstruction(phase: CalibrationPhase): string {
   return PHASE_INSTRUCTIONS[phase];
 }
 
-/** The gate's three states in the plan's words. `holding` is a class the gate
- * is satisfied with; `weak` is one it is extending collection for, which is the
- * only thing the gate is allowed to do. */
+/** The gate reports self-test strength. It never changes the fixed schedule. */
 const GATE_LABELS: Record<GateStatus, string> = {
   [GateStatus.Unknown]: 'collecting',
-  [GateStatus.Holding]: 'passed',
-  [GateStatus.Weak]: 'extended',
+  [GateStatus.Holding]: 'holding',
+  [GateStatus.Weak]: 'weak signal',
 };
 
 export function gateLabel(gate: GateStatus): string {

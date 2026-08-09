@@ -815,10 +815,20 @@ impl App {
     fn service_playback(&mut self) {}
 
     fn advance_calibration(&mut self) {
-        self.calibration.poll(IDLE_POLL_MS, &self.settings);
+        self.calibration.poll(&self.settings);
         let frames = self.calibration.drain_outbound();
         if !frames.is_empty() {
             self.links.send_window(None, &frames);
+        }
+        if self.links.active_link().is_connected() {
+            let generation = self.links.generation();
+            if let Some(narration) = self.calibration.pending_narration(generation) {
+                let revision = narration.revision();
+                if self.links.send_window(None, narration.frames()) {
+                    self.calibration
+                        .mark_narration_delivered(generation, revision);
+                }
+            }
         }
         if let Some(model) = self.calibration.take_installed_model() {
             info!(

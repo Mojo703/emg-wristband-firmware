@@ -307,6 +307,12 @@ class LiveStateManager {
     this.#calibrationResult = value;
   }
 
+  prepareCalibrationStart(): void {
+    this.#calibrationState = null;
+    this.#calibrationResult = null;
+    this.#calibrationProbe = null;
+  }
+
   setCalibrationProbe(value: CalibrationProbeFrame): void {
     this.#calibrationProbe = value;
   }
@@ -535,13 +541,15 @@ export function connect(): void {
 // Commands are deliberately fire-and-forget on the current socket. There is no
 // retained outbox: reconnecting must never replay one-shot intents such as a
 // calibration start into a later device session.
-function sendOneShot(frame: OutgoingFrame): void {
+function sendOneShot(frame: OutgoingFrame): boolean {
   assertOutgoingFrame(frame);
   if (socket !== null && socket.readyState === WebSocket.OPEN) {
     // Copy to a plain Uint8Array backed by an ArrayBuffer so the DOM WebSocket
     // type accepts it without the Node-specific Buffer generics.
     socket.send(new Uint8Array(cbor.encode(frame)));
+    return true;
   }
+  return false;
 }
 
 export const api = {

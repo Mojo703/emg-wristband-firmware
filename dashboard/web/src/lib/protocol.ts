@@ -883,6 +883,9 @@ export interface CalibrationStateFrame {
    * hold-off, so a prompt's alignment pushes the last labeled window later.
    * Render this rather than a local constant. */
   readonly prompt_hold_milliseconds: number;
+  /** Device-clock time left for settling or handover. Other phases use their
+   * rep or fit counters instead of inventing a time estimate. */
+  readonly phase_remaining_milliseconds: number | null;
   readonly classes: readonly CalibrationClassState[];
   readonly accepted_reps: number;
   readonly rejected_reps: number;
@@ -1829,6 +1832,8 @@ export function isCalibrationStateFrame(
     (value['prompt'] === null || isCalibrationGesture(value['prompt'])) &&
     isNumber(value['prompt_generation']) &&
     isNumber(value['prompt_hold_milliseconds']) &&
+    (value['phase_remaining_milliseconds'] === null ||
+      isNumber(value['phase_remaining_milliseconds'])) &&
     isCalibrationClassStateArray(value['classes']) &&
     isNumber(value['accepted_reps']) &&
     isNumber(value['rejected_reps']) &&

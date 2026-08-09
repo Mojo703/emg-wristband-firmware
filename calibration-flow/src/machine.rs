@@ -693,6 +693,20 @@ impl Run {
         }
     }
 
+    /// Device-clock samples left where the phase ends at a fixed sample.
+    /// Collection and fitting phases report progress through their own counters.
+    pub fn phase_remaining_samples(&self) -> Option<u64> {
+        match self {
+            Run::Erasing(phase) => {
+                Some(phase.settle_until.saturating_sub(phase.progress.now_sample))
+            }
+            Run::Elapsing(phase) => {
+                Some(phase.until_sample.saturating_sub(phase.progress.now_sample))
+            }
+            _ => None,
+        }
+    }
+
     pub fn round(&self) -> u32 {
         self.progress().round
     }
@@ -980,6 +994,20 @@ mod tests {
         assert_eq!(run.phase(), CalibrationPhase::ThumbUpRounds);
         let (_, action) = run.poll(settled);
         assert!(matches!(action, Some(Action::Prompt { .. })));
+    }
+
+    #[test]
+    fn timed_phase_reports_remaining_samples_from_its_own_clock() {
+        let constants = constants();
+        let settle_samples = constants.samples_in(constants.settling_milliseconds);
+        let (run, action) = Run::start(constants, 100).poll(100);
+        assert_eq!(action, Some(Action::EraseSlot));
+        let run = run.verified();
+
+        assert_eq!(run.phase_remaining_samples(), Some(settle_samples));
+        let (run, action) = run.poll(100 + settle_samples / 2);
+        assert!(action.is_none());
+        assert_eq!(run.phase_remaining_samples(), Some(settle_samples / 2));
     }
 
     #[test]

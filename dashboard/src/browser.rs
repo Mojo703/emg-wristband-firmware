@@ -225,6 +225,7 @@ async fn replay_retained(
             .into_iter()
             .chain(registry.telemetry_of(id))
             .chain(registry.phone_state_of(id))
+            .chain(registry.calibration_frames_of(id))
         {
             let msg = Message::Binary(frame::encode(&frame));
             send_reliable(tx, msg).await?;
@@ -480,8 +481,31 @@ pub async fn handle_browser(
                         | Frame::CalibrationStart { .. }
                         | Frame::CalibrationAbort {}
                         | Frame::CalibrationRowsRequest { .. }) => {
-                            if let Some(id) = selection.device_id() {
-                                registry.send_control(id, control);
+                            let calibration_control = matches!(
+                                control,
+                                Frame::CalibrationStart { .. } | Frame::CalibrationAbort {}
+                            );
+                            let delivery = selection.device_id().map_or(
+                                Err(crate::registry::ControlDeliveryError::UnknownDevice),
+                                |id| registry.send_control(id, control),
+                            );
+                            match (calibration_control, delivery) {
+                                (true, Err(error)) => {
+                                    let refusal = Frame::BenchError {
+                                        stage: "calibration".into(),
+                                        detail: error.calibration_message().into(),
+                                    };
+                                    if send_reliable(
+                                        &browser_tx,
+                                        Message::Binary(frame::encode(&refusal)),
+                                    )
+                                    .await
+                                    .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                         // Collection control frames go to the session manager.
@@ -657,7 +681,7 @@ mod tests {
         DeviceSelection, LiveKind, Out,
     };
     use crate::frame;
-    use crate::registry::Registry;
+    use crate::registry::{ControlDeliveryError, Registry};
     use axum::extract::ws::Message;
     use protocol::{
         DeviceConfig, DeviceProvenance, DeviceTransport, FirmwareBuild, Frame, PhoneStatus,
@@ -701,6 +725,44 @@ mod tests {
             scale_uv: 1.0,
             samples: Vec::new(),
             missing: Vec::new(),
+        }
+    }
+
+    fn calibration_state(phase: protocol::CalibrationPhase) -> Frame {
+        Frame::CalibrationState {
+            phase,
+            round: 0,
+            rounds_planned: 10,
+            round_floor: 10,
+            prompt: None,
+            prompt_generation: 0,
+            prompt_hold_milliseconds: 1_500,
+            phase_remaining_milliseconds: Some(30_000),
+            classes: Vec::new(),
+            accepted_reps: 0,
+            rejected_reps: 0,
+            last_rejection: None,
+            fit_passes_done: 0,
+            fit_passes_planned: 0,
+            pass_milliseconds: 0,
+            flash_flushes: 0,
+            elapsed_milliseconds: 0,
+        }
+    }
+
+    fn calibration_result() -> Frame {
+        Frame::CalibrationResult {
+            outcome: protocol::CalibrationOutcome::Aborted,
+            installed: None,
+            rounds_completed: 0,
+            rows_stored: 0,
+            accepted_reps: 0,
+            rejected_reps: 0,
+            quality: None,
+            weak_pair: None,
+            classes: Vec::new(),
+            fit_wall_milliseconds: 0,
+            previous_retained: true,
         }
     }
 
@@ -802,6 +864,121 @@ mod tests {
             frame::decode(&bytes).unwrap(),
             Frame::PhoneState {
                 status: PhoneStatus::Advertising
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn browser_reconnect_receives_current_calibration_state() {
+        let registry = Registry::new();
+        let token = register_device(&registry);
+        registry.push_calibration_frame(
+            "opal-test",
+            token,
+            calibration_state(protocol::CalibrationPhase::Settling),
+        );
+        let (tx, mut rx) = mpsc::channel(1);
+
+        assert!(replay_retained(&registry, Some("opal-test"), &tx)
+            .await
+            .is_ok());
+
+        let Out::Reliable(Message::Binary(bytes)) = rx.recv().await.unwrap() else {
+            panic!("expected retained calibration state");
+        };
+        assert!(matches!(
+            frame::decode(&bytes).unwrap(),
+            Frame::CalibrationState {
+                phase: protocol::CalibrationPhase::Settling,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn disconnected_device_rejects_control_with_a_typed_reason() {
+        let registry = Registry::new();
+        let token = register_device(&registry);
+        registry.deregister("opal-test", token);
+
+        assert_eq!(
+            registry.send_control("opal-test", Frame::CalibrationAbort {}),
+            Err(ControlDeliveryError::Disconnected)
+        );
+    }
+
+    #[test]
+    fn calibration_result_requires_a_terminal_state() {
+        let registry = Registry::new();
+        let token = register_device(&registry);
+
+        registry.push_calibration_frame("opal-test", token, calibration_result());
+
+        assert!(registry.calibration_frames_of("opal-test").is_empty());
+    }
+
+    #[tokio::test]
+    async fn browser_reconnect_receives_terminal_state_before_result() {
+        let registry = Registry::new();
+        let token = register_device(&registry);
+        registry.push_calibration_frame(
+            "opal-test",
+            token,
+            calibration_state(protocol::CalibrationPhase::Stopped),
+        );
+        registry.push_calibration_frame("opal-test", token, calibration_result());
+        let (tx, mut rx) = mpsc::channel(2);
+
+        assert!(replay_retained(&registry, Some("opal-test"), &tx)
+            .await
+            .is_ok());
+
+        let Out::Reliable(Message::Binary(state)) = rx.recv().await.unwrap() else {
+            panic!("expected terminal calibration state");
+        };
+        let Out::Reliable(Message::Binary(result)) = rx.recv().await.unwrap() else {
+            panic!("expected calibration result");
+        };
+        assert!(matches!(
+            frame::decode(&state).unwrap(),
+            Frame::CalibrationState {
+                phase: protocol::CalibrationPhase::Stopped,
+                ..
+            }
+        ));
+        assert!(matches!(
+            frame::decode(&result).unwrap(),
+            Frame::CalibrationResult {
+                outcome: protocol::CalibrationOutcome::Aborted,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_new_run_replaces_the_retained_terminal_pair() {
+        let registry = Registry::new();
+        let token = register_device(&registry);
+        registry.push_calibration_frame(
+            "opal-test",
+            token,
+            calibration_state(protocol::CalibrationPhase::Stopped),
+        );
+        registry.push_calibration_frame("opal-test", token, calibration_result());
+
+        registry.push_calibration_frame(
+            "opal-test",
+            token,
+            calibration_state(protocol::CalibrationPhase::Settling),
+        );
+
+        let frames = registry.calibration_frames_of("opal-test");
+        assert_eq!(frames.len(), 1);
+        assert!(matches!(
+            frames[0],
+            Frame::CalibrationState {
+                phase: protocol::CalibrationPhase::Settling,
+                ..
             }
         ));
     }
