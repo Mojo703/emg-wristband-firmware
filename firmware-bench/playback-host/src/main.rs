@@ -387,7 +387,8 @@ fn main() -> Result<()> {
 /// command line uses so a plan file and a shell loop cannot drift apart.
 fn read_plan(path: &Path) -> Result<Vec<Step>> {
     let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    text.lines()
+    let steps: Vec<Step> = text
+        .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .map(|line| {
@@ -397,7 +398,24 @@ fn read_plan(path: &Path) -> Result<Vec<Step>> {
                 .with_context(|| format!("plan line: {line}"))?
                 .step)
         })
-        .collect()
+        .collect::<Result<_>>()?;
+    if steps
+        .iter()
+        .filter(|step| matches!(step, Step::Fit { .. }))
+        .count()
+        > 1
+    {
+        bail!("plan contains more than one fit step");
+    }
+    if steps
+        .iter()
+        .filter(|step| matches!(step, Step::Calibrate { .. }))
+        .count()
+        > 1
+    {
+        bail!("plan contains more than one calibrate step");
+    }
+    Ok(steps)
 }
 
 fn run(step: &Step, link: &mut Link, capture: &mut Capture) -> Result<()> {
@@ -1053,7 +1071,7 @@ fn stream(
         constants: manifest.constants.clone(),
     })?;
     let (mut next_sequence, mut free_chunks) = await_credit(link, capture)?;
-    if let Some(controller) = abort.as_deref_mut() {
+    if let Some(controller) = abort.as_mut() {
         controller.request_if_due(link, capture)?;
     }
 
@@ -1099,7 +1117,7 @@ fn stream(
             for frame in link.drain() {
                 capture.accept(frame);
             }
-            if let Some(controller) = abort.as_deref_mut() {
+            if let Some(controller) = abort.as_mut() {
                 controller.request_if_due(link, capture)?;
             }
             if let Some((sequence, chunks)) = capture.credit.take() {
@@ -1116,7 +1134,7 @@ fn stream(
     // The final status is the device saying it has drained everything, so it is
     // what "the stream is done" means here rather than the last write returning.
     await_status(link, capture)?;
-    if let Some(controller) = abort.as_deref_mut() {
+    if let Some(controller) = abort.as_mut() {
         controller.request_if_due(link, capture)?;
     }
 
@@ -1690,7 +1708,18 @@ fn calibrate(
 
 #[cfg(test)]
 mod tests {
-    use super::CalibrationAbort;
+    use super::{read_plan, CalibrationAbort};
+    use std::path::PathBuf;
+
+    fn write_plan(contents: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "playback-host-plan-{}-{}.txt",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
 
     #[test]
     fn fit_started_waits_for_a_planned_checkpoint() {
@@ -1704,5 +1733,26 @@ mod tests {
         assert!(!abort.reached(2, 16));
         assert!(abort.reached(3, 16));
         assert!(abort.reached(4, 16));
+    }
+
+    #[test]
+    fn plan_rejects_more_than_one_fit_step() {
+        let path = write_plan("fit --model first\nfit --model second\n");
+        let error = read_plan(&path).err().expect("duplicate fit must fail");
+        std::fs::remove_file(path).unwrap();
+
+        assert!(format!("{error:#}").contains("more than one fit step"));
+    }
+
+    #[test]
+    fn plan_rejects_more_than_one_calibrate_step() {
+        let path =
+            write_plan("calibrate --manifest first.json\ncalibrate --manifest second.json\n");
+        let error = read_plan(&path)
+            .err()
+            .expect("duplicate calibrate must fail");
+        std::fs::remove_file(path).unwrap();
+
+        assert!(format!("{error:#}").contains("more than one calibrate step"));
     }
 }

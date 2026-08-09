@@ -9,12 +9,13 @@
 //! run on their own thread, a reader thread owns the decode, and the caller's
 //! thread is left free to write bulk samples while credits arrive behind it.
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use protocol::{Frame, FrameScanner};
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 /// How often the claim is refreshed. The device releases after fifteen seconds
@@ -22,7 +23,7 @@ use std::time::Duration;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 
 pub struct Link {
-    port: File,
+    writer: Arc<Mutex<File>>,
     frames: mpsc::Receiver<Frame>,
 }
 
@@ -40,17 +41,15 @@ impl Link {
             .with_context(|| format!("open {}", path.display()))?;
 
         let mut reader = port.try_clone().context("clone port for reads")?;
+        let raw_tap_path = std::env::var_os("PLAYBACK_HOST_RAW_TAP");
+        let raw_tap = create_raw_tap(raw_tap_path.as_deref())?;
         let (decoded, frames) = mpsc::channel();
         // Everything the port produced, verbatim, beside the decoded frames: a
         // panicking console-enabled device prints its backtrace as plain text,
         // which the scanner rightly skips — and which is then the only record
         // of why a run died. Written unconditionally; a few MB per run.
-        let raw_tap = std::env::var_os("PLAYBACK_HOST_RAW_TAP").map(std::fs::File::create);
         std::thread::spawn(move || {
-            let mut raw_tap = match raw_tap {
-                Some(Ok(file)) => Some(file),
-                _ => None,
-            };
+            let mut raw_tap = raw_tap;
             let mut scanner = FrameScanner::new();
             let mut buffer = [0u8; 8192];
             loop {
@@ -77,16 +76,16 @@ impl Link {
             }
         });
 
-        let mut link = Self { port, frames };
+        let writer = Arc::new(Mutex::new(port));
+        let mut link = Self { writer, frames };
         link.send(&Frame::Probe {})?;
 
-        let mut heartbeat_port = link.port.try_clone().context("clone port for heartbeats")?;
+        let heartbeat_writer = Arc::clone(&link.writer);
         let heartbeat = encode(&Frame::Heartbeat {})?;
         std::thread::spawn(move || loop {
-            if heartbeat_port.write_all(&heartbeat).is_err() {
+            if write_frame(&heartbeat_writer, &heartbeat).is_err() {
                 return;
             }
-            let _ = heartbeat_port.flush();
             std::thread::sleep(HEARTBEAT_INTERVAL);
         });
 
@@ -95,9 +94,7 @@ impl Link {
 
     pub fn send(&mut self, frame: &Frame) -> Result<()> {
         let bytes = encode(frame)?;
-        self.port.write_all(&bytes).context("write frame")?;
-        self.port.flush().context("flush frame")?;
-        Ok(())
+        write_frame(&self.writer, &bytes)
     }
 
     /// The next frame, or `None` if none arrived within `timeout`.
@@ -115,4 +112,73 @@ fn encode(frame: &Frame) -> Result<Vec<u8>> {
     let mut payload = Vec::new();
     ciborium::into_writer(frame, &mut payload).context("encode frame")?;
     Ok(protocol::frame_bytes(&payload))
+}
+
+fn write_frame<W: Write>(writer: &Mutex<W>, bytes: &[u8]) -> Result<()> {
+    let mut writer = writer
+        .lock()
+        .map_err(|_| anyhow!("serial writer lock poisoned"))?;
+    writer.write_all(bytes).context("write frame")?;
+    writer.flush().context("flush frame")?;
+    Ok(())
+}
+
+fn create_raw_tap(path: Option<&OsStr>) -> Result<Option<File>> {
+    path.map(|path| {
+        File::create(path)
+            .with_context(|| format!("create PLAYBACK_HOST_RAW_TAP {}", Path::new(path).display()))
+    })
+    .transpose()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{create_raw_tap, write_frame};
+    use std::io::{self, Write};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct OneByteWriter(Vec<u8>);
+
+    impl Write for OneByteWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.push(bytes[0]);
+            std::thread::yield_now();
+            Ok(1)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn shared_writer_lock_covers_each_complete_frame() {
+        let writer = Arc::new(Mutex::new(OneByteWriter::default()));
+        let first = vec![0x11; 4096];
+        let second = vec![0x22; 4096];
+
+        let first_writer = Arc::clone(&writer);
+        let first_thread = std::thread::spawn(move || write_frame(&first_writer, &first));
+        let second_writer = Arc::clone(&writer);
+        let second_thread = std::thread::spawn(move || write_frame(&second_writer, &second));
+
+        first_thread.join().unwrap().unwrap();
+        second_thread.join().unwrap().unwrap();
+        let bytes = &writer.lock().unwrap().0;
+        let transitions = bytes.windows(2).filter(|pair| pair[0] != pair[1]).count();
+        assert_eq!(transitions, 1, "concurrent frame bytes interleaved");
+    }
+
+    #[test]
+    fn raw_tap_creation_error_names_the_environment_setting_and_path() {
+        let path = std::env::temp_dir()
+            .join(format!("missing-raw-tap-parent-{}", std::process::id()))
+            .join("tap.bin");
+        let error = create_raw_tap(Some(path.as_os_str())).unwrap_err();
+        let message = format!("{error:#}");
+
+        assert!(message.contains("PLAYBACK_HOST_RAW_TAP"));
+        assert!(message.contains(&path.display().to_string()));
+    }
 }
