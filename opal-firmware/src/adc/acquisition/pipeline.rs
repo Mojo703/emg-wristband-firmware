@@ -104,6 +104,10 @@ const SLOW_PERIOD_US: u64 = 1_500;
 /// (~2 per second was measured) describes itself without flooding the link.
 const RECOVERY_LOG_INTERVAL: u32 = 32;
 
+/// A transient command failure gets another full reset/configure attempt while
+/// DRDY remains disabled. Exhaustion leaves the source absent until reboot.
+const RECOVERY_ATTEMPTS: u32 = 3;
+
 /// How long after a warm recovery a chip's frames are read but discarded. The RESET
 /// pulse powers that chip's internal reference buffer down and `configure` powers it
 /// back up, and the datasheet gives the reference a 150 ms start-up (the cold-boot
@@ -360,8 +364,26 @@ impl Pipeline {
             );
             return Err(PipelineStopped);
         }
-        if let Err(error) = self.chip.warm_recover() {
-            warn!("chip {} warm recovery failed: {error}", self.index);
+        let mut recovered = false;
+        for attempt in 1..=RECOVERY_ATTEMPTS {
+            match self.chip.warm_recover() {
+                Ok(()) => {
+                    recovered = true;
+                    break;
+                }
+                Err(error) => warn!(
+                    "chip {} warm recovery attempt {attempt}/{RECOVERY_ATTEMPTS} failed: {error}",
+                    self.index
+                ),
+            }
+        }
+        if !recovered {
+            let _ = self.chip.stop_conversion();
+            warn!(
+                "chip {} recovery attempts exhausted; leaving it absent",
+                self.index
+            );
+            return Err(PipelineStopped);
         }
         self.reader.clear();
         if let Err(error) = self.reader.enable() {

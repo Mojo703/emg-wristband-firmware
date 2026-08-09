@@ -54,6 +54,10 @@ const SERIAL_WRITE_TIMEOUT_MS: u32 = 500;
 /// succeeds, which read as a dead host and dropped the serial link once per claim.
 const SERIAL_WRITE_CHUNK_BYTES: usize = 2048;
 
+/// Inbound controls are bounded by the 16 KiB playback receive contract. The
+/// largest control is one full playback sample chunk; ordinary controls are tiny.
+const SERIAL_CONTROL_MAX_LEN: usize = 16 * 1024;
+
 /// Reads/writes framed CBOR over the USB-Serial-JTAG CDC channel — the same USB port
 /// used for flashing and JTAG debugging (the CDC and JTAG are independent interfaces
 /// of one composite device, so they coexist). Single-threaded: `poll` drains whatever
@@ -68,7 +72,7 @@ impl SerialTransport {
     pub fn new(driver: UsbSerialDriver<'static>) -> Self {
         Self {
             driver,
-            scanner: FrameScanner::new(),
+            scanner: FrameScanner::with_max_len(SERIAL_CONTROL_MAX_LEN),
         }
     }
 
@@ -89,17 +93,16 @@ impl Transport for SerialTransport {
     fn poll(&mut self) -> Option<Control> {
         let mut chunk = [0u8; 256];
         loop {
+            while let Some(payload) = self.scanner.next_frame() {
+                if let Some(control) = decode(&payload) {
+                    return Some(control);
+                }
+            }
             match self.driver.read(&mut chunk, 0) {
-                Ok(0) | Err(_) => break,
+                Ok(0) | Err(_) => return None,
                 Ok(n) => self.scanner.extend(&chunk[..n]),
             }
         }
-        while let Some(payload) = self.scanner.next_frame() {
-            if let Some(control) = decode(&payload) {
-                return Some(control);
-            }
-        }
-        None
     }
 }
 

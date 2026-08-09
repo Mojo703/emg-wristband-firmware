@@ -636,10 +636,12 @@ pub fn slot_to_evict(sequences: [Option<u32>; SLOT_COUNT]) -> usize {
     chosen
 }
 
-/// The sequence a new record takes: one past the highest any live slot holds.
-pub fn next_sequence(sequences: [Option<u32>; SLOT_COUNT]) -> u32 {
+/// The sequence a new record takes, or `None` when the legal space is exhausted.
+pub fn next_sequence(sequences: [Option<u32>; SLOT_COUNT]) -> Option<u32> {
     let highest = sequences.iter().flatten().copied().max().unwrap_or(0);
-    highest.saturating_add(1).max(1)
+    highest
+        .checked_add(1)
+        .filter(|sequence| *sequence != SEQUENCE_ERASED)
 }
 
 #[cfg(test)]
@@ -993,9 +995,10 @@ mod tests {
         assert_eq!(slot_to_evict([None, Some(9)]), 0);
         assert_eq!(slot_to_evict([None, None]), 0);
 
-        assert_eq!(next_sequence([None, None]), 1);
-        assert_eq!(next_sequence([Some(4), Some(9)]), 10);
-        assert_eq!(next_sequence([Some(u32::MAX - 1), None]), u32::MAX);
+        assert_eq!(next_sequence([None, None]), Some(1));
+        assert_eq!(next_sequence([Some(4), Some(9)]), Some(10));
+        assert_eq!(next_sequence([Some(u32::MAX - 1), None]), None);
+        assert_eq!(next_sequence([Some(u32::MAX), None]), None);
     }
 
     /// The one test that crosses the crate boundary: parse an image the host
@@ -1118,7 +1121,7 @@ mod tests {
         assert_eq!(flushed, 120);
 
         let mut record = SlotRecord::empty(class_count);
-        record.sequence = next_sequence([None, None]);
+        record.sequence = next_sequence([None, None]).unwrap();
         record.prior_hash = prior_hash;
         record.reference_gains = [1.0; 16];
         let metadata = record.to_metadata_block(flushed);
@@ -1159,7 +1162,7 @@ mod tests {
         let mut live = [None, None];
         for round in 0..3 {
             let target = slot_to_evict(live);
-            let sequence = next_sequence(live);
+            let sequence = next_sequence(live).unwrap();
             let mut record = SlotRecord::empty(12);
             record.sequence = sequence;
             record.prior_hash = prior_hash;

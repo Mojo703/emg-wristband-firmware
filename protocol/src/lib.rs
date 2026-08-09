@@ -1985,14 +1985,28 @@ pub const FRAME_MAX_LEN: usize = 1 << 20;
 /// backend, serial and TCP). Feed raw bytes with [`FrameScanner::extend`], take complete
 /// CBOR payloads with [`FrameScanner::next_frame`]. Garbage between frames (bootloader
 /// text, a torn frame after reconnect) is skipped by scanning to the next magic.
-#[derive(Default)]
 pub struct FrameScanner {
     buffer: Vec<u8>,
+    max_len: usize,
+}
+
+impl Default for FrameScanner {
+    fn default() -> Self {
+        Self::with_max_len(FRAME_MAX_LEN)
+    }
 }
 
 impl FrameScanner {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Construct a scanner with a tighter payload limit for a constrained reader.
+    pub fn with_max_len(max_len: usize) -> Self {
+        Self {
+            buffer: Vec::new(),
+            max_len: max_len.min(FRAME_MAX_LEN),
+        }
     }
 
     pub fn extend(&mut self, bytes: &[u8]) {
@@ -2027,7 +2041,7 @@ impl FrameScanner {
                 self.buffer[4],
                 self.buffer[5],
             ]) as usize;
-            if length > FRAME_MAX_LEN {
+            if length > self.max_len {
                 // Not a real header — a magic pair inside garbage. Skip it, rescan.
                 self.buffer.drain(0..2);
                 continue;
@@ -2436,6 +2450,14 @@ mod tests {
         let mut scanner = FrameScanner::new();
         scanner.extend(&FRAME_MAGIC);
         scanner.extend(&(u32::MAX).to_le_bytes()); // garbage that happens to start with magic
+        scanner.extend(&frame_bytes(b"ok"));
+        assert_eq!(scanner.next_frame(), Some(b"ok".to_vec()));
+    }
+
+    #[test]
+    fn frame_scanner_applies_its_reader_specific_limit() {
+        let mut scanner = FrameScanner::with_max_len(4);
+        scanner.extend(&frame_bytes(b"12345"));
         scanner.extend(&frame_bytes(b"ok"));
         assert_eq!(scanner.next_frame(), Some(b"ok".to_vec()));
     }

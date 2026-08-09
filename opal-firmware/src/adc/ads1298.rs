@@ -12,7 +12,7 @@ use anyhow::Result;
 use esp_idf_svc::hal::delay::{Ets, FreeRtos};
 use esp_idf_svc::hal::gpio::{Input, Output, PinDriver};
 use esp_idf_svc::hal::spi::{Operation, SpiDeviceDriver, SpiDriver};
-use log::{info, warn};
+use log::warn;
 use std::sync::Arc;
 
 use super::channel::{Channel, DEVICE_COUNT};
@@ -139,6 +139,75 @@ pub(super) enum RightLegDriveMode {
     Disabled,
 }
 
+const CONFIGURATION_REGISTER_COUNT: usize = 23;
+
+impl RightLegDriveMode {
+    /// CONFIG3 with the internal 2.4 V reference and this bias-drive mode.
+    const fn config3(self) -> Config3 {
+        let drive_enabled = !matches!(self, Self::Disabled);
+        Config3 {
+            internal_reference_enabled: true,
+            // The 2.4 V reference is what `preprocess` converts codes against.
+            four_volt_reference: false,
+            right_leg_drive_measurement: false,
+            right_leg_drive_reference_internal: matches!(self, Self::InternalReference),
+            right_leg_drive_enabled: drive_enabled,
+            // Lead-off sense rides on the same amplifier.
+            right_leg_drive_lead_off_sense: drive_enabled,
+        }
+    }
+
+    /// Channels summed into this chip's bias drive: all when powered, none otherwise.
+    const fn sense_channels(self) -> ChannelMask {
+        match self {
+            Self::Disabled => ChannelMask::NONE,
+            _ => ChannelMask::ALL,
+        }
+    }
+
+    /// The complete normal register recipe for a chip using this bias-drive mode.
+    fn expected_configuration(self) -> [(Register, u8); CONFIGURATION_REGISTER_COUNT] {
+        let sense = self.sense_channels();
+        [
+            (Register::Config1, device_config1().to_byte()),
+            (Register::Config3, self.config3().to_byte()),
+            (
+                Register::RldSensP,
+                RightLegDriveSensePositive(sense).to_byte(),
+            ),
+            (
+                Register::RldSensN,
+                RightLegDriveSenseNegative(sense).to_byte(),
+            ),
+            (Register::Config2, NORMAL_CONFIG2.to_byte()),
+            (Register::Loff, LEAD_OFF_CONTROL.to_byte()),
+            (Register::Ch1Set, NORMAL_CHANNEL_SETTINGS.to_byte()),
+            (Register::Ch2Set, NORMAL_CHANNEL_SETTINGS.to_byte()),
+            (Register::Ch3Set, NORMAL_CHANNEL_SETTINGS.to_byte()),
+            (Register::Ch4Set, NORMAL_CHANNEL_SETTINGS.to_byte()),
+            (Register::Ch5Set, NORMAL_CHANNEL_SETTINGS.to_byte()),
+            (Register::Ch6Set, NORMAL_CHANNEL_SETTINGS.to_byte()),
+            (Register::Ch7Set, NORMAL_CHANNEL_SETTINGS.to_byte()),
+            (Register::Ch8Set, NORMAL_CHANNEL_SETTINGS.to_byte()),
+            (
+                Register::LoffSensP,
+                LeadOffSensePositive(lead_off_channels()).to_byte(),
+            ),
+            (
+                Register::LoffSensN,
+                LeadOffSenseNegative(lead_off_channels()).to_byte(),
+            ),
+            (Register::LoffFlip, LeadOffFlip(ChannelMask::NONE).to_byte()),
+            (Register::Gpio, GeneralPurposeInputOutputOff.to_byte()),
+            (Register::Pace, PaceDetectOff.to_byte()),
+            (Register::Resp, RESPIRATION_OFF.to_byte()),
+            (Register::Config4, CONFIG4.to_byte()),
+            (Register::Wct1, WilsonCenterTerminalOneOff.to_byte()),
+            (Register::Wct2, WilsonCenterTerminalTwoOff.to_byte()),
+        ]
+    }
+}
+
 /// Which chip drives, in chip order. Chip 0's board carries the jumper, so the
 /// boards are no longer interchangeable between the two positions: the jumpered one
 /// goes in the chip 0 socket or the drive runs open-loop into a rail.
@@ -151,32 +220,6 @@ pub(super) const RIGHT_LEG_DRIVE_MODE: [RightLegDriveMode; DEVICE_COUNT] = [
     RightLegDriveMode::ExternalReference,
     RightLegDriveMode::Disabled,
 ];
-
-/// CONFIG3: the internal reference buffer on the 2.4 V reference, and the right-leg
-/// drive wherever this chip's [`RIGHT_LEG_DRIVE_MODE`] entry puts it.
-const fn config3_for_mode(mode: RightLegDriveMode) -> Config3 {
-    let drive_enabled = !matches!(mode, RightLegDriveMode::Disabled);
-    Config3 {
-        internal_reference_enabled: true,
-        // The 2.4 V reference, which is what `preprocess` converts codes against.
-        four_volt_reference: false,
-        right_leg_drive_measurement: false,
-        right_leg_drive_reference_internal: matches!(mode, RightLegDriveMode::InternalReference),
-        right_leg_drive_enabled: drive_enabled,
-        // The lead-off sense rides on the same amplifier, so it goes wherever the
-        // drive goes.
-        right_leg_drive_lead_off_sense: drive_enabled,
-    }
-}
-
-/// RLD_SENSP/N: which of this chip's channels sum into its right-leg drive. All
-/// eight where the amplifier is powered, none where it is not.
-const fn sense_channels_for_mode(mode: RightLegDriveMode) -> ChannelMask {
-    match mode {
-        RightLegDriveMode::Disabled => ChannelMask::NONE,
-        _ => ChannelMask::ALL,
-    }
-}
 
 /// CONFIG2 with the internal test signal generator off, which is normal operation.
 const NORMAL_CONFIG2: Config2 = Config2 {
@@ -469,44 +512,10 @@ impl Ads1298Device {
         })
     }
 
-    /// Reads back the registers the sample rate and the status word depend on, and logs
-    /// what actually landed next to what was written.
-    ///
-    /// `configure` writes 23 registers and checks none of them. A write that silently
-    /// fails is invisible until it shows up as a wrong conversion rate, which is a long
-    /// way downstream of the cause. Must be called in SDATAC, before RDATAC starts the
-    /// stream — registers cannot be read while streaming.
-    pub(super) fn log_configuration_readback(&mut self) {
-        let expected = [
-            (Register::Config1, device_config1().to_byte()),
-            (Register::Config2, NORMAL_CONFIG2.to_byte()),
-            (
-                Register::Config3,
-                config3_for_mode(self.right_leg_drive).to_byte(),
-            ),
-            (
-                Register::LoffSensP,
-                LeadOffSensePositive(lead_off_channels()).to_byte(),
-            ),
-        ];
-        for (register, written) in expected {
-            match self.read_register(register) {
-                Ok(read) if read == written => {
-                    info!("{register:?} = {read:#04x} as written")
-                }
-                Ok(read) => warn!(
-                    "{register:?} wrote {written:#04x}, reads {read:#04x} -- the write did not take"
-                ),
-                Err(error) => warn!("{register:?} readback failed: {error}"),
-            }
-        }
-    }
-
     /// Every register as the chip holds it, address order, for the provenance a
-    /// session records. Same constraint as [`Self::log_configuration_readback`]:
-    /// SDATAC only, before RDATAC starts the stream. A register whose read fails
-    /// stays `None` — a snapshot that quietly reported the intended byte would
-    /// defeat the point of reading the chip at all.
+    /// session records. SDATAC only, before RDATAC starts the stream. A register
+    /// whose read fails stays `None` — a snapshot that quietly reported the intended
+    /// byte would defeat the point of reading the chip at all.
     pub(super) fn read_all_registers(&mut self) -> [Option<u8>; Register::ALL.len()] {
         let mut values = [None; Register::ALL.len()];
         for (slot, register) in values.iter_mut().zip(Register::ALL) {
@@ -518,35 +527,22 @@ impl Ads1298Device {
         values
     }
 
-    // Writes this device's full register set. Must be called after
-    // `stop_read_data_continuous()` (SDATAC), since registers can't be written while streaming.
+    // Writes and verifies this device's full register set. Must be called after
+    // `stop_read_data_continuous()` (SDATAC), since registers can't be accessed while streaming.
     pub(super) fn configure(&mut self) -> Result<()> {
-        self.write_register(device_config1())?;
-
-        self.write_register(config3_for_mode(self.right_leg_drive))?;
-
-        let sense = sense_channels_for_mode(self.right_leg_drive);
-        self.write_register(RightLegDriveSensePositive(sense))?;
-        self.write_register(RightLegDriveSenseNegative(sense))?;
-
-        self.write_register(NORMAL_CONFIG2)?;
-        self.write_register(LEAD_OFF_CONTROL)?;
-
-        for channel in Channel::ALL {
-            self.write_channel_settings(channel, NORMAL_CHANNEL_SETTINGS)?;
+        let expected = self.right_leg_drive.expected_configuration();
+        for &(register, value) in &expected {
+            self.write_register_byte(register, value)?;
         }
-
-        // Both ends of every differential pair when lead-off is enabled, nothing
-        // while it is off (see LEAD_OFF_ENABLED).
-        self.write_register(LeadOffSensePositive(lead_off_channels()))?;
-        self.write_register(LeadOffSenseNegative(lead_off_channels()))?;
-        self.write_register(LeadOffFlip(ChannelMask::NONE))?;
-        self.write_register(GeneralPurposeInputOutputOff)?;
-        self.write_register(PaceDetectOff)?;
-        self.write_register(RESPIRATION_OFF)?;
-        self.write_register(CONFIG4)?;
-        self.write_register(WilsonCenterTerminalOneOff)?;
-        self.write_register(WilsonCenterTerminalTwoOff)?;
+        for (register, expected) in expected {
+            let read = self.read_register(register)?;
+            if read != expected {
+                anyhow::bail!(
+                    "{} wrote {expected:#04x}, reads {read:#04x}",
+                    register.name()
+                );
+            }
+        }
 
         Ok(())
     }
@@ -659,6 +655,17 @@ mod tests {
     /// beside it — change a field on purpose and this test names the byte that moved.
     #[test]
     fn configure_writes_the_bytes_the_bench_validated() {
+        let configuration = RIGHT_LEG_DRIVE_MODE[0].expected_configuration();
+        assert_eq!(configuration.len(), 23);
+        for (index, (register, _)) in configuration.iter().enumerate() {
+            assert!(
+                configuration[..index]
+                    .iter()
+                    .all(|(seen, _)| seen != register),
+                "{register:?} appears twice"
+            );
+        }
+
         // CONFIG1: high resolution, per-chip readback, fMOD/256, clock output off —
         // with CLKSEL at 3V3 the CLK pins are 3-stated and unconnected.
         assert_eq!(device_config1().to_byte(), 0xC4);
@@ -670,8 +677,8 @@ mod tests {
         // carries the jumper. Chip 0 drives, chip 1 does not, and both driving at
         // once is the failure this pins against (see RIGHT_LEG_DRIVE_MODE).
         let [drive_zero, drive_one] = RIGHT_LEG_DRIVE_MODE;
-        assert_eq!(config3_for_mode(drive_zero).to_byte(), 0xC6);
-        assert_eq!(config3_for_mode(drive_one).to_byte(), 0xC0);
+        assert_eq!(drive_zero.config3().to_byte(), 0xC6);
+        assert_eq!(drive_one.config3().to_byte(), 0xC0);
         assert_eq!(
             RIGHT_LEG_DRIVE_MODE
                 .iter()
@@ -682,19 +689,19 @@ mod tests {
 
         // RLD_SENSP/N: all eight channels of the driving chip, none of the other's.
         assert_eq!(
-            RightLegDriveSensePositive(sense_channels_for_mode(drive_zero)).to_byte(),
+            RightLegDriveSensePositive(drive_zero.sense_channels()).to_byte(),
             0xFF
         );
         assert_eq!(
-            RightLegDriveSenseNegative(sense_channels_for_mode(drive_zero)).to_byte(),
+            RightLegDriveSenseNegative(drive_zero.sense_channels()).to_byte(),
             0xFF
         );
         assert_eq!(
-            RightLegDriveSensePositive(sense_channels_for_mode(drive_one)).to_byte(),
+            RightLegDriveSensePositive(drive_one.sense_channels()).to_byte(),
             0x00
         );
         assert_eq!(
-            RightLegDriveSenseNegative(sense_channels_for_mode(drive_one)).to_byte(),
+            RightLegDriveSenseNegative(drive_one.sense_channels()).to_byte(),
             0x00
         );
 
@@ -728,9 +735,9 @@ mod tests {
     fn each_right_leg_drive_mode_emits_its_datasheet_byte() {
         use RightLegDriveMode::{Disabled, ExternalReference, InternalReference};
 
-        assert_eq!(config3_for_mode(ExternalReference).to_byte(), 0xC6);
-        assert_eq!(config3_for_mode(InternalReference).to_byte(), 0xCE);
-        assert_eq!(config3_for_mode(Disabled).to_byte(), 0xC0);
+        assert_eq!(ExternalReference.config3().to_byte(), 0xC6);
+        assert_eq!(InternalReference.config3().to_byte(), 0xCE);
+        assert_eq!(Disabled.config3().to_byte(), 0xC0);
     }
 
     /// The same pinning for the test-signal path in `enable_test_signal`.
@@ -760,8 +767,8 @@ mod tests {
             Some(device_config1())
         );
         assert_eq!(
-            Config3::from_byte(config3_for_mode(RIGHT_LEG_DRIVE_MODE[0]).to_byte()),
-            Some(config3_for_mode(RIGHT_LEG_DRIVE_MODE[0]))
+            Config3::from_byte(RIGHT_LEG_DRIVE_MODE[0].config3().to_byte()),
+            Some(RIGHT_LEG_DRIVE_MODE[0].config3())
         );
         assert_eq!(
             Config2::from_byte(TEST_SIGNAL_CONFIG2.to_byte()),

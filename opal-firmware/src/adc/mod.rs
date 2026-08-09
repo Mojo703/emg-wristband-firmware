@@ -290,11 +290,6 @@ pub(crate) fn bring_up<SpiA: SpiAnyPins + 'static, SpiB: SpiAnyPins + 'static>(
     FreeRtos::delay_ms(300);
 
     for (index, chip) in chips.iter_mut().enumerate() {
-        // Still in SDATAC, so registers are readable. Once RDATAC starts below there
-        // is no way to check them again without tearing the stream down.
-        info!("ADS1298 chip {index} configuration readback:");
-        chip.device.log_configuration_readback();
-
         if let Some(channel) = test_signal_channel {
             // Registers can only be written outside RDATAC.
             chip.device.enable_test_signal(channel)?;
@@ -353,6 +348,12 @@ fn claim_frame_reader(
     let driver_frame = chip
         .read_frame()
         .with_context(|| format!("chip {index} driver frame read"))?;
+    if driver_frame.status_word().is_none() {
+        anyhow::bail!(
+            "chip {index} driver frame has no status marker ({:#08x})",
+            driver_frame.status
+        );
+    }
     let reader = frame_reader::FrameReader::claim(
         index,
         spi_host,
@@ -361,23 +362,26 @@ fn claim_frame_reader(
         chip.device.data_ready_pin(),
     )?;
     FreeRtos::delay_ms(2);
-    match reader.validate().map(|bytes| decode::parse_sample(&bytes)) {
-        Some(frame) if frame.status_word().is_some() => info!(
-            "chip {index} interrupt-side frame path verified: driver status {:#08x}, \
-             interrupt-path status {:#08x}",
-            driver_frame.status, frame.status
-        ),
-        Some(frame) => warn!(
-            "chip {index} interrupt-side frame path read {:#08x} with no status marker (the \
-             driver read {:#08x}): the register recipe is wrong and this chip's data cannot \
-             be trusted",
-            frame.status, driver_frame.status
-        ),
-        None => warn!(
+    let bytes = reader.validate().ok_or_else(|| {
+        anyhow::anyhow!(
             "chip {index} interrupt-side frame path produced no frame: the SPI host did not \
              complete the transfer"
-        ),
+        )
+    })?;
+    let frame = decode::parse_sample(&bytes);
+    if frame.status_word().is_none() {
+        anyhow::bail!(
+            "chip {index} interrupt-side frame has no status marker ({:#08x}); driver status \
+             was {:#08x}",
+            frame.status,
+            driver_frame.status
+        );
     }
+    info!(
+        "chip {index} interrupt-side frame path verified: driver status {:#08x}, \
+         interrupt-path status {:#08x}",
+        driver_frame.status, frame.status
+    );
     reader.attach()?;
     Ok(reader)
 }

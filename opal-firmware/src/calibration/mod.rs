@@ -433,7 +433,9 @@ impl Calibration {
     /// erasing under a live front end.
     fn erase_next_slot(partition: Option<&mut CalibrationPartition>) -> Option<usize> {
         let partition = partition?;
-        let slot = flash_image::slot_to_evict(partition.sequences());
+        let sequences = partition.sequences();
+        flash_image::next_sequence(sequences)?;
+        let slot = flash_image::slot_to_evict(sequences);
         if partition.slot_is_erased(slot) {
             info!("calibration slot {slot} is already erased and ready");
             return Some(slot);
@@ -489,6 +491,11 @@ impl Calibration {
             self.refuse("a scripted run needs its cue schedule first");
             return;
         }
+        let sequences = self.stored_sequences();
+        let Some(sequence) = flash_image::next_sequence(sequences) else {
+            self.refuse("calibration sequence space is exhausted; reset the training partition");
+            return;
+        };
         let Some(slot) = self.boot_erased_slot else {
             self.refuse("no slot was erased at boot; reboot before calibrating");
             return;
@@ -517,9 +524,8 @@ impl Calibration {
         // A run that committed earlier this boot moved them, and the slot they
         // point at is the one still holding the previous calibration — erasing
         // it is what the front end cannot survive.
-        let sequences = self.stored_sequences();
         self.slot = slot;
-        self.sequence = flash_image::next_sequence(sequences);
+        self.sequence = sequence;
         self.scripted = scripted_wearer;
         self.gains = GainEstimator::new();
         self.rows.clear();
