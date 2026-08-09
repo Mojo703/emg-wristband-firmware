@@ -422,11 +422,17 @@ pub async fn handle_browser(
                                 break;
                             }
                         }
-                        // Forward control frames to the selected device.
+                        // Forward control frames to the selected device. The three
+                        // calibration frames are the whole of the panel's authority
+                        // over a run: it starts one, stops one, and asks a stored
+                        // slot for its rows. The device paces everything else.
                         control @ (Frame::SetSensitivity { .. }
                         | Frame::SetKeymap { .. }
                         | Frame::SetWifi { .. }
-                        | Frame::SetServer { .. }) => {
+                        | Frame::SetServer { .. }
+                        | Frame::CalibrationStart { .. }
+                        | Frame::CalibrationAbort {}
+                        | Frame::CalibrationRowsRequest { .. }) => {
                             if let Some(id) = selection.device_id() {
                                 registry.send_control(id, control);
                             }
@@ -497,6 +503,20 @@ pub async fn handle_browser(
                 let out = match &frame {
                     // Discrete records must arrive complete and ordered.
                     Frame::Event { .. } | Frame::Log { .. } => Out::Reliable(msg),
+                    // A calibration run narrates itself in edges — a prompt, a
+                    // rejection, a phase boundary — and a run happens once. Coalescing
+                    // would drop the rejection the wearer needs to see between two
+                    // states that both look fine, and a rows dump is a reply to a
+                    // request, not a timeseries.
+                    Frame::CalibrationState { .. }
+                    | Frame::CalibrationResult { .. }
+                    | Frame::CalibrationRowsDump { .. } => Out::Reliable(msg),
+                    // The probe is sent once per run and never superseded; a
+                    // bench error is a one-shot diagnostic. Neither survives
+                    // sharing the coalescing slot with a status frame.
+                    Frame::CalibrationProbe { .. } | Frame::BenchError { .. } => {
+                        Out::Reliable(msg)
+                    }
                     Frame::Emg { .. } => Out::Live(LiveKind::Emg, msg),
                     Frame::Prediction { .. } => Out::Live(LiveKind::Prediction, msg),
                     Frame::Telemetry { source, .. } => {

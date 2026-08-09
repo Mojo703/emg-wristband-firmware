@@ -15,9 +15,15 @@ import {
   asIncomingFrame,
   assertOutgoingFrame,
   decodeEmg,
+  CalibrationPhase,
   type BeatmapFrame,
+  type BenchErrorFrame,
   type Binding,
   type BoardRevision,
+  type CalibrationProbeFrame,
+  type CalibrationResultFrame,
+  type CalibrationRowsDumpFrame,
+  type CalibrationStateFrame,
   type CollectionCatalogFrame,
   type CollectionStateFrame,
   type DecodedEmg,
@@ -53,6 +59,17 @@ const cbor = new Encoder({
   tagUint8Array: false,
   int64AsNumber: true,
 } as ConstructorParameters<typeof Encoder>[0]);
+
+/** The phases a run passes through while it is working. Seeing one means a run
+ * is under way, which is what retires the previous run's result. */
+const ACTIVE_CALIBRATION_PHASES: readonly CalibrationPhase[] = [
+  CalibrationPhase.Settling,
+  CalibrationPhase.ThumbUpRounds,
+  CalibrationPhase.Handover,
+  CalibrationPhase.ThumbDownRounds,
+  CalibrationPhase.Polish,
+  CalibrationPhase.Install,
+];
 
 class LiveStateManager {
   status = $state<'offline' | 'handshake' | 'online'>('offline');
@@ -96,6 +113,15 @@ class LiveStateManager {
    * monitor reads it so an unsubscribed panel does not look like a dead link. */
   emgStream = $state(true);
   #audioSettings = $state<AudioSettingsFrame | null>(null);
+  // On-device calibration. The device paces the run and this is a mirror of
+  // where it stands; the result is retained after the state frames stop so the
+  // panel can show how the run ended.
+  #calibrationState = $state<CalibrationStateFrame | null>(null);
+  #calibrationResult = $state<CalibrationResultFrame | null>(null);
+  // The reuse probe, measured once against this don's settling samples. It
+  // outlives the run's own cards because it describes the don rather than the
+  // run, and a run that ends is still the don the probe measured.
+  #calibrationProbe = $state<CalibrationProbeFrame | null>(null);
 
   get hello(): HelloFrame | null {
     return this.status === 'online' ? this.#hello : null;
@@ -119,6 +145,18 @@ class LiveStateManager {
 
   get audioSettings(): AudioSettingsFrame | null {
     return this.status === 'online' ? this.#audioSettings : null;
+  }
+
+  get calibrationState(): CalibrationStateFrame | null {
+    return this.status === 'online' ? this.#calibrationState : null;
+  }
+
+  get calibrationResult(): CalibrationResultFrame | null {
+    return this.status === 'online' ? this.#calibrationResult : null;
+  }
+
+  get calibrationProbe(): CalibrationProbeFrame | null {
+    return this.status === 'online' ? this.#calibrationProbe : null;
   }
 
   get signalQuality(): SignalQualityFrame | null {
@@ -145,6 +183,11 @@ class LiveStateManager {
       this.#telemetryDevice = device;
       this.telemetry = {};
       this.#signalQuality = null;
+      // A calibration belongs to the device that ran it; another device's run
+      // is not this one's, and neither is its result.
+      this.#calibrationState = null;
+      this.#calibrationResult = null;
+      this.#calibrationProbe = null;
     }
     if (this.status === 'handshake') {
       this.status = 'online';
@@ -231,6 +274,32 @@ class LiveStateManager {
     this.#audioSettings = value;
   }
 
+  setCalibrationState(value: CalibrationStateFrame): void {
+    // A run that has reached a working phase is a new run, so the previous
+    // run's result stops being the answer to "how did it go". The terminal
+    // phases keep it: they are the states the result explains.
+    if (ACTIVE_CALIBRATION_PHASES.includes(value.phase)) {
+      this.#calibrationResult = null;
+    }
+    // Elapsed counts from the moment a run began, so it only goes backwards
+    // when a later run started. That is the one edge that retires the probe:
+    // it arrives mid-settling, so clearing on a phase would throw away the
+    // frame the phase itself delivered.
+    const previous = this.#calibrationState;
+    if (previous !== null && value.elapsed_milliseconds < previous.elapsed_milliseconds) {
+      this.#calibrationProbe = null;
+    }
+    this.#calibrationState = value;
+  }
+
+  setCalibrationResult(value: CalibrationResultFrame): void {
+    this.#calibrationResult = value;
+  }
+
+  setCalibrationProbe(value: CalibrationProbeFrame): void {
+    this.#calibrationProbe = value;
+  }
+
   setHandshake(): void {
     this.status = 'handshake';
     this.#hello = null;
@@ -242,6 +311,9 @@ class LiveStateManager {
     this.#collectionState = null;
     this.#beatmap = null;
     this.#playbackPosition = null;
+    this.#calibrationState = null;
+    this.#calibrationResult = null;
+    this.#calibrationProbe = null;
     this.logs = [];
     this.fps = 0;
     this.#emgSinceTick = 0;
@@ -258,6 +330,9 @@ class LiveStateManager {
     this.#collectionState = null;
     this.#beatmap = null;
     this.#playbackPosition = null;
+    this.#calibrationState = null;
+    this.#calibrationResult = null;
+    this.#calibrationProbe = null;
     this.logs = [];
     this.fps = 0;
     this.#emgSinceTick = 0;
@@ -278,6 +353,13 @@ type LogHandler = (log: LogFrame) => void;
 // Note results are per-cue verdicts, not state: the game view folds each one into
 // a streak as it lands, so they fan out imperatively instead of being retained.
 type NoteResultHandler = (result: NoteResultFrame) => void;
+// Rows dumps answer a request and arrive in runs the panel stitches together, so
+// they fan out to whoever asked instead of being retained as state.
+type CalibrationRowsDumpHandler = (dump: CalibrationRowsDumpFrame) => void;
+// A request the device refused or a run it abandoned. Discrete and one-shot:
+// whoever asked for the thing that failed is who needs to hear about it, and a
+// panel that is not open should not accumulate a backlog of other panels' errors.
+type BenchErrorHandler = (error: BenchErrorFrame) => void;
 
 interface ListenerMap {
   emg: Set<EmgHandler>;
@@ -286,6 +368,8 @@ interface ListenerMap {
   pose: Set<PoseHandler>;
   log: Set<LogHandler>;
   noteResult: Set<NoteResultHandler>;
+  calibrationRowsDump: Set<CalibrationRowsDumpHandler>;
+  benchError: Set<BenchErrorHandler>;
 }
 
 const listeners: ListenerMap = {
@@ -295,6 +379,8 @@ const listeners: ListenerMap = {
   pose: new Set<PoseHandler>(),
   log: new Set<LogHandler>(),
   noteResult: new Set<NoteResultHandler>(),
+  calibrationRowsDump: new Set<CalibrationRowsDumpHandler>(),
+  benchError: new Set<BenchErrorHandler>(),
 };
 
 type HandlerFor<T extends keyof ListenerMap> = T extends 'emg'
@@ -307,7 +393,11 @@ type HandlerFor<T extends keyof ListenerMap> = T extends 'emg'
         ? LogHandler
         : T extends 'noteResult'
           ? NoteResultHandler
-          : EventHandler;
+          : T extends 'calibrationRowsDump'
+            ? CalibrationRowsDumpHandler
+            : T extends 'benchError'
+              ? BenchErrorHandler
+              : EventHandler;
 
 export function on<T extends keyof ListenerMap>(
   type: T,
@@ -413,6 +503,16 @@ export function connect(): void {
       live.setAudioSettings(frame);
     } else if (frame.type === 'note_result') {
       for (const cb of listeners.noteResult) cb(frame);
+    } else if (frame.type === 'calibration_state') {
+      live.setCalibrationState(frame);
+    } else if (frame.type === 'calibration_probe') {
+      live.setCalibrationProbe(frame);
+    } else if (frame.type === 'calibration_result') {
+      live.setCalibrationResult(frame);
+    } else if (frame.type === 'calibration_rows_dump') {
+      for (const cb of listeners.calibrationRowsDump) cb(frame);
+    } else if (frame.type === 'bench_error') {
+      for (const cb of listeners.benchError) cb(frame);
     }
   };
 }
@@ -479,13 +579,32 @@ export const api = {
     send({ type: 'stop_collection', save }),
   capturePlacementPhoto: () =>
     send({ type: 'capture_placement_photo' }),
+  // Calibration: the whole of the panel's authority over a run. `scripted_wearer`
+  // is always false from a browser — a scripted schedule is the bench host's, and
+  // it owns the serial port directly when it drives one.
+  startCalibration: () =>
+    send({ type: 'calibration_start', scripted_wearer: false }),
+  abortCalibration: () =>
+    send({ type: 'calibration_abort' }),
+  requestCalibrationRows: (slot: number, firstRow: number, maxRows: number) =>
+    send({
+      type: 'calibration_rows_request',
+      slot,
+      first_row: firstRow,
+      max_rows: maxRows,
+    }),
 } as const;
 
 // Re-export protocol types so panels can import everything from the socket module.
 export type { Binding, DecodedEmg, EventFrame, HelloFrame, LogFrame, PoseFrame, PredictionFrame } from './protocol';
 export type {
   BeatmapFrame,
+  BenchErrorFrame,
   BoardRevision,
+  CalibrationProbeFrame,
+  CalibrationResultFrame,
+  CalibrationRowsDumpFrame,
+  CalibrationStateFrame,
   ChannelQuality,
   CollectionCatalogFrame,
   CollectionStateFrame,

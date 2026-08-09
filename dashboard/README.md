@@ -32,8 +32,19 @@ the device's own decisions folded in: the per-class confidence track, the
 threshold line, wake-gate status and streak, and event markers), Config (the
 keymap and wifi), Collect (the electrode check, the session setup form, the
 game, and the track library), Pose (a code-split Three.js hand viewer),
-Telemetry (device measurements as live values and trend plots), and Logs (the
-device's log console).
+Calibrate (starts an on-device calibration run and mirrors it), Telemetry
+(device measurements as live values and trend plots), and Logs (the device's log
+console).
+
+The Calibrate panel drives nothing: the device paces a calibration run, decides
+what a valid rep is, fits and installs the model. The panel starts a run, stops
+one, and draws the `calibration_state` and `calibration_result` frames the
+device sends — so closing the page mid-run loses the display and nothing else. A
+run that fails or is stopped leaves the calibration that was installed before it
+in place, which the terminal card says outright. The panel's one other request
+is a stored slot's rows: it asks for them a run at a time and saves the record
+and the rows as two files of the device's own bytes, which is what makes a
+calibration that went wrong in the field replayable on the host.
 
 Shared wire types come from the sibling [`protocol`](../protocol) crate (CBOR via
 ciborium and cbor-x). The optional Python pose service lives in

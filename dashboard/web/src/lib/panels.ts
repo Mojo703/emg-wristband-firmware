@@ -1,6 +1,7 @@
 // Panel registry — the one place panels are wired in. Add a component and one
 // entry here to extend the dashboard.
 import type { Component } from 'svelte';
+import Calibrate from '../panels/Calibrate.svelte';
 import Collect from '../panels/Collect.svelte';
 import EmgViewer from '../panels/EmgViewer.svelte';
 import ConfigApp from '../panels/ConfigApp.svelte';
@@ -27,6 +28,9 @@ export const panels: readonly Panel[] = [
   // Training-data capture: the falling-notes game and its session bookkeeping.
   { id: 'collect', title: 'Collect', icon: 'play', component: Collect },
   { id: 'pose', title: 'Pose', icon: 'scan', component: PoseViewer, drawsEmg: true },
+  // On-device calibration: start a run, watch the device narrate it, pull a
+  // stored slot back for host replay.
+  { id: 'calibrate', title: 'Calibrate', icon: 'target', component: Calibrate },
   // Periodic device measurements as live values + session trend plots.
   { id: 'telemetry', title: 'Telemetry', icon: 'chart', component: Telemetry },
   // The device's log console (replaces the serial text monitor).

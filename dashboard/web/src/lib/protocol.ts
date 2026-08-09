@@ -64,6 +64,19 @@ export const FrameType = {
   Beatmap: 'beatmap',
   PlaybackPosition: 'playback_position',
   NoteResult: 'note_result',
+  CalibrationStart: 'calibration_start',
+  CalibrationAbort: 'calibration_abort',
+  CalibrationRowsRequest: 'calibration_rows_request',
+  CalibrationState: 'calibration_state',
+  CalibrationProbe: 'calibration_probe',
+  CalibrationResult: 'calibration_result',
+  CalibrationRowsDump: 'calibration_rows_dump',
+  PlaybackCredit: 'playback_credit',
+  BenchFeatures: 'bench_features',
+  BenchCommits: 'bench_commits',
+  BenchFitResult: 'bench_fit_result',
+  BenchStatus: 'bench_status',
+  BenchError: 'bench_error',
 } as const;
 
 export const Arm = {
@@ -690,7 +703,258 @@ export interface NoteResultFrame {
   readonly hit: boolean;
 }
 
+// ---------------------------------------------------------------------------
+// On-device calibration (firmware-bench/CALIBRATION-PLAN.md)
+//
+// The device paces the run; the panel starts it, aborts it, and watches. The
+// scripted-wearer schedule (calibration_cue_schedule) is bench-host only and
+// deliberately absent here, like the other host → device bench frames.
+//
+// Quality figures arrive as permille integers rather than floats, so the whole
+// calibration vocabulary survives the device's float-free inbound path and a
+// panel divides by ten to show a percentage.
+// ---------------------------------------------------------------------------
+
+/** The gestures a calibration collects, in the fixed order they are prompted. */
+export const CalibrationGesture = {
+  WristPronation: 'wrist_pronation',
+  WristSupination: 'wrist_supination',
+  WristRadialDeviation: 'wrist_radial_deviation',
+  WristUlnarDeviation: 'wrist_ulnar_deviation',
+  ThumbExtension: 'thumb_extension',
+} as const;
+
+export type CalibrationGesture =
+  (typeof CalibrationGesture)[keyof typeof CalibrationGesture];
+
+/** Prompt order, which is also model class order. The panel shows the list in
+ * this order and never sorts it: the order is what tells a wearer where they
+ * are when they have only the indicator to go on. */
+export const CALIBRATION_GESTURE_ORDER: readonly CalibrationGesture[] = [
+  CalibrationGesture.WristPronation,
+  CalibrationGesture.WristSupination,
+  CalibrationGesture.WristRadialDeviation,
+  CalibrationGesture.WristUlnarDeviation,
+  CalibrationGesture.ThumbExtension,
+];
+
+export const CalibrationPhase = {
+  Idle: 'idle',
+  Settling: 'settling',
+  ThumbUpRounds: 'thumb_up_rounds',
+  Handover: 'handover',
+  ThumbDownRounds: 'thumb_down_rounds',
+  Polish: 'polish',
+  Install: 'install',
+  Complete: 'complete',
+  Stopped: 'stopped',
+} as const;
+
+export type CalibrationPhase =
+  (typeof CalibrationPhase)[keyof typeof CalibrationPhase];
+
+/** Report only. `weak` means the self-test recovers this class poorly — worth
+ * showing — and changes nothing about the schedule. Not a failure either: the
+ * instrument names the weak pair reliably, but its threshold is uncalibrated,
+ * so it reports rather than decides. */
+export const GateStatus = {
+  Unknown: 'unknown',
+  Holding: 'holding',
+  Weak: 'weak',
+} as const;
+
+export type GateStatus = (typeof GateStatus)[keyof typeof GateStatus];
+
+/** Why a labeled span was thrown away and its gesture re-prompted. */
+export const RepRejection = {
+  AtRestBaseline: 'at_rest_baseline',
+  LeadOffChannels: 'lead_off_channels',
+  AdcRecoverySettle: 'adc_recovery_settle',
+  FlashOperationOverlap: 'flash_operation_overlap',
+  MissingSamples: 'missing_samples',
+} as const;
+
+export type RepRejection = (typeof RepRejection)[keyof typeof RepRejection];
+
+export const CalibrationOutcome = {
+  Installed: 'installed',
+  Aborted: 'aborted',
+  FrontEndLost: 'front_end_lost',
+  GestureFailed: 'gesture_failed',
+  StorageFailed: 'storage_failed',
+  FitFailed: 'fit_failed',
+} as const;
+
+export type CalibrationOutcome =
+  (typeof CalibrationOutcome)[keyof typeof CalibrationOutcome];
+
+export interface CalibrationClassState {
+  readonly gesture: CalibrationGesture;
+  readonly accepted_reps: number;
+  readonly rejected_reps: number;
+  readonly gate: GateStatus;
+  /** Reps the self-test recovered out of reps it held out; both zero while the
+   * gate is `unknown`. */
+  readonly self_test_correct: number;
+  readonly self_test_held_out: number;
+}
+
+export interface InstalledSlot {
+  readonly slot: number;
+  /** Monotonic across slots; eviction overwrites the lowest. */
+  readonly sequence: number;
+}
+
+/** The device's own estimate of the four numbers, in permille. A self-test over
+ * the wearer's own reps, not a measurement against the golden fixtures. */
+export interface CalibrationQuality {
+  readonly false_negative_permille: number;
+  readonly misclassification_permille: number;
+  readonly false_fire_permille: number;
+  /** Anything but zero is a regression against the golden baseline. */
+  readonly rest_commits: number;
+}
+
+/** The last rep the run threw away, with enough attached to name it. */
+export interface RejectedRep {
+  readonly reason: RepRejection;
+  readonly gesture: CalibrationGesture;
+  /** Counting from zero within its block. */
+  readonly round: number;
+}
+
+/** One stored calibration as the reuse probe sees it. Information only. */
+export interface SlotProbe {
+  readonly slot: number;
+  readonly sequence: number;
+  /** How well this don's settling samples match the slot's stored statistics,
+   * in permille; a thousand is a perfect match. */
+  readonly match_quality_permille: number;
+  /** Spine commits over the probe window. The wearer was asked to hold still,
+   * so anything above zero is the stored calibration firing at nothing. */
+  readonly spine_commits: number;
+}
+
+export interface ClassPair {
+  readonly first: CalibrationGesture;
+  readonly second: CalibrationGesture;
+}
+
+/** Where the run stands. Sent on every phase change, prompt, and rejection, and
+ * periodically in between. */
+export interface CalibrationStateFrame {
+  readonly type: 'calibration_state';
+  readonly phase: CalibrationPhase;
+  readonly round: number;
+  readonly rounds_planned: number;
+  /** The validated floor for this block — ten thumb-up, twelve thumb-down.
+   * Equal to `rounds_planned`, always: the gate reports and never changes the
+   * round count. Both travel because progress wants a denominator and an
+   * explanation wants the floor. */
+  readonly round_floor: number;
+  readonly prompt: CalibrationGesture | null;
+  /** Changes on every prompt. Two prompts for the same gesture are otherwise
+   * indistinguishable, so this counter is what makes the second one an event. */
+  readonly prompt_generation: number;
+  /** How long to hold the gesture, in milliseconds. Longer than the labeled
+   * span on purpose — the span starts at the first grid boundary after the
+   * hold-off, so a prompt's alignment pushes the last labeled window later.
+   * Render this rather than a local constant. */
+  readonly prompt_hold_milliseconds: number;
+  readonly classes: readonly CalibrationClassState[];
+  readonly accepted_reps: number;
+  readonly rejected_reps: number;
+  readonly last_rejection: RejectedRep | null;
+  readonly fit_passes_done: number;
+  readonly fit_passes_planned: number;
+  readonly pass_milliseconds: number;
+  /** Flushes happen strictly between rounds, so this is what proves no labeled
+   * window overlapped one. */
+  readonly flash_flushes: number;
+  readonly elapsed_milliseconds: number;
+}
+
+/** The run is over, whichever way it ended. */
+export interface CalibrationResultFrame {
+  readonly type: 'calibration_result';
+  readonly outcome: CalibrationOutcome;
+  readonly installed: InstalledSlot | null;
+  readonly rounds_completed: number;
+  readonly rows_stored: number;
+  readonly accepted_reps: number;
+  readonly rejected_reps: number;
+  readonly quality: CalibrationQuality | null;
+  /** The two classes the self-test confused most — what a wearer can act on. */
+  readonly weak_pair: ClassPair | null;
+  readonly classes: readonly CalibrationClassState[];
+  readonly fit_wall_milliseconds: number;
+  /** Whether whatever was installed before this run still is. The slot
+   * protocol guarantees it for every outcome but `installed`; it travels so
+   * the panel states the promise from the device rather than in its own copy. */
+  readonly previous_retained: boolean;
+}
+
+/**
+ * What the reuse probe made of the stored calibrations, measured against this
+ * don's own settling samples. Reuse ships disabled — the accept threshold
+ * cannot be set honestly from the data that exists — and `reuse_enabled` says
+ * so from the frame.
+ */
+export interface CalibrationProbeFrame {
+  readonly type: 'calibration_probe';
+  readonly reuse_enabled: boolean;
+  readonly slots: readonly SlotProbe[];
+}
+
+/**
+ * A stored slot's record and a run of its rows. `record` and `rows` are the
+ * slot's own on-flash bytes, so a host replays what the device fitted on rather
+ * than a re-encoding of it.
+ */
+export interface CalibrationRowsDumpFrame {
+  readonly type: 'calibration_rows_dump';
+  readonly slot: number;
+  readonly sequence: number;
+  /** The prior image the slot was built against; a host replaying these rows
+   * has to know which prior they mean. */
+  readonly prior_hash: number;
+  /** False when the CRC or prior hash did not check out. The rows still travel
+   * — a torn slot is the interesting case — but nothing in them is trustworthy. */
+  readonly valid: boolean;
+  readonly record: Uint8Array;
+  readonly first_row: number;
+  readonly row_count: number;
+  readonly total_rows: number;
+  readonly row_stride: number;
+  /** 0 float32, 1 float16, 2 int8. */
+  readonly precision: number;
+  readonly rows: Uint8Array;
+}
+
+/** Browser → device: begin a calibration run. */
+export interface CalibrationStartFrame {
+  readonly type: 'calibration_start';
+  /** Always false from a browser: the scripted wearer is the bench host's. */
+  readonly scripted_wearer: boolean;
+}
+
+/** Browser → device: stop now. The previous calibration stays installed. */
+export interface CalibrationAbortFrame {
+  readonly type: 'calibration_abort';
+}
+
+/** Browser → device: send back a stored slot's record and rows. */
+export interface CalibrationRowsRequestFrame {
+  readonly type: 'calibration_rows_request';
+  readonly slot: number;
+  readonly first_row: number;
+  readonly max_rows: number;
+}
+
 export type OutgoingFrame =
+  | CalibrationStartFrame
+  | CalibrationAbortFrame
+  | CalibrationRowsRequestFrame
   | SelectDeviceFrame
   | DismissDeviceFrame
   | SetSensitivityFrame
@@ -709,6 +973,111 @@ export type OutgoingFrame =
   | SetAudioVolumeFrame
   | SetAudioOutputFrame;
 
+// ---------------------------------------------------------------------------
+// Firmware validation bench (firmware-bench/PROTOCOL.md)
+//
+// A bare ESP32-S3 replays recorded sessions streamed in from a host tool and
+// reports what its gesture pipeline produced. Only the device → host direction
+// is mirrored here: the backend relays unknown data frames generically, so a
+// browser watching the device sees a bench run go by. The host → device frames
+// (playback_begin, playback_samples, bench_model_load, bench_fit_*, …) are
+// bench-host-only and deliberately absent — that tool owns the serial port
+// directly, and routing multi-megabyte sample streams through the browser is
+// not something to make possible by accident.
+//
+// Every f32 payload crosses as little-endian bits in a byte blob rather than as
+// CBOR floats, so the parity comparison is exact. A viewer has to widen them
+// itself; `decodeBenchFeatures` below does it for the one bulk case.
+// ---------------------------------------------------------------------------
+
+/**
+ * Flow control for the sample stream: the host may send chunks numbered
+ * `next_sequence` up to but not including `next_sequence + free_chunks`.
+ */
+export interface PlaybackCreditFrame {
+  readonly type: 'playback_credit';
+  readonly next_sequence: number;
+  readonly free_chunks: number;
+}
+
+/**
+ * Band-power features for a run of completed windows. `features` is
+ * little-endian float32 bits, `window_count * 64` values, window-major; within
+ * a window the 64 features are band-major then channel.
+ */
+export interface BenchFeaturesFrame {
+  readonly type: 'bench_features';
+  readonly first_window: number;
+  readonly window_count: number;
+  readonly features: Uint8Array;
+}
+
+/** One window's outcome from the reject pipeline. */
+export interface BenchDecision {
+  readonly window: number;
+  readonly command: number;
+  readonly accepted: boolean;
+  /** The reject score as float32 bits; `decodeFloatBits` widens it. */
+  readonly reject_score_bits: number;
+}
+
+/** Every scored window in order, not only the committing ones. */
+export interface BenchCommitsFrame {
+  readonly type: 'bench_commits';
+  readonly decisions: readonly BenchDecision[];
+}
+
+/**
+ * What an on-device calibration fit cost and what it produced. Heap is sampled
+ * either side because whether calibration fits on the device is a question
+ * about memory as much as about time.
+ */
+export interface BenchFitResultFrame {
+  readonly type: 'bench_fit_result';
+  readonly wall_milliseconds: number;
+  readonly rows: number;
+  /**
+   * Flash-resident training rows joined into the fit, and one pass over their
+   * bytes. A fit rereads every row once per step, so the wall time is
+   * arithmetic plus roughly 250 of these.
+   */
+  readonly flash_rows: number;
+  readonly flash_walk_microseconds: number;
+  readonly class_count: number;
+  readonly heap_free_before_bytes: number;
+  readonly heap_free_after_bytes: number;
+  readonly largest_free_block_before_bytes: number;
+  readonly largest_free_block_after_bytes: number;
+  readonly model: Uint8Array;
+}
+
+/** Where the playback engine stands. `mode` is idle/streaming/replaying/fitting. */
+export interface BenchStatusFrame {
+  readonly type: 'bench_status';
+  readonly mode: string;
+  readonly session: string;
+  readonly samples_received: number;
+  readonly windows_processed: number;
+  readonly feature_minimum_microseconds: number;
+  readonly feature_mean_microseconds: number;
+  readonly feature_maximum_microseconds: number;
+  readonly heap_free_bytes: number;
+  readonly largest_free_block_bytes: number;
+  /** Non-zero means the run lost samples and its numbers cannot be trusted. */
+  readonly dropped_chunks: number;
+  readonly sequence_gaps: number;
+  readonly stored_rows: number;
+  /** Rows the flash training partition offers, zero when none is mapped. */
+  readonly flash_rows: number;
+}
+
+/** A bench request the device refused, or a run it abandoned. */
+export interface BenchErrorFrame {
+  readonly type: 'bench_error';
+  readonly stage: string;
+  readonly detail: string;
+}
+
 export type IncomingFrame =
   | HelloFrame
   | EmgFrame
@@ -723,7 +1092,17 @@ export type IncomingFrame =
   | BeatmapFrame
   | PlaybackPositionFrame
   | AudioSettingsFrame
-  | NoteResultFrame;
+  | NoteResultFrame
+  | CalibrationStateFrame
+  | CalibrationProbeFrame
+  | CalibrationResultFrame
+  | CalibrationRowsDumpFrame
+  | PlaybackCreditFrame
+  | BenchFeaturesFrame
+  | BenchCommitsFrame
+  | BenchFitResultFrame
+  | BenchStatusFrame
+  | BenchErrorFrame;
 
 export type Frame = IncomingFrame | OutgoingFrame;
 
@@ -1327,9 +1706,250 @@ export function isOutgoingFrame(value: unknown): value is OutgoingFrame {
       return isNumber(value['volume_permille']);
     case 'set_audio_output':
       return value['output'] === null || isString(value['output']);
+    case 'calibration_start':
+      return isBoolean(value['scripted_wearer']);
+    case 'calibration_abort':
+      return true;
+    case 'calibration_rows_request':
+      return (
+        isNumber(value['slot']) &&
+        isNumber(value['first_row']) &&
+        isNumber(value['max_rows'])
+      );
     default:
       return false;
   }
+}
+
+function isCalibrationGesture(value: unknown): value is CalibrationGesture {
+  return CALIBRATION_GESTURE_ORDER.includes(value as CalibrationGesture);
+}
+
+function isCalibrationClassState(
+  value: unknown,
+): value is CalibrationClassState {
+  return (
+    isObject(value) &&
+    isCalibrationGesture(value['gesture']) &&
+    isNumber(value['accepted_reps']) &&
+    isNumber(value['rejected_reps']) &&
+    isString(value['gate']) &&
+    Object.values(GateStatus).includes(value['gate'] as GateStatus) &&
+    isNumber(value['self_test_correct']) &&
+    isNumber(value['self_test_held_out'])
+  );
+}
+
+function isCalibrationClassStateArray(
+  value: unknown,
+): value is readonly CalibrationClassState[] {
+  return Array.isArray(value) && value.every(isCalibrationClassState);
+}
+
+function isInstalledSlot(value: unknown): value is InstalledSlot {
+  return isObject(value) && isNumber(value['slot']) && isNumber(value['sequence']);
+}
+
+function isCalibrationQuality(value: unknown): value is CalibrationQuality {
+  return (
+    isObject(value) &&
+    isNumber(value['false_negative_permille']) &&
+    isNumber(value['misclassification_permille']) &&
+    isNumber(value['false_fire_permille']) &&
+    isNumber(value['rest_commits'])
+  );
+}
+
+function isClassPair(value: unknown): value is ClassPair {
+  return (
+    isObject(value) &&
+    isCalibrationGesture(value['first']) &&
+    isCalibrationGesture(value['second'])
+  );
+}
+
+export function isCalibrationStateFrame(
+  value: unknown,
+): value is CalibrationStateFrame {
+  return (
+    hasType(value, 'calibration_state') &&
+    isObject(value) &&
+    Object.values(CalibrationPhase).includes(
+      value['phase'] as CalibrationPhase,
+    ) &&
+    isNumber(value['round']) &&
+    isNumber(value['rounds_planned']) &&
+    isNumber(value['round_floor']) &&
+    (value['prompt'] === null || isCalibrationGesture(value['prompt'])) &&
+    isNumber(value['prompt_generation']) &&
+    isNumber(value['prompt_hold_milliseconds']) &&
+    isCalibrationClassStateArray(value['classes']) &&
+    isNumber(value['accepted_reps']) &&
+    isNumber(value['rejected_reps']) &&
+    (value['last_rejection'] === null || isRejectedRep(value['last_rejection'])) &&
+    isNumber(value['fit_passes_done']) &&
+    isNumber(value['fit_passes_planned']) &&
+    isNumber(value['pass_milliseconds']) &&
+    isNumber(value['flash_flushes']) &&
+    isNumber(value['elapsed_milliseconds'])
+  );
+}
+
+function isRejectedRep(value: unknown): value is RejectedRep {
+  return (
+    isObject(value) &&
+    Object.values(RepRejection).includes(value['reason'] as RepRejection) &&
+    isCalibrationGesture(value['gesture']) &&
+    isNumber(value['round'])
+  );
+}
+
+function isSlotProbe(value: unknown): value is SlotProbe {
+  return (
+    isObject(value) &&
+    isNumber(value['slot']) &&
+    isNumber(value['sequence']) &&
+    isNumber(value['match_quality_permille']) &&
+    isNumber(value['spine_commits'])
+  );
+}
+
+export function isCalibrationProbeFrame(
+  value: unknown,
+): value is CalibrationProbeFrame {
+  return (
+    hasType(value, 'calibration_probe') &&
+    isObject(value) &&
+    isBoolean(value['reuse_enabled']) &&
+    Array.isArray(value['slots']) &&
+    value['slots'].every(isSlotProbe)
+  );
+}
+
+export function isCalibrationResultFrame(
+  value: unknown,
+): value is CalibrationResultFrame {
+  return (
+    hasType(value, 'calibration_result') &&
+    isObject(value) &&
+    Object.values(CalibrationOutcome).includes(
+      value['outcome'] as CalibrationOutcome,
+    ) &&
+    (value['installed'] === null || isInstalledSlot(value['installed'])) &&
+    isNumber(value['rounds_completed']) &&
+    isNumber(value['rows_stored']) &&
+    isNumber(value['accepted_reps']) &&
+    isNumber(value['rejected_reps']) &&
+    (value['quality'] === null || isCalibrationQuality(value['quality'])) &&
+    (value['weak_pair'] === null || isClassPair(value['weak_pair'])) &&
+    isCalibrationClassStateArray(value['classes']) &&
+    isNumber(value['fit_wall_milliseconds']) &&
+    isBoolean(value['previous_retained'])
+  );
+}
+
+export function isCalibrationRowsDumpFrame(
+  value: unknown,
+): value is CalibrationRowsDumpFrame {
+  return (
+    hasType(value, 'calibration_rows_dump') &&
+    isObject(value) &&
+    isNumber(value['slot']) &&
+    isNumber(value['sequence']) &&
+    isNumber(value['prior_hash']) &&
+    isBoolean(value['valid']) &&
+    isUint8Array(value['record']) &&
+    isNumber(value['first_row']) &&
+    isNumber(value['row_count']) &&
+    isNumber(value['total_rows']) &&
+    isNumber(value['row_stride']) &&
+    isNumber(value['precision']) &&
+    isUint8Array(value['rows'])
+  );
+}
+
+export function isPlaybackCreditFrame(value: unknown): value is PlaybackCreditFrame {
+  return (
+    hasType(value, 'playback_credit') &&
+    isObject(value) &&
+    isNumber(value['next_sequence']) &&
+    isNumber(value['free_chunks'])
+  );
+}
+
+export function isBenchFeaturesFrame(value: unknown): value is BenchFeaturesFrame {
+  return (
+    hasType(value, 'bench_features') &&
+    isObject(value) &&
+    isNumber(value['first_window']) &&
+    isNumber(value['window_count']) &&
+    isUint8Array(value['features'])
+  );
+}
+
+function isBenchDecision(value: unknown): value is BenchDecision {
+  return (
+    isObject(value) &&
+    isNumber(value['window']) &&
+    isNumber(value['command']) &&
+    isBoolean(value['accepted']) &&
+    isNumber(value['reject_score_bits'])
+  );
+}
+
+export function isBenchCommitsFrame(value: unknown): value is BenchCommitsFrame {
+  return (
+    hasType(value, 'bench_commits') &&
+    isObject(value) &&
+    Array.isArray(value['decisions']) &&
+    value['decisions'].every(isBenchDecision)
+  );
+}
+
+export function isBenchFitResultFrame(value: unknown): value is BenchFitResultFrame {
+  return (
+    hasType(value, 'bench_fit_result') &&
+    isObject(value) &&
+    isNumber(value['wall_milliseconds']) &&
+    isNumber(value['rows']) &&
+    isNumber(value['flash_rows']) &&
+    isNumber(value['flash_walk_microseconds']) &&
+    isNumber(value['class_count']) &&
+    isNumber(value['heap_free_before_bytes']) &&
+    isNumber(value['heap_free_after_bytes']) &&
+    isNumber(value['largest_free_block_before_bytes']) &&
+    isNumber(value['largest_free_block_after_bytes']) &&
+    isUint8Array(value['model'])
+  );
+}
+
+export function isBenchStatusFrame(value: unknown): value is BenchStatusFrame {
+  return (
+    hasType(value, 'bench_status') &&
+    isObject(value) &&
+    isString(value['mode']) &&
+    isString(value['session']) &&
+    isNumber(value['samples_received']) &&
+    isNumber(value['windows_processed']) &&
+    isNumber(value['feature_minimum_microseconds']) &&
+    isNumber(value['feature_mean_microseconds']) &&
+    isNumber(value['feature_maximum_microseconds']) &&
+    isNumber(value['heap_free_bytes']) &&
+    isNumber(value['largest_free_block_bytes']) &&
+    isNumber(value['dropped_chunks']) &&
+    isNumber(value['sequence_gaps']) &&
+    isNumber(value['stored_rows']) &&
+    isNumber(value['flash_rows'])
+  );
+}
+
+export function isBenchErrorFrame(value: unknown): value is BenchErrorFrame {
+  return (
+    hasType(value, 'bench_error') &&
+    isObject(value) &&
+    isString(value['stage']) &&
+    isString(value['detail'])
+  );
 }
 
 export function asIncomingFrame(value: unknown): IncomingFrame | null {
@@ -1347,6 +1967,16 @@ export function asIncomingFrame(value: unknown): IncomingFrame | null {
   if (isPlaybackPositionFrame(value)) return value;
   if (isAudioSettingsFrame(value)) return value;
   if (isNoteResultFrame(value)) return value;
+  if (isCalibrationStateFrame(value)) return value;
+  if (isCalibrationProbeFrame(value)) return value;
+  if (isCalibrationResultFrame(value)) return value;
+  if (isCalibrationRowsDumpFrame(value)) return value;
+  if (isPlaybackCreditFrame(value)) return value;
+  if (isBenchFeaturesFrame(value)) return value;
+  if (isBenchCommitsFrame(value)) return value;
+  if (isBenchFitResultFrame(value)) return value;
+  if (isBenchStatusFrame(value)) return value;
+  if (isBenchErrorFrame(value)) return value;
   // A tagged frame that fails its own guard is a bug on one side of the wire
   // mirror; dropping it silently is how such bugs stay hidden for hours.
   if (isObject(value) && isString(value['type'])) {
@@ -1363,6 +1993,41 @@ export function assertOutgoingFrame(value: unknown): OutgoingFrame {
 // ---------------------------------------------------------------------------
 // Decoding helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Widen a float32 bit pattern carried as an integer, which is how every scalar
+ * float in the bench frames crosses the wire.
+ */
+export function decodeFloatBits(bits: number): number {
+  const buffer = new ArrayBuffer(4);
+  const asInteger = new Uint32Array(buffer);
+  const asFloat = new Float32Array(buffer);
+  asInteger[0] = bits >>> 0;
+  return asFloat[0] ?? 0;
+}
+
+/**
+ * A bench feature batch as `window_count` rows of 64 floats. The blob is
+ * little-endian float32 bits; this assumes a little-endian host, which every
+ * platform the dashboard runs on is.
+ */
+export function decodeBenchFeatures(frame: BenchFeaturesFrame): Float32Array {
+  let bytes: Uint8Array = frame.features;
+  // Float32Array demands a 4-byte-aligned start offset, and the blob's position
+  // inside the decoded CBOR buffer depends on how wide the fields ahead of it
+  // encoded — same hazard decodeEmg handles for Int16Array.
+  if (bytes.byteOffset % 4 !== 0) {
+    bytes = bytes.slice();
+  }
+  const values = new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength >> 2);
+  const expected = frame.window_count * 64;
+  if (values.length !== expected) {
+    throw new RangeError(
+      `bench features hold ${values.length} floats, expected ${expected} for ${frame.window_count} windows`,
+    );
+  }
+  return values;
+}
 
 export function decodeEmg(frame: EmgFrame): DecodedEmg {
   let bytes: Uint8Array = frame.samples;
