@@ -1,0 +1,17 @@
+# The host end of the firmware validation bench: streams recorded sessions into
+# a bare ESP32-S3 running `opal-firmware --features playback` and captures what
+# comes back. Empty [workspace] per repo convention.
+[workspace]
+
+[package]
+name = "playback-host"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+protocol = { path = "../../protocol" }
+anyhow = "1"
+ciborium = "0.2"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
