@@ -1,0 +1,24 @@
+# What the device tells its wearer: the colours, the shapes, the motor rhythms,
+# and the rule that maps a change of state onto exactly one of them.
+#
+# Its own crate for one reason: these are the assertions that have to fail on a
+# laptop. The vocabulary is pure data and a match — no hardware, no allocation —
+# but it lived inside the firmware, where `cargo test` needs a board on a USB
+# port. So a completion cue that felt exactly like a bound command shipped, and
+# cost a hardware slot to find. Everything here runs under plain `cargo test`.
+#
+# `opal-firmware` consumes these definitions rather than copying them; the
+# drivers that render them stay there. Empty [workspace] per repo convention.
+[workspace]
+
+[package]
+name = "feedback-vocabulary"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+protocol = { path = "../protocol" }
+# The motor's effect library and sequence encoding. Default features are the
+# crate's own bench binary and its esp-idf dependencies; the driver itself is
+# no_std over embedded-hal and wants none of them.
+drv2605l = { path = "../drv2605l", default-features = false }

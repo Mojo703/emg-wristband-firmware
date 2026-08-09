@@ -1,0 +1,175 @@
+# scenario: abort_thumb_down_rounds
+# constants:
+#   sample_rate_hz = 2000
+#   window_samples = 500
+#   hop_samples = 125
+#   prompt_delay_milliseconds = 250
+#   prompt_hold_milliseconds = 1500
+#   labeled_windows = 9
+#   thumb_up_round_floor = 2
+#   thumb_down_round_floor = 3
+#   settling_milliseconds = 1000
+#   gain_settle_milliseconds = 30000
+#   handover_milliseconds = 500
+#   gain_window_milliseconds = 30000
+#   rep_attempt_budget = 4
+#   held_out_reps_per_class = 2
+#   passes_per_round = 16
+#   final_passes = 10
+#   prior_stride = 2
+#   holding_accuracy_permille = 700
+
+=== run
+  note   start at 0, settling retimed to 4000
+           state  phase = Settling
+           state  round = 0
+           state  rounds_planned = 2
+           state  round_floor = 2
+           state  prompt = None
+           state  next_gesture = None
+           state  prompt_generation = 0
+           state  notice_generation = 0
+           state  last_rejection = None
+           state  last_rejection_at = None
+           state  accepted_reps = 0
+           state  rejected_reps = 0
+           state  reps.wrist_pronation = 0 accepted, 0 rejected
+           state  reps.wrist_supination = 0 accepted, 0 rejected
+           state  reps.wrist_radial_deviation = 0 accepted, 0 rejected
+           state  reps.wrist_ulnar_deviation = 0 accepted, 0 rejected
+           state  reps.thumb_extension = 0 accepted, 0 rejected
+           state  rows_stored = 0
+           state  flash_flushes = 0
+           state  weak_pair = None
+           state  verdict = None
+           state  fit_passes_done = 0
+           state  fit_passes_planned = 0
+           state  fit_pass_milliseconds = 0
+           state  fit_wall_milliseconds = 0
+           state  outcome = None
+        0  action EraseSlot
+     8000  action Prompt gesture=WristPronation label=0 generation=1 samples[8500,10000) windows[68,77)
+           state  phase = Settling -> ThumbUpRounds
+           state  prompt = None -> Some(WristPronation)
+           state  next_gesture = None -> Some(WristPronation)
+           state  prompt_generation = 0 -> 1
+    10000  rep#0 gesture=WristPronation samples[8500,10000) windows[68,77) evidence(windows=9/9 lead_off=false adc_settle=false flash=false) -> Accepted label=0 samples[8500,10000) windows[68,77)
+           state  prompt = Some(WristPronation) -> None
+           state  next_gesture = Some(WristPronation) -> Some(WristSupination)
+           state  accepted_reps = 0 -> 1
+           state  reps.wrist_pronation = 0 accepted, 0 rejected -> 1 accepted, 0 rejected
+           state  rows_stored = 0 -> 9
+    12000  action Prompt gesture=WristSupination label=1 generation=2 samples[12500,14000) windows[100,109)
+           state  prompt = None -> Some(WristSupination)
+           state  prompt_generation = 1 -> 2
+    14000  rep#1 gesture=WristSupination samples[12500,14000) windows[100,109) evidence(windows=9/9 lead_off=false adc_settle=false flash=false) -> Accepted label=1 samples[12500,14000) windows[100,109)
+           state  prompt = Some(WristSupination) -> None
+           state  next_gesture = Some(WristSupination) -> Some(WristRadialDeviation)
+           state  accepted_reps = 1 -> 2
+           state  reps.wrist_supination = 0 accepted, 0 rejected -> 1 accepted, 0 rejected
+           state  rows_stored = 9 -> 18
+    16000  action Prompt gesture=WristRadialDeviation label=2 generation=3 samples[16500,18000) windows[132,141)
+           state  prompt = None -> Some(WristRadialDeviation)
+           state  prompt_generation = 2 -> 3
+    18000  rep#2 gesture=WristRadialDeviation samples[16500,18000) windows[132,141) evidence(windows=9/9 lead_off=false adc_settle=false flash=false) -> Accepted label=2 samples[16500,18000) windows[132,141)
+           state  prompt = Some(WristRadialDeviation) -> None
+           state  next_gesture = Some(WristRadialDeviation) -> Some(WristUlnarDeviation)
+           state  accepted_reps = 2 -> 3
+           state  reps.wrist_radial_deviation = 0 accepted, 0 rejected -> 1 accepted, 0 rejected
+           state  rows_stored = 18 -> 27
+    20000  action Prompt gesture=WristUlnarDeviation label=3 generation=4 samples[20500,22000) windows[164,173)
+           state  prompt = None -> Some(WristUlnarDeviation)
+           state  prompt_generation = 3 -> 4
+    22000  rep#3 gesture=WristUlnarDeviation samples[20500,22000) windows[164,173) evidence(windows=9/9 lead_off=false adc_settle=false flash=false) -> Accepted label=3 samples[20500,22000) windows[164,173)
+           state  prompt = Some(WristUlnarDeviation) -> None
+           state  next_gesture = Some(WristUlnarDeviation) -> Some(ThumbExtension)
+           state  accepted_reps = 3 -> 4
+           state  reps.wrist_ulnar_deviation = 0 accepted, 0 rejected -> 1 accepted, 0 rejected
+           state  rows_stored = 27 -> 36
+    24000  action Prompt gesture=ThumbExtension label=4 generation=5 samples[24500,26000) windows[196,205)
+           state  prompt = None -> Some(ThumbExtension)
+           state  prompt_generation = 4 -> 5
+    26000  rep#4 gesture=ThumbExtension samples[24500,26000) windows[196,205) evidence(windows=9/9 lead_off=false adc_settle=false flash=false) -> Accepted label=4 samples[24500,26000) windows[196,205)
+           state  prompt = Some(ThumbExtension) -> None
+           state  next_gesture = Some(ThumbExtension) -> None
+           state  accepted_reps = 4 -> 5
+           state  reps.thumb_extension = 0 accepted, 0 rejected -> 1 accepted, 0 rejected
+           state  rows_stored = 36 -> 45
+    26000  action FlushRows
+           state  flash_flushes = 0 -> 1
+    26125  action FitRound round=0
+           state  round = 0 -> 1
+           state  next_gesture = None -> Some(WristPronation)
+           state  verdict = None -> WristPronation=2/2:Holding WristSupination=2/2:Holding WristRadialDeviation=2/2:Holding WristUlnarDeviation=2/2:Holding ThumbExtension=2/2:Holding weak_pair=None
+           state  fit_passes_done = 0 -> 16
+           state  fit_passes_planned = 0 -> 16
+           state  fit_pass_milliseconds = 0 -> 600
+           state  fit_wall_milliseconds = 0 -> 9600
+    28000  action Prompt gesture=WristPronation label=0 generation=6 samples[28500,30000) windows[228,237)
+           state  prompt = None -> Some(WristPronation)
+           state  prompt_generation = 5 -> 6
+    30000  rep#5 gesture=WristPronation samples[28500,30000) windows[228,237) evidence(windows=9/9 lead_off=false adc_settle=false flash=false) -> Accepted label=0 samples[28500,30000) windows[228,237)
+           state  prompt = Some(WristPronation) -> None
+           state  next_gesture = Some(WristPronation) -> Some(WristSupination)
+           state  accepted_reps = 5 -> 6
+           state  reps.wrist_pronation = 1 accepted, 0 rejected -> 2 accepted, 0 rejected
+           state  rows_stored = 45 -> 54
+    32000  action Prompt gesture=WristSupination label=1 generation=7 samples[32500,34000) windows[260,269)
+           state  prompt = None -> Some(WristSupination)
+           state  prompt_generation = 6 -> 7
+    34000  rep#6 gesture=WristSupination samples[32500,34000) windows[260,269) evidence(windows=9/9 lead_off=false adc_settle=false flash=false) -> Accepted label=1 samples[32500,34000) windows[260,269)
+           state  prompt = Some(WristSupination) -> None
+           state  next_gesture = Some(WristSupination) -> Some(WristRadialDeviation)
+           state  accepted_reps = 6 -> 7
+           state  reps.wrist_supination = 1 accepted, 0 rejected -> 2 accepted, 0 rejected
+           state  rows_stored = 54 -> 63
+    36000  action Prompt gesture=WristRadialDeviation label=2 generation=8 samples[36500,38000) windows[292,301)
+           state  prompt = None -> Some(WristRadialDeviation)
+           state  prompt_generation = 7 -> 8
+    38000  rep#7 gesture=WristRadialDeviation samples[36500,38000) windows[292,301) evidence(windows=9/9 lead_off=false adc_settle=false flash=false) -> Accepted label=2 samples[36500,38000) windows[292,301)
+           state  prompt = Some(WristRadialDeviation) -> None
+           state  next_gesture = Some(WristRadialDeviation) -> Some(WristUlnarDeviation)
+           state  accepted_reps = 7 -> 8
+           state  reps.wrist_radial_deviation = 1 accepted, 0 rejected -> 2 accepted, 0 rejected
+           state  rows_stored = 63 -> 72
+    40000  action Prompt gesture=WristUlnarDeviation label=3 generation=9 samples[40500,42000) windows[324,333)
+           state  prompt = None -> Some(WristUlnarDeviation)
+           state  prompt_generation = 8 -> 9
+    42000  rep#8 gesture=WristUlnarDeviation samples[40500,42000) windows[324,333) evidence(windows=9/9 lead_off=false adc_settle=false flash=false) -> Accepted label=3 samples[40500,42000) windows[324,333)
+           state  prompt = Some(WristUlnarDeviation) -> None
+           state  next_gesture = Some(WristUlnarDeviation) -> Some(ThumbExtension)
+           state  accepted_reps = 8 -> 9
+           state  reps.wrist_ulnar_deviation = 1 accepted, 0 rejected -> 2 accepted, 0 rejected
+           state  rows_stored = 72 -> 81
+    44000  action Prompt gesture=ThumbExtension label=4 generation=10 samples[44500,46000) windows[356,365)
+           state  prompt = None -> Some(ThumbExtension)
+           state  prompt_generation = 9 -> 10
+    46000  rep#9 gesture=ThumbExtension samples[44500,46000) windows[356,365) evidence(windows=9/9 lead_off=false adc_settle=false flash=false) -> Accepted label=4 samples[44500,46000) windows[356,365)
+           state  prompt = Some(ThumbExtension) -> None
+           state  next_gesture = Some(ThumbExtension) -> None
+           state  accepted_reps = 9 -> 10
+           state  reps.thumb_extension = 1 accepted, 0 rejected -> 2 accepted, 0 rejected
+           state  rows_stored = 81 -> 90
+    46000  action FlushRows
+           state  flash_flushes = 1 -> 2
+    46125  action FitRound round=1
+           state  phase = ThumbUpRounds -> Handover
+           state  round = 1 -> 2
+           state  fit_passes_done = 16 -> 32
+           state  fit_wall_milliseconds = 9600 -> 19200
+  note   the driver stops the run: Aborted
+           state  phase = Handover -> Stopped
+           state  round = 2 -> 0
+           state  rounds_planned = 2 -> 3
+           state  outcome = None -> Some(Aborted)
+    47250  action Finish outcome=Aborted
+  --- summary
+  phase = Stopped
+  outcome = Some(Aborted)
+  accepted_reps = 10
+  rejected_reps = 0
+  rows_stored = 90
+  flash_flushes = 2
+  elapsed_samples = 47250
+  windows_fed = 375
+  schedule_exhausted = false

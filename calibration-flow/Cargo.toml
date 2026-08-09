@@ -1,0 +1,25 @@
+# The deterministic core of on-device calibration: the labeling arithmetic, the
+# round schedule, the rep-validity rule, the quality gate, and the phase machine
+# that sequences them. No hardware, no clock, no allocation on the hot paths —
+# everything here is a function of the constants and the sample indices it is
+# handed, which is what makes a field calibration replayable on the host
+# (`firmware-bench/CALIBRATION-PLAN.md`, Rule 1).
+#
+# `opal-firmware` wraps it with the device's clock, flash, feedback, and frames;
+# `playback-host` uses it to check a run report against the schedule the device
+# should have produced. Empty [workspace] per repo convention.
+[workspace]
+
+[package]
+name = "calibration-flow"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+protocol = { path = "../protocol" }
+
+[dev-dependencies]
+# Only to read V's constants fixture in a test. The library itself is no_std
+# plus alloc and parses nothing.
+serde_json = "1"
+protocol = { path = "../protocol" }

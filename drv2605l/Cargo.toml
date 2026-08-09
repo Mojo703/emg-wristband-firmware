@@ -38,4 +38,10 @@ default = ["bench"]
 bench = ["dep:esp-idf-svc", "dep:log", "dep:anyhow"]
 
 [build-dependencies]
-embuild = "0.33"
+# The espidf feature explicitly, because feature unification is not available
+# here: when the firmware builds this crate something else in the graph turns
+# it on, but a host consumer building the driver alone gets an `embuild` with
+# no `espidf` module and a build script that will not compile. The script only
+# calls into it under the bench feature, so a host build compiles it and never
+# runs it.
+embuild = { version = "0.33", features = ["espidf"] }

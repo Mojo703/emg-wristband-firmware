@@ -1,0 +1,64 @@
+# scenario: abort_settling
+# constants:
+#   sample_rate_hz = 2000
+#   window_samples = 500
+#   hop_samples = 125
+#   prompt_delay_milliseconds = 250
+#   prompt_hold_milliseconds = 1500
+#   labeled_windows = 9
+#   thumb_up_round_floor = 2
+#   thumb_down_round_floor = 3
+#   settling_milliseconds = 1000
+#   gain_settle_milliseconds = 30000
+#   handover_milliseconds = 500
+#   gain_window_milliseconds = 30000
+#   rep_attempt_budget = 4
+#   held_out_reps_per_class = 2
+#   passes_per_round = 16
+#   final_passes = 10
+#   prior_stride = 2
+#   holding_accuracy_permille = 700
+
+=== run
+  note   start at 0, settling retimed to 4000
+           state  phase = Settling
+           state  round = 0
+           state  rounds_planned = 2
+           state  round_floor = 2
+           state  prompt = None
+           state  next_gesture = None
+           state  prompt_generation = 0
+           state  notice_generation = 0
+           state  last_rejection = None
+           state  last_rejection_at = None
+           state  accepted_reps = 0
+           state  rejected_reps = 0
+           state  reps.wrist_pronation = 0 accepted, 0 rejected
+           state  reps.wrist_supination = 0 accepted, 0 rejected
+           state  reps.wrist_radial_deviation = 0 accepted, 0 rejected
+           state  reps.wrist_ulnar_deviation = 0 accepted, 0 rejected
+           state  reps.thumb_extension = 0 accepted, 0 rejected
+           state  rows_stored = 0
+           state  flash_flushes = 0
+           state  weak_pair = None
+           state  verdict = None
+           state  fit_passes_done = 0
+           state  fit_passes_planned = 0
+           state  fit_pass_milliseconds = 0
+           state  fit_wall_milliseconds = 0
+           state  outcome = None
+        0  action EraseSlot
+  note   the driver stops the run: Aborted
+           state  phase = Settling -> Stopped
+           state  outcome = None -> Some(Aborted)
+      500  action Finish outcome=Aborted
+  --- summary
+  phase = Stopped
+  outcome = Some(Aborted)
+  accepted_reps = 0
+  rejected_reps = 0
+  rows_stored = 0
+  flash_flushes = 0
+  elapsed_samples = 500
+  windows_fed = 1
+  schedule_exhausted = false
