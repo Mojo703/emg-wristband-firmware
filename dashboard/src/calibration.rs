@@ -1091,6 +1091,7 @@ fn unix_milliseconds() -> i64 {
 mod tests {
     use super::*;
     use protocol::{DeviceConfig, DeviceProvenance, DeviceTransport, FirmwareBuild};
+    use std::path::PathBuf;
 
     fn register_device(registry: &Registry) -> crate::registry::DeviceHandle {
         registry.register(
@@ -1137,12 +1138,58 @@ mod tests {
         }
     }
 
+    fn attach_test_collection(
+        adapter: &CalibrationModeAdapter,
+        registry: Arc<Registry>,
+        coordinator: GuidedSessionCoordinator,
+    ) {
+        let directory = std::env::temp_dir().join(format!(
+            "calibration-playback-fixture-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let paths = crate::collect::beatmap::CatalogPaths {
+            config_path: directory.join("collection.json"),
+            tracks_root: directory.join("tracks"),
+        };
+        std::fs::create_dir_all(&paths.tracks_root).expect("fixture track root is writable");
+        std::fs::write(
+            &paths.config_path,
+            r#"{"subjects":["subject"],
+                "collection_classes":[{"id":"a","label":"A","color":"blue"}],
+                "activities":[{"id":"seated","label":"Seated"}],
+                "sweat_levels":[{"id":"dry","label":"Dry"}]}"#,
+        )
+        .expect("fixture catalog is writable");
+        let catalog = paths.load().expect("fixture catalog loads");
+        let collection = crate::collect::manager::CollectionManager::new(
+            catalog,
+            paths,
+            PathBuf::from("/dev/null"),
+            crate::collect::video::CameraSettings::default(),
+            registry,
+            directory.clone(),
+            crate::collect::provenance::ProvenanceStore::load(directory.join("provenance.cbor")),
+            crate::collect::audio::AudioOutput::Silent,
+            coordinator,
+        );
+        adapter.attach_collection(collection);
+    }
+
+    async fn receive_control(device: &mut crate::registry::DeviceHandle) -> Frame {
+        tokio::time::timeout(std::time::Duration::from_secs(1), device.control_rx.recv())
+            .await
+            .expect("calibration control delivery timed out")
+            .expect("calibration control channel closed")
+    }
+
     #[tokio::test]
     async fn song_result_survives_candidate_not_yet_ready_for_continue() {
         let registry = Arc::new(Registry::new());
         let coordinator = GuidedSessionCoordinator::new();
         let adapter =
             CalibrationModeAdapter::new(registry.clone(), coordinator.clone(), vec![track()]);
+        attach_test_collection(&adapter, registry.clone(), coordinator.clone());
         coordinator.set_mode_adapter(GuidedMode::Calibration, adapter.clone());
         let mut device = register_device(&registry);
         let identity = registry.connection_identity("opal-test").unwrap();
@@ -1172,8 +1219,8 @@ mod tests {
                 Some(identity),
             )
             .unwrap();
-        let first = device.control_rx.recv().await.unwrap();
-        let second = device.control_rx.recv().await.unwrap();
+        let first = receive_control(&mut device).await;
+        let second = receive_control(&mut device).await;
         assert!(matches!(
             (&first, &second),
             (
