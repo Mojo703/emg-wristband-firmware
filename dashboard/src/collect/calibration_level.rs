@@ -14,7 +14,8 @@ pub const MAXIMUM_CUES: usize =
     COMMAND_SEMANTIC_COUNT * (COMMAND_CUES_PER_CLASS + ANTI_CUES_PER_CLASS);
 pub const SEMANTIC_COLUMN_COUNT: usize = 10;
 pub const CALIBRATION_LEVEL_SCHEMA_VERSION: u32 = 2;
-pub const CALIBRATION_LEVEL_GENERATOR_VERSION: u32 = 2;
+const LEGACY_CALIBRATION_LEVEL_GENERATOR_VERSION: u32 = 2;
+pub const CALIBRATION_LEVEL_GENERATOR_VERSION: u32 = 3;
 pub const CALIBRATION_SOURCE_LEVEL: &str = "hard";
 
 /// Fixed measured order, beginning at command zero. No implicit song/session
@@ -40,25 +41,25 @@ pub struct CalibrationLevelProductNote {
 
 impl CalibrationLevelProduct {
     pub fn generate(source_notes: &[MapNote], source_duration_ms: u32) -> Self {
-        let selected = select_notes(source_notes, source_duration_ms);
-        let columns = sequential_columns(selected.len());
-        let notes: Vec<_> = selected
-            .into_iter()
-            .zip(columns)
-            .map(
-                |((source_index, map_note), semantic_column)| CalibrationLevelProductNote {
-                    source_index,
-                    map_note,
-                    semantic_column,
-                },
-            )
-            .collect();
+        Self::generate_with_version(
+            source_notes,
+            source_duration_ms,
+            CALIBRATION_LEVEL_GENERATOR_VERSION,
+        )
+    }
+
+    fn generate_with_version(
+        source_notes: &[MapNote],
+        source_duration_ms: u32,
+        generator_version: u32,
+    ) -> Self {
+        let notes = select_notes(source_notes, source_duration_ms, generator_version);
         let duration_ms = notes
             .last()
             .map_or(0, |note| note.map_note.time_ms + note.map_note.hold_ms);
         let mut product = Self {
             schema_version: CALIBRATION_LEVEL_SCHEMA_VERSION,
-            generator_version: CALIBRATION_LEVEL_GENERATOR_VERSION,
+            generator_version,
             source_level: CALIBRATION_SOURCE_LEVEL.to_string(),
             content_identity: String::new(),
             duration_ms,
@@ -79,7 +80,10 @@ impl CalibrationLevelProduct {
                 self.schema_version
             );
         }
-        if self.generator_version != CALIBRATION_LEVEL_GENERATOR_VERSION {
+        if !matches!(
+            self.generator_version,
+            LEGACY_CALIBRATION_LEVEL_GENERATOR_VERSION | CALIBRATION_LEVEL_GENERATOR_VERSION
+        ) {
             anyhow::bail!(
                 "calibration level generator {} is not supported",
                 self.generator_version
@@ -116,7 +120,13 @@ impl CalibrationLevelProduct {
                 .map_note
                 .time_ms
                 .checked_add(HOLD_MILLISECONDS)
-                .and_then(|release| release.checked_add(MINIMUM_RECOVERY_MILLISECONDS))
+                .and_then(|release| {
+                    release.checked_add(recovery_between(
+                        pair[0].semantic_column,
+                        pair[1].semantic_column,
+                        self.generator_version,
+                    ))
+                })
                 .ok_or_else(|| anyhow::anyhow!("calibration cue {position} overflows time"))?;
             if next > pair[1].map_note.time_ms {
                 anyhow::bail!("calibration cue {position} lacks recovery time");
@@ -143,7 +153,13 @@ impl CalibrationLevelProduct {
         source_duration_ms: u32,
     ) -> anyhow::Result<()> {
         self.validate()?;
-        if self != &Self::generate(source_notes, source_duration_ms) {
+        if self
+            != &Self::generate_with_version(
+                source_notes,
+                source_duration_ms,
+                self.generator_version,
+            )
+        {
             anyhow::bail!("calibration level is not canonical for its retained source schedule");
         }
         Ok(())
@@ -172,9 +188,14 @@ impl CalibrationLevelProduct {
 /// Select cues already present in a source-derived schedule. The first eligible
 /// cue wins, then each later cue must leave the fixed recovery interval after
 /// the preceding fixed hold.
-fn select_notes(source_notes: &[MapNote], source_duration_ms: u32) -> Vec<(usize, MapNote)> {
+fn select_notes(
+    source_notes: &[MapNote],
+    source_duration_ms: u32,
+    generator_version: u32,
+) -> Vec<CalibrationLevelProductNote> {
     let mut selected = Vec::with_capacity(MAXIMUM_CUES.min(source_notes.len()));
     let mut next_eligible_onset = 0;
+    let columns = sequential_columns(MAXIMUM_CUES);
 
     for (source_index, source) in source_notes.iter().copied().enumerate() {
         let Some(release) = source.time_ms.checked_add(HOLD_MILLISECONDS) else {
@@ -183,20 +204,39 @@ fn select_notes(source_notes: &[MapNote], source_duration_ms: u32) -> Vec<(usize
         if source.time_ms < next_eligible_onset || release >= source_duration_ms {
             continue;
         }
-        selected.push((
+        let semantic_column = columns[selected.len()];
+        selected.push(CalibrationLevelProductNote {
             source_index,
-            MapNote {
+            map_note: MapNote {
                 hold_ms: HOLD_MILLISECONDS,
                 ..source
             },
-        ));
+            semantic_column,
+        });
         if selected.len() == MAXIMUM_CUES {
             break;
         }
-        next_eligible_onset = release.saturating_add(MINIMUM_RECOVERY_MILLISECONDS);
+        next_eligible_onset = release.saturating_add(recovery_between(
+            semantic_column,
+            columns[selected.len()],
+            generator_version,
+        ));
     }
 
     selected
+}
+
+/// Switching only the thumb state within one gesture lane needs no recovery
+/// beyond the completed 1.5 s labeled hold. Moving to another gesture retains
+/// the measured 0.5 s recovery interval. Version 2 used the latter globally.
+const fn recovery_between(previous: u8, next: u8, generator_version: u32) -> u32 {
+    if generator_version >= CALIBRATION_LEVEL_GENERATOR_VERSION
+        && previous % COMMAND_SEMANTIC_COUNT as u8 == next % COMMAND_SEMANTIC_COUNT as u8
+    {
+        0
+    } else {
+        MINIMUM_RECOVERY_MILLISECONDS
+    }
 }
 
 /// Deal authored cue slots through the measured class queues. Commands stop
@@ -238,6 +278,23 @@ mod tests {
     fn regular_source(count: usize, spacing_ms: u32) -> Vec<MapNote> {
         (0..count)
             .map(|index| note(1_000 + index as u32 * spacing_ms, (index % 12) as u8, 200))
+            .collect()
+    }
+
+    fn paired_thumb_source() -> Vec<MapNote> {
+        let columns = sequential_columns(MAXIMUM_CUES);
+        let mut time_ms = 1_000;
+        columns
+            .iter()
+            .enumerate()
+            .map(|(index, &column)| {
+                let result = note(time_ms, (index % 12) as u8, 200);
+                if let Some(&next) = columns.get(index + 1) {
+                    time_ms += HOLD_MILLISECONDS
+                        + recovery_between(column, next, CALIBRATION_LEVEL_GENERATOR_VERSION);
+                }
+                result
+            })
             .collect()
     }
 
@@ -369,20 +426,17 @@ mod tests {
     }
 
     fn generate(source_notes: &[MapNote], source_duration_ms: u32) -> CalibrationLevel {
-        let selected = select_notes(source_notes, source_duration_ms);
-        let selected_count = selected.len();
-        let notes = selected
-            .into_iter()
-            .zip(sequential_columns(selected_count))
-            .map(|((source_index, map_note), column)| CalibrationNote {
-                source_index,
-                map_note,
-                semantic_column: SemanticColumn::from_index(column).unwrap(),
+        let product = CalibrationLevelProduct::generate(source_notes, source_duration_ms);
+        let notes = product
+            .notes
+            .iter()
+            .map(|note| CalibrationNote {
+                source_index: note.source_index,
+                map_note: note.map_note,
+                semantic_column: SemanticColumn::from_index(note.semantic_column).unwrap(),
             })
             .collect::<Vec<_>>();
-        let duration_ms = notes
-            .last()
-            .map_or(0, |note| note.map_note.time_ms + note.map_note.hold_ms);
+        let duration_ms = product.duration_ms;
         CalibrationLevel { notes, duration_ms }
     }
 
@@ -391,9 +445,15 @@ mod tests {
         let source = regular_source(300, 250);
         let level = generate(&source, source_duration(&source));
 
-        assert_eq!(level.notes().len(), 38);
+        assert_eq!(level.notes().len(), 43);
         assert!(level.notes().windows(2).all(|pair| {
-            pair[0].map_note.time_ms + pair[0].map_note.hold_ms + MINIMUM_RECOVERY_MILLISECONDS
+            pair[0].map_note.time_ms
+                + pair[0].map_note.hold_ms
+                + recovery_between(
+                    pair[0].semantic_column.index(),
+                    pair[1].semantic_column.index(),
+                    CALIBRATION_LEVEL_GENERATOR_VERSION,
+                )
                 <= pair[1].map_note.time_ms
         }));
         assert!(level
@@ -526,10 +586,33 @@ mod tests {
                 .iter()
                 .all(|note| note.map_note.hold_ms == HOLD_MILLISECONDS));
             assert!(level.notes().windows(2).all(|pair| {
-                pair[0].map_note.time_ms + HOLD_MILLISECONDS + MINIMUM_RECOVERY_MILLISECONDS
+                pair[0].map_note.time_ms
+                    + HOLD_MILLISECONDS
+                    + recovery_between(
+                        pair[0].semantic_column.index(),
+                        pair[1].semantic_column.index(),
+                        CALIBRATION_LEVEL_GENERATOR_VERSION,
+                    )
                     <= pair[1].map_note.time_ms
             }));
         }
+    }
+
+    #[test]
+    fn paired_thumb_switches_fill_the_recipe_without_overlapping_holds() {
+        let source = paired_thumb_source();
+        let duration = source_duration(&source);
+        let current = CalibrationLevelProduct::generate(&source, duration);
+        let legacy = CalibrationLevelProduct::generate_with_version(
+            &source,
+            duration,
+            LEGACY_CALIBRATION_LEVEL_GENERATOR_VERSION,
+        );
+
+        assert_eq!(current.cue_count(), MAXIMUM_CUES);
+        assert!(legacy.cue_count() < MAXIMUM_CUES);
+        current.validate_against_source(&source, duration).unwrap();
+        legacy.validate_against_source(&source, duration).unwrap();
     }
 
     #[test]
@@ -628,7 +711,7 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(CALIBRATION_LEVEL_SCHEMA_VERSION, 2);
-        assert_eq!(CALIBRATION_LEVEL_GENERATOR_VERSION, 2);
+        assert_eq!(CALIBRATION_LEVEL_GENERATOR_VERSION, 3);
         assert_eq!(first.schema_version, CALIBRATION_LEVEL_SCHEMA_VERSION);
         assert_eq!(first.generator_version, CALIBRATION_LEVEL_GENERATOR_VERSION);
         assert_eq!(first.source_level, CALIBRATION_SOURCE_LEVEL);
