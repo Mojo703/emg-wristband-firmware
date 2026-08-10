@@ -461,9 +461,6 @@ async fn device_session(
         config.gestures
     );
 
-    // Reset before publishing the new registry entry so a browser cannot race
-    // the reconnect hello and observe the previous connection's Running state.
-    let _ = timing.reset_loop(&device_id);
     let DeviceHandle {
         frames,
         mut control_rx,
@@ -475,6 +472,10 @@ async fn device_session(
         config,
         provenance,
     );
+    // The registry's exact connection token is part of timing ownership. A
+    // same-id reconnect therefore cannot contribute probes or mode statuses to
+    // this epoch even if its reader task drains a late frame after replacement.
+    let mut timing_epoch = timing.begin_epoch(&device_id, token);
     let probe_outgoing = outgoing.clone();
     let probe_task = tokio::spawn(async move {
         let mut sequence = 0u32;
@@ -531,6 +532,11 @@ async fn device_session(
                 // serial reclaim or reboot and later Commit an empty device
                 // upload. The browser may still use it as a config refresh.
                 registry.update_config(&device_id, token, config.clone(), provenance.clone());
+                // A repeated hello can follow a device reboot without a host
+                // serial close. Rotate the timing generation explicitly; do
+                // not infer reboot from whether its new clock happens to be
+                // below the last sampled clock.
+                timing_epoch = timing.begin_epoch(&device_id, token);
                 let _ = frames.send(Frame::DeviceHello {
                     device_id: announced_id,
                     config,
@@ -545,13 +551,18 @@ async fn device_session(
                 acquisition_sample: _acquisition_sample,
             } => {
                 timing.record_clock_probe(
-                    &device_id,
+                    &timing_epoch,
                     host_send_nanoseconds,
                     device_receive_microseconds,
                     device_send_microseconds,
                     crate::timing::host_monotonic_nanoseconds(),
                 );
                 let _ = frames.send(timing.status(&device_id));
+            }
+            Frame::CalibrationTimingLoopStatus { status } => {
+                if let Some(projection) = timing.observe_loop_status(&timing_epoch, status) {
+                    let _ = frames.send(projection);
+                }
             }
             // Everything else is a data frame to fan out. `send` errs only when no
             // browser is subscribed, which is fine — drop it. Logs are additionally
@@ -610,7 +621,6 @@ async fn device_session(
                         | Frame::CalibrationSongResult { .. }
                         | Frame::CalibrationCandidateStatus { .. }
                         | Frame::CalibrationResidentActivated { .. }
-                        | Frame::CalibrationTimingLoopStatus { .. }
                 ) {
                     registry.push_replacement_calibration_frame(&device_id, token, other.clone());
                 }
@@ -625,7 +635,7 @@ async fn device_session(
         .connection_identity(&device_id)
         .is_some_and(|identity| identity.connection_token == token)
     {
-        let _ = timing.reset_loop(&device_id);
+        let _ = timing.end_epoch(&timing_epoch);
     }
     registry.deregister(&device_id, token);
     tracing::info!("device '{device_id}' disconnected");

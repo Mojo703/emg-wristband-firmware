@@ -672,12 +672,6 @@ pub async fn handle_browser(
                     Frame::Telemetry { source, metrics, .. } => {
                         signal_quality.accept_telemetry(source, metrics)
                     }
-                    Frame::CalibrationTimingLoopStatus { status } => {
-                        if let Some(device_id) = selection.device_id() {
-                            let projection = timing.observe_loop_status(device_id, *status);
-                            if send_reliable(&browser_tx, Message::Binary(frame::encode(&projection))).await.is_err() { break; }
-                        }
-                    }
                     _ => {}
                 }
                 // A browser that draws no waveforms has already been served by

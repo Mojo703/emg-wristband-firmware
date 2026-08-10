@@ -13,6 +13,7 @@ use protocol::{
 };
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -22,6 +23,20 @@ const SAMPLE_LIMIT: usize = CALIBRATION_TIMING_PROBE_WINDOW_CAPACITY as usize;
 struct ProbeSample {
     offset_milliseconds: i64,
     round_trip_milliseconds: u64,
+}
+
+/// Ownership proof for timing evidence from one identified device-link epoch.
+///
+/// The connection token prevents an old transport from mutating a replacement
+/// connection. `generation` also changes for a repeated `DeviceHello` on the
+/// same transport, because that hello can be the first observable edge of a
+/// fast device reboot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimingEpoch {
+    device_id: String,
+    connection_token: u64,
+    generation: u64,
+    began_at_host_nanoseconds: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,13 +60,13 @@ impl fmt::Display for TimingTransitionError {
 
 #[derive(Debug, Clone)]
 struct TimingOffsets {
+    active_epoch: Option<(u64, u64)>,
     samples: VecDeque<ProbeSample>,
     /// Device-boot → host-monotonic translation. This is deliberately not
     /// projected as an operator correction: it is normally many days of host
     /// uptime and is only used to place device anchors on the host timeline.
     clock_offsets_milliseconds: VecDeque<i64>,
     clock_epoch_offset_milliseconds: Option<i64>,
-    last_device_microseconds: Option<u64>,
     manual_trim_milliseconds: i64,
     /// Requested transitions and device acknowledgements share the protocol's
     /// tagged phase directly, so the internal lifecycle cannot drift from the
@@ -62,10 +77,10 @@ struct TimingOffsets {
 impl Default for TimingOffsets {
     fn default() -> Self {
         Self {
+            active_epoch: None,
             samples: VecDeque::with_capacity(SAMPLE_LIMIT),
             clock_offsets_milliseconds: VecDeque::with_capacity(SAMPLE_LIMIT),
             clock_epoch_offset_milliseconds: None,
-            last_device_microseconds: None,
             manual_trim_milliseconds: 0,
             loop_phase: CalibrationTimingPhase::Stopped,
         }
@@ -75,6 +90,7 @@ impl Default for TimingOffsets {
 #[derive(Debug)]
 pub struct TimingService {
     devices: Mutex<HashMap<String, TimingOffsets>>,
+    next_epoch_generation: AtomicU64,
     host_wall_minus_monotonic_milliseconds: i64,
 }
 
@@ -82,9 +98,41 @@ impl TimingService {
     pub fn new() -> Self {
         Self {
             devices: Mutex::new(HashMap::new()),
+            next_epoch_generation: AtomicU64::new(1),
             host_wall_minus_monotonic_milliseconds: unix_milliseconds()
                 .saturating_sub((host_monotonic_nanoseconds() / 1_000_000) as i64),
         }
+    }
+
+    /// Start a fresh evidence epoch for every accepted `DeviceHello`.
+    /// Operator trim is device-owned and deliberately survives; probe evidence
+    /// and loop acknowledgements are connection-owned and cannot survive.
+    pub fn begin_epoch(&self, device_id: &str, connection_token: u64) -> TimingEpoch {
+        let generation = self.next_epoch_generation.fetch_add(1, Ordering::Relaxed);
+        let epoch = TimingEpoch {
+            device_id: device_id.to_string(),
+            connection_token,
+            generation,
+            began_at_host_nanoseconds: host_monotonic_nanoseconds(),
+        };
+        self.with_device(device_id, |timing| {
+            timing.active_epoch = Some((connection_token, generation));
+            timing.samples.clear();
+            timing.clock_offsets_milliseconds.clear();
+            timing.clock_epoch_offset_milliseconds = None;
+            timing.loop_phase = CalibrationTimingPhase::Stopped;
+        });
+        epoch
+    }
+
+    fn with_epoch<T>(
+        &self,
+        epoch: &TimingEpoch,
+        f: impl FnOnce(&mut TimingOffsets) -> T,
+    ) -> Option<T> {
+        let mut devices = self.devices.lock().unwrap();
+        let timing = devices.get_mut(&epoch.device_id)?;
+        (timing.active_epoch == Some((epoch.connection_token, epoch.generation))).then(|| f(timing))
     }
 
     fn with_device<T>(&self, device_id: &str, f: impl FnOnce(&mut TimingOffsets) -> T) -> T {
@@ -97,13 +145,14 @@ impl TimingService {
     /// both sides gives the automatic device-minus-host correction.
     pub fn record_clock_probe(
         &self,
-        device_id: &str,
+        epoch: &TimingEpoch,
         host_send_nanoseconds: u64,
         device_receive_microseconds: u64,
         device_send_microseconds: u64,
         host_receive_nanoseconds: u64,
     ) {
-        if host_receive_nanoseconds < host_send_nanoseconds
+        if host_send_nanoseconds < epoch.began_at_host_nanoseconds
+            || host_receive_nanoseconds < host_send_nanoseconds
             || device_send_microseconds < device_receive_microseconds
         {
             return;
@@ -120,18 +169,7 @@ impl TimingService {
             signed_milliseconds_difference(device_midpoint, host_midpoint);
         let round_trip_milliseconds =
             (host_receive_nanoseconds - host_send_nanoseconds) / 1_000_000;
-        self.with_device(device_id, |timing| {
-            // A decreasing device clock means the same id has rebooted. Keep
-            // the operator's volatile trim, but establish a fresh epoch map.
-            if timing
-                .last_device_microseconds
-                .is_some_and(|last| device_send_microseconds < last)
-            {
-                timing.samples.clear();
-                timing.clock_offsets_milliseconds.clear();
-                timing.clock_epoch_offset_milliseconds = None;
-            }
-            timing.last_device_microseconds = Some(device_send_microseconds);
+        let _ = self.with_epoch(epoch, |timing| {
             let epoch = *timing
                 .clock_epoch_offset_milliseconds
                 .get_or_insert(raw_offset_milliseconds);
@@ -180,10 +218,10 @@ impl TimingService {
 
     pub fn observe_loop_status(
         &self,
-        device_id: &str,
+        epoch: &TimingEpoch,
         status: CalibrationTimingLoopStatus,
-    ) -> Frame {
-        self.with_device(device_id, |timing| {
+    ) -> Option<Frame> {
+        self.with_epoch(epoch, |timing| {
             timing.loop_phase = match status {
                 CalibrationTimingLoopStatus::Running { observation } => {
                     CalibrationTimingPhase::Running { observation }
@@ -198,9 +236,13 @@ impl TimingService {
 
     /// Clear connection-owned loop state on disconnect/reconnect while keeping
     /// the volatile per-device probe evidence and manual trim.
-    pub fn reset_loop(&self, device_id: &str) -> Frame {
-        self.with_device(device_id, |timing| {
+    pub fn end_epoch(&self, epoch: &TimingEpoch) -> Option<Frame> {
+        self.with_epoch(epoch, |timing| {
             timing.loop_phase = CalibrationTimingPhase::Stopped;
+            timing.active_epoch = None;
+            timing.samples.clear();
+            timing.clock_offsets_milliseconds.clear();
+            timing.clock_epoch_offset_milliseconds = None;
             Frame::CalibrationTimingStatus {
                 status: timing.status(),
             }
@@ -445,6 +487,12 @@ mod tests {
         });
     }
 
+    fn epoch(service: &TimingService, device_id: &str, token: u64) -> TimingEpoch {
+        let mut epoch = service.begin_epoch(device_id, token);
+        epoch.began_at_host_nanoseconds = 0;
+        epoch
+    }
+
     #[test]
     fn median_and_trim_are_bounded() {
         let service = TimingService::new();
@@ -483,9 +531,10 @@ mod tests {
     #[test]
     fn production_midpoint_maps_device_anchor_to_host_timeline() {
         let service = TimingService::new();
+        let epoch = epoch(&service, "opal", 1);
         let host_uptime_nanoseconds = 4 * 24 * 60 * 60 * 1_000_000_000u64;
         service.record_clock_probe(
-            "opal",
+            &epoch,
             host_uptime_nanoseconds,
             2_000_000,
             2_004_000,
@@ -510,24 +559,26 @@ mod tests {
     }
 
     #[test]
-    fn device_reboot_rebases_epoch_without_losing_manual_trim() {
+    fn quick_reboot_with_higher_clock_starts_fresh_epoch_and_keeps_trim() {
         let service = TimingService::new();
+        let first_epoch = epoch(&service, "opal", 1);
         let host_uptime_nanoseconds = 4 * 24 * 60 * 60 * 1_000_000_000u64;
         service.record_clock_probe(
-            "opal",
+            &first_epoch,
             host_uptime_nanoseconds,
             2_000_000,
             2_004_000,
             host_uptime_nanoseconds + 4_000_000,
         );
         let _ = service.adjust("opal", OffsetMilliseconds::new(50));
-        // Device uptime drops from ~2 s to ~1 ms while host monotonic time
-        // continues: treat this as a reboot and retain only the operator trim.
+        // This reboot's first uptime is higher than the last uptime from the
+        // old boot, so timestamp ordering cannot discover the epoch change.
+        let second_epoch = epoch(&service, "opal", 2);
         service.record_clock_probe(
-            "opal",
+            &second_epoch,
             host_uptime_nanoseconds + 100_000_000,
-            1_000_000,
-            1_004_000,
+            3_000_000,
+            3_004_000,
             host_uptime_nanoseconds + 104_000_000,
         );
         let Frame::CalibrationTimingStatus { status } = service.status("opal") else {
@@ -540,26 +591,69 @@ mod tests {
             .saturating_add(4 * 24 * 60 * 60 * 1_000)
             .saturating_add(153);
         assert_eq!(
-            service.corrected_host_milliseconds("opal", 1_003_000),
+            service.corrected_host_milliseconds("opal", 3_003_000),
             Some(expected_host)
         );
     }
 
     #[test]
+    fn stale_connection_cannot_repopulate_reconnect_epoch() {
+        let service = TimingService::new();
+        let stale_epoch = epoch(&service, "opal", 41);
+        let _ = service.adjust("opal", OffsetMilliseconds::new(50));
+        let current_epoch = epoch(&service, "opal", 42);
+
+        service.record_clock_probe(&stale_epoch, 10_000_000, 20_000, 21_000, 11_000_000);
+        assert!(service
+            .observe_loop_status(
+                &stale_epoch,
+                CalibrationTimingLoopStatus::Stopped {
+                    observed_device_monotonic_microseconds: 21_000,
+                },
+            )
+            .is_none());
+        let Frame::CalibrationTimingStatus { status } = service.status("opal") else {
+            panic!()
+        };
+        assert!(matches!(
+            status.estimate,
+            CalibrationTimingEstimate::NoSamples { .. }
+        ));
+        assert_eq!(status.manual_trim_milliseconds.get(), 50);
+
+        service.record_clock_probe(&current_epoch, 20_000_000, 30_000, 31_000, 21_000_000);
+        let Frame::CalibrationTimingStatus { status } = service.status("opal") else {
+            panic!()
+        };
+        assert!(matches!(
+            status.estimate,
+            CalibrationTimingEstimate::Measured {
+                sample_count: 1,
+                ..
+            }
+        ));
+        assert_eq!(status.manual_trim_milliseconds.get(), 50);
+    }
+
+    #[test]
     fn backend_projects_each_device_owned_rgb_status_without_extrapolating() {
         let service = TimingService::new();
+        let epoch = epoch(&service, "opal", 1);
         let anchor = 10_000_000;
-        let Frame::CalibrationTimingStatus { status } = service.observe_loop_status(
-            "opal",
-            CalibrationTimingLoopStatus::Running {
-                observation: CalibrationTimingObservation {
-                    color: CalibrationTimingColor::Green,
-                    color_elapsed_milliseconds: 100,
-                    anchor_device_monotonic_microseconds: anchor,
-                    observed_device_monotonic_microseconds: anchor + 600_000,
+        let Frame::CalibrationTimingStatus { status } = service
+            .observe_loop_status(
+                &epoch,
+                CalibrationTimingLoopStatus::Running {
+                    observation: CalibrationTimingObservation {
+                        color: CalibrationTimingColor::Green,
+                        color_elapsed_milliseconds: 100,
+                        anchor_device_monotonic_microseconds: anchor,
+                        observed_device_monotonic_microseconds: anchor + 600_000,
+                    },
                 },
-            },
-        ) else {
+            )
+            .unwrap()
+        else {
             panic!()
         };
         assert!(matches!(
@@ -573,7 +667,7 @@ mod tests {
             }
         ));
 
-        let Frame::CalibrationTimingStatus { status } = service.reset_loop("opal") else {
+        let Frame::CalibrationTimingStatus { status } = service.end_epoch(&epoch).unwrap() else {
             panic!()
         };
         assert!(matches!(status.phase, CalibrationTimingPhase::Stopped));
@@ -582,9 +676,10 @@ mod tests {
     #[test]
     fn manual_trim_moves_the_mapped_anchor_in_the_button_direction() {
         let service = TimingService::new();
+        let epoch = epoch(&service, "opal", 1);
         let host_uptime_nanoseconds = 4 * 24 * 60 * 60 * 1_000_000_000u64;
         service.record_clock_probe(
-            "opal",
+            &epoch,
             host_uptime_nanoseconds,
             2_000_000,
             2_004_000,
@@ -633,8 +728,9 @@ mod tests {
     #[test]
     fn stop_intent_keeps_running_until_device_acknowledges_stopped() {
         let service = TimingService::new();
+        let epoch = epoch(&service, "opal", 1);
         let _ = service.observe_loop_status(
-            "opal",
+            &epoch,
             CalibrationTimingLoopStatus::Running {
                 observation: CalibrationTimingObservation {
                     color: CalibrationTimingColor::Red,
@@ -663,12 +759,15 @@ mod tests {
             status.phase,
             CalibrationTimingPhase::Stopping { .. }
         ));
-        let Frame::CalibrationTimingStatus { status } = service.observe_loop_status(
-            "opal",
-            CalibrationTimingLoopStatus::Stopped {
-                observed_device_monotonic_microseconds: 2,
-            },
-        ) else {
+        let Frame::CalibrationTimingStatus { status } = service
+            .observe_loop_status(
+                &epoch,
+                CalibrationTimingLoopStatus::Stopped {
+                    observed_device_monotonic_microseconds: 2,
+                },
+            )
+            .unwrap()
+        else {
             panic!()
         };
         assert!(matches!(status.phase, CalibrationTimingPhase::Stopped));
@@ -677,6 +776,7 @@ mod tests {
     #[test]
     fn failed_delivery_is_explicit_and_a_late_acknowledgement_recovers_it() {
         let service = TimingService::new();
+        let epoch = epoch(&service, "opal", 1);
         let Frame::CalibrationTimingStatus { status } =
             service.control_failed("opal", "exact connection token is stale".into())
         else {
@@ -687,17 +787,20 @@ mod tests {
             CalibrationTimingPhase::Error { ref detail, last_observation: None }
                 if detail == "exact connection token is stale"
         ));
-        let Frame::CalibrationTimingStatus { status } = service.observe_loop_status(
-            "opal",
-            CalibrationTimingLoopStatus::Running {
-                observation: CalibrationTimingObservation {
-                    color: CalibrationTimingColor::Blue,
-                    color_elapsed_milliseconds: 25,
-                    anchor_device_monotonic_microseconds: 1,
-                    observed_device_monotonic_microseconds: 1,
+        let Frame::CalibrationTimingStatus { status } = service
+            .observe_loop_status(
+                &epoch,
+                CalibrationTimingLoopStatus::Running {
+                    observation: CalibrationTimingObservation {
+                        color: CalibrationTimingColor::Blue,
+                        color_elapsed_milliseconds: 25,
+                        anchor_device_monotonic_microseconds: 1,
+                        observed_device_monotonic_microseconds: 1,
+                    },
                 },
-            },
-        ) else {
+            )
+            .unwrap()
+        else {
             panic!()
         };
         assert!(matches!(
