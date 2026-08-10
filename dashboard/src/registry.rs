@@ -41,7 +41,7 @@ struct DeviceEntry {
     /// Newest `Frame::Telemetry` per source, so a browser opened after the fact
     /// starts with the current values. Only the newest: telemetry is loss-tolerant
     /// and its history accumulates in the browser session, not here.
-    telemetry: HashMap<String, Frame>,
+    telemetry: RetainedTelemetry,
     /// Current phone-peripheral state. Unlike commands, device-origin state may be
     /// replayed so a late browser does not wait for the next transition.
     phone_state: Option<Frame>,
@@ -77,6 +77,43 @@ impl DeviceConnection {
 /// Retained log lines per device — enough scrollback to cover a boot and a few
 /// reconnects without growing forever.
 const LOG_RETENTION: usize = 200;
+
+/// Maximum number of device-named telemetry sources retained per connection.
+///
+/// Source names arrive over the wire, so their cardinality is not trusted. This
+/// is shared with the browser's live mailbox: a reconnect snapshot and a live
+/// session therefore have the same bounded latest-per-source semantics.
+pub(crate) const TELEMETRY_SOURCE_CAP: usize = 16;
+
+/// Ordered, bounded latest-frame projection for device telemetry.
+///
+/// Updating a known source refreshes its recency instead of consuming another
+/// slot. Once full, a new source deterministically evicts the least recently
+/// updated source. Iteration is oldest-to-newest, making reconnect snapshots
+/// deterministic and leaving the freshest source last.
+#[derive(Default)]
+struct RetainedTelemetry {
+    entries: VecDeque<(String, Frame)>,
+}
+
+impl RetainedTelemetry {
+    fn insert(&mut self, source: String, frame: Frame) {
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|(existing, _)| existing == &source)
+        {
+            self.entries.remove(index);
+        } else if self.entries.len() >= TELEMETRY_SOURCE_CAP {
+            self.entries.pop_front();
+        }
+        self.entries.push_back((source, frame));
+    }
+
+    fn frames(&self) -> impl Iterator<Item = &Frame> {
+        self.entries.iter().map(|(_, frame)| frame)
+    }
+}
 
 /// Handed to a device's ingest task on registration: it pushes data frames into
 /// `frames` and drains `control_rx` to the device's transport.
@@ -181,7 +218,7 @@ impl Registry {
                     control,
                 },
                 logs: VecDeque::new(),
-                telemetry: HashMap::new(),
+                telemetry: RetainedTelemetry::default(),
                 phone_state: None,
                 replacement_calibration: VecDeque::new(),
             },
@@ -346,10 +383,13 @@ impl Registry {
 
     /// Retain a device's newest telemetry frame per source — token-gated like
     /// `push_log`.
-    pub fn push_telemetry(&self, id: &str, token: u64, source: String, frame: Frame) {
+    pub fn push_telemetry(&self, id: &str, token: u64, frame: Frame) {
+        let Frame::Telemetry { source, .. } = &frame else {
+            return;
+        };
         if let Some(entry) = self.devices.lock().unwrap().get_mut(id) {
             if entry.connection.token() == token {
-                entry.telemetry.insert(source, frame);
+                entry.telemetry.insert(source.clone(), frame);
             }
         }
     }
@@ -360,7 +400,7 @@ impl Registry {
             .lock()
             .unwrap()
             .get(id)
-            .map(|entry| entry.telemetry.values().cloned().collect())
+            .map(|entry| entry.telemetry.frames().cloned().collect())
             .unwrap_or_default()
     }
 
@@ -467,7 +507,7 @@ fn control_delivery_error(error: TrySendError<Frame>) -> ControlDeliveryError {
 
 #[cfg(test)]
 mod tests {
-    use super::{ControlDeliveryError, Registry, CONTROL_BUFFER};
+    use super::{ControlDeliveryError, Registry, CONTROL_BUFFER, TELEMETRY_SOURCE_CAP};
     use protocol::{DeviceConfig, DeviceProvenance, DeviceTransport, FirmwareBuild, Frame};
 
     fn register(registry: &Registry) -> super::DeviceHandle {
@@ -494,6 +534,25 @@ mod tests {
                 analog_front_ends: Vec::new(),
             },
         )
+    }
+
+    fn telemetry(source: impl Into<String>, value: u64) -> Frame {
+        Frame::Telemetry {
+            t_us: value,
+            source: source.into(),
+            metrics: Vec::new(),
+        }
+    }
+
+    fn telemetry_projection(registry: &Registry) -> Vec<(String, u64)> {
+        registry
+            .telemetry_of("opal-test")
+            .into_iter()
+            .map(|frame| match frame {
+                Frame::Telemetry { source, t_us, .. } => (source, t_us),
+                other => panic!("retained a non-telemetry frame: {other:?}"),
+            })
+            .collect()
     }
 
     #[test]
@@ -523,5 +582,44 @@ mod tests {
             registry.send_control("opal-test", Frame::Probe {}),
             Err(ControlDeliveryError::SessionClosed)
         );
+    }
+
+    #[test]
+    fn hostile_source_cardinality_has_deterministic_bounded_snapshot() {
+        let registry = Registry::new();
+        let token = register(&registry).token;
+
+        for source in 0..10_000_u64 {
+            let name = format!("hostile-{source:05}");
+            registry.push_telemetry("opal-test", token, telemetry(name, source));
+        }
+
+        let projection = telemetry_projection(&registry);
+        assert_eq!(projection.len(), TELEMETRY_SOURCE_CAP);
+        let expected_start = 10_000 - TELEMETRY_SOURCE_CAP as u64;
+        let expected: Vec<_> = (expected_start..10_000)
+            .map(|source| (format!("hostile-{source:05}"), source))
+            .collect();
+        assert_eq!(projection, expected);
+    }
+
+    #[test]
+    fn updating_known_source_refreshes_value_and_protects_it_from_next_eviction() {
+        let registry = Registry::new();
+        let token = register(&registry).token;
+        registry.push_telemetry("opal-test", token, telemetry("stable", 1));
+        for source in 0..(TELEMETRY_SOURCE_CAP - 1) {
+            let name = format!("source-{source}");
+            registry.push_telemetry("opal-test", token, telemetry(name, source as u64));
+        }
+
+        registry.push_telemetry("opal-test", token, telemetry("stable", 2));
+        registry.push_telemetry("opal-test", token, telemetry("new", 3));
+
+        let projection = telemetry_projection(&registry);
+        assert_eq!(projection.len(), TELEMETRY_SOURCE_CAP);
+        assert!(!projection.iter().any(|(source, _)| source == "source-0"));
+        assert_eq!(projection[TELEMETRY_SOURCE_CAP - 2], ("stable".into(), 2));
+        assert_eq!(projection[TELEMETRY_SOURCE_CAP - 1], ("new".into(), 3));
     }
 }

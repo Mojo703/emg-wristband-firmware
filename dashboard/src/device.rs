@@ -51,7 +51,6 @@ enum SerialConnectionPhase {
     Probing,
     Connected,
     Backoff,
-    Closed,
 }
 
 #[repr(u8)]
@@ -73,26 +72,27 @@ impl SerialConnectionTracker {
     fn reconcile(&self, candidates: &[String]) {
         let candidate_set: HashSet<&str> = candidates.iter().map(String::as_str).collect();
         let mut phases = self.phases.lock().unwrap();
-        for (path, phase) in phases.iter_mut() {
-            if !candidate_set.contains(path.as_str())
-                && matches!(
+        // Candidate and Backoff are discovery-owned states. Once their path is
+        // absent they carry no live resource and no useful reconnect identity,
+        // so drop them instead of retaining every path the OS has ever named.
+        // Open/Probing/Connected entries are owned by a running session and its
+        // completion path removes or transitions them.
+        phases.retain(|path, phase| {
+            candidate_set.contains(path.as_str())
+                || matches!(
                     *phase,
-                    SerialConnectionPhase::Candidate | SerialConnectionPhase::Backoff
+                    SerialConnectionPhase::Open
+                        | SerialConnectionPhase::Probing
+                        | SerialConnectionPhase::Connected
                 )
-            {
-                *phase = SerialConnectionPhase::Closed;
-            }
-        }
+        });
         for path in candidates {
             match phases.entry(path.clone()) {
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     entry.insert(SerialConnectionPhase::Candidate);
                 }
                 std::collections::hash_map::Entry::Occupied(mut entry)
-                    if matches!(
-                        *entry.get(),
-                        SerialConnectionPhase::Backoff | SerialConnectionPhase::Closed
-                    ) =>
+                    if matches!(*entry.get(), SerialConnectionPhase::Backoff) =>
                 {
                     entry.insert(SerialConnectionPhase::Candidate);
                 }
@@ -117,8 +117,7 @@ impl SerialConnectionTracker {
             SerialConnectionPhase::Open
             | SerialConnectionPhase::Probing
             | SerialConnectionPhase::Connected
-            | SerialConnectionPhase::Backoff
-            | SerialConnectionPhase::Closed => false,
+            | SerialConnectionPhase::Backoff => false,
         }
     }
 
@@ -155,6 +154,11 @@ impl SerialConnectionTracker {
     #[cfg(test)]
     fn phase(&self, path: &str) -> Option<SerialConnectionPhase> {
         self.phases.lock().unwrap().get(path).copied()
+    }
+
+    #[cfg(test)]
+    fn retained_path_count(&self) -> usize {
+        self.phases.lock().unwrap().len()
     }
 
     fn transition(&self, path: &str, expected: SerialConnectionPhase, next: SerialConnectionPhase) {
@@ -581,10 +585,10 @@ async fn device_session(
                     }
                     registry.push_log(&device_id, token, other.clone());
                 }
-                if let Frame::Telemetry { source, .. } = &other {
+                if let Frame::Telemetry { .. } = &other {
                     // Newest per source, so a browser that connects later starts
                     // with current values instead of waiting out an interval.
-                    registry.push_telemetry(&device_id, token, source.clone(), other.clone());
+                    registry.push_telemetry(&device_id, token, other.clone());
                 }
                 if let Frame::PhoneState { status } = &other {
                     registry.push_phone_state(&device_id, token, status.clone());
@@ -808,6 +812,14 @@ fn serial_candidates(
     candidates
 }
 
+fn retain_current_warning_paths(warned_paths: &Mutex<HashSet<String>>, candidates: &[String]) {
+    let candidates: HashSet<&str> = candidates.iter().map(String::as_str).collect();
+    warned_paths
+        .lock()
+        .unwrap()
+        .retain(|path| candidates.contains(path.as_str()));
+}
+
 /// Discover serial-attached devices and run a probed session on each until it dies
 /// (unplug, or the device ignores us). An explicit `EMG_SERIAL_PORT` override wins
 /// whenever it names a path that exists; otherwise auto-select by USB identity. The
@@ -856,6 +868,7 @@ pub async fn run_serial_discovery(registry: Arc<Registry>, timing: Arc<TimingSer
             }
         };
 
+        retain_current_warning_paths(&warned_ports, &candidates);
         connections.reconcile(&candidates);
         for path in candidates {
             if !connections.claim_open(&path) {
@@ -1304,18 +1317,48 @@ mod tests {
     }
 
     #[test]
-    fn absent_automatic_candidate_closes_without_ending_a_connected_session() {
+    fn absent_automatic_candidate_is_forgotten_without_ending_connected_session() {
         let path = "/tmp/opal-test-tty".to_owned();
         let tracker = SerialConnectionTracker::default();
         tracker.reconcile(std::slice::from_ref(&path));
         tracker.reconcile(&[]);
-        assert_eq!(tracker.phase(&path), Some(SerialConnectionPhase::Closed));
+        assert_eq!(tracker.phase(&path), None);
         tracker.reconcile(std::slice::from_ref(&path));
         assert!(tracker.claim_open(&path));
         tracker.opened(&path);
         tracker.hello(&path);
         tracker.reconcile(&[]);
         assert_eq!(tracker.phase(&path), Some(SerialConnectionPhase::Connected));
+    }
+
+    #[test]
+    fn serial_discovery_does_not_retain_historical_path_names() {
+        let tracker = SerialConnectionTracker::default();
+        for index in 0..10_000 {
+            tracker.reconcile(&[format!("/tmp/opal-enumeration-{index}")]);
+        }
+        assert_eq!(tracker.retained_path_count(), 1);
+        tracker.reconcile(&[]);
+        assert_eq!(tracker.retained_path_count(), 0);
+    }
+
+    #[test]
+    fn serial_warning_deduplication_forgets_absent_paths() {
+        let warned = Mutex::new(HashSet::new());
+        for index in 0..10_000 {
+            warned
+                .lock()
+                .unwrap()
+                .insert(format!("/tmp/failed-{index}"));
+        }
+        retain_current_warning_paths(
+            &warned,
+            &["/tmp/failed-3".into(), "/tmp/failed-9000".into()],
+        );
+        assert_eq!(
+            *warned.lock().unwrap(),
+            HashSet::from(["/tmp/failed-3".into(), "/tmp/failed-9000".into()])
+        );
     }
 
     #[test]

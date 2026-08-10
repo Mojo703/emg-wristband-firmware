@@ -4,7 +4,7 @@
 
 use crate::frame;
 use crate::looks;
-use crate::registry::Registry;
+use crate::registry::{Registry, TELEMETRY_SOURCE_CAP};
 use crate::timing::TimingService;
 use axum::extract::ws::{Message, WebSocket};
 use dashboard::guided_session::{
@@ -29,10 +29,6 @@ const POSE_QUEUE_MAX: usize = 100;
 /// Bound on frames queued toward one browser: slack for a momentary stall, not an
 /// unbounded backlog.
 const OUTBOUND_CAP: usize = 256;
-/// Telemetry sources are named by the device, so they cannot be allowed to
-/// grow a browser mailbox without bound. Real devices use only a handful.
-const LIVE_TELEMETRY_CAP: usize = 16;
-
 /// Which live stream a frame belongs to. Live frames are coalesced *per kind* when the
 /// browser falls behind: the device emits each EMG window immediately followed by its
 /// prediction, so a single "latest live frame" slot would race the pair and near-always
@@ -75,7 +71,7 @@ impl LatestLive {
                     .position(|(existing, _)| existing == &source)
                 {
                     self.telemetry.remove(index);
-                } else if self.telemetry.len() == LIVE_TELEMETRY_CAP {
+                } else if self.telemetry.len() == TELEMETRY_SOURCE_CAP {
                     self.telemetry.pop_front();
                 }
                 self.telemetry.push_back((source, message));
@@ -886,9 +882,10 @@ async fn run_pose_proxy(
 mod tests {
     use super::{
         apply_guided_frame, delivery_for, next_frame, replay_retained, send_live, send_reliable,
-        BrowserSender, Delivery, DeviceSelection, LiveKind, LiveMailbox, LIVE_TELEMETRY_CAP,
+        BrowserSender, Delivery, DeviceSelection, LiveKind, LiveMailbox,
     };
     use crate::frame;
+    use crate::registry::TELEMETRY_SOURCE_CAP;
     use crate::registry::{ControlDeliveryError, DeviceHandle, Registry};
     use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
     use axum::extract::State;
@@ -1274,13 +1271,13 @@ mod tests {
     #[test]
     fn device_named_telemetry_sources_cannot_make_live_storage_unbounded() {
         let mailbox = LiveMailbox::default();
-        for source in 0..(LIVE_TELEMETRY_CAP * 4) {
+        for source in 0..(TELEMETRY_SOURCE_CAP * 4) {
             mailbox.put(
                 LiveKind::Telemetry(format!("source-{source}")),
                 Message::Text(source.to_string()),
             );
         }
-        assert_eq!(mailbox.drain().len(), LIVE_TELEMETRY_CAP);
+        assert_eq!(mailbox.drain().len(), TELEMETRY_SOURCE_CAP);
     }
 
     #[tokio::test]
