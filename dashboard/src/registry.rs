@@ -103,11 +103,11 @@ pub enum ControlDeliveryError {
 }
 
 impl ControlDeliveryError {
-    pub fn calibration_message(self) -> &'static str {
+    pub fn operator_message(self) -> &'static str {
         match self {
-            Self::UnknownDevice => "no device is selected for calibration",
-            Self::Disconnected => "the selected device is offline; reconnect it before calibrating",
-            Self::StaleConnection => "the selected device reconnected; refresh before calibrating",
+            Self::UnknownDevice => "no device is selected",
+            Self::Disconnected => "the selected device is offline; reconnect it and retry",
+            Self::StaleConnection => "the selected device reconnected; refresh and retry",
             Self::QueueFull => {
                 "the selected device is not accepting commands; retry after the link recovers"
             }
@@ -115,6 +115,10 @@ impl ControlDeliveryError {
                 "the selected device connection closed before the command was delivered"
             }
         }
+    }
+
+    pub fn calibration_message(self) -> &'static str {
+        self.operator_message()
     }
 }
 

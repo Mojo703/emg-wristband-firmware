@@ -534,10 +534,10 @@ pub async fn handle_browser(
                             };
                             if let Some(control) = control {
                                 if let Err(error) = registry.send_control(device_id, control) {
-                                    let status = timing.control_failed(device_id, error.calibration_message().into());
+                                    let status = timing.control_failed(device_id, error.operator_message().into());
                                     let refusal = Frame::BenchError {
                                         stage: "timing".into(),
-                                        detail: error.calibration_message().into(),
+                                        detail: error.operator_message().into(),
                                     };
                                     if send_reliable(&browser_tx, Message::Binary(frame::encode(&refusal))).await.is_err() { break; }
                                     if send_reliable(&browser_tx, Message::Binary(frame::encode(&status))).await.is_err() { break; }
@@ -571,10 +571,26 @@ pub async fn handle_browser(
                         | Frame::SetWifi { .. }
                         | Frame::SetServer { .. }
                         | Frame::SetPhone { .. }) => {
-                            let _ = selection.device_id().map_or(
+                            let delivery = selection.device_id().map_or(
                                 Err(crate::registry::ControlDeliveryError::UnknownDevice),
                                 |id| registry.send_control(id, control),
                             );
+                            if let Err(error) = delivery {
+                                tracing::warn!(?error, "device control was not delivered");
+                                let refusal = Frame::BenchError {
+                                    stage: "device-control".into(),
+                                    detail: error.operator_message().into(),
+                                };
+                                if send_reliable(
+                                    &browser_tx,
+                                    Message::Binary(frame::encode(&refusal)),
+                                )
+                                .await
+                                .is_err()
+                                {
+                                    break;
+                                }
+                            }
                         }
                         // Collection control frames go to the session manager.
                         Frame::StartCollection { metadata, track_id, difficulty, record_video } => {
@@ -667,7 +683,25 @@ pub async fn handle_browser(
                         break;
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!(skipped, "browser lagged collection projection; replaying current state");
+                    let mut browser_closed = false;
+                    for frame in collection.connect_frames() {
+                        if send_reliable(
+                            &browser_tx,
+                            Message::Binary(frame::encode(&frame)),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            browser_closed = true;
+                            break;
+                        }
+                    }
+                    if browser_closed {
+                        break;
+                    }
+                }
                 Err(broadcast::error::RecvError::Closed) => {} // manager lives as long as the process
             },
             changed = guided_snapshots.changed() => {
