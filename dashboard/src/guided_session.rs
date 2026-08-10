@@ -291,6 +291,7 @@ pub enum CoordinatorError {
     DeviceRequired,
     AdapterTaskUnavailable,
     AdapterTaskBusy,
+    ActionUnavailable,
     CalibrationTrackRequired,
     UnknownCalibrationTrack,
 }

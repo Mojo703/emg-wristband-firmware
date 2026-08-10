@@ -189,6 +189,16 @@ enum PlaybackState {
     Playing(crate::collect::audio::Playback),
 }
 
+fn enter_between_songs(
+    evidence: &mut EvidenceState,
+    heartbeat: &mut HeartbeatMode,
+    playback: &mut PlaybackState,
+) {
+    *evidence = EvidenceState::Retained;
+    *heartbeat = HeartbeatMode::Withheld;
+    *playback = PlaybackState::Dormant;
+}
+
 /// An opened song is affine authority for one accepted schedule identity.  A
 /// `JoinHandle` is a future and may not be polled after it has completed; keeping
 /// it loose beside the mutable track previously let Continue poll the first
@@ -252,6 +262,22 @@ enum EvidenceState {
 enum CandidateState {
     Absent,
     Present(protocol::CalibrationCandidateValidity),
+}
+
+fn run_action_is_authorized(
+    action: &RunAction,
+    evidence: EvidenceState,
+    candidate: CandidateState,
+) -> bool {
+    match action {
+        RunAction::Continue | RunAction::SelectNextTrack(_) => {
+            matches!(evidence, EvidenceState::Retained)
+        }
+        RunAction::Save => {
+            matches!(evidence, EvidenceState::Retained) && candidate.permits_activation()
+        }
+        RunAction::Discard => true,
+    }
 }
 
 impl CandidateState {
@@ -682,9 +708,7 @@ impl CalibrationModeAdapter {
                         if interruption.run == run
                             && interruption.schedule_revision == schedule_revision
                             && interruption.content_identity == track.content_identity => {
-                        evidence = EvidenceState::Retained;
-                        heartbeat_mode = HeartbeatMode::Withheld;
-                        playback = PlaybackState::Dormant;
+                        enter_between_songs(&mut evidence, &mut heartbeat_mode, &mut playback);
                         let _ = self.coordinator.update_calibration(
                             &binding,
                             between_songs_snapshot(
@@ -701,8 +725,13 @@ impl CalibrationModeAdapter {
                             && result.schedule_revision == schedule_revision
                             && result.content_identity == track.content_identity => {
                         song_counts = result.counts;
-                        evidence = EvidenceState::Retained;
                         candidate = candidate.with_validity(result.validity);
+                        // A normal song result is the same transport/output
+                        // boundary as an explicit interruption.  Previously
+                        // the UI entered BetweenSongs while the actor kept
+                        // heartbeating and playing; SelectNextTrack therefore
+                        // rejected the very state the UI advertised.
+                        enter_between_songs(&mut evidence, &mut heartbeat_mode, &mut playback);
                         let _ = self.coordinator.update_calibration(
                             &binding,
                             between_songs_snapshot(
@@ -800,11 +829,14 @@ impl CalibrationModeAdapter {
                     let Some(command) = command else {
                         break SessionExit::TaskFailed("calibration actor action channel closed".into());
                     };
-                    let terminal_discard = matches!(&command, RunAction::Discard);
-                    if matches!(&command, RunAction::Save) && !candidate.permits_activation()
-                    {
+                    // The browser projection is not transaction authority.
+                    // Re-check the actor-owned boundary so a racing or forged
+                    // Continue cannot replace an upload that is still being
+                    // prepared, acknowledged, or played.
+                    if !run_action_is_authorized(&command, evidence, candidate) {
                         continue;
                     }
+                    let terminal_discard = matches!(&command, RunAction::Discard);
                     let frame = match command {
                         RunAction::Continue => {
                             let Some(next_revision) = next_schedule_revision(schedule_revision) else {
@@ -976,16 +1008,34 @@ impl CalibrationModeAdapter {
             .find(|track| track.id.0 == track_id)
             .cloned()
             .ok_or(CoordinatorError::UnknownCalibrationTrack)?;
+        self.require_between_songs(binding)?;
+        self.send_action(binding, RunAction::SelectNextTrack(track))
+    }
+
+    fn require_between_songs(
+        &self,
+        binding: &GuidedSessionBinding,
+    ) -> Result<(), CoordinatorError> {
         let snapshot = self.coordinator.snapshot();
-        if snapshot.active() != Some(binding)
-            || !matches!(
+        if snapshot.active() == Some(binding)
+            && matches!(
                 snapshot.calibration(),
                 Some(GuidedCalibrationSnapshot::BetweenSongs { .. })
             )
         {
-            return Ok(());
+            Ok(())
+        } else {
+            Err(CoordinatorError::ActionUnavailable)
         }
-        self.send_action(binding, RunAction::SelectNextTrack(track))
+    }
+
+    fn send_between_songs_action(
+        &self,
+        binding: &GuidedSessionBinding,
+        action: RunAction,
+    ) -> Result<(), CoordinatorError> {
+        self.require_between_songs(binding)?;
+        self.send_action(binding, action)
     }
 }
 
@@ -1034,11 +1084,11 @@ impl GuidedModeAdapter for CalibrationModeAdapter {
                 session.ok_or(CoordinatorError::LeaseMismatch)?,
                 RunAction::Discard,
             ),
-            GuidedSessionAction::SaveCalibration => self.send_action(
+            GuidedSessionAction::SaveCalibration => self.send_between_songs_action(
                 session.ok_or(CoordinatorError::LeaseMismatch)?,
                 RunAction::Save,
             ),
-            GuidedSessionAction::ContinueCalibration => self.send_action(
+            GuidedSessionAction::ContinueCalibration => self.send_between_songs_action(
                 session.ok_or(CoordinatorError::LeaseMismatch)?,
                 RunAction::Continue,
             ),
@@ -1423,6 +1473,41 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
+    fn between_songs_is_one_actor_owned_transport_and_action_boundary() {
+        let revision = CalibrationScheduleRevision::new(1).unwrap();
+        let mut evidence = EvidenceState::Fresh;
+        let mut heartbeat = HeartbeatMode::Sending {
+            schedule_revision: revision,
+            next_sequence: 7,
+        };
+        let mut playback = PlaybackState::Dormant;
+        let absent = CandidateState::Absent;
+        let valid = CandidateState::Present(protocol::CalibrationCandidateValidity {
+            model_numerically_valid: true,
+            record_crc_valid: true,
+        });
+
+        assert!(!run_action_is_authorized(
+            &RunAction::Continue,
+            evidence,
+            absent,
+        ));
+        assert!(!run_action_is_authorized(&RunAction::Save, evidence, valid));
+
+        enter_between_songs(&mut evidence, &mut heartbeat, &mut playback);
+
+        assert!(matches!(evidence, EvidenceState::Retained));
+        assert!(matches!(heartbeat, HeartbeatMode::Withheld));
+        assert!(matches!(playback, PlaybackState::Dormant));
+        assert!(run_action_is_authorized(
+            &RunAction::Continue,
+            evidence,
+            absent,
+        ));
+        assert!(run_action_is_authorized(&RunAction::Save, evidence, valid));
+    }
+
+    #[test]
     fn run_action_queue_is_bounded_and_distinguishes_full_from_closed() {
         let (actions, mut receiver) = mpsc::channel(2);
         enqueue_run_action(&actions, RunAction::Continue).unwrap();
@@ -1680,6 +1765,20 @@ mod tests {
                 Frame::CalibrationScheduleBegin { .. }
             )
         ));
+        let preparing = coordinator.snapshot();
+        assert_eq!(
+            coordinator.handle_intent_for_device(
+                GuidedIntentRequest {
+                    expected_revision: preparing.revision,
+                    expected_run_revision: preparing.run_revision,
+                    expected_session_id: preparing.active().map(|active| active.session_id),
+                    action: GuidedSessionAction::ContinueCalibration,
+                },
+                None,
+            ),
+            Err(CoordinatorError::ActionUnavailable),
+            "Continue must not replace a preparation/upload transaction"
+        );
         let run = CalibrationRunKey {
             session_id: CalibrationSessionId::new(1).unwrap(),
             run_id: CalibrationRunId::new(1).unwrap(),
