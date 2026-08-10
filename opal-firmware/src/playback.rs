@@ -272,20 +272,6 @@ impl PlaybackEngine {
     /// there is no front end, so the acquisition threads and the GPIO
     /// dispatcher that own that core on real hardware do not exist.
     pub fn start() -> anyhow::Result<Self> {
-        // A calibration fit occupies core 1 for minutes without yielding, which
-        // starves that core's idle task past the 5 s task watchdog and reboots
-        // the chip mid-measurement. Stop watching the idle tasks; the serve
-        // loop keeps its own subscription and feeds it every iteration, so a
-        // hung link still reboots.
-        let watchdog = esp_idf_svc::sys::esp_task_wdt_config_t {
-            timeout_ms: 5000,
-            idle_core_mask: 0,
-            trigger_panic: true,
-        };
-        let reconfigured = unsafe { esp_idf_svc::sys::esp_task_wdt_reconfigure(&watchdog) };
-        if reconfigured != esp_idf_svc::sys::ESP_OK {
-            warn!("task watchdog reconfigure failed ({reconfigured}); long fits will reboot");
-        }
         let (commands, command_queue) = mpsc::sync_channel(COMMAND_QUEUE_DEPTH);
         let (produced_control, outbound_control) = mpsc::sync_channel(OUTBOUND_CONTROL_DEPTH);
         let (produced_payload, outbound_payload) = mpsc::sync_channel(OUTBOUND_PAYLOAD_DEPTH);

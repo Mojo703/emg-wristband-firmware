@@ -709,9 +709,28 @@ impl App {
             },
         };
 
-        // The main loop paces at one window (~244 ms); if it ever stops feeding the task
-        // watchdog (default 5 s), something below hung on I/O and the chip must reboot
-        // rather than sit dead until unplugged. The boot log names the reset reason.
+        // Watch the serve task itself, not FreeRTOS's idle tasks.  Calibration fitting is
+        // intentionally sliced into small bounded chunks, but a continuous stream of
+        // windows plus those chunks can keep core 0 usefully busy for longer than the
+        // idle-task watchdog permits.  That is not a hang: links and acquisition are
+        // still progressing and this task reaches this loop between every chunk.  The
+        // serve-task subscription below is the precise liveness invariant we need.
+        //
+        // Reconfigure in every build.  This used to happen only in playback builds,
+        // which left real-hardware calibration vulnerable to a misleading task-WDT
+        // reset shortly after its first accepted cue began fitting.
+        let watchdog = esp_idf_svc::sys::esp_task_wdt_config_t {
+            timeout_ms: 5000,
+            idle_core_mask: 0,
+            trigger_panic: true,
+        };
+        let reconfigured = unsafe { esp_idf_svc::sys::esp_task_wdt_reconfigure(&watchdog) };
+        if reconfigured != esp_idf_svc::sys::ESP_OK {
+            warn!("task watchdog reconfigure failed ({reconfigured}); calibration may reboot");
+        } else {
+            info!("task watchdog: serve task only, 5000 ms timeout");
+        }
+        crate::cores::log_thread_priority("serve task");
         unsafe {
             esp_idf_svc::sys::esp_task_wdt_add(std::ptr::null_mut());
         }
