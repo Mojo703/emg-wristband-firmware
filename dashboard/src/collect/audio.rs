@@ -596,6 +596,34 @@ impl Drop for Playback {
 }
 
 impl Playback {
+    /// A real silent sink backed by an in-memory track for actor tests that
+    /// exercise playback ownership without depending on an imported song.
+    #[cfg(test)]
+    pub(crate) fn silent_fixture() -> Playback {
+        let track = Arc::new(DecodedTrack {
+            sample_rate: 1_000,
+            channels: 1,
+            samples: vec![0.0; 60_000],
+        });
+        let mut playback = Playback {
+            shared: build_mixer(Arc::clone(&track), &[], &[], 1, 1, 1.0),
+            sink: None,
+            output_name: String::new(),
+            output: AudioOutput::Silent,
+            track,
+            note_onsets: Vec::new(),
+            beat_times: Vec::new(),
+        };
+        playback
+            .open_sink(
+                &AudioOutput::Silent,
+                TrackMilliseconds::new(0),
+                PlaybackPhase::Stopped,
+            )
+            .expect("the silent fixture sink always opens");
+        playback
+    }
+
     /// Decode a track, build the click schedule, and open the sink. Playback is
     /// silent until [`Playback::play`]: the stream runs from here so the output
     /// latency is measured before the session's manifest is written.

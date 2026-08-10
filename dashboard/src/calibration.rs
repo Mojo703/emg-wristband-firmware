@@ -231,6 +231,10 @@ enum PlaybackPreparation {
         content_identity: String,
         task: tokio::task::JoinHandle<anyhow::Result<crate::collect::audio::Playback>>,
     },
+    Ready {
+        content_identity: String,
+        playback: crate::collect::audio::Playback,
+    },
     Consumed,
 }
 
@@ -240,7 +244,38 @@ impl PlaybackPreparation {
     /// wire; awaiting an unfinished task after acceptance would suspend this
     /// actor's heartbeats and could miss that irrevocable anchor.
     fn is_ready(&self) -> bool {
-        matches!(self, Self::Pending { task, .. } if task.is_finished())
+        matches!(self, Self::Ready { .. })
+    }
+
+    /// Resolve a finished background task before authorizing Commit. Task
+    /// completion alone is not readiness: an audio decoder or output sink may
+    /// have already returned an error, in which case the device must never be
+    /// given an irrevocable schedule anchor.
+    async fn resolve_if_finished(&mut self) -> Result<(), String> {
+        let Self::Pending { task, .. } = self else {
+            return Ok(());
+        };
+        if !task.is_finished() {
+            return Ok(());
+        }
+        let Self::Pending {
+            content_identity,
+            task,
+        } = core::mem::replace(self, Self::Consumed)
+        else {
+            unreachable!("checked pending playback preparation")
+        };
+        match task.await {
+            Ok(Ok(playback)) => {
+                *self = Self::Ready {
+                    content_identity,
+                    playback,
+                };
+                Ok(())
+            }
+            Ok(Err(error)) => Err(format!("calibration audio failed: {error:#}")),
+            Err(error) => Err(format!("calibration audio task failed: {error}")),
+        }
     }
 }
 
@@ -249,6 +284,15 @@ fn prepare_playback(
     track: &crate::collect::beatmap::CalibrationTrack,
 ) -> PlaybackPreparation {
     let content_identity = track.content_identity.clone();
+    #[cfg(test)]
+    if content_identity == "test-content" {
+        let task =
+            tokio::task::spawn_blocking(|| Ok(crate::collect::audio::Playback::silent_fixture()));
+        return PlaybackPreparation::Pending {
+            content_identity,
+            task,
+        };
+    }
     let track_id = track.id.clone();
     let entries = track.entries.clone();
     let task = tokio::task::spawn_blocking(move || {
@@ -260,13 +304,13 @@ fn prepare_playback(
     }
 }
 
-async fn consume_playback_preparation(
+fn consume_playback_preparation(
     preparation: &mut PlaybackPreparation,
     expected_content_identity: &str,
 ) -> Result<crate::collect::audio::Playback, String> {
-    let PlaybackPreparation::Pending {
+    let PlaybackPreparation::Ready {
         content_identity,
-        task,
+        playback,
     } = core::mem::replace(preparation, PlaybackPreparation::Consumed)
     else {
         return Err("the accepted calibration schedule has no unused audio preparation".into());
@@ -276,11 +320,7 @@ async fn consume_playback_preparation(
             "calibration audio identity changed before acceptance (prepared {content_identity}, accepted {expected_content_identity})"
         ));
     }
-    match task.await {
-        Ok(Ok(playback)) => Ok(playback),
-        Ok(Err(error)) => Err(format!("calibration audio failed: {error:#}")),
-        Err(error) => Err(format!("calibration audio task failed: {error}")),
-    }
+    Ok(playback)
 }
 
 enum EvidenceState {
@@ -577,6 +617,9 @@ impl CalibrationModeAdapter {
         upload_ack_timeout.tick().await;
         let mut chunk_ack_retries = 0u8;
         let outcome = loop {
+            if let Err(detail) = prepared_playback.resolve_if_finished().await {
+                break SessionExit::TaskFailed(detail);
+            }
             // Playback readiness is independent of device traffic. Re-check it
             // on every actor turn (the heartbeat supplies a 500-ms upper bound)
             // and authorize Commit only once acceptance can be handled without
@@ -719,7 +762,7 @@ impl CalibrationModeAdapter {
                         let opened = match consume_playback_preparation(
                             &mut prepared_playback,
                             &track.content_identity,
-                        ).await {
+                        ) {
                             Ok(opened) => opened,
                             Err(detail) => break SessionExit::TaskFailed(detail),
                         };
@@ -1912,7 +1955,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn playback_preparation_is_identity_bound_and_consumed_exactly_once() {
+    async fn failed_playback_preparation_never_becomes_ready() {
         let task = tokio::spawn(async {
             Err(anyhow::anyhow!("fixture audio failed"))
                 as anyhow::Result<crate::collect::audio::Playback>
@@ -1921,41 +1964,31 @@ mod tests {
             content_identity: "first-song".into(),
             task,
         };
-
-        let mismatch =
-            match consume_playback_preparation(&mut preparation, "replacement-song").await {
-                Ok(_) => panic!("a mismatched song must not consume prepared audio"),
-                Err(detail) => detail,
-            };
-        assert!(mismatch.contains("identity changed"));
-        let reused = match consume_playback_preparation(&mut preparation, "first-song").await {
-            Ok(_) => panic!("a preparation must be affine"),
-            Err(detail) => detail,
-        };
-        assert!(reused.contains("no unused audio preparation"));
+        while matches!(&preparation, PlaybackPreparation::Pending { task, .. } if !task.is_finished())
+        {
+            tokio::task::yield_now().await;
+        }
+        let failure = preparation.resolve_if_finished().await.unwrap_err();
+        assert!(failure.contains("fixture audio failed"));
+        assert!(!preparation.is_ready());
+        assert!(matches!(preparation, PlaybackPreparation::Consumed));
     }
 
     #[tokio::test]
-    async fn completed_playback_preparation_cannot_be_polled_twice() {
-        let task = tokio::spawn(async {
-            Err(anyhow::anyhow!("fixture audio failed"))
-                as anyhow::Result<crate::collect::audio::Playback>
-        });
+    async fn panicked_playback_preparation_never_becomes_ready() {
+        let task = tokio::spawn(async { panic!("fixture audio task panicked") });
         let mut preparation = PlaybackPreparation::Pending {
             content_identity: "song".into(),
             task,
         };
-
-        let first = match consume_playback_preparation(&mut preparation, "song").await {
-            Ok(_) => panic!("the fixture task must fail"),
-            Err(detail) => detail,
-        };
-        assert!(first.contains("fixture audio failed"));
-        let second = match consume_playback_preparation(&mut preparation, "song").await {
-            Ok(_) => panic!("a completed preparation must not be reusable"),
-            Err(detail) => detail,
-        };
-        assert!(second.contains("no unused audio preparation"));
+        while matches!(&preparation, PlaybackPreparation::Pending { task, .. } if !task.is_finished())
+        {
+            tokio::task::yield_now().await;
+        }
+        let failure = preparation.resolve_if_finished().await.unwrap_err();
+        assert!(failure.contains("audio task failed"));
+        assert!(!preparation.is_ready());
+        assert!(matches!(preparation, PlaybackPreparation::Consumed));
     }
 
     #[tokio::test]
