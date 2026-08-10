@@ -184,19 +184,20 @@ fn anchored_gain_collection_active(
     acquisition_sample >= settle_end && acquisition_sample < gain_end
 }
 
-fn anchored_fully_contained_window_count(
+fn acquisition_sample_at_device_instant(
     constants: Constants,
-    opened_sample: u64,
-    closed_sample: u64,
-) -> u32 {
-    let hop = constants.hop_samples as u64;
-    let window = constants.window_samples as u64;
-    let first_start = opened_sample.div_ceil(hop) * hop;
-    if first_start.saturating_add(window) > closed_sample {
-        0
-    } else {
-        ((closed_sample - window - first_start) / hop + 1) as u32
-    }
+    anchor: calibration_flow::SongAnchor,
+    device_monotonic_microseconds: u64,
+) -> u64 {
+    debug_assert!(
+        device_monotonic_microseconds >= anchor.acknowledged_device_monotonic_microseconds
+    );
+    let elapsed_microseconds = device_monotonic_microseconds
+        .saturating_sub(anchor.acknowledged_device_monotonic_microseconds);
+    let elapsed_samples = (u128::from(elapsed_microseconds) * u128::from(constants.sample_rate_hz)
+        / 1_000_000)
+        .min(u128::from(u64::MAX)) as u64;
+    anchor.acquisition_sample.saturating_add(elapsed_samples)
 }
 
 fn anchored_song_is_runnable(song: &AnchoredSong) -> bool {
@@ -413,13 +414,13 @@ struct OpenRep {
     flash_microseconds_at_open: u32,
 }
 
-/// Capture owned by an anchored device-time cue. The opening sample is observed
-/// on the acquisition clock exactly when the device trigger is dispatched;
-/// only windows fully inside the later device-clock close are admitted.
+/// Capture owned by an anchored device-time cue. The exact device-time onset is
+/// projected onto the acquisition grid and then uses the same delayed,
+/// nine-window span that the validated host recipe scored.
 #[derive(Debug)]
 struct AnchoredCapture {
     entry: protocol::CalibrationScheduleEntry,
-    opened_acquisition_sample: u64,
+    span: LabeledSpan,
     evidence: RepEvidence,
     flash_microseconds_at_open: u32,
 }
@@ -1483,18 +1484,18 @@ impl Calibration {
     /// so the state machine never sees a sample.
     pub fn observe_window(&mut self, window: &CalibrationWindow, settings: &Settings) {
         self.acquisition_sample = window.end_sample;
-        let window_start = window
-            .end_sample
-            .saturating_sub(self.constants.window_samples as u64);
         if let Some(capture) = self
             .anchored
             .cue_mut()
             .and_then(AnchoredCueLifecycle::capture_mut)
         {
-            // The close handler runs before the next acquisition window. This
-            // admits exactly the fully-contained windows seen while device time
-            // held the cue open, never a window that began before its trigger.
-            if window_start >= capture.opened_acquisition_sample {
+            // Use the same delayed nine-window grid span that the host
+            // validation scored. Merely taking every window inside a 1.5 s
+            // authored hold yields about twenty rows while the bounded buffer
+            // intentionally stores nine, making every otherwise-clean cue look
+            // like MissingSamples.
+            let index = self.constants.grid().window_ending_at(window.end_sample);
+            if index.is_some_and(|index| capture.span.covers_window(index)) {
                 if self.rep_rows.len() < self.rep_rows.capacity() {
                     self.rep_rows.push(window.features);
                     capture.evidence.windows_present += 1;
@@ -1662,7 +1663,20 @@ impl Calibration {
             Some(_) => return,
         };
         match action {
-            Ok(Some(AnchoredSongAction::OpenCue { entry, .. })) => {
+            Ok(Some(AnchoredSongAction::OpenCue {
+                entry,
+                device_monotonic_microseconds,
+            })) => {
+                let anchor = self
+                    .anchored
+                    .song()
+                    .and_then(AnchoredSong::anchor)
+                    .expect("an open cue belongs to a committed song");
+                let prompt_sample = acquisition_sample_at_device_instant(
+                    self.constants,
+                    anchor,
+                    device_monotonic_microseconds,
+                );
                 self.rep_rows.clear();
                 *self
                     .anchored
@@ -1670,7 +1684,12 @@ impl Calibration {
                     .expect("a song action belongs to an active run") =
                     AnchoredCueLifecycle::open(AnchoredCapture {
                         entry,
-                        opened_acquisition_sample: self.acquisition_sample,
+                        span: LabeledSpan::after_prompt(
+                            self.constants.grid(),
+                            prompt_sample,
+                            self.constants.prompt_delay_samples(),
+                            self.constants.labeled_windows,
+                        ),
                         evidence: RepEvidence::default(),
                         flash_microseconds_at_open: self.flash_microseconds,
                     });
@@ -1714,8 +1733,7 @@ impl Calibration {
         }
         capture.evidence.flash_operation =
             capture.flash_microseconds_at_open != self.flash_microseconds;
-        capture.evidence.windows_expected = self
-            .anchored_expected_windows(capture.opened_acquisition_sample, self.acquisition_sample);
+        capture.evidence.windows_expected = capture.span.window_count;
         if self.rows.capacity().saturating_sub(self.rows.len()) < self.rep_rows.len() {
             // Reuse the existing missing-samples rejection: the candidate must
             // never claim an accepted cue whose rows could not be retained.
@@ -2033,10 +2051,6 @@ impl Calibration {
             }
             None => self.refuse("candidate record commit has no partition"),
         }
-    }
-
-    fn anchored_expected_windows(&self, opened_sample: u64, closed_sample: u64) -> u32 {
-        anchored_fully_contained_window_count(self.constants, opened_sample, closed_sample)
     }
 
     fn anchored_count_mut(
@@ -3200,9 +3214,15 @@ mod anchored_lifecycle_tests {
     }
 
     fn capture(cue_id: u32) -> AnchoredCapture {
+        let constants = Constants::DEFAULT;
         AnchoredCapture {
             entry: cue_entry(cue_id),
-            opened_acquisition_sample: 10_000,
+            span: LabeledSpan::after_prompt(
+                constants.grid(),
+                10_000,
+                constants.prompt_delay_samples(),
+                constants.labeled_windows,
+            ),
             evidence: RepEvidence::default(),
             flash_microseconds_at_open: 0,
         }
@@ -3608,21 +3628,38 @@ mod anchored_lifecycle_tests {
     }
 
     #[test]
-    fn anchored_labels_admit_only_windows_fully_inside_the_device_owned_hold() {
+    fn anchored_labels_use_the_exact_validated_nine_window_span() {
         let constants = Constants::DEFAULT;
-        // With the shipped 500-sample windows and 125-sample hop, a cue that
-        // opens at an unaligned sample first admits the 1125..1625 window.
-        assert_eq!(
-            anchored_fully_contained_window_count(constants, 1_001, 1_624),
-            0
+        let anchor = calibration_flow::SongAnchor {
+            acknowledged_device_monotonic_microseconds: 10_000_000,
+            device_monotonic_microseconds: 13_000_000,
+            acquisition_sample: 1_001,
+        };
+        let prompt_sample = acquisition_sample_at_device_instant(constants, anchor, 13_000_000);
+        assert_eq!(prompt_sample, 7_001);
+
+        let span = LabeledSpan::after_prompt(
+            constants.grid(),
+            prompt_sample,
+            constants.prompt_delay_samples(),
+            constants.labeled_windows,
+        );
+        assert_eq!(span.window_count, constants.labeled_windows);
+        assert_eq!(span.windows().count(), 9);
+        assert!(
+            span.end_sample
+                <= prompt_sample + constants.samples_in(constants.prompt_hold_milliseconds),
+            "all nine labeled windows fit inside the authored hold"
         );
         assert_eq!(
-            anchored_fully_contained_window_count(constants, 1_001, 1_625),
-            1
-        );
-        assert_eq!(
-            anchored_fully_contained_window_count(constants, 1_001, 1_750),
-            2
+            RepEvidence {
+                windows_present: 9,
+                windows_expected: span.window_count,
+                ..RepEvidence::default()
+            }
+            .rejection(),
+            None,
+            "the bounded nine-row capture must not be compared with every window in the hold"
         );
     }
 

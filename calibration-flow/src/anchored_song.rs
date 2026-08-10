@@ -318,6 +318,18 @@ impl AnchoredSong {
         }
     }
 
+    /// The immutable device/acquisition coordinate of a committed song.
+    /// Upload phases have no anchor; interruption and completion retain it so
+    /// evidence and diagnostics keep the exact authored coordinate.
+    pub const fn anchor(&self) -> Option<SongAnchor> {
+        match &self.lifecycle {
+            SongLifecycle::Running(song)
+            | SongLifecycle::Interrupted(song)
+            | SongLifecycle::Completed(song) => Some(song.anchor),
+            SongLifecycle::AwaitingUpload | SongLifecycle::ReceivingUpload(_) => None,
+        }
+    }
+
     /// Starts an isolated upload.  The next song in the same run must use a
     /// later revision, which makes Continue require a fresh upload and anchor.
     pub fn begin_upload(
@@ -870,6 +882,7 @@ mod tests {
         assert_eq!(anchor.device_monotonic_microseconds, 3_010_000);
         assert_eq!(anchor.acquisition_sample, 77);
         assert_eq!(song.identity(), Some(&identity));
+        assert_eq!(song.anchor(), Some(anchor));
     }
 
     #[test]

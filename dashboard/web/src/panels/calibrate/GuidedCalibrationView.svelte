@@ -214,9 +214,11 @@
     {#if snapshot.deficits.length > 0}
       <div class="deficits">
         <strong>Class deficits</strong>
-        {#each snapshot.deficits as deficit}
-          <span>{deficit}</span>
-        {/each}
+        <ul>
+          {#each snapshot.deficits as deficit}
+            <li>{deficit}</li>
+          {/each}
+        </ul>
       </div>
     {/if}
     <div class="track-grid" aria-label="Choose the next calibration track">
@@ -295,7 +297,8 @@
   .song-end { display: grid; gap: 18px; }
   .song-end h3 { margin: 3px 0; font-size: 1.6rem; }
   .eyebrow { color: var(--brand-tint-foreground); font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; }
-  .deficits { display: flex; flex-direction: column; gap: 4px; }
+  .deficits { display: flex; flex-direction: column; gap: 6px; }
+  .deficits ul { display: grid; gap: 4px 24px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); margin: 0; padding-left: 20px; }
   @media (max-width: 640px) {
     .topbar { align-items: flex-start; }
     .topbar .spacer { display: none; }

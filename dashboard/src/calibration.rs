@@ -1018,6 +1018,7 @@ impl CalibrationModeAdapter {
                                 &evidence,
                                 candidate,
                                 &self.tracks,
+                                &collection_classes,
                             ),
                         );
                     }
@@ -1060,6 +1061,7 @@ impl CalibrationModeAdapter {
                                 &evidence,
                                 candidate,
                                 &self.tracks,
+                                &collection_classes,
                             ),
                         );
                     }
@@ -1078,6 +1080,7 @@ impl CalibrationModeAdapter {
                                     &evidence,
                                     candidate,
                                     &self.tracks,
+                                    &collection_classes,
                                 ),
                             );
                             }
@@ -1276,6 +1279,7 @@ impl CalibrationModeAdapter {
                                     &evidence,
                                     candidate,
                                     &self.tracks,
+                                    &collection_classes,
                                 ),
                             );
                             continue;
@@ -1825,13 +1829,7 @@ fn calibration_lanes(
     protocol::CalibrationGesture::ALL
         .into_iter()
         .map(|gesture| {
-            let id = match gesture {
-                protocol::CalibrationGesture::WristPronation => "wrist_pronation",
-                protocol::CalibrationGesture::WristSupination => "wrist_supination",
-                protocol::CalibrationGesture::WristRadialDeviation => "wrist_radial_deviation",
-                protocol::CalibrationGesture::WristUlnarDeviation => "wrist_ulnar_deviation",
-                protocol::CalibrationGesture::ThumbExtension => "thumb_extension",
-            };
+            let id = calibration_gesture_id(gesture);
             let descriptor = collection_classes
                 .iter()
                 .find(|descriptor| descriptor.id.0 == id);
@@ -1844,6 +1842,35 @@ fn calibration_lanes(
             }
         })
         .collect()
+}
+
+fn calibration_gesture_id(gesture: protocol::CalibrationGesture) -> &'static str {
+    match gesture {
+        protocol::CalibrationGesture::WristPronation => "wrist_pronation",
+        protocol::CalibrationGesture::WristSupination => "wrist_supination",
+        protocol::CalibrationGesture::WristRadialDeviation => "wrist_radial_deviation",
+        protocol::CalibrationGesture::WristUlnarDeviation => "wrist_ulnar_deviation",
+        protocol::CalibrationGesture::ThumbExtension => "thumb_extension",
+    }
+}
+
+fn calibration_count_label(
+    count: &protocol::CalibrationClassCounts,
+    collection_classes: &[protocol::CollectionClass],
+) -> String {
+    let id = calibration_gesture_id(count.gesture);
+    let gesture = collection_classes
+        .iter()
+        .find(|descriptor| descriptor.id.0 == id)
+        .map_or_else(
+            || id.replace('_', " "),
+            |descriptor| descriptor.label.clone(),
+        );
+    let variant = match count.modifier {
+        protocol::CalibrationModifier::ThumbUp => "command",
+        protocol::CalibrationModifier::ThumbDown => "no-op",
+    };
+    format!("{gesture}, {variant}")
 }
 
 fn preparing_snapshot_from_device(
@@ -1890,6 +1917,7 @@ fn between_songs_snapshot(
     evidence: &EvidenceState,
     candidate: CandidateState,
     tracks: &[crate::collect::beatmap::CalibrationTrack],
+    collection_classes: &[protocol::CollectionClass],
 ) -> GuidedCalibrationSnapshot {
     let valid_reps = counts.iter().map(|count| count.accepted_count).sum();
     let invalid_reps = counts.iter().map(|count| count.rejected_count).sum();
@@ -1898,8 +1926,9 @@ fn between_songs_snapshot(
         .filter(|count| count.deficit_count > 0)
         .map(|count| {
             format!(
-                "{:?} {:?}: {} short",
-                count.gesture, count.modifier, count.deficit_count
+                "{}: {} short",
+                calibration_count_label(count, collection_classes),
+                count.deficit_count,
             )
         })
         .collect();
@@ -3052,6 +3081,7 @@ mod tests {
             &evidence,
             candidate,
             &[completed.clone(), next.clone()],
+            &[],
         );
 
         assert!(matches!(
@@ -3063,6 +3093,53 @@ mod tests {
                 continue_available: true,
                 ..
             } if track_title == completed.title && selected == next.id.0
+        ));
+    }
+
+    #[test]
+    fn song_deficits_use_collect_labels_and_user_facing_variants() {
+        let completed = track();
+        let evidence = EvidenceState::Retained {
+            completed_track_title: completed.title.clone(),
+        };
+        let classes = [protocol::CollectionClass {
+            id: protocol::ClassId("wrist_pronation".into()),
+            label: "Tilt in".into(),
+            color: "blue".into(),
+            motion: None,
+        }];
+        let counts = [
+            protocol::CalibrationClassCounts {
+                gesture: protocol::CalibrationGesture::WristPronation,
+                modifier: protocol::CalibrationModifier::ThumbUp,
+                accepted_count: 2,
+                rejected_count: 1,
+                target_count: 10,
+                deficit_count: 8,
+            },
+            protocol::CalibrationClassCounts {
+                gesture: protocol::CalibrationGesture::WristPronation,
+                modifier: protocol::CalibrationModifier::ThumbDown,
+                accepted_count: 3,
+                rejected_count: 0,
+                target_count: 16,
+                deficit_count: 13,
+            },
+        ];
+
+        let snapshot = between_songs_snapshot(
+            &completed,
+            &counts,
+            &evidence,
+            CandidateState::Absent,
+            core::slice::from_ref(&completed),
+            &classes,
+        );
+
+        assert!(matches!(
+            snapshot,
+            GuidedCalibrationSnapshot::BetweenSongs { deficits, .. }
+                if deficits == ["Tilt in, command: 8 short", "Tilt in, no-op: 13 short"]
         ));
     }
 

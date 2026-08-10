@@ -137,6 +137,7 @@ test('song end keeps unavailable actions visible and disabled', async () => {
   assert.match(button(body, 'Save'), DISABLED_ATTRIBUTE);
   assert.match(button(body, 'Continue'), DISABLED_ATTRIBUTE);
   assert.doesNotMatch(button(body, 'Discard'), DISABLED_ATTRIBUTE);
+  assert.match(body, /<li[^>]*>Tip back, thumb down: 14\/16<\/li>/);
 });
 
 test('technical failure is an alert with no candidate actions', async () => {
