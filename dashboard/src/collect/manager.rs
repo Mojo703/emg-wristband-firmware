@@ -33,7 +33,7 @@
 //! - a second `StartTrack` for a started session is ignored;
 //! - `StartCollection` ids are validated against the live catalog.
 
-use crate::collect::audio::{self, AudioOutput, Playback, Timeline};
+use crate::collect::audio::{self, AudioOutput, Playback, PlaybackPhase, Timeline};
 use crate::collect::beatmap::{CatalogPaths, TrackCatalog};
 use crate::collect::interfaces::{
     AudioPlayback, BeatmapGenerator, EmgWindow, HardwareIdentity, RecordingHandle, SessionEvent,
@@ -1213,6 +1213,10 @@ struct RunningSession {
     browser_departure: watch::Receiver<BrowserDeparture>,
     audio: watch::Receiver<LiveAudioSettings>,
     applied_audio: LiveAudioSettings,
+    desired_audio: LiveAudioSettings,
+    output_switch_tx: mpsc::UnboundedSender<(AudioOutput, anyhow::Result<audio::PreparedOutput>)>,
+    output_switch_rx: mpsc::UnboundedReceiver<(AudioOutput, anyhow::Result<audio::PreparedOutput>)>,
+    output_switch_in_flight: bool,
     cues: Vec<CueState>,
     track: TrackInfo,
     /// `Some` on a rest track; the finalizer logs the played stretch.
@@ -1250,6 +1254,7 @@ impl RunningSession {
         playback: Playback,
         lease: SessionLease,
     ) -> Self {
+        let (output_switch_tx, output_switch_rx) = mpsc::unbounded_channel();
         let cues = beatmap
             .iter()
             .map(|(index, note)| CueState {
@@ -1271,7 +1276,11 @@ impl RunningSession {
             control,
             browser_departure,
             audio,
+            desired_audio: applied_audio.clone(),
             applied_audio,
+            output_switch_tx,
+            output_switch_rx,
+            output_switch_in_flight: false,
             cues,
             track,
             rest_label,
@@ -1299,7 +1308,7 @@ impl RunningSession {
         // Settings may have changed while track decoding or device acquisition was
         // in flight. Reconcile the playback built above before accepting controls.
         let desired_audio = self.audio.borrow_and_update().clone();
-        self.apply_audio_settings(desired_audio).await;
+        self.apply_audio_settings(desired_audio);
         let mut ticker = tokio::time::interval(TICK);
         let mut publish_health = false;
         let outcome = loop {
@@ -1324,10 +1333,16 @@ impl RunningSession {
                 changed = self.audio.changed() => match changed {
                     Ok(()) => {
                         let settings = self.audio.borrow_and_update().clone();
-                        self.apply_audio_settings(settings).await;
+                        self.apply_audio_settings(settings);
                     }
                     Err(_) => break SessionExit::TaskFailed(
                         "collection audio control channel closed".into(),
+                    ),
+                },
+                switched = self.output_switch_rx.recv() => match switched {
+                    Some((output, result)) => self.finish_output_switch(output, result),
+                    None => break SessionExit::TaskFailed(
+                        "collection audio switch channel closed".into(),
                     ),
                 },
                 frame = next_emg(self.capture.emg_receiver_mut()) => match frame {
@@ -1357,14 +1372,28 @@ impl RunningSession {
         self.finalize(outcome).await;
     }
 
-    async fn apply_audio_settings(&mut self, settings: LiveAudioSettings) {
+    fn apply_audio_settings(&mut self, settings: LiveAudioSettings) {
+        self.desired_audio = settings.clone();
         if settings.gain != self.applied_audio.gain {
             self.playback.set_music_gain(settings.gain);
+            self.applied_audio.gain = settings.gain;
         }
-        if settings.output != self.applied_audio.output {
-            self.set_output(&settings.output).await;
+        if settings.output != self.applied_audio.output && !self.output_switch_in_flight {
+            self.begin_output_switch(settings.output);
         }
-        self.applied_audio = settings;
+    }
+
+    fn begin_output_switch(&mut self, output: AudioOutput) {
+        self.output_switch_in_flight = true;
+        let request = self.playback.output_switch_request(output.clone());
+        let sender = self.output_switch_tx.clone();
+        tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || request.prepare())
+                .await
+                .map_err(|error| anyhow::anyhow!("audio output worker failed: {error}"))
+                .and_then(|result| result);
+            let _ = sender.send((output, result));
+        });
     }
 
     /// The operator tapped Start: play the track, then take the anchor off the
@@ -1378,7 +1407,7 @@ impl RunningSession {
             return;
         }
         self.playback.play();
-        let Some(timeline) = self.playhead_after_command(true).await else {
+        let Some(timeline) = self.playhead_after_command(PlaybackPhase::Playing).await else {
             self.playback.pause();
             self.manager
                 .publish_error("audio output did not start; the track has not begun".into());
@@ -1403,12 +1432,12 @@ impl RunningSession {
     /// Wait for the mixer to publish a playhead taken after playback was
     /// commanded, so the reading describes the command's effect rather than
     /// what came before it.
-    async fn playhead_after_command(&self, playing: bool) -> Option<Timeline> {
+    async fn playhead_after_command(&self, phase: PlaybackPhase) -> Option<Timeline> {
         let commanded = now();
         let deadline = tokio::time::Instant::now() + PLAYHEAD_TIMEOUT;
         loop {
             let timeline = self.playback.timeline();
-            if timeline.playing == playing && timeline.heard_at >= commanded {
+            if timeline.phase == phase && timeline.heard_at >= commanded {
                 return Some(timeline);
             }
             if tokio::time::Instant::now() >= deadline {
@@ -1442,14 +1471,34 @@ impl RunningSession {
     /// re-placed against a fresh anchor — the same re-derivation a resume does,
     /// for the same reason. Cues already logged keep the instants they were
     /// logged with: those are when the subject actually heard them.
-    async fn set_output(&mut self, output: &AudioOutput) {
-        if let Err(error) = self.playback.switch_output(output) {
-            self.manager.publish_error(format!(
-                "could not switch audio output: {error:#}; still on {}",
-                self.playback.output_name()
-            ));
+    fn finish_output_switch(
+        &mut self,
+        output: AudioOutput,
+        result: anyhow::Result<audio::PreparedOutput>,
+    ) {
+        self.output_switch_in_flight = false;
+        if output != self.desired_audio.output {
+            // Latest wins. Dropping a successfully prepared stale sink stops
+            // its private thread without ever making it audible.
+            drop(result);
+            if self.applied_audio.output != self.desired_audio.output {
+                self.begin_output_switch(self.desired_audio.output.clone());
+            }
             return;
         }
+        let prepared = match result {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.manager.publish_error(format!(
+                    "could not switch audio output: {error:#}; still on {}",
+                    self.playback.output_name()
+                ));
+                return;
+            }
+        };
+        self.playback.install_prepared_output(prepared);
+        self.playback.set_music_gain(self.desired_audio.gain);
+        self.applied_audio = self.desired_audio.clone();
         tracing::info!(
             "collection audio moved to '{}' at {} Hz",
             self.playback.output_name(),
@@ -1462,7 +1511,8 @@ impl RunningSession {
             self.publish_playback_position();
             return;
         }
-        if let Some(timeline) = self.playhead_after_command(true).await {
+        let timeline = self.playback.timeline();
+        if timeline.phase == PlaybackPhase::Playing {
             let anchor = timeline.heard_at.before_track_position(timeline.position);
             self.anchor = Some(anchor);
             self.place_unlogged_cues(anchor);
@@ -1500,7 +1550,7 @@ impl RunningSession {
     /// is what a windowing tool subtracts to get back onto the track's timeline.
     async fn freeze(&mut self, cause: PauseCause, silent_for: DurationMilliseconds) {
         self.playback.pause();
-        let track_position = match self.playhead_after_command(false).await {
+        let track_position = match self.playhead_after_command(PlaybackPhase::Paused).await {
             Some(timeline) => timeline.position,
             None => self.track_position(now()),
         };
@@ -1575,7 +1625,7 @@ impl RunningSession {
             return;
         }
         self.playback.play();
-        let Some(timeline) = self.playhead_after_command(true).await else {
+        let Some(timeline) = self.playhead_after_command(PlaybackPhase::Playing).await else {
             self.playback.pause();
             self.manager
                 .publish_error("audio output did not resume; the timeline is still frozen".into());
@@ -1625,7 +1675,7 @@ impl RunningSession {
             session_id: self.session_id.clone(),
             position_ms: timeline.position,
             at_unix_ms: timeline.heard_at,
-            playing: timeline.playing && self.anchor.is_some(),
+            playing: timeline.phase.is_playing() && self.anchor.is_some(),
         });
     }
 

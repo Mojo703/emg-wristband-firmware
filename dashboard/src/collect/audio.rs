@@ -229,9 +229,26 @@ pub struct Timeline {
     /// The instant `position` is heard, which is a little after the read
     /// because it includes the output device's latency.
     pub heard_at: UnixMilliseconds,
-    pub playing: bool,
-    /// The cursor has run past the end of the decoded audio.
-    pub finished: bool,
+    pub phase: PlaybackPhase,
+}
+
+/// The mutually-exclusive states of the audio playhead.
+///
+/// In particular, end-of-track is not a second flag layered over `Playing`:
+/// reaching EOF freezes the cursor at the final frame and transitions to
+/// `Finished` in the render callback itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaybackPhase {
+    Stopped,
+    Playing,
+    Paused,
+    Finished,
+}
+
+impl PlaybackPhase {
+    pub fn is_playing(self) -> bool {
+        self == Self::Playing
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -249,7 +266,7 @@ struct MixerState {
     /// Output frames rendered so far, which is the playhead. Everything else
     /// about position is derived from this one number.
     cursor: u64,
-    playing: bool,
+    phase: PlaybackPhase,
     voices: Vec<Voice>,
     /// Index of the next click in the schedule; re-derived after a seek.
     next_click: usize,
@@ -305,14 +322,24 @@ impl Shared {
     /// Place the cursor, and put the click schedule wherever that lands.
     /// Without the second half, rebuilding the mixer at a position mid-track
     /// would fire every click the track has already played.
-    fn seek(&self, frames: u64, playing: bool) {
+    fn seek(&self, frames: u64, phase: PlaybackPhase) {
         let mut state = self.state.lock().unwrap();
-        state.cursor = frames;
+        state.cursor = frames.min(self.track_output_frames);
         state.voices.clear();
         state.next_click = self
             .clicks
             .partition_point(|(click_frame, _)| *click_frame <= frames);
-        state.playing = playing;
+        state.phase = if frames >= self.track_output_frames {
+            PlaybackPhase::Finished
+        } else {
+            phase
+        };
+        let latency_ms = self.latency_microseconds.load(Ordering::Acquire) / 1_000;
+        *self.timeline.lock().unwrap() = Timeline {
+            position: self.frames_to_position(state.cursor),
+            heard_at: UnixMilliseconds::new(now().get().saturating_add(latency_ms)),
+            phase: state.phase,
+        };
     }
 
     /// Render one buffer and publish where its first frame lands, and when the
@@ -355,21 +382,26 @@ impl Shared {
 
         let mut state = self.state.lock().unwrap();
         let start = state.cursor;
-        let playing = state.playing;
+        let phase = state.phase;
         *self.timeline.lock().unwrap() = Timeline {
             position: self.frames_to_position(start),
             heard_at,
-            playing,
-            finished: start >= self.track_output_frames,
+            phase,
         };
 
         let frames = frames as usize;
-        if !playing {
+        if !phase.is_playing() {
             output.fill(0.0);
             return;
         }
         for frame in 0..frames {
             let cursor = state.cursor;
+            if cursor >= self.track_output_frames {
+                state.phase = PlaybackPhase::Finished;
+                state.voices.clear();
+                output[frame * self.output_channels..].fill(0.0);
+                break;
+            }
             while let Some((_, kind)) = self
                 .clicks
                 .get(state.next_click)
@@ -406,6 +438,15 @@ impl Shared {
                 output[frame * self.output_channels + channel] = (music + click).clamp(-1.0, 1.0);
             }
             state.cursor = cursor + 1;
+        }
+        if state.cursor >= self.track_output_frames {
+            state.cursor = self.track_output_frames;
+            state.phase = PlaybackPhase::Finished;
+            *self.timeline.lock().unwrap() = Timeline {
+                position: self.frames_to_position(self.track_output_frames),
+                heard_at,
+                phase: PlaybackPhase::Finished,
+            };
         }
     }
 }
@@ -456,15 +497,14 @@ fn build_mixer(
         track_output_frames,
         state: Mutex::new(MixerState {
             cursor: 0,
-            playing: false,
+            phase: PlaybackPhase::Stopped,
             voices: Vec::with_capacity(VOICE_CAPACITY),
             next_click: 0,
         }),
         timeline: Mutex::new(Timeline {
             position: TrackMilliseconds::new(0),
             heard_at: now(),
-            playing: false,
-            finished: false,
+            phase: PlaybackPhase::Stopped,
         }),
         pacing: Mutex::new(Pacing {
             started: Instant::now(),
@@ -510,6 +550,45 @@ pub struct Playback {
     beat_times: Vec<TrackMilliseconds>,
 }
 
+/// Owned recipe handed to Tokio's blocking pool when an output is changed.
+/// It contains no reference to the live playback, so the current sink remains
+/// usable by controls and EMG processing while the driver opens and settles.
+pub(crate) struct OutputSwitchRequest {
+    output: AudioOutput,
+    track: Arc<DecodedTrack>,
+    note_onsets: Vec<TrackMilliseconds>,
+    beat_times: Vec<TrackMilliseconds>,
+    music_gain: f32,
+}
+
+pub(crate) struct PreparedOutput {
+    output: AudioOutput,
+    output_name: String,
+    shared: Arc<Shared>,
+    sink: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for PreparedOutput {
+    fn drop(&mut self) {
+        if let Some(sink) = self.sink.take() {
+            self.shared.stop.store(true, Ordering::Release);
+            let _ = sink.join();
+        }
+    }
+}
+
+impl OutputSwitchRequest {
+    pub(crate) fn prepare(self) -> anyhow::Result<PreparedOutput> {
+        prepare_output(
+            self.output,
+            self.track,
+            &self.note_onsets,
+            &self.beat_times,
+            self.music_gain,
+        )
+    }
+}
+
 impl Drop for Playback {
     fn drop(&mut self) {
         self.stop_sink();
@@ -546,7 +625,7 @@ impl Playback {
         };
         // The placeholder mixer above is never played; `open_sink` replaces it
         // with one built for the rate the device actually reports.
-        playback.open_sink(output, TrackMilliseconds::new(0), false)?;
+        playback.open_sink(output, TrackMilliseconds::new(0), PlaybackPhase::Stopped)?;
         Ok(playback)
     }
 
@@ -561,17 +640,17 @@ impl Playback {
         &mut self,
         output: &AudioOutput,
         position: TrackMilliseconds,
-        playing: bool,
+        phase: PlaybackPhase,
     ) -> anyhow::Result<()> {
         // The outgoing sink goes quiet before the incoming one is built, so no
         // moment has both playing, and it comes back if the new one refuses:
         // an operator picking the wrong device gets an error, not a dead
         // session in the middle of a take.
-        let outgoing_was_playing = self.shared.state.lock().unwrap().playing;
-        self.shared.state.lock().unwrap().playing = false;
-        let opened = self.build_sink(output, position, playing);
+        let outgoing_phase = self.shared.state.lock().unwrap().phase;
+        self.shared.state.lock().unwrap().phase = PlaybackPhase::Paused;
+        let opened = self.build_sink(output, position, phase);
         if opened.is_err() {
-            self.shared.state.lock().unwrap().playing = outgoing_was_playing;
+            self.shared.state.lock().unwrap().phase = outgoing_phase;
         }
         opened
     }
@@ -580,67 +659,50 @@ impl Playback {
         &mut self,
         output: &AudioOutput,
         position: TrackMilliseconds,
-        playing: bool,
+        phase: PlaybackPhase,
     ) -> anyhow::Result<()> {
-        let (sink_kind, output_sample_rate, output_channels, output_name) = match output {
-            AudioOutput::Silent => (
-                SinkKind::Silent,
-                self.track.sample_rate,
-                self.track.channels.min(2),
-                "silent".to_string(),
-            ),
-            AudioOutput::Default | AudioOutput::Named(_) => {
-                let device = open_device(output)?;
-                let name = device
-                    .name()
-                    .unwrap_or_else(|_| "unnamed output device".to_string());
-                let config = device
-                    .default_output_config()
-                    .context("the output device offers no default configuration")?;
-                (
-                    SinkKind::Device(device),
-                    config.sample_rate().0,
-                    config.channels() as usize,
-                    name,
-                )
-            }
+        let request = OutputSwitchRequest {
+            output: output.clone(),
+            track: Arc::clone(&self.track),
+            note_onsets: self.note_onsets.clone(),
+            beat_times: self.beat_times.clone(),
+            music_gain: self.music_gain(),
         };
-
-        let shared = build_mixer(
-            Arc::clone(&self.track),
-            &self.note_onsets,
-            &self.beat_times,
-            output_sample_rate,
-            output_channels,
-            self.music_gain(),
-        );
-        let frames = u64::from(position.get()) * u64::from(output_sample_rate) / 1000;
-        shared.seek(frames, playing);
-        let sink = spawn_sink(sink_kind, Arc::clone(&shared))?;
-
-        self.stop_sink();
-        self.shared = shared;
-        self.sink = Some(sink);
-        self.output_name = output_name;
-        self.output = output.clone();
-
-        let deadline = Instant::now() + MEASUREMENT_TIMEOUT;
-        loop {
-            let measured = self.shared.latency_microseconds.load(Ordering::Acquire) > 0;
-            let settled = self.shared.buffers.load(Ordering::Acquire) >= SETTLING_BUFFERS;
-            if measured && settled {
-                break;
-            }
-            if Instant::now() >= deadline {
-                if self.shared.buffers.load(Ordering::Acquire) == 0 {
-                    anyhow::bail!("the audio output produced no buffers within a second");
-                }
-                tracing::warn!("audio output reported no latency; treating it as none");
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        }
+        let prepared = request.prepare()?;
+        self.install_output(prepared, position, phase);
         Ok(())
+    }
+
+    pub(crate) fn output_switch_request(&self, output: AudioOutput) -> OutputSwitchRequest {
+        OutputSwitchRequest {
+            output,
+            track: Arc::clone(&self.track),
+            note_onsets: self.note_onsets.clone(),
+            beat_times: self.beat_times.clone(),
+            music_gain: self.music_gain(),
+        }
+    }
+
+    pub(crate) fn install_prepared_output(&mut self, prepared: PreparedOutput) {
+        let timeline = self.timeline();
+        self.install_output(prepared, timeline.position, timeline.phase);
+    }
+
+    fn install_output(
+        &mut self,
+        mut prepared: PreparedOutput,
+        position: TrackMilliseconds,
+        phase: PlaybackPhase,
+    ) {
+        let frames =
+            u64::from(position.get()) * u64::from(prepared.shared.output_sample_rate) / 1000;
+        prepared.shared.seek(frames, phase);
+        self.shared.state.lock().unwrap().phase = PlaybackPhase::Paused;
+        self.stop_sink();
+        self.shared = Arc::clone(&prepared.shared);
+        self.sink = prepared.sink.take();
+        self.output_name = std::mem::take(&mut prepared.output_name);
+        self.output = prepared.output.clone();
     }
 
     fn stop_sink(&mut self) {
@@ -650,27 +712,21 @@ impl Playback {
         }
     }
 
-    /// Move playback to another device without losing the track's place.
-    ///
-    /// The new sink has its own rate and its own latency, so the caller has to
-    /// re-anchor: [`Timeline::heard_at`] afterwards describes the new device,
-    /// and cues placed against the old one would be out by the difference.
-    /// A failure to open leaves the old sink running rather than the session
-    /// silent, so the operator can pick something else.
-    pub fn switch_output(&mut self, output: &AudioOutput) -> anyhow::Result<()> {
-        let timeline = self.timeline();
-        self.open_sink(output, timeline.position, timeline.playing)
-    }
-
     /// Start, or continue from where a pause left the cursor.
     pub fn play(&self) {
-        self.shared.state.lock().unwrap().playing = true;
+        let mut state = self.shared.state.lock().unwrap();
+        if state.phase != PlaybackPhase::Finished {
+            state.phase = PlaybackPhase::Playing;
+        }
     }
 
     /// Freeze the cursor. The sink keeps running and keeps publishing, so a
     /// frozen timeline is still readable.
     pub fn pause(&self) {
-        self.shared.state.lock().unwrap().playing = false;
+        let mut state = self.shared.state.lock().unwrap();
+        if state.phase == PlaybackPhase::Playing {
+            state.phase = PlaybackPhase::Paused;
+        }
     }
 
     pub fn timeline(&self) -> Timeline {
@@ -708,6 +764,71 @@ impl Playback {
 enum SinkKind {
     Device(cpal::Device),
     Silent,
+}
+
+fn prepare_output(
+    output: AudioOutput,
+    track: Arc<DecodedTrack>,
+    note_onsets: &[TrackMilliseconds],
+    beat_times: &[TrackMilliseconds],
+    music_gain: f32,
+) -> anyhow::Result<PreparedOutput> {
+    let (sink_kind, output_sample_rate, output_channels, output_name) = match &output {
+        AudioOutput::Silent => (
+            SinkKind::Silent,
+            track.sample_rate,
+            track.channels.min(2),
+            "silent".to_string(),
+        ),
+        AudioOutput::Default | AudioOutput::Named(_) => {
+            let device = open_device(&output)?;
+            let name = device
+                .name()
+                .unwrap_or_else(|_| "unnamed output device".to_string());
+            let config = device
+                .default_output_config()
+                .context("the output device offers no default configuration")?;
+            (
+                SinkKind::Device(device),
+                config.sample_rate().0,
+                config.channels() as usize,
+                name,
+            )
+        }
+    };
+    let shared = build_mixer(
+        track,
+        note_onsets,
+        beat_times,
+        output_sample_rate,
+        output_channels,
+        music_gain,
+    );
+    let sink = spawn_sink(sink_kind, Arc::clone(&shared))?;
+    let deadline = Instant::now() + MEASUREMENT_TIMEOUT;
+    loop {
+        let measured = shared.latency_microseconds.load(Ordering::Acquire) > 0;
+        let settled = shared.buffers.load(Ordering::Acquire) >= SETTLING_BUFFERS;
+        if measured && settled {
+            break;
+        }
+        if Instant::now() >= deadline {
+            if shared.buffers.load(Ordering::Acquire) == 0 {
+                shared.stop.store(true, Ordering::Release);
+                let _ = sink.join();
+                anyhow::bail!("the audio output produced no buffers within a second");
+            }
+            tracing::warn!("audio output reported no latency; treating it as none");
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    Ok(PreparedOutput {
+        output,
+        output_name,
+        shared,
+        sink: Some(sink),
+    })
 }
 
 fn open_device(output: &AudioOutput) -> anyhow::Result<cpal::Device> {
@@ -850,7 +971,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_millis(500);
         loop {
             let timeline = playback.timeline();
-            if timeline.playing && timeline.heard_at >= commanded {
+            if timeline.phase.is_playing() && timeline.heard_at >= commanded {
                 return timeline;
             }
             assert!(Instant::now() < deadline, "the sink published nothing");
@@ -864,7 +985,7 @@ mod tests {
         let playback = silent_playback(&track);
         std::thread::sleep(Duration::from_millis(60));
         let frozen = playback.timeline();
-        assert!(!frozen.playing);
+        assert!(!frozen.phase.is_playing());
         std::thread::sleep(Duration::from_millis(60));
         assert_eq!(playback.timeline().position, frozen.position);
     }
@@ -885,6 +1006,29 @@ mod tests {
             (advanced - elapsed).abs() < 60,
             "cursor advanced {advanced} ms while {elapsed} ms of wall clock passed"
         );
+    }
+
+    #[test]
+    fn reaching_eof_finishes_and_caps_the_cursor() {
+        let track = Arc::new(DecodedTrack {
+            sample_rate: 1_000,
+            channels: 1,
+            samples: vec![0.25; 10],
+        });
+        let mixer = build_mixer(track, &[], &[], 1_000, 1, 1.0);
+        mixer.state.lock().unwrap().phase = PlaybackPhase::Playing;
+
+        let mut output = vec![1.0; 32];
+        mixer.render(&mut output);
+        let at_eof = mixer.timeline.lock().unwrap().to_owned();
+        assert_eq!(at_eof.phase, PlaybackPhase::Finished);
+        assert_eq!(at_eof.position, TrackMilliseconds::new(10));
+        assert!(output[10..].iter().all(|sample| *sample == 0.0));
+
+        mixer.render(&mut output);
+        let later = mixer.timeline.lock().unwrap().to_owned();
+        assert_eq!(later.phase, PlaybackPhase::Finished);
+        assert_eq!(later.position, at_eof.position);
     }
 
     /// Pausing and resuming picks up where it froze; nothing is skipped and
@@ -925,7 +1069,7 @@ mod tests {
             let decoded = decode(&track).expect("the library's audio decodes");
             let channels = decoded.channels.min(2);
             let mixer = build_mixer(Arc::new(decoded), cues, &[], rate, channels, gain);
-            mixer.state.lock().unwrap().playing = true;
+            mixer.state.lock().unwrap().phase = PlaybackPhase::Playing;
             let mut buffer = vec![0.0f32; rate as usize * channels];
             mixer.render(&mut buffer);
             buffer
@@ -969,9 +1113,11 @@ mod tests {
         std::thread::sleep(Duration::from_millis(300));
 
         let before = playback.timeline().position;
-        playback
-            .switch_output(&AudioOutput::Silent)
+        let prepared = playback
+            .output_switch_request(AudioOutput::Silent)
+            .prepare()
             .expect("the silent sink always opens");
+        playback.install_prepared_output(prepared);
         let after = playing_timeline(&playback).position;
         let drift = after.get() as i64 - before.get() as i64;
         assert!(
@@ -996,6 +1142,38 @@ mod tests {
             already_played,
             "the new sink would replay the clicks the old one already played"
         );
+    }
+
+    /// Driver opening and latency settling can take a full second. Preparing
+    /// the replacement on the blocking pool must leave the live playhead
+    /// controllable for that entire interval.
+    #[tokio::test(flavor = "current_thread")]
+    async fn preparing_an_output_does_not_block_live_playback_controls() {
+        let Some(track) = sample_track() else { return };
+        let mut playback = silent_playback(&track);
+        playback.play();
+        playing_timeline(&playback);
+
+        let request = playback.output_switch_request(AudioOutput::Silent);
+        let preparing = tokio::task::spawn_blocking(move || request.prepare());
+        let commanded = Instant::now();
+        playback.pause();
+        while playback.timeline().phase != PlaybackPhase::Paused {
+            assert!(
+                commanded.elapsed() < Duration::from_millis(100),
+                "a pending output switch blocked pause"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        playback.play();
+        assert!(playback.timeline().position.get() < u32::MAX);
+
+        let prepared = preparing
+            .await
+            .expect("the output worker did not panic")
+            .expect("the silent output prepares");
+        playback.install_prepared_output(prepared);
+        assert_eq!(playback.output_name(), "silent");
     }
 
     /// The click envelope has to reach zero, or a voice would keep sounding for
@@ -1024,7 +1202,7 @@ mod tests {
             let decoded = decode(&track).expect("the library's audio decodes");
             let channels = decoded.channels.min(2);
             let mixer = build_mixer(Arc::new(decoded), cues, &[], rate, channels, 1.0);
-            mixer.state.lock().unwrap().playing = true;
+            mixer.state.lock().unwrap().phase = PlaybackPhase::Playing;
             let mut buffer = vec![0.0f32; rate as usize * channels];
             mixer.render(&mut buffer);
             (buffer, channels)
