@@ -346,8 +346,9 @@ fn write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
 mod tests {
     use super::Capture;
     use protocol::{
-        CalibrationCandidateValidity, CalibrationResidentActivation, CalibrationRunId,
-        CalibrationRunKey, CalibrationScheduleRevision, CalibrationSessionId, Frame,
+        CalibrationCandidateValidity, CalibrationClassCounts, CalibrationGesture,
+        CalibrationModifier, CalibrationResidentActivation, CalibrationRunId, CalibrationRunKey,
+        CalibrationScheduleRevision, CalibrationSessionId, CalibrationSongResult, Frame,
     };
 
     fn activation(validity: CalibrationCandidateValidity) -> Frame {
@@ -371,6 +372,41 @@ mod tests {
             model_numerically_valid: true,
             record_crc_valid: false,
         }));
+        assert!(!capture.has_valid_resident_activation());
+
+        capture.accept(activation(CalibrationCandidateValidity {
+            model_numerically_valid: true,
+            record_crc_valid: true,
+        }));
+        assert!(capture.has_valid_resident_activation());
+    }
+
+    #[test]
+    fn song_deficits_do_not_block_a_validity_only_save() {
+        let mut capture = Capture::new("unused");
+        capture.accept(Frame::CalibrationSongResult {
+            result: CalibrationSongResult {
+                run: CalibrationRunKey {
+                    session_id: CalibrationSessionId::new(1).unwrap(),
+                    run_id: CalibrationRunId::new(2).unwrap(),
+                },
+                schedule_revision: CalibrationScheduleRevision::new(3).unwrap(),
+                content_identity: "sha256:short-song".into(),
+                counts: vec![CalibrationClassCounts {
+                    gesture: CalibrationGesture::WristPronation,
+                    modifier: CalibrationModifier::ThumbUp,
+                    accepted_count: 0,
+                    rejected_count: 1,
+                    target_count: 1,
+                    deficit_count: 1,
+                }],
+                validity: CalibrationCandidateValidity {
+                    model_numerically_valid: false,
+                    record_crc_valid: false,
+                },
+            },
+        });
+        assert!(capture.assert_calibration_song_completed().is_ok());
         assert!(!capture.has_valid_resident_activation());
 
         capture.accept(activation(CalibrationCandidateValidity {

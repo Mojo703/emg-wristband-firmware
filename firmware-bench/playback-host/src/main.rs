@@ -264,16 +264,18 @@ fn main() -> Result<()> {
     } = &arguments.step
     {
         return playback_host::clock_capture::capture(
-            &arguments.port,
-            &arguments.output,
-            *count,
-            Duration::from_millis(*interval_milliseconds),
-            Duration::from_millis(*timeout_milliseconds),
-            output_device,
-            *pause_revision,
-            Duration::from_millis(*scheduling_horizon_milliseconds),
-            *maximum_device_uncertainty_microseconds,
-            *maximum_acquisition_uncertainty_samples,
+            playback_host::clock_capture::CaptureRequest {
+                port_path: &arguments.port,
+                output: &arguments.output,
+                count: *count,
+                interval: Duration::from_millis(*interval_milliseconds),
+                timeout: Duration::from_millis(*timeout_milliseconds),
+                output_device,
+                pause_revision: *pause_revision,
+                scheduling_horizon: Duration::from_millis(*scheduling_horizon_milliseconds),
+                maximum_device_uncertainty_microseconds: *maximum_device_uncertainty_microseconds,
+                maximum_acquisition_uncertainty_samples: *maximum_acquisition_uncertainty_samples,
+            },
         );
     }
     #[cfg(feature = "clock-probe")]
@@ -1685,8 +1687,8 @@ mod tests {
             }"#,
         )
         .unwrap();
-        let (entries, identity) = anchored_schedule(&[manifest.clone()]).unwrap();
-        let (_, repeated_identity) = anchored_schedule(&[manifest.clone()]).unwrap();
+        let (entries, identity) = anchored_schedule(std::slice::from_ref(&manifest)).unwrap();
+        let (_, repeated_identity) = anchored_schedule(std::slice::from_ref(&manifest)).unwrap();
         std::fs::remove_file(manifest).unwrap();
 
         assert_eq!(entries.len(), 2);
@@ -1751,6 +1753,32 @@ mod tests {
             Frame::CalibrationScheduleCommit { run: frame_run, schedule_revision, content_identity, total_count }
                 if *frame_run == run && *schedule_revision == revision
                     && content_identity == "sha256:complete-song" && *total_count == 130
+        ));
+    }
+
+    #[test]
+    fn a_short_nonempty_song_still_has_begin_chunk_and_commit() {
+        let run = calibration_run(1, 2);
+        let revision = calibration_revision(3);
+        let frames =
+            schedule_upload_frames(run, revision, "sha256:short-song", &entries(1)).unwrap();
+
+        assert_eq!(frames.len(), 3);
+        assert!(matches!(
+            &frames[0],
+            Frame::CalibrationScheduleBegin { content_identity, total_count, .. }
+                if content_identity == "sha256:short-song" && *total_count == 1
+        ));
+        assert!(matches!(
+            &frames[1],
+            Frame::CalibrationScheduleChunk { first_entry, entries, content_identity, total_count, .. }
+                if *first_entry == 0 && entries.len() == 1
+                    && content_identity == "sha256:short-song" && *total_count == 1
+        ));
+        assert!(matches!(
+            &frames[2],
+            Frame::CalibrationScheduleCommit { content_identity, total_count, .. }
+                if content_identity == "sha256:short-song" && *total_count == 1
         ));
     }
 

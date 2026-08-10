@@ -21,6 +21,22 @@ const FIT_FLOAT_RELATIVE_TOLERANCE: f64 = 1e-12;
 
 type ProbeRecord = ProbeSample;
 
+/// Complete input to one non-interactive capture. Grouping these fields keeps
+/// the CLI-to-capture boundary explicit as options grow rather than relying on
+/// an ordered ten-argument call.
+pub struct CaptureRequest<'a> {
+    pub port_path: &'a Path,
+    pub output: &'a Path,
+    pub count: u32,
+    pub interval: Duration,
+    pub timeout: Duration,
+    pub output_device: &'a str,
+    pub pause_revision: u64,
+    pub scheduling_horizon: Duration,
+    pub maximum_device_uncertainty_microseconds: Option<f64>,
+    pub maximum_acquisition_uncertainty_samples: Option<f64>,
+}
+
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct CaptureOutput {
     pub transport: String,
@@ -51,18 +67,19 @@ struct CaptureSummary {
 ///
 /// Returns an error if the port or output cannot be opened, a probe times out,
 /// or the requested count exceeds the capture safety limit.
-pub fn capture(
-    port_path: &Path,
-    output: &Path,
-    count: u32,
-    interval: Duration,
-    timeout: Duration,
-    output_device: &str,
-    pause_revision: u64,
-    scheduling_horizon: Duration,
-    maximum_device_uncertainty_microseconds: Option<f64>,
-    maximum_acquisition_uncertainty_samples: Option<f64>,
-) -> Result<()> {
+pub fn capture(request: CaptureRequest<'_>) -> Result<()> {
+    let CaptureRequest {
+        port_path,
+        output,
+        count,
+        interval,
+        timeout,
+        output_device,
+        pause_revision,
+        scheduling_horizon,
+        maximum_device_uncertainty_microseconds,
+        maximum_acquisition_uncertainty_samples,
+    } = request;
     if count == 0 || count > MAX_PROBE_COUNT {
         bail!("clock probe count must be in 1..={MAX_PROBE_COUNT}");
     }
@@ -141,8 +158,7 @@ pub fn capture(
         outlier_mad_multiplier: 3.0,
         outlier_padding_nanoseconds: 1_000_000,
     };
-    let fit = fit_clock(&records, policy.clone())
-        .context("fit clock: need at least three valid probes")?;
+    let fit = fit_clock(&records, policy).context("fit clock: need at least three valid probes")?;
     let capture = CaptureOutput {
         transport: "serial".into(),
         output_device_label: output_device.into(),
@@ -170,7 +186,7 @@ pub fn replay(path: &Path) -> Result<bool> {
         File::open(path).with_context(|| format!("open {}", path.display()))?,
     )
     .with_context(|| format!("read {}", path.display()))?;
-    let fit = fit_clock(&capture.probes, capture.policy.clone())
+    let fit = fit_clock(&capture.probes, capture.policy)
         .context("replay clock: need at least three valid probes")?;
     if !fits_equivalent(&fit, &capture.fit) {
         bail!("replayed fit differs from captured fit");
