@@ -66,9 +66,10 @@ enum RunAction {
     Discard,
 }
 
-/// Latest requested heartbeat/playback gate. Pause and resume are idempotent
-/// state, not an event backlog. A watch channel bounds storage at one value and
-/// makes the browser-departure interrupt impossible to reject under load.
+/// Latest requested heartbeat/playback gate. Before Commit, pause and resume
+/// are idempotent state rather than an event backlog. After Commit, a pause is
+/// sticky until the device reports the song boundary because the anchored
+/// device timeline cannot be resumed in place.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RunGate {
     Interrupted,
@@ -81,6 +82,20 @@ fn gate_withholds_heartbeat(gate: RunGate, commit: &ScheduleCommitPhase) -> bool
             commit,
             ScheduleCommitPhase::Sent { .. } | ScheduleCommitPhase::Accepted
         )
+}
+
+/// Visibility may reopen a transaction only before Commit. Once Commit has
+/// crossed the wire, the device schedule is tied to an absolute monotonic
+/// anchor. Pausing host audio and then resuming it in place would move the song
+/// while the device cues kept their original instants, silently mislabelling
+/// every later window. That departure is therefore a sticky interruption until
+/// the device reports the between-songs boundary.
+fn effective_gate(requested: RunGate, commit: &ScheduleCommitPhase) -> RunGate {
+    match (requested, commit) {
+        (RunGate::Running, ScheduleCommitPhase::AwaitingDeviceReadiness) => RunGate::Running,
+        (RunGate::Running, ScheduleCommitPhase::Sent { .. } | ScheduleCommitPhase::Accepted)
+        | (RunGate::Interrupted, _) => RunGate::Interrupted,
+    }
 }
 
 fn schedule_commit_is_authorized(
@@ -578,18 +593,7 @@ impl CalibrationModeAdapter {
                             }
                         }
                         RunGate::Running => {
-                            gate_state = RunGate::Running;
-                            if matches!(heartbeat_mode, HeartbeatMode::Withheld)
-                                && matches!(playback, PlaybackState::Playing(_) | PlaybackState::Armed { .. })
-                            {
-                                heartbeat_mode = HeartbeatMode::Sending {
-                                    schedule_revision,
-                                    next_sequence: 0,
-                                };
-                                if let PlaybackState::Playing(opened) = &playback {
-                                    opened.play();
-                                }
-                            }
+                            gate_state = effective_gate(RunGate::Running, &commit_phase);
                             if schedule_commit_is_authorized(
                                 gate_state,
                                 &upload,
@@ -947,6 +951,12 @@ impl CalibrationModeAdapter {
                             // gets a full Begin acknowledgement window.
                             upload_ack_timeout.reset();
                             commit_phase = ScheduleCommitPhase::AwaitingDeviceReadiness;
+                            // A browser may have returned while the preceding
+                            // committed song was waiting for its device-owned
+                            // interruption edge. The new revision is a fresh
+                            // pre-Commit transaction and may follow the latest
+                            // visibility request again.
+                            gate_state = effective_gate(*gate.borrow(), &commit_phase);
                             device_ready_for_commit = false;
                             evidence = EvidenceState::Fresh;
                             prepared_playback = prepare_playback(playback_collection.clone(), &track);
@@ -1739,14 +1749,29 @@ mod tests {
     }
 
     #[test]
-    fn interruption_after_commit_withholds_playback_lease() {
+    fn interruption_after_commit_is_sticky_across_a_quick_browser_return() {
         let sent = ScheduleCommitPhase::sent_at(tokio::time::Instant::now());
         assert!(gate_withholds_heartbeat(RunGate::Interrupted, &sent));
         assert!(gate_withholds_heartbeat(
             RunGate::Interrupted,
             &ScheduleCommitPhase::Accepted,
         ));
-        assert!(!gate_withholds_heartbeat(RunGate::Running, &sent));
+        assert_eq!(
+            effective_gate(RunGate::Running, &sent),
+            RunGate::Interrupted
+        );
+        assert_eq!(
+            effective_gate(RunGate::Running, &ScheduleCommitPhase::Accepted),
+            RunGate::Interrupted
+        );
+        assert_eq!(
+            effective_gate(
+                RunGate::Running,
+                &ScheduleCommitPhase::AwaitingDeviceReadiness
+            ),
+            RunGate::Running,
+            "the next revision may use the latest browser presence again"
+        );
     }
 
     fn register_device(registry: &Registry) -> crate::registry::DeviceHandle {
