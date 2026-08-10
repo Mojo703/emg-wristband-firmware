@@ -146,6 +146,10 @@ pub struct RetainedSongProgress {
 pub enum AnchoredSongError {
     EmptyContentIdentity,
     EmptySchedule,
+    /// The device could not reserve its bounded upload transaction before
+    /// accepting it.  This is a protocol refusal, never an allocator panic or
+    /// watchdog-reset halfway through a calibration.
+    UploadAllocationFailed,
     WrongRun {
         expected: CalibrationRunKey,
         received: CalibrationRunKey,
@@ -240,9 +244,26 @@ struct RunnableSong {
     anchor: SongAnchor,
     committed_at_microseconds: u64,
     last_heartbeat_microseconds: Option<u64>,
-    next_entry: usize,
-    open: Option<OpenCue>,
-    closed: Option<OpenCue>,
+    cue: CueLifecycle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CueLifecycle {
+    Waiting { next_entry: usize },
+    Open { next_entry: usize, cue: OpenCue },
+    AwaitingEvidence { next_entry: usize, cue: OpenCue },
+}
+
+/// A song has exactly one lifecycle owner.  Upload and runnable storage cannot
+/// coexist, and a public `SongState` is derived from this value instead of
+/// being a second mutable account of the same transition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SongLifecycle {
+    AwaitingUpload,
+    ReceivingUpload(PendingUpload),
+    Running(RunnableSong),
+    Interrupted(RunnableSong),
+    Completed(RunnableSong),
 }
 
 /// Pure state machine for complete device-anchored songs.
@@ -250,9 +271,7 @@ struct RunnableSong {
 pub struct AnchoredSong {
     run: CalibrationRunKey,
     previous_revision: Option<CalibrationScheduleRevision>,
-    pending: Option<PendingUpload>,
-    runnable: Option<RunnableSong>,
-    state: SongState,
+    lifecycle: SongLifecycle,
     retained: RetainedSongProgress,
 }
 
@@ -261,9 +280,7 @@ impl AnchoredSong {
         Self {
             run,
             previous_revision: None,
-            pending: None,
-            runnable: None,
-            state: SongState::AwaitingUpload,
+            lifecycle: SongLifecycle::AwaitingUpload,
             retained: RetainedSongProgress {
                 accepted_cues: 0,
                 rejected_cues: 0,
@@ -274,7 +291,17 @@ impl AnchoredSong {
     }
 
     pub const fn state(&self) -> SongState {
-        self.state
+        match &self.lifecycle {
+            SongLifecycle::AwaitingUpload => SongState::AwaitingUpload,
+            SongLifecycle::ReceivingUpload(_) => SongState::ReceivingUpload,
+            SongLifecycle::Running(song) => match song.cue {
+                CueLifecycle::Waiting { .. } => SongState::Anchored,
+                CueLifecycle::Open { .. } => SongState::CueOpen,
+                CueLifecycle::AwaitingEvidence { .. } => SongState::AwaitingCueEvidence,
+            },
+            SongLifecycle::Interrupted(_) => SongState::Interrupted,
+            SongLifecycle::Completed(_) => SongState::Completed,
+        }
     }
 
     pub const fn retained_progress(&self) -> RetainedSongProgress {
@@ -282,10 +309,13 @@ impl AnchoredSong {
     }
 
     pub fn identity(&self) -> Option<&AnchoredSongIdentity> {
-        self.runnable
-            .as_ref()
-            .map(|song| &song.identity)
-            .or_else(|| self.pending.as_ref().map(|upload| &upload.identity))
+        match &self.lifecycle {
+            SongLifecycle::AwaitingUpload => None,
+            SongLifecycle::ReceivingUpload(upload) => Some(&upload.identity),
+            SongLifecycle::Running(song)
+            | SongLifecycle::Interrupted(song)
+            | SongLifecycle::Completed(song) => Some(&song.identity),
+        }
     }
 
     /// Starts an isolated upload.  The next song in the same run must use a
@@ -296,14 +326,14 @@ impl AnchoredSong {
     ) -> Result<(), AnchoredSongError> {
         identity.validate()?;
         self.check_run(identity.run)?;
-        if self.pending.is_some() {
-            return Err(AnchoredSongError::UploadAlreadyInProgress);
-        }
-        if !matches!(
-            self.state,
-            SongState::AwaitingUpload | SongState::Interrupted | SongState::Completed
-        ) {
-            return Err(AnchoredSongError::SongNotRunnable);
+        match self.lifecycle {
+            SongLifecycle::ReceivingUpload(_) => {
+                return Err(AnchoredSongError::UploadAlreadyInProgress);
+            }
+            SongLifecycle::Running(_) => return Err(AnchoredSongError::SongNotRunnable),
+            SongLifecycle::AwaitingUpload
+            | SongLifecycle::Interrupted(_)
+            | SongLifecycle::Completed(_) => {}
         }
         if let Some(previous) = self.previous_revision {
             if identity.revision <= previous {
@@ -313,13 +343,22 @@ impl AnchoredSong {
                 });
             }
         }
-        self.pending = Some(PendingUpload {
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(identity.total_count as usize)
+            .map_err(|_| AnchoredSongError::UploadAllocationFailed)?;
+        let mut received_chunks = Vec::new();
+        let chunk_count = (identity.total_count as usize)
+            .saturating_add(MAX_ANCHORED_SONG_CHUNK_CUES - 1)
+            / MAX_ANCHORED_SONG_CHUNK_CUES;
+        received_chunks
+            .try_reserve_exact(chunk_count)
+            .map_err(|_| AnchoredSongError::UploadAllocationFailed)?;
+        self.lifecycle = SongLifecycle::ReceivingUpload(PendingUpload {
             identity,
-            entries: Vec::new(),
-            received_chunks: Vec::new(),
+            entries,
+            received_chunks,
         });
-        self.runnable = None;
-        self.state = SongState::ReceivingUpload;
         Ok(())
     }
 
@@ -332,10 +371,9 @@ impl AnchoredSong {
         first_entry: u32,
         entries: &[CalibrationScheduleEntry],
     ) -> Result<UploadEffect, AnchoredSongError> {
-        let pending = self
-            .pending
-            .as_mut()
-            .ok_or(AnchoredSongError::NoUploadInProgress)?;
+        let SongLifecycle::ReceivingUpload(pending) = &mut self.lifecycle else {
+            return Err(AnchoredSongError::NoUploadInProgress);
+        };
         check_identity(&pending.identity, identity)?;
         if entries.is_empty() {
             return Err(AnchoredSongError::EmptyChunk);
@@ -374,10 +412,15 @@ impl AnchoredSong {
             });
         }
         validate_appended_entries(pending.entries.last().copied(), entries)?;
+        let mut duplicate_entries = Vec::new();
+        duplicate_entries
+            .try_reserve_exact(entries.len())
+            .map_err(|_| AnchoredSongError::UploadAllocationFailed)?;
+        duplicate_entries.extend_from_slice(entries);
         pending.entries.extend_from_slice(entries);
         pending.received_chunks.push(ReceivedChunk {
             first_entry,
-            entries: entries.to_vec(),
+            entries: duplicate_entries,
         });
         Ok(UploadEffect::Applied)
     }
@@ -390,10 +433,9 @@ impl AnchoredSong {
         acknowledged_device_monotonic_microseconds: u64,
         acquisition_sample: u64,
     ) -> Result<SongAnchor, AnchoredSongError> {
-        let pending = self
-            .pending
-            .as_ref()
-            .ok_or(AnchoredSongError::NoUploadInProgress)?;
+        let SongLifecycle::ReceivingUpload(pending) = &self.lifecycle else {
+            return Err(AnchoredSongError::NoUploadInProgress);
+        };
         check_identity(&pending.identity, identity)?;
         if pending.entries.len() as u32 != pending.identity.total_count {
             return Err(AnchoredSongError::IncompleteSchedule {
@@ -405,19 +447,20 @@ impl AnchoredSong {
             acknowledged_device_monotonic_microseconds,
             acquisition_sample,
         )?;
-        let pending = self.pending.take().expect("checked above");
+        let previous = core::mem::replace(&mut self.lifecycle, SongLifecycle::AwaitingUpload);
+        let SongLifecycle::ReceivingUpload(pending) = previous else {
+            self.lifecycle = previous;
+            return Err(AnchoredSongError::NoUploadInProgress);
+        };
         self.previous_revision = Some(pending.identity.revision);
-        self.runnable = Some(RunnableSong {
+        self.lifecycle = SongLifecycle::Running(RunnableSong {
             identity: pending.identity,
             entries: pending.entries,
             anchor,
             committed_at_microseconds: acknowledged_device_monotonic_microseconds,
             last_heartbeat_microseconds: None,
-            next_entry: 0,
-            open: None,
-            closed: None,
+            cue: CueLifecycle::Waiting { next_entry: 0 },
         });
-        self.state = SongState::Anchored;
         Ok(anchor)
     }
 
@@ -429,17 +472,16 @@ impl AnchoredSong {
         identity: &AnchoredSongIdentity,
         received_device_monotonic_microseconds: u64,
     ) -> Result<(), AnchoredSongError> {
-        let song = self
-            .runnable
-            .as_mut()
-            .ok_or(AnchoredSongError::ScheduleNotAnchored)?;
+        let song = match &mut self.lifecycle {
+            SongLifecycle::Running(song) => song,
+            SongLifecycle::Interrupted(_) | SongLifecycle::Completed(_) => {
+                return Err(AnchoredSongError::SongMustBeReuploaded);
+            }
+            SongLifecycle::AwaitingUpload | SongLifecycle::ReceivingUpload(_) => {
+                return Err(AnchoredSongError::ScheduleNotAnchored);
+            }
+        };
         check_identity(&song.identity, identity)?;
-        if !matches!(
-            self.state,
-            SongState::Anchored | SongState::CueOpen | SongState::AwaitingCueEvidence
-        ) {
-            return Err(AnchoredSongError::SongMustBeReuploaded);
-        }
         song.last_heartbeat_microseconds = Some(received_device_monotonic_microseconds);
         Ok(())
     }
@@ -450,16 +492,13 @@ impl AnchoredSong {
         &mut self,
         now_device_monotonic_microseconds: u64,
     ) -> Result<Option<AnchoredSongAction>, AnchoredSongError> {
-        let song = self
-            .runnable
-            .as_mut()
-            .ok_or(AnchoredSongError::ScheduleNotAnchored)?;
-        if !matches!(
-            self.state,
-            SongState::Anchored | SongState::CueOpen | SongState::AwaitingCueEvidence
-        ) {
-            return Ok(None);
-        }
+        let song = match &mut self.lifecycle {
+            SongLifecycle::Running(song) => song,
+            SongLifecycle::Interrupted(_) | SongLifecycle::Completed(_) => return Ok(None),
+            SongLifecycle::AwaitingUpload | SongLifecycle::ReceivingUpload(_) => {
+                return Err(AnchoredSongError::ScheduleNotAnchored);
+            }
+        };
         let heartbeat_from = song
             .last_heartbeat_microseconds
             .unwrap_or(song.committed_at_microseconds);
@@ -468,13 +507,18 @@ impl AnchoredSong {
         // ordinary completed cue even when this poll arrives late.  Otherwise
         // a delayed service loop could incorrectly reject a cue that the
         // device-owned clock had already closed.
-        if let Some(open) = song.open {
+        if let CueLifecycle::Open {
+            next_entry,
+            cue: open,
+        } = song.cue
+        {
             if now_device_monotonic_microseconds >= open.closes_at_microseconds
                 && open.closes_at_microseconds <= heartbeat_deadline
             {
-                song.open = None;
-                song.closed = Some(open);
-                self.state = SongState::AwaitingCueEvidence;
+                song.cue = CueLifecycle::AwaitingEvidence {
+                    next_entry,
+                    cue: open,
+                };
                 return Ok(Some(AnchoredSongAction::CloseCue {
                     entry: open.entry,
                     device_monotonic_microseconds: open.closes_at_microseconds,
@@ -482,21 +526,34 @@ impl AnchoredSong {
             }
         }
         if now_device_monotonic_microseconds >= heartbeat_deadline {
-            let rejected_open_cue = song.open.map(|open| open.entry);
+            let rejected_open_cue = match song.cue {
+                CueLifecycle::Open { cue, .. } => Some(cue.entry),
+                CueLifecycle::Waiting { .. } | CueLifecycle::AwaitingEvidence { .. } => None,
+            };
             if rejected_open_cue.is_some() {
                 self.retained.rejected_cues += 1;
             }
-            self.state = SongState::Interrupted;
+            let previous = core::mem::replace(&mut self.lifecycle, SongLifecycle::AwaitingUpload);
+            let SongLifecycle::Running(song) = previous else {
+                self.lifecycle = previous;
+                return Err(AnchoredSongError::ScheduleNotAnchored);
+            };
+            self.lifecycle = SongLifecycle::Interrupted(song);
             return Ok(Some(AnchoredSongAction::Interrupted {
                 reason: SongInterruption::HeartbeatTimedOut,
                 rejected_open_cue,
             }));
         }
-        if let Some(open) = song.open {
+        if let CueLifecycle::Open {
+            next_entry,
+            cue: open,
+        } = song.cue
+        {
             if now_device_monotonic_microseconds >= open.closes_at_microseconds {
-                song.open = None;
-                song.closed = Some(open);
-                self.state = SongState::AwaitingCueEvidence;
+                song.cue = CueLifecycle::AwaitingEvidence {
+                    next_entry,
+                    cue: open,
+                };
                 return Ok(Some(AnchoredSongAction::CloseCue {
                     entry: open.entry,
                     device_monotonic_microseconds: open.closes_at_microseconds,
@@ -504,11 +561,16 @@ impl AnchoredSong {
             }
             return Ok(None);
         }
-        if song.closed.is_some() {
+        let CueLifecycle::Waiting { next_entry } = song.cue else {
             return Ok(None);
-        }
-        let Some(entry) = song.entries.get(song.next_entry).copied() else {
-            self.state = SongState::Completed;
+        };
+        let Some(entry) = song.entries.get(next_entry).copied() else {
+            let previous = core::mem::replace(&mut self.lifecycle, SongLifecycle::AwaitingUpload);
+            let SongLifecycle::Running(song) = previous else {
+                self.lifecycle = previous;
+                return Err(AnchoredSongError::ScheduleNotAnchored);
+            };
+            self.lifecycle = SongLifecycle::Completed(song);
             return Ok(Some(AnchoredSongAction::Completed));
         };
         let opens_at_microseconds = cue_instant(song.anchor, entry)?;
@@ -518,12 +580,14 @@ impl AnchoredSong {
         let closes_at_microseconds = opens_at_microseconds
             .checked_add(u64::from(entry.hold.get()) * 1_000)
             .ok_or(AnchoredSongError::TimestampOverflow)?;
-        song.open = Some(OpenCue {
-            entry,
-            opens_at_microseconds,
-            closes_at_microseconds,
-        });
-        self.state = SongState::CueOpen;
+        song.cue = CueLifecycle::Open {
+            next_entry,
+            cue: OpenCue {
+                entry,
+                opens_at_microseconds,
+                closes_at_microseconds,
+            },
+        };
         Ok(Some(AnchoredSongAction::OpenCue {
             entry,
             device_monotonic_microseconds: opens_at_microseconds,
@@ -538,19 +602,23 @@ impl AnchoredSong {
         evidence: RepEvidence,
         accepted_rows: u32,
     ) -> Result<Result<(), RepRejection>, AnchoredSongError> {
-        let song = self
-            .runnable
-            .as_mut()
-            .ok_or(AnchoredSongError::ScheduleNotAnchored)?;
-        let Some(_closed) = song.closed.take() else {
-            return Err(if song.open.is_some() {
-                AnchoredSongError::CueStillOpen
-            } else {
-                AnchoredSongError::NoClosedCue
-            });
+        let song = match &mut self.lifecycle {
+            SongLifecycle::Running(song) | SongLifecycle::Interrupted(song) => song,
+            SongLifecycle::Completed(_) => {
+                return Err(AnchoredSongError::SongMustBeReuploaded);
+            }
+            SongLifecycle::AwaitingUpload | SongLifecycle::ReceivingUpload(_) => {
+                return Err(AnchoredSongError::ScheduleNotAnchored);
+            }
         };
-        song.next_entry += 1;
-        self.state = SongState::Anchored;
+        let (next_entry, _closed) = match song.cue {
+            CueLifecycle::AwaitingEvidence { next_entry, cue } => (next_entry, cue),
+            CueLifecycle::Open { .. } => return Err(AnchoredSongError::CueStillOpen),
+            CueLifecycle::Waiting { .. } => return Err(AnchoredSongError::NoClosedCue),
+        };
+        song.cue = CueLifecycle::Waiting {
+            next_entry: next_entry + 1,
+        };
         match evidence.rejection() {
             Some(reason) => {
                 self.retained.rejected_cues += 1;
@@ -574,21 +642,27 @@ impl AnchoredSong {
         &mut self,
         reason: SongInterruption,
     ) -> Result<AnchoredSongAction, AnchoredSongError> {
-        let song = self
-            .runnable
-            .as_ref()
-            .ok_or(AnchoredSongError::ScheduleNotAnchored)?;
-        if !matches!(
-            self.state,
-            SongState::Anchored | SongState::CueOpen | SongState::AwaitingCueEvidence
-        ) {
-            return Err(AnchoredSongError::SongMustBeReuploaded);
-        }
-        let rejected_open_cue = song.open.map(|open| open.entry);
+        let rejected_open_cue = match &self.lifecycle {
+            SongLifecycle::Running(song) => match song.cue {
+                CueLifecycle::Open { cue, .. } => Some(cue.entry),
+                CueLifecycle::Waiting { .. } | CueLifecycle::AwaitingEvidence { .. } => None,
+            },
+            SongLifecycle::Interrupted(_) | SongLifecycle::Completed(_) => {
+                return Err(AnchoredSongError::SongMustBeReuploaded);
+            }
+            SongLifecycle::AwaitingUpload | SongLifecycle::ReceivingUpload(_) => {
+                return Err(AnchoredSongError::ScheduleNotAnchored);
+            }
+        };
         if rejected_open_cue.is_some() {
             self.retained.rejected_cues += 1;
         }
-        self.state = SongState::Interrupted;
+        let previous = core::mem::replace(&mut self.lifecycle, SongLifecycle::AwaitingUpload);
+        let SongLifecycle::Running(song) = previous else {
+            self.lifecycle = previous;
+            return Err(AnchoredSongError::SongMustBeReuploaded);
+        };
+        self.lifecycle = SongLifecycle::Interrupted(song);
         Ok(AnchoredSongAction::Interrupted {
             reason,
             rejected_open_cue,
@@ -687,7 +761,7 @@ fn cue_instant(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::{string::ToString, vec};
+    use alloc::string::ToString;
     use protocol::{
         CalibrationCueId, CalibrationGesture, CalibrationModifier, CalibrationRunId,
         CalibrationSessionId, DurationMilliseconds, TrackMilliseconds,
@@ -799,6 +873,42 @@ mod tests {
     }
 
     #[test]
+    fn an_arbitrary_nonempty_short_song_completes_after_a_rejected_cue() {
+        let identity = identity(1, 1);
+        let mut song = AnchoredSong::new(run());
+        song.begin_upload(identity.clone()).unwrap();
+        song.upload_chunk(&identity, 0, &[cue(1, 0)]).unwrap();
+        let anchor = song.commit(&identity, 10_000, 77).unwrap();
+
+        song.heartbeat(&identity, anchor.device_monotonic_microseconds)
+            .unwrap();
+        assert!(matches!(
+            song.poll(anchor.device_monotonic_microseconds),
+            Ok(Some(AnchoredSongAction::OpenCue { entry, .. })) if entry == cue(1, 0)
+        ));
+        assert!(matches!(
+            song.poll(anchor.device_monotonic_microseconds + 1_500_000),
+            Ok(Some(AnchoredSongAction::CloseCue { entry, .. })) if entry == cue(1, 0)
+        ));
+        assert_eq!(
+            song.record_closed_evidence(
+                RepEvidence {
+                    windows_present: 8,
+                    windows_expected: 9,
+                    ..RepEvidence::default()
+                },
+                0,
+            ),
+            Ok(Err(RepRejection::MissingSamples))
+        );
+        assert_eq!(
+            song.poll(anchor.device_monotonic_microseconds + 1_500_000),
+            Ok(Some(AnchoredSongAction::Completed))
+        );
+        assert_eq!(song.retained_progress().rejected_cues, 1);
+    }
+
+    #[test]
     fn interruption_rejects_only_the_open_cue_and_retains_finished_work() {
         let (mut song, first_identity, anchor) = song_with_two_cues();
         song.heartbeat(&first_identity, anchor.device_monotonic_microseconds)
@@ -868,6 +978,36 @@ mod tests {
     }
 
     #[test]
+    fn closed_evidence_can_finish_after_interruption_without_resuming_the_song() {
+        let (mut song, identity, anchor) = song_with_two_cues();
+        song.heartbeat(&identity, anchor.device_monotonic_microseconds)
+            .unwrap();
+        song.poll(anchor.device_monotonic_microseconds).unwrap();
+        song.poll(anchor.device_monotonic_microseconds + 1_500_000)
+            .unwrap();
+        assert_eq!(song.state(), SongState::AwaitingCueEvidence);
+
+        song.interrupt(SongInterruption::OperatorStopped).unwrap();
+        assert_eq!(song.state(), SongState::Interrupted);
+        song.record_closed_evidence(
+            RepEvidence {
+                windows_present: 9,
+                windows_expected: 9,
+                ..RepEvidence::default()
+            },
+            9,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(song.state(), SongState::Interrupted);
+        assert_eq!(song.retained_progress().accepted_cues, 1);
+        assert_eq!(
+            song.heartbeat(&identity, anchor.device_monotonic_microseconds + 1_500_001),
+            Err(AnchoredSongError::SongMustBeReuploaded)
+        );
+    }
+
+    #[test]
     fn heartbeat_timeout_counts_an_open_cue_once_but_never_rejects_an_already_closed_cue() {
         let (mut song, identity, anchor) = song_with_two_cues();
         song.heartbeat(&identity, anchor.device_monotonic_microseconds)
@@ -917,7 +1057,7 @@ mod tests {
         ));
         let continued = identity(2, 1);
         song.begin_upload(continued.clone()).unwrap();
-        song.upload_chunk(&continued, 0, &vec![cue(3, 0)]).unwrap();
+        song.upload_chunk(&continued, 0, &[cue(3, 0)]).unwrap();
         let next_anchor = song.commit(&continued, 20_000, 99).unwrap();
         assert_ne!(next_anchor, anchor);
         assert_eq!(song.retained_progress().completed_fit_checkpoints, 1);
@@ -945,5 +1085,85 @@ mod tests {
             song.heartbeat(&wrong, 11),
             Err(AnchoredSongError::WrongContentIdentity)
         );
+    }
+
+    #[test]
+    fn every_public_phase_has_one_exhaustive_transition_path() {
+        let first = identity(1, 1);
+        let mut song = AnchoredSong::new(run());
+        assert_eq!(song.state(), SongState::AwaitingUpload);
+        assert_eq!(song.identity(), None);
+        assert_eq!(song.poll(0), Err(AnchoredSongError::ScheduleNotAnchored));
+
+        song.begin_upload(first.clone()).unwrap();
+        assert_eq!(song.state(), SongState::ReceivingUpload);
+        assert_eq!(song.identity(), Some(&first));
+        assert_eq!(
+            song.begin_upload(first.clone()),
+            Err(AnchoredSongError::UploadAlreadyInProgress)
+        );
+        assert!(matches!(
+            song.commit(&first, 10, 4),
+            Err(AnchoredSongError::IncompleteSchedule { .. })
+        ));
+        assert_eq!(song.state(), SongState::ReceivingUpload);
+
+        song.upload_chunk(&first, 0, &[cue(1, 0)]).unwrap();
+        let anchor = song.commit(&first, 10, 4).unwrap();
+        assert_eq!(song.state(), SongState::Anchored);
+        assert_eq!(
+            song.begin_upload(identity(2, 1)),
+            Err(AnchoredSongError::SongNotRunnable)
+        );
+
+        song.heartbeat(&first, anchor.device_monotonic_microseconds)
+            .unwrap();
+        assert!(matches!(
+            song.poll(anchor.device_monotonic_microseconds),
+            Ok(Some(AnchoredSongAction::OpenCue { .. }))
+        ));
+        assert_eq!(song.state(), SongState::CueOpen);
+        assert_eq!(
+            song.record_closed_evidence(RepEvidence::default(), 0),
+            Err(AnchoredSongError::CueStillOpen)
+        );
+        assert_eq!(song.state(), SongState::CueOpen);
+
+        assert!(matches!(
+            song.poll(anchor.device_monotonic_microseconds + 1_500_000),
+            Ok(Some(AnchoredSongAction::CloseCue { .. }))
+        ));
+        assert_eq!(song.state(), SongState::AwaitingCueEvidence);
+        assert_eq!(
+            song.begin_upload(identity(2, 1)),
+            Err(AnchoredSongError::SongNotRunnable)
+        );
+        song.record_closed_evidence(
+            RepEvidence {
+                windows_present: 9,
+                windows_expected: 9,
+                ..RepEvidence::default()
+            },
+            9,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(song.state(), SongState::Anchored);
+
+        assert_eq!(
+            song.poll(anchor.device_monotonic_microseconds + 1_500_000),
+            Ok(Some(AnchoredSongAction::Completed))
+        );
+        assert_eq!(song.state(), SongState::Completed);
+        assert_eq!(song.identity(), Some(&first));
+        assert_eq!(
+            song.heartbeat(&first, anchor.device_monotonic_microseconds + 1_500_001),
+            Err(AnchoredSongError::SongMustBeReuploaded)
+        );
+
+        let second = identity(2, 1);
+        song.begin_upload(second.clone()).unwrap();
+        assert_eq!(song.state(), SongState::ReceivingUpload);
+        assert_eq!(song.identity(), Some(&second));
     }
 }

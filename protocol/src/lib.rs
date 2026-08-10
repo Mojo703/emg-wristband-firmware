@@ -564,6 +564,22 @@ pub enum Frame {
         total_count: u32,
     },
 
+    /// Device → host: receipt of one upload transaction operation.  The host
+    /// advances an upload only after this exact acknowledgement, so a serial
+    /// reconnect can never turn a locally queued Commit into a commit of an
+    /// empty device-side transaction.
+    CalibrationScheduleUploadAcknowledged {
+        acknowledgement: CalibrationScheduleUploadAcknowledgement,
+    },
+
+    /// Device → host: authoritative progress through the acquisition-driven
+    /// preparation that precedes an anchored calibration schedule.  The host
+    /// must never manufacture this progress from its own clock: the device is
+    /// the only side that knows whether stillness/gain windows are arriving.
+    CalibrationPreparationStatus {
+        status: CalibrationPreparationStatus,
+    },
+
     /// Device → host: atomically accepted complete schedule and its exact
     /// device/acquisition anchor, three seconds ahead of the acknowledgement.
     CalibrationScheduleAccepted {
@@ -606,149 +622,6 @@ pub enum Frame {
     /// Device → host: a candidate was made resident and activated immediately.
     CalibrationResidentActivated {
         activation: CalibrationResidentActivation,
-    },
-
-    /// Host → device: send back a stored slot's record and rows. The one thing
-    /// that makes a calibration that went wrong in the field diagnosable at a
-    /// desk, so it exists for every slot, not only the installed one.
-    CalibrationRowsRequest {
-        slot: u32,
-        first_row: u32,
-        /// Rows per [`Frame::CalibrationRowsDump`]; the device caps it at what
-        /// its encode buffer holds.
-        max_rows: u32,
-    },
-
-    /// Device → host: where the run stands, sent on every phase change, every
-    /// prompt, every rejection, and periodically in between.
-    CalibrationState {
-        phase: CalibrationPhase,
-        /// Rounds completed in the current block, how many the schedule
-        /// expects, and the validated floor.
-        ///
-        /// `rounds_planned` and `round_floor` are equal, always. The gate used
-        /// to extend collection for a weak class; V measured that breaking
-        /// misclassification monotonically whichever classes were extended, so
-        /// the schedule ships tuned to its exact floors and nothing may move
-        /// the round count off them. Both fields stay on the wire because a
-        /// panel showing progress wants the denominator and a panel explaining
-        /// the protocol wants the floor, and they will not diverge again
-        /// without this comment changing.
-        ///
-        /// The floor is per block and asymmetric: ten rounds thumb-up, twelve
-        /// thumb-down, because false fires only reach the golden figure at
-        /// twelve same-don thumb-down reps per class.
-        round: u32,
-        rounds_planned: u32,
-        round_floor: u32,
-        /// Which gesture the wearer is being asked for, and a counter that
-        /// changes on every prompt. Two prompts for the same gesture are
-        /// otherwise indistinguishable — there is no state edge in the gesture
-        /// alone — so the counter is what makes the second one an event.
-        prompt: Option<CalibrationGesture>,
-        prompt_generation: u32,
-        /// How long the wearer should hold the gesture, in milliseconds.
-        ///
-        /// From the device rather than the panel's own copy, and longer than
-        /// the labeled span on purpose: the span starts at the first grid
-        /// boundary at or after the hold-off, so where a prompt fell relative
-        /// to the grid pushes the last labeled window later. Asking for exactly
-        /// what is labeled would have the wearer relaxing into the last window
-        /// on whichever reps happened to land badly, and nothing downstream
-        /// could tell that from a gesture performed poorly.
-        prompt_hold_milliseconds: u32,
-        /// Device-clock time left in a timed phase. Present for settling and
-        /// handover; absent where progress is counted in reps or optimizer passes.
-        phase_remaining_milliseconds: Option<u32>,
-        /// One entry per gesture, in the canonical prompt order.
-        classes: Vec<CalibrationClassState>,
-        accepted_reps: u32,
-        rejected_reps: u32,
-        /// The last rejected rep, `None` before there was one. Carries which
-        /// gesture and which round as well as why, so a panel can say "your
-        /// third ulnar rep sat at rest" rather than naming a reason with
-        /// nothing attached to it.
-        last_rejection: Option<RejectedRep>,
-        /// Optimizer passes finished and planned for the checkpoint in flight,
-        /// and how long the last completed pass took. The fit is deterministic
-        /// in the data, so this is progress, not an estimate.
-        fit_passes_done: u32,
-        fit_passes_planned: u32,
-        pass_milliseconds: u32,
-        /// Flash flushes performed. Flushes happen strictly between rounds, so
-        /// this counter is what proves no labeled window overlapped one.
-        flash_flushes: u32,
-        /// Milliseconds since the run began, on the device clock.
-        elapsed_milliseconds: u32,
-    },
-
-    /// Device → host: the run is over, whichever way it ended.
-    CalibrationResult {
-        outcome: CalibrationOutcome,
-        /// The slot written and the monotonic sequence it carries, present only
-        /// when a model was installed.
-        installed: Option<InstalledSlot>,
-        rounds_completed: u32,
-        rows_stored: u32,
-        accepted_reps: u32,
-        rejected_reps: u32,
-        /// The four golden numbers as the device's own leave-recent-cues-out
-        /// self-test estimates them, when there were enough reps to compute
-        /// them. An estimate from one wearer's own reps, not a measurement
-        /// against the fixtures.
-        quality: Option<CalibrationQuality>,
-        /// The two classes the self-test confused most, which is what a wearer
-        /// can act on ("your radial and ulnar reps look alike").
-        weak_pair: Option<ClassPair>,
-        classes: Vec<CalibrationClassState>,
-        fit_wall_milliseconds: u32,
-        /// Whether whatever was installed before this run is still installed.
-        /// Structurally the complement of `outcome == Installed` — the slot
-        /// protocol guarantees it, since a run that did not install never
-        /// wrote a CRC — and on the wire anyway so a panel states the promise
-        /// from the device rather than asserting it in its own copy.
-        previous_retained: bool,
-    },
-
-    /// Device → host: what the reuse probe made of the calibrations already
-    /// stored, measured over the settling phase against samples of this don
-    /// rather than a previous one's.
-    ///
-    /// Informational and nothing else. Reuse ships **disabled**: the accept
-    /// threshold cannot be set honestly from the data that exists, because the
-    /// only "accept" pair was recorded without re-seating the band. The flag
-    /// travels so a panel says so from the frame instead of hardcoding it.
-    CalibrationProbe {
-        reuse_enabled: bool,
-        slots: Vec<SlotProbe>,
-    },
-
-    /// Device → host: a stored slot's record and a run of its rows, answering
-    /// [`Frame::CalibrationRowsRequest`]. `record` and `rows` are opaque byte
-    /// blobs in the slot's own on-flash layout so the host replays exactly what
-    /// the device fitted on, rather than a re-encoding of it.
-    CalibrationRowsDump {
-        slot: u32,
-        sequence: u32,
-        /// The prior image the slot was built against. A stored calibration
-        /// binds to it, so a host replaying these rows has to know which prior
-        /// they mean.
-        prior_hash: u32,
-        /// False when the slot's CRC or prior hash did not check out. The rows
-        /// still travel — a torn slot is the interesting case — but nothing in
-        /// them may be trusted.
-        valid: bool,
-        #[serde(with = "serde_bytes")]
-        record: Vec<u8>,
-        first_row: u32,
-        row_count: u32,
-        /// Total rows the slot holds, so a host knows when to stop asking.
-        total_rows: u32,
-        row_stride: u32,
-        /// 0 `f32`, 1 `f16`, 2 `i8`, matching the bench row precisions.
-        precision: u8,
-        #[serde(with = "serde_bytes")]
-        rows: Vec<u8>,
     },
 
     // ------------------------------------------------------------------
@@ -1065,6 +938,14 @@ pub enum GuidedCalibrationSnapshot {
         tracks: Vec<GuidedCalibrationTrack>,
         selected_track_id: Option<String>,
     },
+    /// Backend projection of the device-owned 10 s still + 20 s gain
+    /// preparation interval. The browser renders this snapshot only.
+    Preparing {
+        track: GuidedCalibrationTrack,
+        stage: GuidedCalibrationPreparationStage,
+        elapsed_milliseconds: u32,
+        remaining_milliseconds: u32,
+    },
     Playing {
         track: GuidedCalibrationTrack,
         lanes: Vec<GuidedCalibrationLane>,
@@ -1077,6 +958,10 @@ pub enum GuidedCalibrationSnapshot {
     },
     BetweenSongs {
         track_title: String,
+        /// The authored tracks that can supply the next revision. Selection is
+        /// allowed only at this song boundary, never while a schedule is live.
+        tracks: Vec<GuidedCalibrationTrack>,
+        selected_track_id: Option<String>,
         candidate_available: bool,
         continue_available: bool,
         valid_reps: u32,
@@ -1086,6 +971,14 @@ pub enum GuidedCalibrationSnapshot {
     TechnicalFailure {
         detail: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuidedCalibrationPreparationStage {
+    Stillness,
+    GainEstimation,
+    ReadyForSchedule,
 }
 
 macro_rules! calibration_nonzero_id {
@@ -1135,6 +1028,51 @@ pub struct CalibrationRunKey {
     pub run_id: CalibrationRunId,
 }
 
+/// The device-owned preparation lifecycle for one exact schedule revision.
+///
+/// `Settling` and `EstimatingGains` carry the device's measured acquisition
+/// progress rather than a host-side estimate.  A terminal preparation failure
+/// is explicit so a stale progress update cannot be mistaken for a runnable
+/// schedule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CalibrationPreparationStatus {
+    pub run: CalibrationRunKey,
+    pub schedule_revision: CalibrationScheduleRevision,
+    pub phase: CalibrationPreparationPhase,
+}
+
+/// One successfully applied step in a schedule upload transaction.  The
+/// identity is deliberately repeated because the acknowledgement crosses a
+/// lossy/reconnecting serial link; an acknowledgement for a prior revision is
+/// never authority to advance the current upload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CalibrationScheduleUploadAcknowledgement {
+    pub run: CalibrationRunKey,
+    pub schedule_revision: CalibrationScheduleRevision,
+    pub content_identity: String,
+    pub total_count: u32,
+    /// `None` acknowledges Begin.  A value acknowledges the chunk beginning
+    /// at that exact entry index.
+    pub first_entry: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "phase", rename_all = "snake_case")]
+pub enum CalibrationPreparationPhase {
+    Settling {
+        elapsed_milliseconds: u32,
+        remaining_milliseconds: u32,
+    },
+    EstimatingGains {
+        elapsed_milliseconds: u32,
+        remaining_milliseconds: u32,
+    },
+    ReadyForSchedule,
+    Failed {
+        detail: String,
+    },
+}
+
 /// The browser-visible RGB cycle is fixed by the device: red, green, blue,
 /// 500 ms per colour. No RGB values are configurable on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1149,7 +1087,16 @@ pub enum CalibrationTimingColor {
 #[serde(rename_all = "snake_case")]
 pub enum CalibrationTimingState {
     Stopped,
+    /// The backend delivered Start on the exact selected connection and waits
+    /// for the device-owned Running acknowledgement.
+    Starting,
     Running,
+    /// The backend delivered Stop on the exact selected connection and waits
+    /// for the device-owned Stopped acknowledgement.
+    Stopping,
+    /// Delivery or an impossible device acknowledgement failed. `detail` is
+    /// carried by the browser projection, never guessed by the frontend.
+    Error,
 }
 
 /// The device's own fixed RGB-loop observation. `anchor` is the instant the
@@ -1173,7 +1120,7 @@ pub struct CalibrationTimingProbeWindow {
     pub capacity: u8,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CalibrationTimingStatus {
     pub state: CalibrationTimingState,
     pub color: CalibrationTimingColor,
@@ -1185,6 +1132,7 @@ pub struct CalibrationTimingStatus {
     pub manual_trim_milliseconds: OffsetMilliseconds,
     pub total_correction_milliseconds: Option<OffsetMilliseconds>,
     pub probe_window: CalibrationTimingProbeWindow,
+    pub error_detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1397,7 +1345,7 @@ pub enum CalibrationPhase {
     Polish,
     Install,
     Complete,
-    /// Aborted or failed; [`Frame::CalibrationResult`] says which.
+    /// Aborted or failed in the retained local calibration-flow state.
     Stopped,
 }
 
@@ -1415,20 +1363,6 @@ pub enum GateStatus {
     Unknown,
     Holding,
     Weak,
-}
-
-/// One class's standing, inside [`Frame::CalibrationState`] and
-/// [`Frame::CalibrationResult`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CalibrationClassState {
-    pub gesture: CalibrationGesture,
-    pub accepted_reps: u32,
-    pub rejected_reps: u32,
-    pub gate: GateStatus,
-    /// The leave-recent-cues-out self-test's score for this class: reps it
-    /// recovered out of reps it held out. Both zero while `gate` is `Unknown`.
-    pub self_test_correct: u32,
-    pub self_test_held_out: u32,
 }
 
 /// Why a labeled span was thrown away. Rejection re-prompts the same gesture;
@@ -1466,52 +1400,6 @@ pub enum CalibrationOutcome {
     /// A slot erase, append, or commit failed.
     StorageFailed,
     FitFailed,
-}
-
-/// The slot a finished calibration was written to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct InstalledSlot {
-    pub slot: u32,
-    /// Monotonic across slots; eviction overwrites the lowest.
-    pub sequence: u32,
-}
-
-/// The device's own estimate of the four numbers the work is judged on, in
-/// permille so the whole calibration vocabulary stays float-free. It is a
-/// self-test over the wearer's own reps, not a measurement against the golden
-/// fixtures, and reads as information rather than a verdict.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CalibrationQuality {
-    pub false_negative_permille: u32,
-    pub misclassification_permille: u32,
-    pub false_fire_permille: u32,
-    /// Commits the self-test produced over held-out rest rows. Anything but
-    /// zero is a regression against the golden baseline.
-    pub rest_commits: u32,
-}
-
-/// The last rep the run threw away, and everything about it a panel can use.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RejectedRep {
-    pub reason: RepRejection,
-    pub gesture: CalibrationGesture,
-    /// The round it happened in, counting from zero within its block.
-    pub round: u32,
-}
-
-/// One stored calibration, as the reuse probe sees it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SlotProbe {
-    pub slot: u32,
-    pub sequence: u32,
-    /// How well this don's settling-phase samples match the slot's stored
-    /// per-class statistics, in permille — a thousand is a perfect match.
-    /// A number to look at, not a number anything is decided on.
-    pub match_quality_permille: u32,
-    /// Commits the reject spine produced over the probe window. The wearer was
-    /// asked to hold still, so anything above zero is the stored calibration
-    /// firing at nothing.
-    pub spine_commits: u32,
 }
 
 /// The two classes a self-test confused most.
@@ -2472,6 +2360,26 @@ impl FrameScanner {
 
     pub fn extend(&mut self, bytes: &[u8]) {
         self.buffer.extend_from_slice(bytes);
+    }
+
+    /// Number of raw bytes retained while waiting for the next complete frame.
+    /// Transport diagnostics use this to distinguish a torn CDC transfer from a
+    /// decoded-but-rejected CBOR payload without exposing the backing storage.
+    pub fn buffered_len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// The payload length advertised by the next candidate header, if its full
+    /// six-byte header has arrived. This is diagnostic-only: [`next_frame`]
+    /// remains the sole operation that consumes/resynchronizes the buffer.
+    pub fn pending_payload_len(&self) -> Option<usize> {
+        let start = self
+            .buffer
+            .windows(2)
+            .position(|pair| pair == FRAME_MAGIC)?;
+        let header_end = start.checked_add(6)?;
+        let header = self.buffer.get(start..header_end)?;
+        Some(u32::from_le_bytes([header[2], header[3], header[4], header[5]]) as usize)
     }
 
     /// The next complete frame's CBOR payload, if the buffer holds one.
@@ -3685,11 +3593,6 @@ mod tests {
         }
 
         let inbound = [
-            Frame::CalibrationRowsRequest {
-                slot: 1,
-                first_row: 0,
-                max_rows: 64,
-            },
             Frame::CalibrationScheduleBegin {
                 run: run_key(),
                 schedule_revision: schedule_revision(),
@@ -3794,6 +3697,7 @@ mod tests {
                     sample_count: CALIBRATION_TIMING_PROBE_WINDOW_CAPACITY,
                     capacity: CALIBRATION_TIMING_PROBE_WINDOW_CAPACITY,
                 },
+                error_detail: Some("delivery failed".into()),
             },
         };
         assert_eq!(
@@ -3809,6 +3713,16 @@ mod tests {
                     color_elapsed_milliseconds: 0,
                     anchor_device_monotonic_microseconds: 1,
                     observed_device_monotonic_microseconds: u64::MAX,
+                },
+            },
+            Frame::CalibrationPreparationStatus {
+                status: CalibrationPreparationStatus {
+                    run,
+                    schedule_revision: schedule_revision(),
+                    phase: CalibrationPreparationPhase::EstimatingGains {
+                        elapsed_milliseconds: u32::MAX,
+                        remaining_milliseconds: 0,
+                    },
                 },
             },
             Frame::CalibrationScheduleAccepted {
@@ -3921,237 +3835,6 @@ mod tests {
                 assert_eq!(entries.len(), CALIBRATION_SCHEDULE_CHUNK_MAX_ENTRIES);
                 assert_eq!(entries[0].cue_id.get(), 1);
                 assert_eq!(entries[31].cue_id.get(), 32);
-            }
-            other => panic!("wrong variant: {other:?}"),
-        }
-    }
-
-    fn class_states() -> Vec<CalibrationClassState> {
-        CalibrationGesture::ALL
-            .iter()
-            .map(|gesture| CalibrationClassState {
-                gesture: *gesture,
-                accepted_reps: 6,
-                rejected_reps: 1,
-                gate: GateStatus::Holding,
-                self_test_correct: 5,
-                self_test_held_out: 6,
-            })
-            .collect()
-    }
-
-    #[test]
-    fn calibration_state_roundtrips() {
-        let frame = Frame::CalibrationState {
-            phase: CalibrationPhase::ThumbDownRounds,
-            round: 4,
-            rounds_planned: 13,
-            round_floor: 12,
-            prompt: Some(CalibrationGesture::WristRadialDeviation),
-            prompt_generation: 37,
-            prompt_hold_milliseconds: 1500,
-            phase_remaining_milliseconds: None,
-            classes: class_states(),
-            accepted_reps: 30,
-            rejected_reps: 5,
-            last_rejection: Some(RejectedRep {
-                reason: RepRejection::AtRestBaseline,
-                gesture: CalibrationGesture::WristUlnarDeviation,
-                round: 3,
-            }),
-            fit_passes_done: 3,
-            fit_passes_planned: 4,
-            pass_milliseconds: 812,
-            flash_flushes: 4,
-            elapsed_milliseconds: 96_400,
-        };
-        match roundtrip(&frame) {
-            Frame::CalibrationState {
-                phase,
-                prompt,
-                prompt_generation,
-                prompt_hold_milliseconds,
-                phase_remaining_milliseconds,
-                classes,
-                last_rejection,
-                flash_flushes,
-                ..
-            } => {
-                assert_eq!(phase, CalibrationPhase::ThumbDownRounds);
-                assert_eq!(prompt, Some(CalibrationGesture::WristRadialDeviation));
-                assert_eq!(prompt_generation, 37);
-                assert_eq!(prompt_hold_milliseconds, 1500);
-                assert_eq!(phase_remaining_milliseconds, None);
-                assert_eq!(classes, class_states());
-                let rejection = last_rejection.expect("a rejection");
-                assert_eq!(rejection.reason, RepRejection::AtRestBaseline);
-                assert_eq!(rejection.gesture, CalibrationGesture::WristUlnarDeviation);
-                assert_eq!(rejection.round, 3);
-                assert_eq!(flash_flushes, 4);
-            }
-            other => panic!("wrong variant: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn calibration_result_roundtrips_without_a_quality_estimate() {
-        // The self-estimate is absent when too few reps were collected to
-        // compute it, and an aborted run installs nothing — both together are
-        // the shape a panel has to render without a placeholder number.
-        let frame = Frame::CalibrationResult {
-            outcome: CalibrationOutcome::Aborted,
-            installed: None,
-            rounds_completed: 2,
-            rows_stored: 40,
-            accepted_reps: 10,
-            rejected_reps: 3,
-            quality: None,
-            weak_pair: None,
-            classes: class_states(),
-            fit_wall_milliseconds: 0,
-            previous_retained: true,
-        };
-        match roundtrip(&frame) {
-            Frame::CalibrationResult {
-                outcome,
-                installed,
-                quality,
-                weak_pair,
-                previous_retained,
-                ..
-            } => {
-                assert_eq!(outcome, CalibrationOutcome::Aborted);
-                assert_eq!(installed, None);
-                assert_eq!(quality, None);
-                assert_eq!(weak_pair, None);
-                // Rule 2 on the wire: an aborted run leaves what was there.
-                assert!(previous_retained);
-            }
-            other => panic!("wrong variant: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn calibration_result_carries_the_installed_slot_and_the_four_numbers() {
-        let frame = Frame::CalibrationResult {
-            outcome: CalibrationOutcome::Installed,
-            installed: Some(InstalledSlot {
-                slot: 1,
-                sequence: 9,
-            }),
-            rounds_completed: 10,
-            rows_stored: 400,
-            accepted_reps: 50,
-            rejected_reps: 4,
-            quality: Some(CalibrationQuality {
-                false_negative_permille: 80,
-                misclassification_permille: 0,
-                false_fire_permille: 38,
-                rest_commits: 0,
-            }),
-            weak_pair: Some(ClassPair {
-                first: CalibrationGesture::WristRadialDeviation,
-                second: CalibrationGesture::WristUlnarDeviation,
-            }),
-            classes: class_states(),
-            fit_wall_milliseconds: 7400,
-            previous_retained: false,
-        };
-        match roundtrip(&frame) {
-            Frame::CalibrationResult {
-                installed,
-                quality,
-                weak_pair,
-                ..
-            } => {
-                assert_eq!(
-                    installed,
-                    Some(InstalledSlot {
-                        slot: 1,
-                        sequence: 9
-                    })
-                );
-                assert_eq!(
-                    quality.expect("quality present").false_negative_permille,
-                    80
-                );
-                assert_eq!(
-                    weak_pair.expect("weak pair present").second,
-                    CalibrationGesture::WristUlnarDeviation
-                );
-            }
-            other => panic!("wrong variant: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn calibration_rows_dump_roundtrips_a_torn_slot() {
-        // The rows of a slot that failed its CRC are exactly the ones worth
-        // dumping, so `valid: false` must still carry a payload.
-        let frame = Frame::CalibrationRowsDump {
-            slot: 0,
-            sequence: 3,
-            prior_hash: 0xdead_beef,
-            valid: false,
-            record: alloc::vec![7u8; 96],
-            first_row: 128,
-            row_count: 64,
-            total_rows: 400,
-            row_stride: 69,
-            precision: 2,
-            rows: alloc::vec![9u8; 64 * 69],
-        };
-        match roundtrip(&frame) {
-            Frame::CalibrationRowsDump {
-                valid,
-                prior_hash,
-                record,
-                rows,
-                row_stride,
-                total_rows,
-                ..
-            } => {
-                assert!(!valid);
-                assert_eq!(prior_hash, 0xdead_beef);
-                assert_eq!(record.len(), 96);
-                assert_eq!(rows.len(), 64 * 69);
-                assert_eq!(row_stride, 69);
-                assert_eq!(total_rows, 400);
-            }
-            other => panic!("wrong variant: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn the_reuse_probe_reports_without_deciding_anything() {
-        // Reuse ships disabled, and the flag says so on the wire rather than
-        // in a panel's own constant.
-        let frame = Frame::CalibrationProbe {
-            reuse_enabled: false,
-            slots: alloc::vec![
-                SlotProbe {
-                    slot: 0,
-                    sequence: 8,
-                    match_quality_permille: 940,
-                    spine_commits: 0,
-                },
-                SlotProbe {
-                    slot: 1,
-                    sequence: 9,
-                    match_quality_permille: 310,
-                    spine_commits: 4,
-                },
-            ],
-        };
-        match roundtrip(&frame) {
-            Frame::CalibrationProbe {
-                reuse_enabled,
-                slots,
-            } => {
-                assert!(!reuse_enabled);
-                assert_eq!(slots.len(), 2);
-                assert_eq!(slots[0].match_quality_permille, 940);
-                assert_eq!(slots[1].spine_commits, 4);
             }
             other => panic!("wrong variant: {other:?}"),
         }

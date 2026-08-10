@@ -4,6 +4,7 @@ use super::{decode, encode_to, frame_header, Control, Transport};
 use anyhow::Result;
 use esp_idf_svc::hal::delay;
 use esp_idf_svc::hal::usb_serial::UsbSerialDriver;
+use log::{info, warn};
 use protocol::{Frame, FrameScanner};
 use std::io::Write;
 use std::time::Duration;
@@ -32,7 +33,7 @@ pub const SERIAL_HOST_ABSENCE_GRACE: Duration = Duration::from_secs(2);
 /// After a stalled serial write releases the claim, plain heartbeats may not re-claim
 /// the link until this much time has passed. The backend heartbeats every ~2 s whether
 /// or not it is draining the port, so without the cooldown a stalled link flaps
-/// claimed/stalled/claimed and starves the wifi fallback. A stall is also evidence
+/// claimed/stalled/claimed. A stall is also evidence
 /// serial can't sustain the stream right now, so the cooldown is long — wifi carries
 /// the data meanwhile. A probe (a dashboard freshly opening the port) still claims
 /// immediately.
@@ -45,6 +46,12 @@ pub const SERIAL_RECLAIM_COOLDOWN: Duration = Duration::from_secs(60);
 /// case this blocks the main loop for one timeout per chunk until the stale claim
 /// expires (~5 s).
 const SERIAL_WRITE_TIMEOUT_MS: u32 = 500;
+
+/// A zero-tick USB Serial/JTAG read can observe an empty endpoint immediately
+/// before the host's short Probe is queued and never service it under a busy
+/// acquisition loop. A small bounded wait keeps control latency low while
+/// guaranteeing the CDC driver gets a receive opportunity each serve pass.
+const SERIAL_READ_TIMEOUT_MS: u32 = 10;
 
 /// The largest slice handed to the driver in one write call. The ESP-IDF
 /// USB-Serial-JTAG driver's write is all-or-nothing against its transmit ring
@@ -66,6 +73,9 @@ pub(super) const SERIAL_CONTROL_MAX_LEN: usize = 16 * 1024;
 pub struct SerialTransport {
     driver: UsbSerialDriver<'static>,
     scanner: FrameScanner,
+    /// The one large candidate frame announced on CDC. Suppress per-packet
+    /// narration while retaining one high-signal start/complete trace.
+    reported_pending_payload: Option<usize>,
 }
 
 impl SerialTransport {
@@ -73,6 +83,7 @@ impl SerialTransport {
         Self {
             driver,
             scanner: FrameScanner::with_max_len(SERIAL_CONTROL_MAX_LEN),
+            reported_pending_payload: None,
         }
     }
 
@@ -93,12 +104,42 @@ impl Transport for SerialTransport {
     fn poll(&mut self) -> Option<Control> {
         let mut chunk = [0u8; 256];
         loop {
-            while let Some(payload) = self.scanner.next_frame() {
-                if let Some(control) = decode(&payload) {
-                    return Some(control);
+            if let Some(length) = self.scanner.pending_payload_len() {
+                if length > SERIAL_CONTROL_MAX_LEN {
+                    warn!(
+                        "serial control rejected oversize header: payload {length} exceeds max {SERIAL_CONTROL_MAX_LEN}"
+                    );
+                } else if length > 512 && self.reported_pending_payload != Some(length) {
+                    info!(
+                        "serial control accumulating payload {length} bytes ({} raw buffered)",
+                        self.scanner.buffered_len()
+                    );
+                    self.reported_pending_payload = Some(length);
                 }
             }
-            match self.driver.read(&mut chunk, 0) {
+            while let Some(payload) = self.scanner.next_frame() {
+                self.reported_pending_payload = None;
+                match decode(&payload) {
+                    Some(control) => {
+                        info!(
+                            "serial control decoded {} bytes fingerprint {:08x} as {}",
+                            payload.len(),
+                            wire_fingerprint(&payload),
+                            control_kind(&control)
+                        );
+                        return Some(control);
+                    }
+                    None => warn!(
+                        "serial control rejected CBOR payload of {} bytes fingerprint {:08x} after complete framing",
+                        payload.len(),
+                        wire_fingerprint(&payload),
+                    ),
+                }
+            }
+            match self.driver.read(
+                &mut chunk,
+                delay::TickType::new_millis(SERIAL_READ_TIMEOUT_MS as u64).ticks(),
+            ) {
                 Ok(0) | Err(_) => return None,
                 Ok(n) => self.scanner.extend(&chunk[..n]),
             }
@@ -106,13 +147,63 @@ impl Transport for SerialTransport {
     }
 }
 
+fn control_kind(control: &Control) -> &'static str {
+    match control {
+        Control::SetSensitivity { .. } => "set_sensitivity",
+        Control::SetKeymap { .. } => "set_keymap",
+        Control::SetWifi { .. } => "set_wifi",
+        Control::SetServer { .. } => "set_server",
+        Control::SetPhone { .. } => "set_phone",
+        Control::Probe { .. } => "probe",
+        Control::Heartbeat { .. } => "heartbeat",
+        Control::CalibrationTimingLoopStart { .. } => "timing_start",
+        Control::CalibrationTimingLoopStop { .. } => "timing_stop",
+        Control::ClockProbeRequest { .. } => "clock_probe",
+        Control::CalibrationScheduleBegin { .. } => "schedule_begin",
+        Control::CalibrationScheduleChunk { .. } => "schedule_chunk",
+        Control::CalibrationScheduleCommit { .. } => "schedule_commit",
+        Control::CalibrationHeartbeat { .. } => "calibration_heartbeat",
+        Control::CalibrationContinue { .. } => "calibration_continue",
+        Control::CalibrationSave { .. } => "calibration_save",
+        Control::CalibrationDiscard { .. } => "calibration_discard",
+        #[cfg(feature = "playback")]
+        Control::PlaybackBegin { .. } => "playback_begin",
+        #[cfg(feature = "playback")]
+        Control::PlaybackSamples { .. } => "playback_samples",
+        #[cfg(feature = "playback")]
+        Control::PlaybackEnd { .. } => "playback_end",
+        #[cfg(feature = "playback")]
+        Control::BenchModelLoad { .. } => "bench_model_load",
+        #[cfg(feature = "playback")]
+        Control::BenchReplayRows { .. } => "bench_replay_rows",
+        #[cfg(feature = "playback")]
+        Control::BenchFitBegin { .. } => "bench_fit_begin",
+        #[cfg(feature = "playback")]
+        Control::BenchFitRows { .. } => "bench_fit_rows",
+        #[cfg(feature = "playback")]
+        Control::BenchFitRun { .. } => "bench_fit_run",
+        #[cfg(feature = "playback")]
+        Control::BenchStatusRequest { .. } => "bench_status_request",
+        #[cfg(feature = "playback")]
+        Control::BenchReset { .. } => "bench_reset",
+    }
+}
+
+fn wire_fingerprint(bytes: &[u8]) -> u32 {
+    bytes.iter().fold(0x811c_9dc5u32, |hash, byte| {
+        (hash ^ u32::from(*byte)).wrapping_mul(0x0100_0193)
+    })
+}
+
 struct SerialWriter<'a>(&'a mut UsbSerialDriver<'static>);
 
 impl Write for SerialWriter<'_> {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         let chunk_len = bytes.len().min(SERIAL_WRITE_CHUNK_BYTES);
-        // A window spans several bounded writes. Feed between chunks so their
-        // aggregate time cannot trip the watchdog; one hung call still can.
+        // A frame spans several bounded writes. This feeds the subscribed main
+        // task between chunks; `Links::send_window` separately bounds retained
+        // log work per serve pass so core 0's watched idle task gets a chance
+        // to run too. One hung driver call still fails at the write timeout.
         // SAFETY: serial sends run on the registered main task.
         unsafe {
             esp_idf_svc::sys::esp_task_wdt_reset();

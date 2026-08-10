@@ -16,11 +16,12 @@ use crate::frame;
 use crate::registry::{DeviceHandle, Registry};
 use crate::timing::TimingService;
 use protocol::{DeviceTransport, Frame, FrameScanner, LogLevel};
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::io::{self, Read};
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -29,13 +30,185 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_serial::SerialPortType;
 
+/// An opened CDC node is not a connected wristband until its flushed Probe
+/// produces DeviceHello. Bound the anonymous phase so it cannot pin a path.
+const DEVICE_HELLO_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// One local USB path's lifecycle. A path claim is not equivalent to a device
+/// connection: only a `DeviceHello` after the flushed Probe reaches Connected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SerialConnectionPhase {
+    Candidate,
+    Open,
+    Probing,
+    Connected,
+    Backoff,
+    Closed,
+}
+
+#[repr(u8)]
+enum SerialWriterLifecycle {
+    Running = 0,
+    Closed = 1,
+}
+
+fn writer_is_closed(lifecycle: &AtomicU8) -> bool {
+    lifecycle.load(Ordering::SeqCst) == SerialWriterLifecycle::Closed as u8
+}
+
+#[derive(Default)]
+struct SerialConnectionTracker {
+    phases: Mutex<HashMap<String, SerialConnectionPhase>>,
+}
+
+impl SerialConnectionTracker {
+    fn reconcile(&self, candidates: &[String]) {
+        let candidate_set: HashSet<&str> = candidates.iter().map(String::as_str).collect();
+        let mut phases = self.phases.lock().unwrap();
+        for (path, phase) in phases.iter_mut() {
+            if !candidate_set.contains(path.as_str())
+                && matches!(
+                    *phase,
+                    SerialConnectionPhase::Candidate | SerialConnectionPhase::Backoff
+                )
+            {
+                *phase = SerialConnectionPhase::Closed;
+            }
+        }
+        for path in candidates {
+            match phases.entry(path.clone()) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(SerialConnectionPhase::Candidate);
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry)
+                    if matches!(
+                        *entry.get(),
+                        SerialConnectionPhase::Backoff | SerialConnectionPhase::Closed
+                    ) =>
+                {
+                    entry.insert(SerialConnectionPhase::Candidate);
+                }
+                std::collections::hash_map::Entry::Occupied(_) => {}
+            }
+        }
+    }
+
+    /// Atomically consume a candidate. Every other lifecycle phase rejects a
+    /// duplicate open. `reconcile` is the only event that renews Backoff or
+    /// Closed into Candidate, so a replug gets a fresh explicit claim.
+    fn claim_open(&self, path: &str) -> bool {
+        let mut phases = self.phases.lock().unwrap();
+        let phase = phases
+            .entry(path.to_owned())
+            .or_insert(SerialConnectionPhase::Candidate);
+        match *phase {
+            SerialConnectionPhase::Candidate => {
+                *phase = SerialConnectionPhase::Open;
+                true
+            }
+            SerialConnectionPhase::Open
+            | SerialConnectionPhase::Probing
+            | SerialConnectionPhase::Connected
+            | SerialConnectionPhase::Backoff
+            | SerialConnectionPhase::Closed => false,
+        }
+    }
+
+    fn opened(&self, path: &str) {
+        self.transition(
+            path,
+            SerialConnectionPhase::Open,
+            SerialConnectionPhase::Probing,
+        );
+    }
+
+    fn hello(&self, path: &str) {
+        self.transition(
+            path,
+            SerialConnectionPhase::Probing,
+            SerialConnectionPhase::Connected,
+        );
+    }
+
+    fn finished(&self, path: &str) {
+        let mut phases = self.phases.lock().unwrap();
+        if matches!(
+            phases.get(path),
+            Some(
+                SerialConnectionPhase::Open
+                    | SerialConnectionPhase::Probing
+                    | SerialConnectionPhase::Connected
+            )
+        ) {
+            phases.insert(path.to_owned(), SerialConnectionPhase::Backoff);
+        }
+    }
+
+    #[cfg(test)]
+    fn phase(&self, path: &str) -> Option<SerialConnectionPhase> {
+        self.phases.lock().unwrap().get(path).copied()
+    }
+
+    fn transition(&self, path: &str, expected: SerialConnectionPhase, next: SerialConnectionPhase) {
+        let mut phases = self.phases.lock().unwrap();
+        if matches!(phases.get(path), Some(phase) if *phase == expected) {
+            phases.insert(path.to_owned(), next);
+        }
+    }
+}
+
 fn serial_frame_bytes(frame: &Frame) -> Vec<u8> {
     protocol::frame_bytes(&frame::encode(frame))
 }
 
+/// Small dependency-free wire fingerprint for matching a host's encoded payload
+/// to the firmware scanner trace. This is diagnostic evidence, not an integrity
+/// mechanism (the production framing remains magic + length + CBOR).
+fn wire_fingerprint(bytes: &[u8]) -> u32 {
+    bytes.iter().fold(0x811c_9dc5u32, |hash, byte| {
+        (hash ^ u32::from(*byte)).wrapping_mul(0x0100_0193)
+    })
+}
+
+/// Keep a control write below the USB CDC endpoint's immediately available
+/// capacity.  A complete 32-cue upload chunk is several kilobytes; handing it
+/// to a plain `File` in one write can block before the device sees a complete
+/// frame, while the per-slice sequence lets the CDC driver and device RX task
+/// make progress together.
+const SERIAL_CONTROL_WRITE_CHUNK_BYTES: usize = 64;
+/// The USB-Serial-JTAG host driver accepts a burst into its kernel buffer much
+/// faster than the device's CDC RX task can drain endpoint packets.  Yielding
+/// one millisecond between full packets keeps a schedule frame ordered on the
+/// one writer while allowing that task to service each 64-byte packet.  This
+/// applies only to multi-packet control frames; Probe/heartbeat latency stays
+/// unchanged.
+const SERIAL_CONTROL_WRITE_PACKET_PACE: Duration = Duration::from_millis(1);
+
 fn write_serial_frame(writer: &mut impl std::io::Write, frame: &Frame) -> std::io::Result<()> {
-    writer.write_all(&serial_frame_bytes(frame))?;
+    let bytes = serial_frame_bytes(frame);
+    let chunk_count = bytes.len().div_ceil(SERIAL_CONTROL_WRITE_CHUNK_BYTES);
+    for (index, chunk) in bytes.chunks(SERIAL_CONTROL_WRITE_CHUNK_BYTES).enumerate() {
+        writer.write_all(chunk)?;
+        if index + 1 < chunk_count {
+            std::thread::sleep(SERIAL_CONTROL_WRITE_PACKET_PACE);
+        }
+    }
     writer.flush()
+}
+
+fn drain_serial_output(port: &std::fs::File) -> std::io::Result<()> {
+    loop {
+        // tcdrain is the tty driver's completion boundary.  Unlike File::flush
+        // it waits for queued CDC output rather than merely returning after the
+        // kernel accepted a schedule packet burst.
+        if unsafe { libc::tcdrain(port.as_raw_fd()) } == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
 }
 
 /// Whether device log lines are echoed onto the backend's own tty (`tracing`).
@@ -56,22 +229,43 @@ async fn device_session(
     timing: Arc<TimingService>,
 ) {
     // A connection is anonymous until it identifies itself.
-    let (device_id, config, provenance) = loop {
-        match incoming.recv().await {
-            Some(Frame::DeviceHello {
-                device_id,
-                config,
-                provenance,
-            }) => break (device_id, config, provenance),
-            Some(_) => continue, // ignore data frames before identity
-            None => return,      // closed before identifying
+    let hello = tokio::time::timeout(DEVICE_HELLO_TIMEOUT, async {
+        loop {
+            match incoming.recv().await {
+                Some(Frame::DeviceHello {
+                    device_id,
+                    config,
+                    provenance,
+                }) => {
+                    break Some((device_id, config, provenance));
+                }
+                Some(_) => continue,
+                None => break None,
+            }
         }
+    })
+    .await;
+    let Some((device_id, config, provenance)) = (match hello {
+        Ok(identity) => identity,
+        Err(_) => {
+            tracing::warn!(
+                "device DeviceHello timed out after {} ms; releasing connection",
+                DEVICE_HELLO_TIMEOUT.as_millis()
+            );
+            return;
+        }
+    }) else {
+        tracing::warn!("device stream closed before DeviceHello; releasing connection");
+        return;
     };
     tracing::info!(
-        "device '{device_id}' connected ({} gestures)",
+        "DeviceHello-connected device '{device_id}' ({} gestures)",
         config.gestures
     );
 
+    // Reset before publishing the new registry entry so a browser cannot race
+    // the reconnect hello and observe the previous connection's Running state.
+    let _ = timing.reset_loop(&device_id);
     let DeviceHandle {
         frames,
         mut control_rx,
@@ -83,7 +277,6 @@ async fn device_session(
         config,
         provenance,
     );
-
     let probe_outgoing = outgoing.clone();
     let probe_task = tokio::spawn(async move {
         let mut sequence = 0u32;
@@ -91,7 +284,7 @@ async fn device_session(
             if probe_outgoing
                 .send(Frame::ClockProbeRequest {
                     sequence,
-                    host_send_nanoseconds: unix_nanoseconds(),
+                    host_send_nanoseconds: crate::timing::host_monotonic_nanoseconds(),
                 })
                 .is_err()
             {
@@ -109,7 +302,7 @@ async fn device_session(
             if probe_outgoing
                 .send(Frame::ClockProbeRequest {
                     sequence,
-                    host_send_nanoseconds: unix_nanoseconds(),
+                    host_send_nanoseconds: crate::timing::host_monotonic_nanoseconds(),
                 })
                 .is_err()
             {
@@ -132,8 +325,23 @@ async fn device_session(
         match frame {
             // Re-announced config (e.g. after honoring a SetSensitivity).
             Frame::DeviceHello {
-                config, provenance, ..
-            } => registry.update_config(&device_id, token, config, provenance),
+                device_id: announced_id,
+                config,
+                provenance,
+            } => {
+                // A second hello on an already registered transport is a
+                // device-side link epoch, not merely a cosmetic config
+                // refresh. Forward it to exact-connection actors so an
+                // in-flight schedule transaction cannot migrate across a
+                // serial reclaim or reboot and later Commit an empty device
+                // upload. The browser may still use it as a config refresh.
+                registry.update_config(&device_id, token, config.clone(), provenance.clone());
+                let _ = frames.send(Frame::DeviceHello {
+                    device_id: announced_id,
+                    config,
+                    provenance,
+                });
+            }
             Frame::ClockProbeResponse {
                 sequence: _sequence,
                 host_send_nanoseconds,
@@ -146,7 +354,7 @@ async fn device_session(
                     host_send_nanoseconds,
                     device_receive_microseconds,
                     device_send_microseconds,
-                    unix_nanoseconds(),
+                    crate::timing::host_monotonic_nanoseconds(),
                 );
                 let _ = frames.send(timing.status(&device_id));
             }
@@ -190,9 +398,18 @@ async fn device_session(
                 if let Frame::PhoneState { status } = &other {
                     registry.push_phone_state(&device_id, token, status.clone());
                 }
+                if let Frame::CalibrationScheduleUploadAcknowledged { acknowledgement } = &other {
+                    tracing::info!(
+                        "{device_id} received calibration upload acknowledgement run {:?} revision {:?} first {:?}",
+                        acknowledgement.run,
+                        acknowledgement.schedule_revision,
+                        acknowledgement.first_entry,
+                    );
+                }
                 if matches!(
                     other,
-                    Frame::CalibrationScheduleAccepted { .. }
+                    Frame::CalibrationPreparationStatus { .. }
+                        | Frame::CalibrationScheduleAccepted { .. }
                         | Frame::CalibrationSongInterrupted { .. }
                         | Frame::CalibrationSongResult { .. }
                         | Frame::CalibrationCandidateStatus { .. }
@@ -208,6 +425,12 @@ async fn device_session(
 
     control_task.abort();
     probe_task.abort();
+    if registry
+        .connection_identity(&device_id)
+        .is_some_and(|identity| identity.connection_token == token)
+    {
+        let _ = timing.reset_loop(&device_id);
+    }
     registry.deregister(&device_id, token);
     tracing::info!("device '{device_id}' disconnected");
 }
@@ -350,6 +573,29 @@ fn auto_discover_ports() -> Vec<String> {
         .collect()
 }
 
+/// Keep a forced path in the reconciliation set even while unplugged.  A USB
+/// node can disappear before its session finishes; forgetting the override at
+/// that moment makes the later re-enumeration depend on a one-shot port list.
+fn serial_candidates(
+    override_port: Option<&str>,
+    path_exists: impl Fn(&str) -> bool,
+    auto_ports: impl FnOnce() -> Vec<String>,
+) -> Vec<String> {
+    let Some(path) = override_port else {
+        return auto_ports();
+    };
+    if path_exists(path) {
+        return vec![path.to_owned()];
+    }
+    let mut candidates = vec![path.to_owned()];
+    candidates.extend(
+        auto_ports()
+            .into_iter()
+            .filter(|candidate| candidate != path),
+    );
+    candidates
+}
+
 /// Discover serial-attached devices and run a probed session on each until it dies
 /// (unplug, or the device ignores us). An explicit `EMG_SERIAL_PORT` override wins
 /// whenever it names a path that exists; otherwise auto-select by USB identity. The
@@ -364,44 +610,60 @@ pub async fn run_serial_discovery(registry: Arc<Registry>, timing: Arc<TimingSer
             "serial discovery running (USB-Serial-JTAG {USB_SERIAL_JTAG_VID:04x}:{USB_SERIAL_JTAG_PID:04x})"
         ),
     }
-    // Ports we already run a session on, and ports whose open we've already explained
-    // (a permission failure repeats every scan; warn about it once).
-    let open_ports: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    // Per-path lifecycle replaces an in-flight set: a local file may be open
+    // while Probe is still awaiting DeviceHello, and that is not Connected.
+    let connections = Arc::new(SerialConnectionTracker::default());
+    // Persistent open failures are diagnostic facts, not connection phase.
     let warned_ports: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
     let mut warned_missing_override = false;
     loop {
         let candidates = match override_port.as_deref() {
-            // A valid override is the whole candidate set; ignore USB identity so any
-            // adapter or symlink works.
-            Some(path) if std::path::Path::new(path).exists() => {
-                warned_missing_override = false;
-                vec![path.to_string()]
-            }
-            // Override named but absent (not plugged in yet, or a typo): fall back to
-            // auto-discovery so a matching board still connects, and say so once.
             Some(path) => {
-                if !warned_missing_override {
+                let present = std::path::Path::new(path).exists();
+                if present {
+                    warned_missing_override = false;
+                    tracing::info!("serial path discovered: {path}");
+                } else if !warned_missing_override {
                     tracing::warn!(
-                        "{SERIAL_PORT_ENV}={path} is not present; auto-discovering by USB identity until it appears"
+                        "{SERIAL_PORT_ENV}={path} is not present; retaining it as a reconnect target and auto-discovering by USB identity"
                     );
                     warned_missing_override = true;
                 }
-                auto_discover_ports()
+                serial_candidates(
+                    Some(path),
+                    |candidate| std::path::Path::new(candidate).exists(),
+                    auto_discover_ports,
+                )
             }
-            None => auto_discover_ports(),
+            None => {
+                let candidates = auto_discover_ports();
+                for path in &candidates {
+                    tracing::info!("serial path discovered: {path}");
+                }
+                candidates
+            }
         };
 
+        connections.reconcile(&candidates);
         for path in candidates {
-            if !open_ports.lock().unwrap().insert(path.clone()) {
-                continue; // already running a session on it
+            if !connections.claim_open(&path) {
+                continue;
             }
             let registry = registry.clone();
-            let open_ports = open_ports.clone();
+            let connections = connections.clone();
             let warned_ports = warned_ports.clone();
             let session_timing = timing.clone();
             tokio::spawn(async move {
-                serial_session(&path, registry, &warned_ports, session_timing).await;
-                open_ports.lock().unwrap().remove(&path);
+                tracing::info!("serial open attempt: {path}");
+                serial_session(
+                    &path,
+                    registry,
+                    &warned_ports,
+                    session_timing,
+                    connections.clone(),
+                )
+                .await;
+                connections.finished(&path);
             });
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -418,6 +680,7 @@ async fn serial_session(
     registry: Arc<Registry>,
     warned_ports: &Mutex<HashSet<String>>,
     timing: Arc<TimingService>,
+    connections: Arc<SerialConnectionTracker>,
 ) {
     // Match the proven playback-host link exactly: a plain read/write file
     // descriptor.  TTYPort's POLLOUT readiness and modem-line setup are not
@@ -444,6 +707,7 @@ async fn serial_session(
             return;
         }
     };
+    connections.opened(path);
     // A later successful open means the earlier failure was transient — allow it to be
     // reported again if it recurs.
     warned_ports.lock().unwrap().remove(path);
@@ -481,17 +745,19 @@ async fn serial_session(
     // gone is a zombie — its heartbeats have stopped, so the device will never
     // (re-)claim the link, yet the live reader keeps the port occupied and discovery
     // never reopens it.
-    let writer_dead = Arc::new(AtomicBool::new(false));
+    let writer_lifecycle = Arc::new(AtomicU8::new(SerialWriterLifecycle::Running as u8));
 
     {
-        let writer_dead = writer_dead.clone();
+        let writer_lifecycle = writer_lifecycle.clone();
+        let reader_path = path.to_owned();
+        let connections = connections.clone();
         std::thread::spawn(move || {
             let mut port = reader_port;
             let mut scanner = FrameScanner::new();
             let mut chunk = [0u8; 4096];
             loop {
                 // The read timeout paces this check; a dead writer ends the session.
-                if writer_dead.load(Ordering::SeqCst) {
+                if writer_is_closed(&writer_lifecycle) {
                     return;
                 }
                 match wait_readable(&port, Duration::from_millis(100)) {
@@ -507,6 +773,10 @@ async fn serial_session(
                         scanner.extend(&chunk[..n]);
                         while let Some(payload) = scanner.next_frame() {
                             if let Some(frame) = decode_wire_frame(&payload) {
+                                if matches!(frame, Frame::DeviceHello { .. }) {
+                                    tracing::info!("serial {reader_path} received DeviceHello");
+                                    connections.hello(&reader_path);
+                                }
                                 if in_tx.send(frame).is_err() {
                                     return;
                                 }
@@ -522,16 +792,78 @@ async fn serial_session(
             }
         });
     }
+    let writer_path = path.to_owned();
     std::thread::spawn(move || {
         let mut port = writer_port;
         let mut out_rx = out_rx;
         'session: while let Some(frame) = out_rx.blocking_recv() {
+            if matches!(frame, Frame::Probe {}) {
+                tracing::info!("serial {writer_path} writing flushed Probe");
+            }
+            match &frame {
+                Frame::CalibrationScheduleBegin {
+                    run,
+                    schedule_revision,
+                    total_count,
+                    ..
+                } => tracing::info!(
+                    "serial {writer_path} writing calibration Begin run {run:?} revision {schedule_revision:?} count {total_count}"
+                ),
+                Frame::CalibrationScheduleChunk {
+                    run,
+                    schedule_revision,
+                    first_entry,
+                    entries,
+                    ..
+                } => tracing::info!(
+                    "serial {writer_path} writing calibration Chunk run {run:?} revision {schedule_revision:?} first {first_entry} count {} payload {} bytes fingerprint {:08x}",
+                    entries.len(),
+                    serial_frame_bytes(&frame).len() - protocol::FRAME_MAGIC.len() - 4,
+                    wire_fingerprint(&serial_frame_bytes(&frame)[protocol::FRAME_MAGIC.len() + 4..]),
+                ),
+                Frame::CalibrationScheduleCommit {
+                    run,
+                    schedule_revision,
+                    total_count,
+                    ..
+                } => tracing::info!(
+                    "serial {writer_path} writing calibration Commit run {run:?} revision {schedule_revision:?} count {total_count}"
+                ),
+                Frame::CalibrationTimingLoopStart {} => {
+                    tracing::info!("serial {writer_path} writing calibration timing Start")
+                }
+                Frame::CalibrationTimingLoopStop {} => {
+                    tracing::info!("serial {writer_path} writing calibration timing Stop")
+                }
+                _ => {}
+            }
             if let Err(e) = write_serial_frame(&mut port, &frame) {
                 tracing::warn!("serial write failed ({e}); ending session");
                 break 'session;
             }
+            if let Frame::CalibrationScheduleChunk {
+                first_entry,
+                entries,
+                ..
+            } = &frame
+            {
+                tracing::info!(
+                    "serial {writer_path} completed calibration Chunk first {first_entry} count {} in {}-byte paced packets",
+                    entries.len(),
+                    SERIAL_CONTROL_WRITE_CHUNK_BYTES,
+                );
+                if let Err(e) = drain_serial_output(&port) {
+                    tracing::warn!(
+                        "serial CDC drain failed after calibration Chunk ({e}); ending session"
+                    );
+                    break 'session;
+                }
+                tracing::info!(
+                    "serial {writer_path} drained calibration Chunk first {first_entry}"
+                );
+            }
         }
-        writer_dead.store(true, Ordering::SeqCst);
+        writer_lifecycle.store(SerialWriterLifecycle::Closed as u8, Ordering::SeqCst);
     });
 
     device_session(in_rx, out_tx, registry, DeviceTransport::Serial, timing).await;
@@ -572,20 +904,85 @@ fn wait_readable(file: &std::fs::File, timeout: Duration) -> io::Result<bool> {
     }
 }
 
-fn unix_nanoseconds() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| {
-            duration.as_nanos().min(u64::MAX as u128) as u64
-        })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::{Read, Seek, SeekFrom};
     #[cfg(unix)]
     use std::os::fd::FromRawFd;
+
+    #[test]
+    fn forced_path_reconciliation_keeps_retrying_across_unplug_and_replug() {
+        let forced = "/tmp/opal-test-tty";
+        let absent = serial_candidates(Some(forced), |_| false, || vec!["/tmp/other".into()]);
+        assert_eq!(absent, vec![forced, "/tmp/other"]);
+        let replugged = serial_candidates(
+            Some(forced),
+            |path| path == forced,
+            || vec!["/tmp/other".into()],
+        );
+        assert_eq!(replugged, vec![forced]);
+    }
+
+    #[test]
+    fn serial_connection_transitions_prevent_duplicate_open_and_replug_retries() {
+        let path = "/tmp/opal-test-tty".to_owned();
+        let tracker = SerialConnectionTracker::default();
+        tracker.reconcile(std::slice::from_ref(&path));
+        assert_eq!(tracker.phase(&path), Some(SerialConnectionPhase::Candidate));
+        assert!(tracker.claim_open(&path));
+        assert_eq!(tracker.phase(&path), Some(SerialConnectionPhase::Open));
+        assert!(
+            !tracker.claim_open(&path),
+            "an Open path cannot be opened twice"
+        );
+        tracker.opened(&path);
+        assert_eq!(tracker.phase(&path), Some(SerialConnectionPhase::Probing));
+        tracker.hello(&path);
+        assert_eq!(tracker.phase(&path), Some(SerialConnectionPhase::Connected));
+        tracker.finished(&path);
+        assert_eq!(tracker.phase(&path), Some(SerialConnectionPhase::Backoff));
+        assert!(
+            !tracker.claim_open(&path),
+            "only discovery may renew Backoff"
+        );
+        tracker.reconcile(std::slice::from_ref(&path));
+        assert_eq!(tracker.phase(&path), Some(SerialConnectionPhase::Candidate));
+        assert!(
+            tracker.claim_open(&path),
+            "a replugged candidate can reopen"
+        );
+    }
+
+    #[test]
+    fn stale_hello_cannot_connect_a_newer_open_attempt() {
+        let path = "/tmp/opal-test-tty".to_owned();
+        let tracker = SerialConnectionTracker::default();
+        tracker.reconcile(std::slice::from_ref(&path));
+        assert!(tracker.claim_open(&path));
+        // A delayed hello from a prior closed/backoff attempt is illegal: only
+        // the current Probing phase may become Connected.
+        tracker.hello(&path);
+        assert_eq!(tracker.phase(&path), Some(SerialConnectionPhase::Open));
+        tracker.opened(&path);
+        tracker.hello(&path);
+        assert_eq!(tracker.phase(&path), Some(SerialConnectionPhase::Connected));
+    }
+
+    #[test]
+    fn absent_automatic_candidate_closes_without_ending_a_connected_session() {
+        let path = "/tmp/opal-test-tty".to_owned();
+        let tracker = SerialConnectionTracker::default();
+        tracker.reconcile(std::slice::from_ref(&path));
+        tracker.reconcile(&[]);
+        assert_eq!(tracker.phase(&path), Some(SerialConnectionPhase::Closed));
+        tracker.reconcile(std::slice::from_ref(&path));
+        assert!(tracker.claim_open(&path));
+        tracker.opened(&path);
+        tracker.hello(&path);
+        tracker.reconcile(&[]);
+        assert_eq!(tracker.phase(&path), Some(SerialConnectionPhase::Connected));
+    }
 
     #[test]
     fn serial_frames_use_the_same_plain_file_frame_as_firmware() {
@@ -706,6 +1103,134 @@ mod tests {
         write_serial_frame(&mut writer, &Frame::Probe {}).unwrap();
         assert_eq!(writer.bytes, serial_frame_bytes(&Frame::Probe {}));
         assert_eq!(writer.flushes, 1);
+    }
+
+    #[test]
+    fn serial_frame_writer_bounds_a_full_schedule_chunk_for_cdc() {
+        use protocol::{
+            CalibrationCueId, CalibrationGesture, CalibrationModifier, CalibrationRunId,
+            CalibrationRunKey, CalibrationScheduleEntry, CalibrationScheduleRevision,
+            CalibrationSessionId, DurationMilliseconds, TrackMilliseconds,
+        };
+
+        const PROVEN_CDC_WRITE_CAPACITY: usize = 64;
+        struct CdcWriter {
+            bytes: Vec<u8>,
+            maximum_write: usize,
+        }
+        impl std::io::Write for CdcWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if bytes.len() > PROVEN_CDC_WRITE_CAPACITY {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "CDC write exceeded its currently available capacity",
+                    ));
+                }
+                self.maximum_write = self.maximum_write.max(bytes.len());
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let run = CalibrationRunKey {
+            session_id: CalibrationSessionId::new(1).unwrap(),
+            run_id: CalibrationRunId::new(1).unwrap(),
+        };
+        let frame = Frame::CalibrationScheduleChunk {
+            run,
+            schedule_revision: CalibrationScheduleRevision::new(1).unwrap(),
+            content_identity: "7e5ddcd14352dd27983c4967ddc5254ce6214d2d6b4221e25669d001ff49d229"
+                .into(),
+            total_count: 90,
+            first_entry: 0,
+            entries: (0..protocol::CALIBRATION_SCHEDULE_CHUNK_MAX_ENTRIES)
+                .map(|index| CalibrationScheduleEntry {
+                    cue_id: CalibrationCueId::new((index + 1) as u32).unwrap(),
+                    gesture: CalibrationGesture::ALL[index % CalibrationGesture::ALL.len()],
+                    modifier: CalibrationModifier::ThumbUp,
+                    track_offset: TrackMilliseconds::new((index as u32 + 1) * 2_000),
+                    hold: DurationMilliseconds::new(1_500),
+                })
+                .collect(),
+        };
+        assert!(serial_frame_bytes(&frame).len() > PROVEN_CDC_WRITE_CAPACITY);
+        let mut writer = CdcWriter {
+            bytes: Vec::new(),
+            maximum_write: 0,
+        };
+        write_serial_frame(&mut writer, &frame).unwrap();
+        assert!(writer.maximum_write <= PROVEN_CDC_WRITE_CAPACITY);
+        let mut scanner = FrameScanner::new();
+        scanner.extend(&writer.bytes);
+        assert!(matches!(
+            frame::decode(&scanner.next_frame().unwrap()).unwrap(),
+            Frame::CalibrationScheduleChunk {
+                first_entry: 0,
+                entries,
+                ..
+            } if entries.len() == protocol::CALIBRATION_SCHEDULE_CHUNK_MAX_ENTRIES
+        ));
+    }
+
+    #[test]
+    fn schedule_chunk_and_heartbeat_stay_whole_and_ordered_on_the_single_writer() {
+        use protocol::{
+            CalibrationCueId, CalibrationGesture, CalibrationModifier, CalibrationRunId,
+            CalibrationRunKey, CalibrationScheduleEntry, CalibrationScheduleRevision,
+            CalibrationSessionId, DurationMilliseconds, TrackMilliseconds,
+        };
+
+        let run = CalibrationRunKey {
+            session_id: CalibrationSessionId::new(1).unwrap(),
+            run_id: CalibrationRunId::new(2).unwrap(),
+        };
+        let chunk = Frame::CalibrationScheduleChunk {
+            run,
+            schedule_revision: CalibrationScheduleRevision::new(3).unwrap(),
+            content_identity: "7e5ddcd14352dd27983c4967ddc5254ce6214d2d6b4221e25669d001ff49d229"
+                .into(),
+            total_count: 32,
+            first_entry: 0,
+            entries: (0..protocol::CALIBRATION_SCHEDULE_CHUNK_MAX_ENTRIES)
+                .map(|index| CalibrationScheduleEntry {
+                    cue_id: CalibrationCueId::new((index + 1) as u32).unwrap(),
+                    gesture: CalibrationGesture::ALL[index % CalibrationGesture::ALL.len()],
+                    modifier: CalibrationModifier::ThumbDown,
+                    track_offset: TrackMilliseconds::new((index as u32 + 1) * 2_000),
+                    hold: DurationMilliseconds::new(1_500),
+                })
+                .collect(),
+        };
+        let heartbeat = Frame::CalibrationHeartbeat {
+            heartbeat: protocol::CalibrationHeartbeat {
+                run,
+                schedule_revision: CalibrationScheduleRevision::new(3).unwrap(),
+                sequence: 11,
+            },
+        };
+        let mut writer = Vec::new();
+        // This is the serial_session writer's queue order: it calls the frame
+        // writer to completion before dequeuing a heartbeat/control successor.
+        write_serial_frame(&mut writer, &chunk).unwrap();
+        write_serial_frame(&mut writer, &heartbeat).unwrap();
+
+        let mut scanner = FrameScanner::new();
+        scanner.extend(&writer);
+        assert!(matches!(
+            frame::decode(&scanner.next_frame().unwrap()).unwrap(),
+            Frame::CalibrationScheduleChunk { first_entry: 0, entries, .. }
+                if entries.len() == protocol::CALIBRATION_SCHEDULE_CHUNK_MAX_ENTRIES
+        ));
+        assert!(matches!(
+            frame::decode(&scanner.next_frame().unwrap()).unwrap(),
+            Frame::CalibrationHeartbeat {
+                heartbeat: protocol::CalibrationHeartbeat { sequence: 11, .. }
+            }
+        ));
+        assert!(scanner.next_frame().is_none());
     }
 
     #[cfg(unix)]

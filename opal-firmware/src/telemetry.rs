@@ -44,7 +44,29 @@ pub fn report(source: &str, metrics: Vec<TelemetryMetric>) {
     pending.push_back(frame);
 }
 
-/// Take everything reported since the last drain, oldest first.
-pub fn drain() -> Vec<Frame> {
-    PENDING.lock().unwrap().drain(..).collect()
+/// Take at most `limit` reports, oldest first.  This keeps a stalled CDC
+/// consumer from monopolising the main task long enough to starve its core's
+/// watched idle task; reports left behind are sent on a later serve pass.
+pub fn drain_at_most(limit: usize) -> Vec<Frame> {
+    let mut pending = PENDING.lock().unwrap();
+    drain_at_most_from(&mut pending, limit)
+}
+
+fn drain_at_most_from<T>(pending: &mut VecDeque<T>, limit: usize) -> Vec<T> {
+    let count = pending.len().min(limit);
+    pending.drain(..count).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_drain_keeps_newer_telemetry_for_later_serve_passes() {
+        let mut pending = VecDeque::from([1, 2, 3]);
+        assert_eq!(drain_at_most_from(&mut pending, 1), vec![1]);
+        assert_eq!(pending, VecDeque::from([2, 3]));
+        assert_eq!(drain_at_most_from(&mut pending, 8), vec![2, 3]);
+        assert!(pending.is_empty());
+    }
 }

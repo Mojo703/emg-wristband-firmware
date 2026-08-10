@@ -1,17 +1,13 @@
-//! The links to the dashboard. The device emits frames and polls for control frames;
-//! the byte pipe underneath is either a TCP socket (wifi, [`tcp`]) or the
-//! USB-Serial-JTAG CDC channel ([`serial`]), both carrying `protocol`'s magic +
-//! length + CBOR framing, so the rest of the firmware is transport-agnostic.
+//! The USB-Serial-JTAG link to the dashboard. The device emits frames and polls
+//! for controls over `protocol`'s magic + length + CBOR framing.
 
 mod control;
 mod serial;
-mod tcp;
 
 pub use control::Control;
 pub use serial::{
     SerialTransport, SERIAL_CLAIM_TIMEOUT, SERIAL_HOST_ABSENCE_GRACE, SERIAL_RECLAIM_COOLDOWN,
 };
-pub use tcp::TcpTransport;
 
 use anyhow::Result;
 use protocol::Frame;
@@ -188,11 +184,55 @@ mod tests {
             8,
             "begin + 32/32/32/32/2 + commit + heartbeat"
         );
-        for frame in frames {
+        let mut wire = Vec::new();
+        let mut chunk_zero_payload_len = None;
+        for frame in &frames {
             let mut bytes = Vec::new();
-            ciborium::into_writer(&frame, &mut bytes).unwrap();
+            ciborium::into_writer(frame, &mut bytes).unwrap();
             assert!(decode(&bytes).is_some_and(|control| control.is_calibration()));
+            if matches!(
+                frame,
+                Frame::CalibrationScheduleChunk {
+                    first_entry: 0,
+                    entries,
+                    ..
+                } if entries.len() == protocol::CALIBRATION_SCHEDULE_CHUNK_MAX_ENTRIES
+            ) {
+                chunk_zero_payload_len = Some(bytes.len());
+            }
+            assert!(
+                bytes.len() <= super::serial::SERIAL_CONTROL_MAX_LEN,
+                "every production upload control fits the firmware scanner"
+            );
+            wire.extend_from_slice(&frame_header(frame).unwrap());
+            wire.extend_from_slice(&bytes);
         }
+        assert!(
+            chunk_zero_payload_len.is_some_and(|len| len > 64),
+            "the regression must exercise a genuinely multi-packet Chunk0"
+        );
+
+        // Feed the exact framed production shape through the same bounded
+        // scanner the serial transport uses, splitting inside arbitrary header
+        // and CBOR boundaries. Direct `decode` above cannot catch a scanner
+        // length/resynchronization regression.
+        let mut scanner =
+            protocol::FrameScanner::with_max_len(super::serial::SERIAL_CONTROL_MAX_LEN);
+        for packet in wire.chunks(64) {
+            scanner.extend(packet);
+        }
+        let controls: Vec<_> = std::iter::from_fn(|| scanner.next_frame())
+            .map(|payload| decode(&payload).expect("framed upload control decodes"))
+            .collect();
+        assert_eq!(controls.len(), frames.len());
+        assert!(matches!(
+            controls[1],
+            Control::CalibrationScheduleChunk {
+                first_entry: 0,
+                ref entries,
+                ..
+            } if entries.len() == protocol::CALIBRATION_SCHEDULE_CHUNK_MAX_ENTRIES
+        ));
     }
 
     #[test]
