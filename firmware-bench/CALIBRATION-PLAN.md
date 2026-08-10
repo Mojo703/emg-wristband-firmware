@@ -1,4 +1,27 @@
-# On-device calibration: system plan (revised after adversarial review)
+# Historical on-device calibration system plan
+
+> **Superseded for Tuesday.** The device-paced rounds, `CalibrationStart` /
+> `CalibrationAbort` controls, scripted schedule, and standalone-on-link-loss
+> behavior described below are historical. The implemented path is the
+> device-anchored complete-song contract in
+> `CONTINUE-TUESDAY-CALIBRATION.md`: Begin/Chunk/Commit with chunks of at most
+> 32, an identity-bearing acceptance exactly three seconds ahead, host
+> heartbeats every 500 ms, retained evidence on interruption, and a
+> new-revision upload before Continue.
+>
+> The dashboard uses five immediate midpoint probes and then five-second
+> maintenance probes in a rolling window of 11 to project the device anchor to
+> both audio and visuals. Save is permissive about counts and quality but
+> requires numerical and CRC validity; activation installs the resident model
+> and gains immediately. The remaining work is operator-present hardware
+> acceptance: Timing real-link smoke after the serial-writer fix, BLE continuity
+> and suppression, command/anti-gesture behavior, reboot persistence, and
+> interruption retention.
+
+## Historical system plan
+
+> The remainder is retained to explain the older evidence and storage choices.
+> It is not an operator procedure or a fallback implementation.
 
 Streaming calibration for the thumb-modifier pipeline: a deterministic
 per-round fit schedule that finishes within 10 seconds of the last example,
@@ -79,18 +102,17 @@ Partition (983,040 B) layout, version-bumped image format:
   the prior's standardization statistics, the prior's warm-start weights
   (65 × 12 f32), then pre-standardized i8 rows. Written by
   `build-partition-v2`, flashed once.
-- **Two wearer slots** (fixed offsets, 192 KB each): a slot holds a
-  monotonic sequence number, the prior hash it was built against, the
-  reference gains, per-class centroid + spread, the fitted model, the live
-  rows (i8, standardized-at-append), and a CRC written last. Eviction is
-  overwrite-lowest-sequence — no compaction, ever. A slot whose CRC or
-  prior hash does not match is dead; the device says so and runs the prior
-  alone.
+- **Two physical slots** (fixed offsets, 192 KB each): together they hold one
+  logical resident and one candidate or scratch. A slot records its sequence,
+  role, prior hash, fitted state and live rows. Its CRC is written last. A
+  newer resident promotes the candidate and leaves the old resident as future
+  scratch. A newer inactive tombstone persists `None` without a selector
+  partition. Invalid CRC or prior hash makes a slot dead.
 
 Write discipline (the flash-cache stall is real: every write/erase stalls
 the other core and blocks all non-IRAM code):
 
-- The active slot's region is **erased once, at boot**, before the front end
+- The recovered scratch region is **erased once, at boot**, before the front end
   is brought up — not during the settling phase, which is where this plan
   first put it. A slot erase is ~48 sector erases, each suspending the other
   core and taking the flash cache down with it for tens of milliseconds, ~2 s
