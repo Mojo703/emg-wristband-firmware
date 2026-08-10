@@ -57,7 +57,8 @@ use protocol::{
 use training_rows::CalibrationPartition;
 
 use resident_selector::{
-    PhysicalSlot, ResidentIdentity, SelectorPersistenceCapability, StoreSelector, StoredRole,
+    PhysicalSlot, ResidentIdentity, SelectorPersistenceCapability, StoreSelector, StoredIdentity,
+    StoredRole,
 };
 
 /// Rows the RAM buffer holds: one round, with room to spare.
@@ -277,7 +278,23 @@ enum AnchoredFitLifecycle {
     CheckpointRequested,
     Running(AnchoredPendingFit),
     RunningThenCheckpoint(AnchoredPendingFit),
-    CandidateReady,
+    CandidateReady(CandidateOwnership),
+}
+
+/// A candidate is not merely "the exportable slot". It is the durable record
+/// produced by one exact schedule transaction. Keeping both identities in the
+/// ready variant prevents a later run from adopting a slot left by an older
+/// run (or recovered after a reboot, where the volatile run identity is gone).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CandidateOwnership {
+    schedule: AnchoredSongIdentity,
+    stored: StoredIdentity,
+}
+
+impl CandidateOwnership {
+    fn matches(&self, schedule: &AnchoredSongIdentity, stored: Option<StoredIdentity>) -> bool {
+        self.schedule == *schedule && stored == Some(self.stored)
+    }
 }
 
 /// A step the machine asked for, dispatched here and not yet reported back.
@@ -535,7 +552,29 @@ enum PreparationStatusReport {
     AtSample(u64),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreparationBeginDisposition {
+    Start,
+    ResumeSameRun,
+    RejectForeignRun,
+}
+
 impl AnchoredPreparation {
+    fn begin_disposition(&self, requested: CalibrationRunKey) -> PreparationBeginDisposition {
+        match self {
+            Self::Settling { run, .. }
+            | Self::EstimatingGains { run, .. }
+            | Self::ReadyForSchedule { run, .. } => {
+                if *run == requested {
+                    PreparationBeginDisposition::ResumeSameRun
+                } else {
+                    PreparationBeginDisposition::RejectForeignRun
+                }
+            }
+            Self::Idle | Self::Failed { .. } => PreparationBeginDisposition::Start,
+        }
+    }
+
     fn is_live(&self) -> bool {
         matches!(
             self,
@@ -709,6 +748,33 @@ impl Calibration {
             );
         }
         let mut active_selector = StoreSelector::recover(stored);
+        // Run/revision ownership is deliberately RAM-only: after a reboot no
+        // control request can prove that it owns an exportable record. Retire
+        // such an orphan before acquisition starts, preserving the resident
+        // in the other slot and making this physical slot boot's scratch.
+        if let Some(orphan) = active_selector.exportable() {
+            match partition
+                .as_mut()
+                .map(|partition| partition.invalidate_slot(orphan.physical))
+            {
+                Some(Ok(_)) => {
+                    info!(
+                        "retired unowned calibration candidate sequence {} after reboot",
+                        orphan.generation
+                    );
+                    active_selector = StoreSelector::recover(
+                        partition
+                            .as_ref()
+                            .expect("partition remains mapped after orphan retirement")
+                            .stored_identities(),
+                    );
+                }
+                Some(Err(error)) => warn!(
+                    "unowned calibration candidate could not be retired ({error:#}); calibration unavailable this boot"
+                ),
+                None => {}
+            }
+        }
         // The one erase a calibration needs, done here — at boot, before the
         // front end exists.
         //
@@ -797,30 +863,27 @@ impl Calibration {
             );
             return false;
         }
-        match &self.anchored_preparation {
-            AnchoredPreparation::Settling { run: active, .. }
-            | AnchoredPreparation::EstimatingGains { run: active, .. }
-            | AnchoredPreparation::ReadyForSchedule { run: active, .. } => {
-                if *active != run {
-                    self.fail_anchored_preparation(
-                        run,
-                        schedule_revision,
-                        "a different calibration run is already preparing",
-                    );
-                    return false;
-                }
+        match self.anchored_preparation.begin_disposition(run) {
+            PreparationBeginDisposition::RejectForeignRun => {
+                // A foreign request is not a transition of the active run.
+                // Report the still-authoritative phase, then reject the
+                // intruder without replacing preparation ownership.
+                self.emit_anchored_preparation_status();
+                self.refuse("a different calibration run is already preparing");
+                return false;
+            }
+            PreparationBeginDisposition::ResumeSameRun => {
                 self.anchored_preparation
                     .set_schedule_revision(run, schedule_revision);
                 self.emit_anchored_preparation_status();
                 return true;
             }
-            AnchoredPreparation::Failed { .. } => {
+            PreparationBeginDisposition::Start => {
                 // A fresh explicit run is allowed to retry after the terminal
                 // failure has been reported. It receives a fresh acquisition
                 // start rather than inheriting the failed phase.
                 self.anchored_preparation = AnchoredPreparation::Idle;
             }
-            AnchoredPreparation::Idle => {}
         }
         if self.partition.is_none() {
             self.fail_anchored_preparation(
@@ -1053,6 +1116,14 @@ impl Calibration {
                         return None;
                     }
                 };
+                if let Some(AnchoredFitLifecycle::CandidateReady(owner)) = self.anchored.fit() {
+                    let owner = owner.schedule.clone();
+                    self.emit_anchored_candidate_status(owner.run, owner.revision);
+                    self.refuse(
+                        "a completed candidate requires Save or Discard before another schedule",
+                    );
+                    return None;
+                }
                 if !self.begin_anchored_lifecycle(run, schedule_revision) {
                     return None;
                 }
@@ -1608,7 +1679,7 @@ impl Calibration {
             AnchoredFitLifecycle::RunningThenCheckpoint(pending) => {
                 AnchoredFitLifecycle::RunningThenCheckpoint(pending)
             }
-            AnchoredFitLifecycle::CandidateReady => AnchoredFitLifecycle::CheckpointRequested,
+            AnchoredFitLifecycle::CandidateReady(_) => AnchoredFitLifecycle::CheckpointRequested,
         };
     }
 
@@ -1739,7 +1810,7 @@ impl Calibration {
     fn finalize_anchored_candidate(&mut self) {
         if matches!(
             self.anchored.fit(),
-            Some(AnchoredFitLifecycle::CandidateReady)
+            Some(AnchoredFitLifecycle::CandidateReady(_))
         ) {
             return;
         }
@@ -1789,16 +1860,19 @@ impl Calibration {
                         .expect("partition remains mapped after candidate commit")
                         .stored_identities(),
                 );
-                if self.active_selector.exportable().is_none() {
+                let Some(stored) = self.active_selector.exportable() else {
                     self.refuse("candidate CRC validation failed after final polish");
                     self.emit_anchored_candidate_status(identity.run, identity.revision);
                     return;
-                }
+                };
                 *self
                     .anchored
                     .fit_mut()
                     .expect("candidate readiness belongs to an active run") =
-                    AnchoredFitLifecycle::CandidateReady;
+                    AnchoredFitLifecycle::CandidateReady(CandidateOwnership {
+                        schedule: identity.clone(),
+                        stored,
+                    });
                 // Keep `model` alive only long enough to prove its shape was
                 // constructible; Save reloads the CRC-validated flash record.
                 let _ = model;
@@ -1924,8 +1998,20 @@ impl Calibration {
         self.emit_anchored_candidate_status(identity.run, identity.revision);
     }
 
-    fn anchored_candidate_validity(&self) -> (bool, CalibrationCandidateValidity) {
-        let candidate_present = self.active_selector.exportable();
+    fn owned_candidate(&self, schedule: &AnchoredSongIdentity) -> Option<StoredIdentity> {
+        let owner = match self.anchored.fit()? {
+            AnchoredFitLifecycle::CandidateReady(owner) => owner,
+            _ => return None,
+        };
+        let stored = self.active_selector.exportable();
+        owner.matches(schedule, stored).then_some(owner.stored)
+    }
+
+    fn anchored_candidate_validity(
+        &self,
+        schedule: &AnchoredSongIdentity,
+    ) -> (bool, CalibrationCandidateValidity) {
+        let candidate_present = self.owned_candidate(schedule);
         let model_numerically_valid = candidate_present
             .and_then(|identity| {
                 self.partition
@@ -1952,7 +2038,22 @@ impl Calibration {
         run: protocol::CalibrationRunKey,
         schedule_revision: protocol::CalibrationScheduleRevision,
     ) {
-        let (candidate_present, validity) = self.anchored_candidate_validity();
+        let owned_schedule = self
+            .anchored
+            .song()
+            .and_then(|song| song.identity())
+            .filter(|identity| identity.run == run && identity.revision == schedule_revision)
+            .cloned();
+        let (candidate_present, validity) = owned_schedule.as_ref().map_or(
+            (
+                false,
+                CalibrationCandidateValidity {
+                    model_numerically_valid: false,
+                    record_crc_valid: false,
+                },
+            ),
+            |identity| self.anchored_candidate_validity(identity),
+        );
         self.outbound.push(Frame::CalibrationCandidateStatus {
             candidate: CalibrationCandidateStatus {
                 run,
@@ -1973,13 +2074,13 @@ impl Calibration {
             self.refuse("Save did not identify the retained calibration run");
             return;
         };
-        let (candidate_present, validity) = self.anchored_candidate_validity();
+        let (candidate_present, validity) = self.anchored_candidate_validity(&identity);
         if !candidate_present || !validity.permits_activation() {
             self.emit_anchored_candidate_status(identity.run, identity.revision);
             self.refuse("Save requires a numerically valid, CRC-validated candidate model");
             return;
         }
-        let Some(candidate) = self.active_selector.exportable() else {
+        let Some(candidate) = self.owned_candidate(&identity) else {
             unreachable!("candidate validity required an exportable candidate")
         };
         let Some(partition) = self.partition.as_mut() else {
@@ -2045,7 +2146,17 @@ impl Calibration {
             self.reset_anchored_lifecycle();
             return;
         }
-        if let Some(candidate) = self.active_selector.exportable() {
+        let owned_candidate = self
+            .anchored
+            .song()
+            .and_then(|song| song.identity())
+            .cloned()
+            .and_then(|identity| self.owned_candidate(&identity));
+        if self.active_selector.exportable().is_some() && owned_candidate.is_none() {
+            self.refuse("Discard cannot invalidate a candidate owned by another schedule");
+            return;
+        }
+        if let Some(candidate) = owned_candidate {
             let discarded = self
                 .partition
                 .as_mut()
@@ -2819,6 +2930,31 @@ mod anchored_lifecycle_tests {
         }
     }
 
+    fn run(session: u64, run: u32) -> CalibrationRunKey {
+        CalibrationRunKey {
+            session_id: CalibrationSessionId::new(session).unwrap(),
+            run_id: CalibrationRunId::new(run).unwrap(),
+        }
+    }
+
+    fn candidate_owner(run: CalibrationRunKey) -> CandidateOwnership {
+        CandidateOwnership {
+            schedule: AnchoredSongIdentity::new(
+                run,
+                CalibrationScheduleRevision::new(3).unwrap(),
+                "owned-track".into(),
+                12,
+            )
+            .unwrap(),
+            stored: StoredIdentity {
+                physical: PhysicalSlot::Second,
+                generation: 8,
+                crc: 0x1234_5678,
+                role: StoredRole::ExportableCandidate,
+            },
+        }
+    }
+
     #[test]
     fn anchored_cue_owns_capture_and_exactly_once_prompt_delivery() {
         let mut cue = AnchoredCueLifecycle::open(capture(1));
@@ -2867,15 +3003,12 @@ mod anchored_lifecycle_tests {
 
     #[test]
     fn anchored_run_reset_atomically_drops_song_cue_fit_and_counts() {
-        let run = CalibrationRunKey {
-            session_id: CalibrationSessionId::new(9).unwrap(),
-            run_id: CalibrationRunId::new(3).unwrap(),
-        };
+        let run = run(9, 3);
         let mut lifecycle = AnchoredRunLifecycle::start(run);
         *lifecycle.cue_mut().expect("active run owns cue state") =
             AnchoredCueLifecycle::open(capture(4));
         *lifecycle.fit_mut().expect("active run owns fit state") =
-            AnchoredFitLifecycle::CandidateReady;
+            AnchoredFitLifecycle::CandidateReady(candidate_owner(run));
         lifecycle
             .count_mut(0)
             .expect("active run owns counts")
@@ -2887,6 +3020,71 @@ mod anchored_lifecycle_tests {
         assert!(lifecycle.cue().is_none());
         assert!(lifecycle.fit().is_none());
         assert!(lifecycle.counts().is_none());
+    }
+
+    #[test]
+    fn candidate_ownership_requires_exact_schedule_and_stored_record() {
+        let owner = candidate_owner(run(9, 3));
+        assert!(owner.matches(&owner.schedule, Some(owner.stored)));
+
+        let foreign_run = candidate_owner(run(9, 4));
+        assert!(!owner.matches(&foreign_run.schedule, Some(owner.stored)));
+
+        let mut foreign_revision = owner.schedule.clone();
+        foreign_revision.revision = CalibrationScheduleRevision::new(4).unwrap();
+        assert!(!owner.matches(&foreign_revision, Some(owner.stored)));
+
+        let mut replaced_record = owner.stored;
+        replaced_record.generation += 1;
+        assert!(!owner.matches(&owner.schedule, Some(replaced_record)));
+        assert!(!owner.matches(&owner.schedule, None));
+    }
+
+    #[test]
+    fn every_live_preparation_phase_rejects_foreign_begin_without_transition() {
+        let active = run(4, 7);
+        let foreign = run(4, 8);
+        let revision = CalibrationScheduleRevision::new(1).unwrap();
+        let phases = [
+            AnchoredPreparation::Settling {
+                run: active,
+                schedule_revision: revision,
+                started_at_sample: 10,
+            },
+            AnchoredPreparation::EstimatingGains {
+                run: active,
+                schedule_revision: revision,
+                started_at_sample: 20,
+            },
+            AnchoredPreparation::ReadyForSchedule {
+                run: active,
+                schedule_revision: revision,
+            },
+        ];
+        for phase in phases {
+            assert_eq!(
+                phase.begin_disposition(foreign),
+                PreparationBeginDisposition::RejectForeignRun
+            );
+            assert_eq!(
+                phase.begin_disposition(active),
+                PreparationBeginDisposition::ResumeSameRun
+            );
+            assert!(anchored_preparation_matches_run(&phase, active));
+        }
+        assert_eq!(
+            AnchoredPreparation::Idle.begin_disposition(foreign),
+            PreparationBeginDisposition::Start
+        );
+        assert_eq!(
+            AnchoredPreparation::Failed {
+                run: active,
+                schedule_revision: revision,
+                detail: "old failure".into(),
+            }
+            .begin_disposition(foreign),
+            PreparationBeginDisposition::Start
+        );
     }
 
     #[test]
