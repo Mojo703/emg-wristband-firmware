@@ -635,9 +635,6 @@ impl CollectionManager {
 
         let created = now();
         let practice = acquired.is_none();
-        let session_device_id = acquired
-            .as_ref()
-            .map(|device| device.hardware.device_id.clone());
         let session_id = SessionId(format!(
             "{}_{}{}",
             chrono::Local::now().format("%Y-%m-%dT%H-%M-%S"),
@@ -645,11 +642,12 @@ impl CollectionManager {
             if practice { "_practice" } else { "" },
         ));
 
-        let (recorder, directory, emg_receiver) = match acquired {
+        let mut capture = match acquired {
             Some(AcquiredDevice {
                 emg_receiver,
                 hardware,
             }) => {
+                let device_id = hardware.device_id.clone();
                 let don_count = self
                     .provenance
                     .next_don_count(&metadata.subject, metadata.arm);
@@ -687,39 +685,43 @@ impl CollectionManager {
                         Err(error) => tracing::warn!("placement photo not adopted: {error}"),
                     }
                 }
-                (Some(recorder), Some(directory), Some(emg_receiver))
+                CaptureResources::Recording {
+                    directory,
+                    recorder: Box::new(recorder),
+                    emg_receiver,
+                    device_id,
+                    video: None,
+                }
             }
-            None => (None, None, None),
+            None => CaptureResources::Practice,
         };
 
         // The operator asked for video or they did not. A camera that cannot
         // deliver it aborts the start — a session that silently records EMG
         // alone is the failure this whole path exists to prevent. Practice
         // sessions have no directory to record into, so no video either.
-        let recording_handle: Option<RecordingHandle> = match (record_video, &directory) {
-            (true, Some(directory)) => {
-                let video = Arc::clone(&self.video);
-                let video_output = directory.join("video.mkv");
-                let requested_start = now();
-                let started = tokio::task::spawn_blocking(move || {
-                    video
-                        .lock()
-                        .unwrap()
-                        .start_recording(&video_output, requested_start)
-                })
-                .await?;
-                match started {
-                    Ok(handle) => Some(handle),
-                    Err(error) => {
-                        // Nothing has been recorded yet, so the directory holds
-                        // only the manifest; leaving it would look like a take.
-                        let _ = std::fs::remove_dir_all(directory);
-                        return Err(error.context("this session asked for video"));
-                    }
+        if let (true, Some(directory)) = (record_video, capture.directory()) {
+            let directory = directory.clone();
+            let video = Arc::clone(&self.video);
+            let video_output = directory.join("video.mkv");
+            let requested_start = now();
+            let started = tokio::task::spawn_blocking(move || {
+                video
+                    .lock()
+                    .unwrap()
+                    .start_recording(&video_output, requested_start)
+            })
+            .await?;
+            match started {
+                Ok(handle) => capture.attach_video(handle),
+                Err(error) => {
+                    // Nothing has been recorded yet, so the directory holds
+                    // only the manifest; leaving it would look like a take.
+                    let _ = std::fs::remove_dir_all(directory);
+                    return Err(error.context("this session asked for video"));
                 }
             }
-            (false, _) | (true, None) => None,
-        };
+        }
 
         let (control, control_receiver) = mpsc::unbounded_channel();
         let guided_session_id = lease
@@ -750,12 +752,8 @@ impl CollectionManager {
         let session = RunningSession::new(
             Arc::clone(&self),
             session_id,
-            directory,
-            recorder,
-            emg_receiver,
-            session_device_id,
+            capture,
             control_receiver,
-            recording_handle,
             beatmap,
             track,
             rest_label,
@@ -994,7 +992,7 @@ impl Drop for CameraPreviewHold {
 /// Next frame from the session's device stream, or pend forever for a practice
 /// session (no device, so the EMG select arm simply never fires).
 async fn next_emg(
-    receiver: &mut Option<broadcast::Receiver<Frame>>,
+    receiver: Option<&mut broadcast::Receiver<Frame>>,
 ) -> Result<Frame, broadcast::error::RecvError> {
     match receiver {
         Some(receiver) => receiver.recv().await,
@@ -1076,18 +1074,75 @@ impl ActivityBaseline {
     }
 }
 
-/// A live session. The four device-shaped `Option`s below are all `None`
-/// together for a practice session: nothing records, nothing can stall, and
-/// every cue misses.
+/// Resources that exist together only when a physical device was acquired.
+/// Keeping them in one variant makes a half-recording session unrepresentable:
+/// practice cannot accidentally own a recorder, and recording cannot lose its
+/// EMG stream or destination while retaining the others.
+enum CaptureResources {
+    Practice,
+    Recording {
+        directory: PathBuf,
+        recorder: Box<FileSessionRecorder>,
+        emg_receiver: broadcast::Receiver<Frame>,
+        device_id: String,
+        video: Option<RecordingHandle>,
+    },
+}
+
+impl CaptureResources {
+    fn recorder_mut(&mut self) -> Option<&mut FileSessionRecorder> {
+        match self {
+            Self::Practice => None,
+            Self::Recording { recorder, .. } => Some(recorder.as_mut()),
+        }
+    }
+
+    fn recorder(&self) -> Option<&FileSessionRecorder> {
+        match self {
+            Self::Practice => None,
+            Self::Recording { recorder, .. } => Some(recorder.as_ref()),
+        }
+    }
+
+    fn emg_receiver_mut(&mut self) -> Option<&mut broadcast::Receiver<Frame>> {
+        match self {
+            Self::Practice => None,
+            Self::Recording { emg_receiver, .. } => Some(emg_receiver),
+        }
+    }
+
+    fn device_id(&self) -> &str {
+        match self {
+            Self::Practice => "",
+            Self::Recording { device_id, .. } => device_id,
+        }
+    }
+
+    fn directory(&self) -> Option<&PathBuf> {
+        match self {
+            Self::Practice => None,
+            Self::Recording { directory, .. } => Some(directory),
+        }
+    }
+
+    fn attach_video(&mut self, handle: RecordingHandle) {
+        match self {
+            Self::Practice => unreachable!("practice sessions never open video"),
+            Self::Recording { video, .. } => *video = Some(handle),
+        }
+    }
+
+    fn is_recording(&self) -> bool {
+        matches!(self, Self::Recording { .. })
+    }
+}
+
+/// A live session.
 struct RunningSession {
     manager: Arc<CollectionManager>,
     session_id: SessionId,
-    directory: Option<PathBuf>,
-    recorder: Option<FileSessionRecorder>,
-    emg_receiver: Option<broadcast::Receiver<Frame>>,
-    device_id: Option<String>,
+    capture: CaptureResources,
     control: mpsc::UnboundedReceiver<SessionControl>,
-    recording_handle: Option<RecordingHandle>,
     cues: Vec<CueState>,
     track: TrackInfo,
     /// `Some` on a rest track; the finalizer logs the played stretch.
@@ -1114,12 +1169,8 @@ impl RunningSession {
     fn new(
         manager: Arc<CollectionManager>,
         session_id: SessionId,
-        directory: Option<PathBuf>,
-        recorder: Option<FileSessionRecorder>,
-        emg_receiver: Option<broadcast::Receiver<Frame>>,
-        device_id: Option<String>,
+        capture: CaptureResources,
         control: mpsc::UnboundedReceiver<SessionControl>,
-        recording_handle: Option<RecordingHandle>,
         beatmap: Beatmap,
         track: TrackInfo,
         rest_label: Option<String>,
@@ -1143,12 +1194,8 @@ impl RunningSession {
         Self {
             manager,
             session_id,
-            directory,
-            recorder,
-            emg_receiver,
-            device_id,
+            capture,
             control,
-            recording_handle,
             cues,
             track,
             rest_label,
@@ -1187,7 +1234,7 @@ impl RunningSession {
                     Some(SessionControl::Finish) => break SessionExit::OperatorStopped,
                     None => break SessionExit::TaskFailed("collection control channel closed".into()),
                 },
-                frame = next_emg(&mut self.emg_receiver) => match frame {
+                frame = next_emg(self.capture.emg_receiver_mut()) => match frame {
                     Ok(Frame::Emg { seq, t0_us, channels, samples, missing, .. }) => {
                         self.ingest_window(seq, t0_us, channels, &samples, &missing);
                     }
@@ -1355,7 +1402,7 @@ impl RunningSession {
         };
         let Some(anchor) = self.anchor else { return };
         let at = anchor.at_track_position(track_position);
-        let device_id = self.device_id.clone().unwrap_or_default();
+        let device_id = self.capture.device_id().to_owned();
         self.interrupt_cues_in_progress(at);
         self.log_event(&SessionEvent::Paused {
             at,
@@ -1401,7 +1448,7 @@ impl RunningSession {
                     note_index: index,
                     at,
                 };
-                if let Some(recorder) = &mut self.recorder {
+                if let Some(recorder) = self.capture.recorder_mut() {
                     if let Err(error) = recorder.append_event(&event) {
                         tracing::warn!("failed to log the interrupted cue: {error:#}");
                     }
@@ -1460,7 +1507,7 @@ impl RunningSession {
     }
 
     fn log_event(&mut self, event: &SessionEvent) {
-        if let Some(recorder) = &mut self.recorder {
+        if let Some(recorder) = self.capture.recorder_mut() {
             if let Err(error) = recorder.append_event(event) {
                 tracing::warn!("failed to log {event:?}: {error:#}");
             }
@@ -1498,7 +1545,7 @@ impl RunningSession {
             }
             self.publish_state();
         }
-        if let Some(recorder) = &mut self.recorder {
+        if let Some(recorder) = self.capture.recorder_mut() {
             if let Err(error) = recorder.append_emg(EmgWindow {
                 seq,
                 t0_us,
@@ -1573,7 +1620,7 @@ impl RunningSession {
     /// device to fall silent.
     fn silence_past_threshold(&self, current: UnixMilliseconds) -> Option<DurationMilliseconds> {
         let last = self.last_window_at?;
-        self.emg_receiver.as_ref()?;
+        self.capture.is_recording().then_some(())?;
         let silent = current.since(last).get().max(0);
         (silent > STALL_THRESHOLD.as_millis() as i64)
             .then(|| DurationMilliseconds::new(silent.min(u32::MAX as i64) as u32))
@@ -1604,7 +1651,7 @@ impl RunningSession {
                     release: release_wall,
                 };
                 *self.cues_per_class.entry(cue.class_id.clone()).or_insert(0) += 1;
-                if let Some(recorder) = &mut self.recorder {
+                if let Some(recorder) = self.capture.recorder_mut() {
                     if let Err(error) = recorder.append_event(&event) {
                         tracing::warn!("failed to log cue: {error:#}");
                     }
@@ -1623,7 +1670,7 @@ impl RunningSession {
                         note_index: index,
                         at: current,
                     };
-                    if let Some(recorder) = &mut self.recorder {
+                    if let Some(recorder) = self.capture.recorder_mut() {
                         if let Err(error) = recorder.append_event(&event) {
                             tracing::warn!("failed to log activity hit: {error:#}");
                         }
@@ -1641,21 +1688,23 @@ impl RunningSession {
     fn poll_health(&mut self) {
         // A practice session records nothing; its EMG "stream" is honestly
         // reported as never advancing.
-        let emg = self.recorder.as_mut().map_or(
+        let emg = self.capture.recorder_mut().map_or(
             StreamProgress {
                 bytes_on_disk: 0,
                 advancing: false,
             },
             |recorder| recorder.health(),
         );
-        let video = self
-            .recording_handle
-            .as_ref()
-            .map(|handle| self.manager.video.lock().unwrap().health(handle));
+        let video = match &self.capture {
+            CaptureResources::Practice => None,
+            CaptureResources::Recording { video, .. } => video
+                .as_ref()
+                .map(|handle| self.manager.video.lock().unwrap().health(handle)),
+        };
         self.latest_health = RecordingHealth {
             emg,
             video,
-            recorded: self.recorder.as_ref().map(SessionRecorder::recorded_emg),
+            recorded: self.capture.recorder().map(SessionRecorder::recorded_emg),
         };
     }
 
@@ -1673,8 +1722,8 @@ impl RunningSession {
             }
         };
         let placement_photo = self
-            .directory
-            .as_ref()
+            .capture
+            .directory()
             .is_some_and(|directory| directory.join("placement.jpg").exists())
             .then(now);
         self.manager.publish(Frame::CollectionState {
@@ -1709,8 +1758,19 @@ impl RunningSession {
             });
         }
 
+        let capture = std::mem::replace(&mut self.capture, CaptureResources::Practice);
+        let (directory, recorder, video_handle) = match capture {
+            CaptureResources::Practice => (None, None, None),
+            CaptureResources::Recording {
+                directory,
+                recorder,
+                video,
+                ..
+            } => (Some(directory), Some(recorder), video),
+        };
+
         // Video first, off the runtime: stop_recording can block up to 5 s.
-        let video_report: Option<VideoReport> = match self.recording_handle.take() {
+        let video_report: Option<VideoReport> = match video_handle {
             Some(handle) => {
                 let video = Arc::clone(&self.manager.video);
                 match tokio::task::spawn_blocking(move || {
@@ -1746,7 +1806,7 @@ impl RunningSession {
                 detail: report.detail.clone(),
             });
         }
-        if let Some(directory) = &self.directory {
+        if let Some(directory) = &directory {
             if let Ok(metadata) = std::fs::metadata(directory.join("placement.jpg")) {
                 files.push(FileReport {
                     name: "placement.jpg".into(),
@@ -1760,8 +1820,7 @@ impl RunningSession {
             cues_per_class: self.cues_per_class.clone(),
             activity_hits: self.activity_hits,
             files,
-            emg_gap_count: self
-                .recorder
+            emg_gap_count: recorder
                 .as_ref()
                 .map_or(0, |recorder| recorder.emg_gap_count()),
             video_start_offset: video_report.map(|report| report.start_offset),
@@ -1771,8 +1830,8 @@ impl RunningSession {
         // SessionEnd event's summary carries video/photo files; the frame the
         // summary screen renders carries all of them. A practice session has no
         // recorder and reports no files.
-        if let Some(recorder) = self.recorder.take() {
-            match Box::new(recorder).finish(&summary) {
+        if let Some(recorder) = recorder {
+            match recorder.finish(&summary) {
                 Ok(recorder_reports) => {
                     let mut all = recorder_reports;
                     all.append(&mut summary.files);
@@ -1788,7 +1847,7 @@ impl RunningSession {
         {
             let mut state = self.manager.state.lock().unwrap();
             state.phase = Phase::Reviewing {
-                directory: self.directory.clone(),
+                directory: directory.clone(),
             };
         }
         self.manager.publish(Frame::CollectionState {
