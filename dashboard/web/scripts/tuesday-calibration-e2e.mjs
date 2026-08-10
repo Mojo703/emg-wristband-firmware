@@ -91,19 +91,19 @@ async function main() {
 
   // The timing UI’s exact intent sequence and device-authoritative transitions.
   await waitFor('initial timing snapshot', frame => frame.type === 'calibration_timing_status');
-  await waitFor('five clock probes', () => timing?.probe_window?.sample_count >= 5, 25_000);
+  await waitFor('five clock probes', () => timing?.estimate?.availability === 'measured' && timing.estimate.sample_count >= 5, 25_000);
   send({ type: 'calibration_timing_intent', intent: { name: 'start' } });
-  await waitFor('Timing Starting', frame => frame.type === 'calibration_timing_status' && frame.status.state === 'starting');
+  await waitFor('Timing Starting', frame => frame.type === 'calibration_timing_status' && frame.status.phase.state === 'starting');
   const colors = new Set();
   while (colors.size < 3) {
     const frame = await waitFor('device-authoritative Timing Running colour', candidate =>
-      candidate.type === 'calibration_timing_status' && candidate.status.state === 'running', 8_000);
-    colors.add(frame.status.color);
+      candidate.type === 'calibration_timing_status' && candidate.status.phase.state === 'running', 8_000);
+    colors.add(frame.status.phase.observation.color);
   }
   if (!['red', 'green', 'blue'].every(color => colors.has(color))) fail('timing did not emit RGB cycle');
   send({ type: 'calibration_timing_intent', intent: { name: 'stop' } });
-  await waitFor('Timing Stopping', frame => frame.type === 'calibration_timing_status' && frame.status.state === 'stopping');
-  await waitFor('device-authoritative Timing Stopped', frame => frame.type === 'calibration_timing_status' && frame.status.state === 'stopped');
+  await waitFor('Timing Stopping', frame => frame.type === 'calibration_timing_status' && frame.status.phase.state === 'stopping');
+  await waitFor('device-authoritative Timing Stopped', frame => frame.type === 'calibration_timing_status' && frame.status.phase.state === 'stopped');
 
   // The same visibility and guided intents emitted by GuidedCalibrationView.
   // Discard retained setup snapshots that arrived before this socket declared

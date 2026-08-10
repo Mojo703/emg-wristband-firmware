@@ -1372,20 +1372,22 @@ mod decision_pipeline_tests {
         ] {
             let observed = anchor + elapsed_milliseconds * 1_000;
             let status = feedback::timing_loop_status(Some(anchor), observed);
-            assert_eq!(status.state, protocol::CalibrationTimingState::Running);
-            assert_eq!(status.color, expected_color);
-            assert_eq!(status.anchor_device_monotonic_microseconds, anchor);
-            assert_eq!(status.observed_device_monotonic_microseconds, observed);
-            assert!(status.color_elapsed_milliseconds < 500);
+            let protocol::CalibrationTimingLoopStatus::Running { observation } = status else {
+                panic!("running loop reported stopped")
+            };
+            assert_eq!(observation.color, expected_color);
+            assert_eq!(observation.anchor_device_monotonic_microseconds, anchor);
+            assert_eq!(observation.observed_device_monotonic_microseconds, observed);
+            assert!(observation.color_elapsed_milliseconds < 500);
         }
 
         let stopped = feedback::timing_loop_status(None, anchor + 1_500_000);
-        assert_eq!(stopped.state, protocol::CalibrationTimingState::Stopped);
-        assert_eq!(stopped.color_elapsed_milliseconds, 0);
-        assert_eq!(
-            stopped.observed_device_monotonic_microseconds,
-            anchor + 1_500_000
-        );
+        assert!(matches!(
+            stopped,
+            protocol::CalibrationTimingLoopStatus::Stopped {
+                observed_device_monotonic_microseconds
+            } if observed_device_monotonic_microseconds == anchor + 1_500_000
+        ));
     }
 
     #[test]

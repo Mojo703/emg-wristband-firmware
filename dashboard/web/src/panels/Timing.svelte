@@ -21,6 +21,12 @@
   const running = $derived(display.running);
   const timingState = $derived(display.state);
   const qualityWarning = $derived(timingQualityWarning(status));
+  const measured = $derived(status?.estimate.availability === 'measured' ? status.estimate : null);
+  const totalCorrection = $derived(
+    measured === null || status === null
+      ? null
+      : measured.automatic_offset_milliseconds + status.manual_trim_milliseconds,
+  );
 
   function adjust(delta: 5 | -5 | 50 | -50): void {
     api.timing({ name: 'adjust_host_timeline', delta_milliseconds: asOffsetMilliseconds(delta) });
@@ -90,18 +96,18 @@
   </section>
 
   <section class="card metrics" aria-label="Timing measurements">
-    <div><span>Median RTT</span><strong>{milliseconds(status?.median_round_trip_milliseconds)}</strong></div>
-    <div><span>RTT spread</span><strong>{milliseconds(status?.round_trip_spread_milliseconds)}</strong></div>
-    <div><span>Automatic estimate</span><strong>{milliseconds(status?.automatic_offset_milliseconds)}</strong></div>
+    <div><span>Median RTT</span><strong>{milliseconds(measured?.median_round_trip_milliseconds)}</strong></div>
+    <div><span>RTT spread</span><strong>{milliseconds(measured?.round_trip_spread_milliseconds)}</strong></div>
+    <div><span>Automatic estimate</span><strong>{milliseconds(measured?.automatic_offset_milliseconds)}</strong></div>
     <div><span>Manual trim</span><strong>{milliseconds(status?.manual_trim_milliseconds ?? 0)}</strong></div>
-    <div><span>Total correction</span><strong>{milliseconds(status?.total_correction_milliseconds)}</strong></div>
-    <div><span>Probe window</span><strong>{status === null ? '—' : `${status.probe_window.sample_count}/${status.probe_window.capacity}`}</strong></div>
+    <div><span>Total correction</span><strong>{milliseconds(totalCorrection)}</strong></div>
+    <div><span>Probe window</span><strong>{status === null ? '—' : `${status.estimate.availability === 'measured' ? status.estimate.sample_count : 0}/${status.estimate.capacity}`}</strong></div>
   </section>
   {#if qualityWarning !== null}
     <p class="warn" role="status">{qualityWarning}</p>
   {/if}
-  {#if status?.state === 'error' && status.error_detail !== null}
-    <p class="warn" role="alert">{status.error_detail}</p>
+  {#if status?.phase.state === 'error'}
+    <p class="warn" role="alert">{status.phase.detail}</p>
   {/if}
   <p class="muted footnote">Timing state is volatile and retained per device only while this dashboard process runs. Persistence is intentionally deferred.</p>
 {/if}

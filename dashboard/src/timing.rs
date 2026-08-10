@@ -6,8 +6,8 @@
 //! deferred for the Tuesday path.
 
 use protocol::{
-    CalibrationTimingColor, CalibrationTimingIntent, CalibrationTimingLoopStatus,
-    CalibrationTimingProbeWindow, CalibrationTimingState, CalibrationTimingStatus, Frame,
+    CalibrationTimingEstimate, CalibrationTimingIntent, CalibrationTimingLoopStatus,
+    CalibrationTimingObservation, CalibrationTimingPhase, CalibrationTimingStatus, Frame,
     OffsetMilliseconds, CALIBRATION_TIMING_MANUAL_TRIM_LIMIT_MILLISECONDS,
     CALIBRATION_TIMING_PROBE_WINDOW_CAPACITY,
 };
@@ -31,13 +31,13 @@ struct ProbeSample {
 enum TimingLoopPhase {
     Stopped,
     Starting,
-    Running(CalibrationTimingLoopStatus),
+    Running(CalibrationTimingObservation),
     Stopping {
-        last_observation: CalibrationTimingLoopStatus,
+        last_observation: CalibrationTimingObservation,
     },
     Error {
         detail: String,
-        last_observation: Option<CalibrationTimingLoopStatus>,
+        last_observation: Option<CalibrationTimingObservation>,
     },
 }
 
@@ -198,18 +198,11 @@ impl TimingService {
         status: CalibrationTimingLoopStatus,
     ) -> Frame {
         self.with_device(device_id, |timing| {
-            timing.loop_phase = match status.state {
-                CalibrationTimingState::Running => TimingLoopPhase::Running(status),
-                CalibrationTimingState::Stopped => TimingLoopPhase::Stopped,
-                // The firmware's status is an acknowledgement, never a
-                // request. If it emits a backend-only transient state, retain
-                // its last observation but make the contract failure visible.
-                CalibrationTimingState::Starting
-                | CalibrationTimingState::Stopping
-                | CalibrationTimingState::Error => TimingLoopPhase::Error {
-                    detail: "device emitted a non-acknowledgement timing state".into(),
-                    last_observation: Some(status),
-                },
+            timing.loop_phase = match status {
+                CalibrationTimingLoopStatus::Running { observation } => {
+                    TimingLoopPhase::Running(observation)
+                }
+                CalibrationTimingLoopStatus::Stopped { .. } => TimingLoopPhase::Stopped,
             };
             Frame::CalibrationTimingStatus {
                 status: timing.status(),
@@ -364,68 +357,44 @@ impl TimingOffsets {
             let spread = rtts.last().unwrap() - rtts.first().unwrap();
             (Some(median), Some(rtt), Some(spread))
         };
-        let total = automatic_offset.map(|automatic| automatic + self.manual_trim_milliseconds);
-        let (state, color, elapsed, anchor, error_detail) = match &self.loop_phase {
-            TimingLoopPhase::Stopped => (
-                CalibrationTimingState::Stopped,
-                CalibrationTimingColor::Red,
-                0,
-                None,
-                None,
-            ),
-            TimingLoopPhase::Starting => (
-                CalibrationTimingState::Starting,
-                CalibrationTimingColor::Red,
-                0,
-                None,
-                None,
-            ),
-            TimingLoopPhase::Running(status) => (
-                CalibrationTimingState::Running,
-                status.color,
-                status.color_elapsed_milliseconds,
-                Some(status.anchor_device_monotonic_microseconds),
-                None,
-            ),
-            TimingLoopPhase::Stopping { last_observation } => (
-                CalibrationTimingState::Stopping,
-                last_observation.color,
-                last_observation.color_elapsed_milliseconds,
-                Some(last_observation.anchor_device_monotonic_microseconds),
-                None,
-            ),
+        let phase = match &self.loop_phase {
+            TimingLoopPhase::Stopped => CalibrationTimingPhase::Stopped,
+            TimingLoopPhase::Starting => CalibrationTimingPhase::Starting,
+            TimingLoopPhase::Running(observation) => CalibrationTimingPhase::Running {
+                observation: *observation,
+            },
+            TimingLoopPhase::Stopping { last_observation } => CalibrationTimingPhase::Stopping {
+                last_observation: *last_observation,
+            },
             TimingLoopPhase::Error {
                 detail,
                 last_observation,
-            } => (
-                CalibrationTimingState::Error,
-                last_observation.map_or(CalibrationTimingColor::Red, |status| status.color),
-                last_observation.map_or(0, |status| status.color_elapsed_milliseconds),
-                last_observation.map(|status| status.anchor_device_monotonic_microseconds),
-                Some(detail.clone()),
-            ),
+            } => CalibrationTimingPhase::Error {
+                detail: detail.clone(),
+                last_observation: *last_observation,
+            },
         };
-        CalibrationTimingStatus {
-            state,
-            color,
-            color_elapsed_milliseconds: elapsed,
-            anchor_device_monotonic_microseconds: anchor,
-            automatic_offset_milliseconds: automatic_offset.map(OffsetMilliseconds::new),
-            median_round_trip_milliseconds: median_rtt
-                .map(|v| protocol::DurationMilliseconds::new(v as u32)),
-            round_trip_spread_milliseconds: spread
-                .map(|v| protocol::DurationMilliseconds::new(v as u32)),
-            manual_trim_milliseconds: OffsetMilliseconds::new(self.manual_trim_milliseconds),
-            total_correction_milliseconds: total.map(OffsetMilliseconds::new),
-            probe_window: CalibrationTimingProbeWindow {
+        let estimate = match (automatic_offset, median_rtt, spread) {
+            (Some(automatic), Some(rtt), Some(spread)) => CalibrationTimingEstimate::Measured {
+                automatic_offset_milliseconds: OffsetMilliseconds::new(automatic),
+                median_round_trip_milliseconds: protocol::DurationMilliseconds::new(rtt as u32),
+                round_trip_spread_milliseconds: protocol::DurationMilliseconds::new(spread as u32),
                 sample_count: self.samples.len() as u8,
                 capacity: CALIBRATION_TIMING_PROBE_WINDOW_CAPACITY,
             },
-            error_detail,
+            (None, None, None) => CalibrationTimingEstimate::NoSamples {
+                capacity: CALIBRATION_TIMING_PROBE_WINDOW_CAPACITY,
+            },
+            _ => unreachable!("timing estimate statistics are computed atomically"),
+        };
+        CalibrationTimingStatus {
+            phase,
+            estimate,
+            manual_trim_milliseconds: OffsetMilliseconds::new(self.manual_trim_milliseconds),
         }
     }
 
-    fn last_observation(&self) -> Option<CalibrationTimingLoopStatus> {
+    fn last_observation(&self) -> Option<CalibrationTimingObservation> {
         match &self.loop_phase {
             TimingLoopPhase::Running(status) => Some(*status),
             TimingLoopPhase::Stopping { last_observation } => Some(*last_observation),
@@ -475,6 +444,18 @@ fn unix_milliseconds() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use protocol::CalibrationTimingColor;
+
+    fn measured_offset(status: &CalibrationTimingStatus) -> i64 {
+        let CalibrationTimingEstimate::Measured {
+            automatic_offset_milliseconds,
+            ..
+        } = status.estimate
+        else {
+            panic!("expected a measured timing estimate")
+        };
+        automatic_offset_milliseconds.get()
+    }
 
     fn record_residual_probe(
         service: &TimingService,
@@ -503,9 +484,12 @@ mod tests {
         let Frame::CalibrationTimingStatus { status } = frame else {
             panic!()
         };
-        assert_eq!(status.automatic_offset_milliseconds.unwrap().get(), 20);
+        assert_eq!(measured_offset(&status), 20);
         assert_eq!(status.manual_trim_milliseconds.get(), 50);
-        assert_eq!(status.total_correction_milliseconds.unwrap().get(), 70);
+        assert_eq!(
+            measured_offset(&status) + status.manual_trim_milliseconds.get(),
+            70
+        );
     }
 
     #[test]
@@ -547,8 +531,11 @@ mod tests {
         let Frame::CalibrationTimingStatus { status } = service.status("opal") else {
             panic!()
         };
-        assert_eq!(status.automatic_offset_milliseconds.unwrap().get(), 0);
-        assert_eq!(status.total_correction_milliseconds.unwrap().get(), 0);
+        assert_eq!(measured_offset(&status), 0);
+        assert_eq!(
+            measured_offset(&status) + status.manual_trim_milliseconds.get(),
+            0
+        );
     }
 
     #[test]
@@ -575,7 +562,7 @@ mod tests {
         let Frame::CalibrationTimingStatus { status } = service.status("opal") else {
             panic!()
         };
-        assert_eq!(status.automatic_offset_milliseconds.unwrap().get(), 0);
+        assert_eq!(measured_offset(&status), 0);
         assert_eq!(status.manual_trim_milliseconds.get(), 50);
         let expected_host = service
             .host_wall_minus_monotonic_milliseconds
@@ -593,24 +580,32 @@ mod tests {
         let anchor = 10_000_000;
         let Frame::CalibrationTimingStatus { status } = service.observe_loop_status(
             "opal",
-            CalibrationTimingLoopStatus {
-                state: CalibrationTimingState::Running,
-                color: CalibrationTimingColor::Green,
-                color_elapsed_milliseconds: 100,
-                anchor_device_monotonic_microseconds: anchor,
-                observed_device_monotonic_microseconds: anchor + 600_000,
+            CalibrationTimingLoopStatus::Running {
+                observation: CalibrationTimingObservation {
+                    color: CalibrationTimingColor::Green,
+                    color_elapsed_milliseconds: 100,
+                    anchor_device_monotonic_microseconds: anchor,
+                    observed_device_monotonic_microseconds: anchor + 600_000,
+                },
             },
         ) else {
             panic!()
         };
-        assert_eq!(status.state, CalibrationTimingState::Running);
-        assert_eq!(status.color, CalibrationTimingColor::Green);
-        assert_eq!(status.color_elapsed_milliseconds, 100);
+        assert!(matches!(
+            status.phase,
+            CalibrationTimingPhase::Running {
+                observation: CalibrationTimingObservation {
+                    color: CalibrationTimingColor::Green,
+                    color_elapsed_milliseconds: 100,
+                    ..
+                }
+            }
+        ));
 
         let Frame::CalibrationTimingStatus { status } = service.reset_loop("opal") else {
             panic!()
         };
-        assert_eq!(status.state, CalibrationTimingState::Stopped);
+        assert!(matches!(status.phase, CalibrationTimingPhase::Stopped));
     }
 
     #[test]
@@ -657,7 +652,7 @@ mod tests {
         else {
             panic!()
         };
-        assert_eq!(status.state, CalibrationTimingState::Starting);
+        assert!(matches!(status.phase, CalibrationTimingPhase::Starting));
         assert!(matches!(
             service.intent("opal", CalibrationTimingIntent::Start),
             Err(TimingTransitionError::StartRequiresStopped)
@@ -669,12 +664,13 @@ mod tests {
         let service = TimingService::new();
         let _ = service.observe_loop_status(
             "opal",
-            CalibrationTimingLoopStatus {
-                state: CalibrationTimingState::Running,
-                color: CalibrationTimingColor::Red,
-                color_elapsed_milliseconds: 0,
-                anchor_device_monotonic_microseconds: 1,
-                observed_device_monotonic_microseconds: 1,
+            CalibrationTimingLoopStatus::Running {
+                observation: CalibrationTimingObservation {
+                    color: CalibrationTimingColor::Red,
+                    color_elapsed_milliseconds: 0,
+                    anchor_device_monotonic_microseconds: 1,
+                    observed_device_monotonic_microseconds: 1,
+                },
             },
         );
         let (frame, _) = service
@@ -683,26 +679,28 @@ mod tests {
         let Frame::CalibrationTimingStatus { status } = frame else {
             panic!()
         };
-        assert_eq!(status.state, CalibrationTimingState::Running);
+        assert!(matches!(
+            status.phase,
+            CalibrationTimingPhase::Running { .. }
+        ));
         let Frame::CalibrationTimingStatus { status } =
             service.control_delivered("opal", CalibrationTimingIntent::Stop)
         else {
             panic!()
         };
-        assert_eq!(status.state, CalibrationTimingState::Stopping);
+        assert!(matches!(
+            status.phase,
+            CalibrationTimingPhase::Stopping { .. }
+        ));
         let Frame::CalibrationTimingStatus { status } = service.observe_loop_status(
             "opal",
-            CalibrationTimingLoopStatus {
-                state: CalibrationTimingState::Stopped,
-                color: CalibrationTimingColor::Red,
-                color_elapsed_milliseconds: 0,
-                anchor_device_monotonic_microseconds: 0,
+            CalibrationTimingLoopStatus::Stopped {
                 observed_device_monotonic_microseconds: 2,
             },
         ) else {
             panic!()
         };
-        assert_eq!(status.state, CalibrationTimingState::Stopped);
+        assert!(matches!(status.phase, CalibrationTimingPhase::Stopped));
     }
 
     #[test]
@@ -713,24 +711,27 @@ mod tests {
         else {
             panic!()
         };
-        assert_eq!(status.state, CalibrationTimingState::Error);
-        assert_eq!(
-            status.error_detail.as_deref(),
-            Some("exact connection token is stale")
-        );
+        assert!(matches!(
+            status.phase,
+            CalibrationTimingPhase::Error { ref detail, last_observation: None }
+                if detail == "exact connection token is stale"
+        ));
         let Frame::CalibrationTimingStatus { status } = service.observe_loop_status(
             "opal",
-            CalibrationTimingLoopStatus {
-                state: CalibrationTimingState::Running,
-                color: CalibrationTimingColor::Blue,
-                color_elapsed_milliseconds: 25,
-                anchor_device_monotonic_microseconds: 1,
-                observed_device_monotonic_microseconds: 1,
+            CalibrationTimingLoopStatus::Running {
+                observation: CalibrationTimingObservation {
+                    color: CalibrationTimingColor::Blue,
+                    color_elapsed_milliseconds: 25,
+                    anchor_device_monotonic_microseconds: 1,
+                    observed_device_monotonic_microseconds: 1,
+                },
             },
         ) else {
             panic!()
         };
-        assert_eq!(status.state, CalibrationTimingState::Running);
-        assert_eq!(status.error_detail, None);
+        assert!(matches!(
+            status.phase,
+            CalibrationTimingPhase::Running { .. }
+        ));
     }
 }

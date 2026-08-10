@@ -46,17 +46,24 @@ test('replacement browser mirrors expose bounded integer timing state', () => {
   const status = asIncomingFrame({
     type: 'calibration_timing_status',
     status: {
-      state: 'running',
-      color: 'blue',
-      color_elapsed_milliseconds: 499,
-      anchor_device_monotonic_microseconds: 100,
-      automatic_offset_milliseconds: asOffsetMilliseconds(-2147483648),
-      median_round_trip_milliseconds: asDurationMilliseconds(12),
-      round_trip_spread_milliseconds: asDurationMilliseconds(4),
+      phase: {
+        state: 'running',
+        observation: {
+          color: 'blue',
+          color_elapsed_milliseconds: 499,
+          anchor_device_monotonic_microseconds: 100,
+          observed_device_monotonic_microseconds: 101,
+        },
+      },
+      estimate: {
+        availability: 'measured',
+        automatic_offset_milliseconds: asOffsetMilliseconds(-2147483648),
+        median_round_trip_milliseconds: asDurationMilliseconds(12),
+        round_trip_spread_milliseconds: asDurationMilliseconds(4),
+        sample_count: 11,
+        capacity: 11,
+      },
       manual_trim_milliseconds: asOffsetMilliseconds(-1000),
-      total_correction_milliseconds: asOffsetMilliseconds(-2147484648),
-      probe_window: { sample_count: 11, capacity: 11 },
-      error_detail: null,
     },
   });
   assert.equal(status?.type, 'calibration_timing_status');
@@ -64,21 +71,61 @@ test('replacement browser mirrors expose bounded integer timing state', () => {
     asIncomingFrame({
       type: 'calibration_timing_status',
       status: {
-        state: 'running',
-        color: 'red',
-        color_elapsed_milliseconds: 500,
-        anchor_device_monotonic_microseconds: null,
-        automatic_offset_milliseconds: null,
-        median_round_trip_milliseconds: null,
-        round_trip_spread_milliseconds: null,
+        phase: { state: 'running' },
+        estimate: { availability: 'no_samples', capacity: 11 },
         manual_trim_milliseconds: 1001,
-        total_correction_milliseconds: null,
-        probe_window: { sample_count: 12, capacity: 11 },
-        error_detail: null,
       },
     }),
     null,
   );
+});
+
+test('timing wire guard rejects every formerly nullable invalid combination', () => {
+  const valid = {
+    type: 'calibration_timing_status',
+    status: {
+      phase: { state: 'stopped' },
+      estimate: { availability: 'no_samples', capacity: 11 },
+      manual_trim_milliseconds: 0,
+    },
+  };
+  assert.equal(asIncomingFrame(valid)?.type, 'calibration_timing_status');
+
+  const invalidStatuses = [
+    { ...valid.status, phase: { state: 'running' } },
+    { ...valid.status, phase: { state: 'stopping', last_observation: null } },
+    { ...valid.status, phase: { state: 'error', detail: '', last_observation: null } },
+    {
+      ...valid.status,
+      phase: {
+        state: 'stopped',
+        observation: {
+          color: 'red',
+          color_elapsed_milliseconds: 0,
+          anchor_device_monotonic_microseconds: 1,
+          observed_device_monotonic_microseconds: 1,
+        },
+      },
+    },
+    {
+      ...valid.status,
+      estimate: { availability: 'no_samples', sample_count: 0, capacity: 11 },
+    },
+    {
+      ...valid.status,
+      estimate: {
+        availability: 'measured',
+        automatic_offset_milliseconds: 0,
+        median_round_trip_milliseconds: 0,
+        round_trip_spread_milliseconds: 0,
+        sample_count: 0,
+        capacity: 11,
+      },
+    },
+  ];
+  for (const status of invalidStatuses) {
+    assert.equal(asIncomingFrame({ type: 'calibration_timing_status', status }), null);
+  }
 });
 
 test('schedule acceptance echoes whole-song identity and candidate state', () => {

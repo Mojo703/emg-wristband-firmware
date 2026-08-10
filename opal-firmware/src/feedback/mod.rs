@@ -35,7 +35,7 @@ use haptics::{Haptics, Playback};
 use led::{Color, IndicatorLed, Shape};
 use log::{info, warn};
 use protocol::{
-    CalibrationTimingColor, CalibrationTimingLoopStatus, CalibrationTimingState,
+    CalibrationTimingColor, CalibrationTimingLoopStatus, CalibrationTimingObservation,
     CALIBRATION_TIMING_COLOR_PHASE_MILLISECONDS,
 };
 use std::sync::{Arc, Mutex};
@@ -219,11 +219,7 @@ pub(crate) fn timing_loop_status(
     observed_device_monotonic_microseconds: u64,
 ) -> CalibrationTimingLoopStatus {
     let Some(anchor_device_monotonic_microseconds) = anchor_device_monotonic_microseconds else {
-        return CalibrationTimingLoopStatus {
-            state: CalibrationTimingState::Stopped,
-            color: CalibrationTimingColor::Red,
-            color_elapsed_milliseconds: 0,
-            anchor_device_monotonic_microseconds: 0,
+        return CalibrationTimingLoopStatus::Stopped {
             observed_device_monotonic_microseconds,
         };
     };
@@ -236,17 +232,21 @@ pub(crate) fn timing_loop_status(
         1 => CalibrationTimingColor::Green,
         _ => CalibrationTimingColor::Blue,
     };
-    CalibrationTimingLoopStatus {
-        state: CalibrationTimingState::Running,
-        color,
-        color_elapsed_milliseconds: ((elapsed % phase_microseconds) / 1_000) as u32,
-        anchor_device_monotonic_microseconds,
-        observed_device_monotonic_microseconds,
+    CalibrationTimingLoopStatus::Running {
+        observation: CalibrationTimingObservation {
+            color,
+            color_elapsed_milliseconds: ((elapsed % phase_microseconds) / 1_000) as u32,
+            anchor_device_monotonic_microseconds,
+            observed_device_monotonic_microseconds,
+        },
     }
 }
 
 fn timing_color(status: CalibrationTimingLoopStatus) -> Color {
-    match status.color {
+    let CalibrationTimingLoopStatus::Running { observation } = status else {
+        return Color::OFF;
+    };
+    match observation.color {
         CalibrationTimingColor::Red => Color::RED,
         CalibrationTimingColor::Green => Color::GREEN,
         CalibrationTimingColor::Blue => Color::BLUE,
@@ -618,15 +618,27 @@ mod tests {
         let anchor = 10_000_000;
         let observed =
             |milliseconds: u64| timing_loop_status(Some(anchor), anchor + milliseconds * 1_000);
-        assert_eq!(observed(0).color, CalibrationTimingColor::Red);
-        assert_eq!(observed(499).color, CalibrationTimingColor::Red);
-        assert_eq!(observed(500).color, CalibrationTimingColor::Green);
-        assert_eq!(observed(1_000).color, CalibrationTimingColor::Blue);
-        assert_eq!(observed(1_500).color, CalibrationTimingColor::Red);
-        assert_eq!(observed(1_999).color_elapsed_milliseconds, 499);
-        assert_eq!(
-            timing_loop_status(None, anchor).state,
-            CalibrationTimingState::Stopped
-        );
+        let color = |milliseconds| match observed(milliseconds) {
+            CalibrationTimingLoopStatus::Running { observation } => observation.color,
+            CalibrationTimingLoopStatus::Stopped { .. } => panic!("loop unexpectedly stopped"),
+        };
+        assert_eq!(color(0), CalibrationTimingColor::Red);
+        assert_eq!(color(499), CalibrationTimingColor::Red);
+        assert_eq!(color(500), CalibrationTimingColor::Green);
+        assert_eq!(color(1_000), CalibrationTimingColor::Blue);
+        assert_eq!(color(1_500), CalibrationTimingColor::Red);
+        assert!(matches!(
+            observed(1_999),
+            CalibrationTimingLoopStatus::Running {
+                observation: CalibrationTimingObservation {
+                    color_elapsed_milliseconds: 499,
+                    ..
+                }
+            }
+        ));
+        assert!(matches!(
+            timing_loop_status(None, anchor),
+            CalibrationTimingLoopStatus::Stopped { .. }
+        ));
     }
 }

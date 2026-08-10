@@ -1140,56 +1140,76 @@ pub enum CalibrationTimingColor {
     Blue,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CalibrationTimingState {
-    Stopped,
-    /// The backend delivered Start on the exact selected connection and waits
-    /// for the device-owned Running acknowledgement.
-    Starting,
-    Running,
-    /// The backend delivered Stop on the exact selected connection and waits
-    /// for the device-owned Stopped acknowledgement.
-    Stopping,
-    /// Delivery or an impossible device acknowledgement failed. `detail` is
-    /// carried by the browser projection, never guessed by the frontend.
-    Error,
-}
-
 /// The device's own fixed RGB-loop observation. `anchor` is the instant the
 /// current red → green → blue cycle began; colour and elapsed are sampled at
 /// `observed_device_monotonic_microseconds`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CalibrationTimingLoopStatus {
-    pub state: CalibrationTimingState,
+#[serde(deny_unknown_fields)]
+pub struct CalibrationTimingObservation {
     pub color: CalibrationTimingColor,
     pub color_elapsed_milliseconds: u32,
     pub anchor_device_monotonic_microseconds: u64,
     pub observed_device_monotonic_microseconds: u64,
 }
 
-/// Bounded state of the rolling automatic timing estimate. The samples stay in
-/// the dashboard process; this projection intentionally exposes only enough to
-/// explain how much evidence the median contains.
+/// The device can report either an idle loop or a complete running
+/// observation. A stopped report cannot accidentally carry a stale colour or
+/// anchor, and a running report cannot omit either.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CalibrationTimingProbeWindow {
-    pub sample_count: u8,
-    pub capacity: u8,
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CalibrationTimingLoopStatus {
+    Stopped {
+        observed_device_monotonic_microseconds: u64,
+    },
+    Running {
+        observation: CalibrationTimingObservation,
+    },
+}
+
+/// Browser-facing device-loop lifecycle. Phase-specific evidence lives in the
+/// variant that requires it rather than in nullable sibling fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CalibrationTimingPhase {
+    Stopped,
+    Starting,
+    Running {
+        observation: CalibrationTimingObservation,
+    },
+    Stopping {
+        last_observation: CalibrationTimingObservation,
+    },
+    Error {
+        detail: String,
+        last_observation: Option<CalibrationTimingObservation>,
+    },
+}
+
+/// Bounded state of the rolling automatic timing estimate. There is no
+/// half-populated estimate: all statistics appear together after the first
+/// sample. Total correction is deliberately derived by consumers from the
+/// automatic offset and the orthogonal operator trim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "availability", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CalibrationTimingEstimate {
+    NoSamples {
+        capacity: u8,
+    },
+    Measured {
+        automatic_offset_milliseconds: OffsetMilliseconds,
+        median_round_trip_milliseconds: DurationMilliseconds,
+        round_trip_spread_milliseconds: DurationMilliseconds,
+        sample_count: u8,
+        capacity: u8,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CalibrationTimingStatus {
-    pub state: CalibrationTimingState,
-    pub color: CalibrationTimingColor,
-    pub color_elapsed_milliseconds: u32,
-    pub anchor_device_monotonic_microseconds: Option<u64>,
-    pub automatic_offset_milliseconds: Option<OffsetMilliseconds>,
-    pub median_round_trip_milliseconds: Option<DurationMilliseconds>,
-    pub round_trip_spread_milliseconds: Option<DurationMilliseconds>,
+    pub phase: CalibrationTimingPhase,
+    pub estimate: CalibrationTimingEstimate,
     pub manual_trim_milliseconds: OffsetMilliseconds,
-    pub total_correction_milliseconds: Option<OffsetMilliseconds>,
-    pub probe_window: CalibrationTimingProbeWindow,
-    pub error_detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -4273,20 +4293,22 @@ mod tests {
         let run = run_key();
         let timing = Frame::CalibrationTimingStatus {
             status: CalibrationTimingStatus {
-                state: CalibrationTimingState::Running,
-                color: CalibrationTimingColor::Blue,
-                color_elapsed_milliseconds: 499,
-                anchor_device_monotonic_microseconds: Some(u64::MAX),
-                automatic_offset_milliseconds: Some(OffsetMilliseconds::new(i64::MIN)),
-                median_round_trip_milliseconds: Some(DurationMilliseconds::new(u32::MAX)),
-                round_trip_spread_milliseconds: Some(DurationMilliseconds::new(u32::MAX)),
-                manual_trim_milliseconds: OffsetMilliseconds::new(i64::MAX),
-                total_correction_milliseconds: Some(OffsetMilliseconds::new(i64::MAX)),
-                probe_window: CalibrationTimingProbeWindow {
+                phase: CalibrationTimingPhase::Running {
+                    observation: CalibrationTimingObservation {
+                        color: CalibrationTimingColor::Blue,
+                        color_elapsed_milliseconds: 499,
+                        anchor_device_monotonic_microseconds: u64::MAX,
+                        observed_device_monotonic_microseconds: u64::MAX,
+                    },
+                },
+                estimate: CalibrationTimingEstimate::Measured {
+                    automatic_offset_milliseconds: OffsetMilliseconds::new(i64::MIN),
+                    median_round_trip_milliseconds: DurationMilliseconds::new(u32::MAX),
+                    round_trip_spread_milliseconds: DurationMilliseconds::new(u32::MAX),
                     sample_count: CALIBRATION_TIMING_PROBE_WINDOW_CAPACITY,
                     capacity: CALIBRATION_TIMING_PROBE_WINDOW_CAPACITY,
                 },
-                error_detail: Some("delivery failed".into()),
+                manual_trim_milliseconds: OffsetMilliseconds::new(i64::MAX),
             },
         };
         assert_eq!(
@@ -4296,12 +4318,13 @@ mod tests {
 
         let frames = [
             Frame::CalibrationTimingLoopStatus {
-                status: CalibrationTimingLoopStatus {
-                    state: CalibrationTimingState::Running,
-                    color: CalibrationTimingColor::Red,
-                    color_elapsed_milliseconds: 0,
-                    anchor_device_monotonic_microseconds: 1,
-                    observed_device_monotonic_microseconds: u64::MAX,
+                status: CalibrationTimingLoopStatus::Running {
+                    observation: CalibrationTimingObservation {
+                        color: CalibrationTimingColor::Red,
+                        color_elapsed_milliseconds: 0,
+                        anchor_device_monotonic_microseconds: 1,
+                        observed_device_monotonic_microseconds: u64::MAX,
+                    },
                 },
             },
             Frame::CalibrationPreparationStatus {
@@ -4392,6 +4415,79 @@ mod tests {
                 core::mem::discriminant(&frame)
             );
         }
+    }
+
+    #[test]
+    fn timing_phase_wire_variants_carry_only_their_required_evidence() {
+        let observation = CalibrationTimingObservation {
+            color: CalibrationTimingColor::Green,
+            color_elapsed_milliseconds: 250,
+            anchor_device_monotonic_microseconds: 1,
+            observed_device_monotonic_microseconds: 2,
+        };
+        let phases = [
+            CalibrationTimingPhase::Stopped,
+            CalibrationTimingPhase::Starting,
+            CalibrationTimingPhase::Running { observation },
+            CalibrationTimingPhase::Stopping {
+                last_observation: observation,
+            },
+            CalibrationTimingPhase::Error {
+                detail: "delivery failed".into(),
+                last_observation: Some(observation),
+            },
+        ];
+        for phase in phases {
+            let expected_status = CalibrationTimingStatus {
+                phase,
+                estimate: CalibrationTimingEstimate::NoSamples {
+                    capacity: CALIBRATION_TIMING_PROBE_WINDOW_CAPACITY,
+                },
+                manual_trim_milliseconds: OffsetMilliseconds::new(0),
+            };
+            let frame = Frame::CalibrationTimingStatus {
+                status: expected_status.clone(),
+            };
+            let Frame::CalibrationTimingStatus { status } = roundtrip(&frame) else {
+                panic!("timing status decoded as another frame variant")
+            };
+            assert_eq!(status, expected_status);
+        }
+    }
+
+    #[test]
+    fn timing_wire_rejects_a_running_phase_without_its_observation() {
+        use ciborium::value::{Integer, Value};
+
+        let invalid = Value::Map(vec![
+            (
+                Value::Text("phase".into()),
+                Value::Map(vec![(
+                    Value::Text("state".into()),
+                    Value::Text("running".into()),
+                )]),
+            ),
+            (
+                Value::Text("estimate".into()),
+                Value::Map(vec![
+                    (
+                        Value::Text("availability".into()),
+                        Value::Text("no_samples".into()),
+                    ),
+                    (
+                        Value::Text("capacity".into()),
+                        Value::Integer(Integer::from(CALIBRATION_TIMING_PROBE_WINDOW_CAPACITY)),
+                    ),
+                ]),
+            ),
+            (
+                Value::Text("manual_trim_milliseconds".into()),
+                Value::Integer(Integer::from(0)),
+            ),
+        ]);
+        let mut bytes = alloc::vec![];
+        ciborium::ser::into_writer(&invalid, &mut bytes).unwrap();
+        assert!(ciborium::de::from_reader::<CalibrationTimingStatus, _>(&bytes[..]).is_err());
     }
 
     #[test]

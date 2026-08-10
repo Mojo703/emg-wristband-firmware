@@ -28,11 +28,18 @@ export function timingDisplayProjection(
   status: CalibrationTimingStatusFrame['status'] | null,
 ): TimingDisplayProjection {
   return {
-    state: status?.state ?? 'unknown',
-    running: status?.state === 'running',
+    state: status?.phase.state ?? 'unknown',
+    running: status?.phase.state === 'running',
     // No device acknowledgement means no colour claim. Stopping retains the
     // last observed device colour until the Stopped acknowledgement arrives.
-    color: status?.state === 'running' || status?.state === 'stopping' ? status.color : null,
+    color:
+      status?.phase.state === 'running'
+        ? status.phase.observation.color
+        : status?.phase.state === 'stopping'
+          ? status.phase.last_observation.color
+          : status?.phase.state === 'error'
+            ? status.phase.last_observation?.color ?? null
+            : null,
   };
 }
 
@@ -40,9 +47,10 @@ export function timingQualityWarning(
   status: CalibrationTimingStatusFrame['status'] | null,
 ): string | null {
   if (status === null) return null;
-  const rtt = status.median_round_trip_milliseconds;
-  const spread = status.round_trip_spread_milliseconds;
-  if ((rtt !== null && rtt > 50) || (spread !== null && spread > 50)) {
+  if (status.estimate.availability === 'no_samples') return null;
+  const rtt = status.estimate.median_round_trip_milliseconds;
+  const spread = status.estimate.round_trip_spread_milliseconds;
+  if (rtt > 50 || spread > 50) {
     return 'Probe timing is noisy; correction remains available, but repeat the window if the wearer sees drift.';
   }
   return null;

@@ -15,17 +15,16 @@ test('Timing Start is available only for an exact connected selection while idle
 
 test('high RTT or spread warns without gating timing', () => {
   const status = {
-    state: 'stopped' as const,
-    color: 'red' as const,
-    color_elapsed_milliseconds: 0,
-    anchor_device_monotonic_microseconds: null,
-    automatic_offset_milliseconds: asOffsetMilliseconds(3),
-    median_round_trip_milliseconds: asDurationMilliseconds(82),
-    round_trip_spread_milliseconds: asDurationMilliseconds(154),
+    phase: { state: 'stopped' as const },
+    estimate: {
+      availability: 'measured' as const,
+      automatic_offset_milliseconds: asOffsetMilliseconds(3),
+      median_round_trip_milliseconds: asDurationMilliseconds(82),
+      round_trip_spread_milliseconds: asDurationMilliseconds(154),
+      sample_count: 6,
+      capacity: 11 as const,
+    },
     manual_trim_milliseconds: asOffsetMilliseconds(0),
-    total_correction_milliseconds: asOffsetMilliseconds(3),
-    probe_window: { sample_count: 6, capacity: 11 as const },
-    error_detail: null,
   };
   const warning = timingQualityWarning(status);
   assert.ok(warning);
@@ -35,31 +34,29 @@ test('high RTT or spread warns without gating timing', () => {
 
 test('display remains backend-stopped until Running arrives and follows each backend colour', () => {
   const baseStatus = {
-    state: 'stopped',
-    color: 'red',
-    color_elapsed_milliseconds: 0,
-    anchor_device_monotonic_microseconds: null,
-    automatic_offset_milliseconds: null,
-    median_round_trip_milliseconds: null,
-    round_trip_spread_milliseconds: null,
+    phase: { state: 'stopped' },
+    estimate: { availability: 'no_samples', capacity: 11 },
     manual_trim_milliseconds: asOffsetMilliseconds(0),
-    total_correction_milliseconds: null,
-    probe_window: { sample_count: 0, capacity: 11 },
-    error_detail: null,
   } as const;
   const stopped = timingDisplayProjection(baseStatus);
   assert.deepEqual(stopped, { state: 'stopped', running: false, color: null });
   for (const color of ['red', 'green', 'blue'] as const) {
     const running = timingDisplayProjection({
       ...baseStatus,
-      state: 'running',
-      color,
-      anchor_device_monotonic_microseconds: 10,
+      phase: {
+        state: 'running',
+        observation: {
+          color,
+          color_elapsed_milliseconds: 0,
+          anchor_device_monotonic_microseconds: 10,
+          observed_device_monotonic_microseconds: 10,
+        },
+      },
     });
     assert.deepEqual(running, { state: 'running', running: true, color });
   }
   assert.deepEqual(
-    timingDisplayProjection({ ...baseStatus, state: 'starting' }),
+    timingDisplayProjection({ ...baseStatus, phase: { state: 'starting' } }),
     { state: 'starting', running: false, color: null },
     'the frontend does not invent a colour before a device Running acknowledgement',
   );

@@ -753,36 +753,46 @@ export interface NoteResultFrame {
 export type CalibrationTimingColor = 'red' | 'green' | 'blue';
 export type CalibrationTimingState = 'stopped' | 'starting' | 'running' | 'stopping' | 'error';
 
+export interface CalibrationTimingObservation {
+  readonly color: CalibrationTimingColor;
+  readonly color_elapsed_milliseconds: number;
+  readonly anchor_device_monotonic_microseconds: number;
+  readonly observed_device_monotonic_microseconds: number;
+}
+
 /** Device → backend: fixed RGB loop state on the device monotonic clock. */
 export interface CalibrationTimingLoopStatusFrame {
   readonly type: 'calibration_timing_loop_status';
-  readonly status: {
-    readonly state: CalibrationTimingState;
-    readonly color: CalibrationTimingColor;
-    readonly color_elapsed_milliseconds: number;
-    readonly anchor_device_monotonic_microseconds: number;
-    readonly observed_device_monotonic_microseconds: number;
-  };
+  readonly status:
+    | { readonly state: 'stopped'; readonly observed_device_monotonic_microseconds: number }
+    | { readonly state: 'running'; readonly observation: CalibrationTimingObservation };
 }
 
 /** Browser-facing projection of the bounded automatic timing estimate. */
 export interface CalibrationTimingStatusFrame {
   readonly type: 'calibration_timing_status';
   readonly status: {
-    readonly state: CalibrationTimingState;
-    readonly color: CalibrationTimingColor;
-    readonly color_elapsed_milliseconds: number;
-    readonly anchor_device_monotonic_microseconds: number | null;
-    readonly automatic_offset_milliseconds: OffsetMilliseconds | null;
-    readonly median_round_trip_milliseconds: DurationMilliseconds | null;
-    readonly round_trip_spread_milliseconds: DurationMilliseconds | null;
+    readonly phase:
+      | { readonly state: 'stopped' }
+      | { readonly state: 'starting' }
+      | { readonly state: 'running'; readonly observation: CalibrationTimingObservation }
+      | { readonly state: 'stopping'; readonly last_observation: CalibrationTimingObservation }
+      | {
+          readonly state: 'error';
+          readonly detail: string;
+          readonly last_observation: CalibrationTimingObservation | null;
+        };
+    readonly estimate:
+      | { readonly availability: 'no_samples'; readonly capacity: 11 }
+      | {
+          readonly availability: 'measured';
+          readonly automatic_offset_milliseconds: OffsetMilliseconds;
+          readonly median_round_trip_milliseconds: DurationMilliseconds;
+          readonly round_trip_spread_milliseconds: DurationMilliseconds;
+          readonly sample_count: number;
+          readonly capacity: 11;
+        };
     readonly manual_trim_milliseconds: OffsetMilliseconds;
-    readonly total_correction_milliseconds: OffsetMilliseconds | null;
-    readonly probe_window: {
-      readonly sample_count: number;
-      readonly capacity: number;
-    };
-    readonly error_detail: string | null;
   };
 }
 
@@ -2197,52 +2207,98 @@ function isContentIdentity(value: unknown): value is string {
 export function isCalibrationTimingStatusFrame(
   value: unknown,
 ): value is CalibrationTimingStatusFrame {
+  if (!isObject(value) || !hasType(value, 'calibration_timing_status') || !isObject(value['status'])) return false;
+  const status = value['status'];
+  if (!hasExactlyKeys(status, ['phase', 'estimate', 'manual_trim_milliseconds'])) return false;
+  if (!isObject(status['phase']) || !isTimingPhase(status['phase'])) return false;
+  if (!isObject(status['estimate']) || !isTimingEstimate(status['estimate'])) return false;
   return (
-    hasType(value, 'calibration_timing_status') &&
-    isObject(value) &&
-    isObject(value['status']) &&
-    ['stopped', 'starting', 'running', 'stopping', 'error'].includes(
-      value['status']['state'] as string,
-    ) &&
-    ['red', 'green', 'blue'].includes(value['status']['color'] as string) &&
-    isNonnegativeInteger(value['status']['color_elapsed_milliseconds']) &&
-    value['status']['color_elapsed_milliseconds'] < 500 &&
-    (value['status']['anchor_device_monotonic_microseconds'] === null ||
-      isNonnegativeInteger(value['status']['anchor_device_monotonic_microseconds'])) &&
-    (value['status']['automatic_offset_milliseconds'] === null ||
-      isInteger(value['status']['automatic_offset_milliseconds'])) &&
-    (value['status']['median_round_trip_milliseconds'] === null ||
-      isNonnegativeInteger(value['status']['median_round_trip_milliseconds'])) &&
-    (value['status']['round_trip_spread_milliseconds'] === null ||
-      isNonnegativeInteger(value['status']['round_trip_spread_milliseconds'])) &&
-    isInteger(value['status']['manual_trim_milliseconds']) &&
-    Math.abs(value['status']['manual_trim_milliseconds']) <= 1000 &&
-    (value['status']['total_correction_milliseconds'] === null ||
-      isInteger(value['status']['total_correction_milliseconds'])) &&
-    isObject(value['status']['probe_window']) &&
-    isNonnegativeInteger(value['status']['probe_window']['sample_count']) &&
-    isPositiveInteger(value['status']['probe_window']['capacity']) &&
-    value['status']['probe_window']['capacity'] === 11 &&
-    value['status']['probe_window']['sample_count'] <=
-      value['status']['probe_window']['capacity'] &&
-    (value['status']['error_detail'] === null || isString(value['status']['error_detail']))
+    isInteger(status['manual_trim_milliseconds']) &&
+    Math.abs(status['manual_trim_milliseconds']) <= 1000
   );
+}
+
+function isTimingObservation(value: unknown): value is CalibrationTimingObservation {
+  return (
+    isObject(value) &&
+    hasExactlyKeys(value, [
+      'color',
+      'color_elapsed_milliseconds',
+      'anchor_device_monotonic_microseconds',
+      'observed_device_monotonic_microseconds',
+    ]) &&
+    ['red', 'green', 'blue'].includes(value['color'] as string) &&
+    isNonnegativeInteger(value['color_elapsed_milliseconds']) &&
+    value['color_elapsed_milliseconds'] < 500 &&
+    isNonnegativeInteger(value['anchor_device_monotonic_microseconds']) &&
+    isNonnegativeInteger(value['observed_device_monotonic_microseconds'])
+  );
+}
+
+function isTimingPhase(value: Record<string, unknown>): boolean {
+  switch (value['state']) {
+    case 'stopped':
+    case 'starting':
+      return hasExactlyKeys(value, ['state']);
+    case 'running':
+      return hasExactlyKeys(value, ['state', 'observation']) && isTimingObservation(value['observation']);
+    case 'stopping':
+      return hasExactlyKeys(value, ['state', 'last_observation']) && isTimingObservation(value['last_observation']);
+    case 'error':
+      return (
+        hasExactlyKeys(value, ['state', 'detail', 'last_observation']) &&
+        isString(value['detail']) &&
+        value['detail'].length > 0 &&
+        (value['last_observation'] === null || isTimingObservation(value['last_observation']))
+      );
+    default:
+      return false;
+  }
+}
+
+function isTimingEstimate(value: Record<string, unknown>): boolean {
+  if (value['capacity'] !== 11) return false;
+  if (value['availability'] === 'no_samples') {
+    return hasExactlyKeys(value, ['availability', 'capacity']);
+  }
+  return (
+    value['availability'] === 'measured' &&
+    hasExactlyKeys(value, [
+      'availability',
+      'automatic_offset_milliseconds',
+      'median_round_trip_milliseconds',
+      'round_trip_spread_milliseconds',
+      'sample_count',
+      'capacity',
+    ]) &&
+    isInteger(value['automatic_offset_milliseconds']) &&
+    isNonnegativeInteger(value['median_round_trip_milliseconds']) &&
+    isNonnegativeInteger(value['round_trip_spread_milliseconds']) &&
+    isPositiveInteger(value['sample_count']) &&
+    value['sample_count'] <= value['capacity']
+  );
+}
+
+function hasExactlyKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
+  const actual = Object.keys(value);
+  return actual.length === expected.length && expected.every((key) => actual.includes(key));
 }
 
 export function isCalibrationTimingLoopStatusFrame(
   value: unknown,
 ): value is CalibrationTimingLoopStatusFrame {
-  return (
-    hasType(value, 'calibration_timing_loop_status') &&
-    isObject(value) &&
-    isObject(value['status']) &&
-    (value['status']['state'] === 'stopped' || value['status']['state'] === 'running') &&
-    ['red', 'green', 'blue'].includes(value['status']['color'] as string) &&
-    isNonnegativeInteger(value['status']['color_elapsed_milliseconds']) &&
-    value['status']['color_elapsed_milliseconds'] < 500 &&
-    isNonnegativeInteger(value['status']['anchor_device_monotonic_microseconds']) &&
-    isNonnegativeInteger(value['status']['observed_device_monotonic_microseconds'])
-  );
+  if (
+    !hasType(value, 'calibration_timing_loop_status') ||
+    !isObject(value) ||
+    !isObject(value['status'])
+  ) return false;
+  const status = value['status'];
+  return status['state'] === 'stopped'
+    ? hasExactlyKeys(status, ['state', 'observed_device_monotonic_microseconds']) &&
+        isNonnegativeInteger(status['observed_device_monotonic_microseconds'])
+    : status['state'] === 'running' &&
+        hasExactlyKeys(status, ['state', 'observation']) &&
+        isTimingObservation(status['observation']);
 }
 
 export function isCalibrationScheduleChunkFrame(
