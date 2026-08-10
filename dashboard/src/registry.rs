@@ -13,11 +13,18 @@ use protocol::{DeviceConfig, DeviceInfo, DeviceProvenance, DeviceTransport, Fram
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{broadcast, mpsc};
 
 /// Capacity of a device's data-frame broadcast. A browser that falls this far behind
 /// drops the oldest frames (it only ever renders the latest anyway).
 const FRAME_BUFFER: usize = 256;
+
+/// Reliable controls waiting for the device writer.  A healthy serial link drains
+/// this almost immediately; reaching the bound means the transport is stalled and
+/// callers must fail the operation instead of building an arbitrarily old command
+/// backlog that will execute after recovery.
+const CONTROL_BUFFER: usize = 32;
 
 struct DeviceEntry {
     label: String,
@@ -48,7 +55,7 @@ enum DeviceConnection {
     Connected {
         token: u64,
         frames: broadcast::Sender<Frame>,
-        control: mpsc::UnboundedSender<Frame>,
+        control: mpsc::Sender<Frame>,
     },
     Disconnected {
         token: u64,
@@ -75,7 +82,7 @@ const LOG_RETENTION: usize = 200;
 /// `frames` and drains `control_rx` to the device's transport.
 pub struct DeviceHandle {
     pub frames: broadcast::Sender<Frame>,
-    pub control_rx: mpsc::UnboundedReceiver<Frame>,
+    pub control_rx: mpsc::Receiver<Frame>,
     pub token: u64,
 }
 
@@ -91,6 +98,7 @@ pub enum ControlDeliveryError {
     UnknownDevice,
     Disconnected,
     StaleConnection,
+    QueueFull,
     SessionClosed,
 }
 
@@ -100,6 +108,9 @@ impl ControlDeliveryError {
             Self::UnknownDevice => "no device is selected for calibration",
             Self::Disconnected => "the selected device is offline; reconnect it before calibrating",
             Self::StaleConnection => "the selected device reconnected; refresh before calibrating",
+            Self::QueueFull => {
+                "the selected device is not accepting commands; retry after the link recovers"
+            }
             Self::SessionClosed => {
                 "the selected device connection closed before the command was delivered"
             }
@@ -147,7 +158,7 @@ impl Registry {
         provenance: DeviceProvenance,
     ) -> DeviceHandle {
         let (frames, _) = broadcast::channel(FRAME_BUFFER);
-        let (control, control_rx) = mpsc::unbounded_channel();
+        let (control, control_rx) = mpsc::channel(CONTROL_BUFFER);
         let token = self.next_token.fetch_add(1, Ordering::Relaxed);
         // A reconnect (same id) replaces the whole entry, logs included: device ids
         // are not guaranteed stable across units, so the previous session's history
@@ -411,9 +422,9 @@ impl Registry {
         let devices = self.devices.lock().unwrap();
         let entry = devices.get(id).ok_or(ControlDeliveryError::UnknownDevice)?;
         match &entry.connection {
-            DeviceConnection::Connected { control, .. } => control
-                .send(frame)
-                .map_err(|_| ControlDeliveryError::SessionClosed),
+            DeviceConnection::Connected { control, .. } => {
+                control.try_send(frame).map_err(control_delivery_error)
+            }
             DeviceConnection::Disconnected { .. } => Err(ControlDeliveryError::Disconnected),
         }
     }
@@ -435,10 +446,78 @@ impl Registry {
             DeviceConnection::Disconnected { token } if *token != identity.connection_token => {
                 Err(ControlDeliveryError::StaleConnection)
             }
-            DeviceConnection::Connected { control, .. } => control
-                .send(frame)
-                .map_err(|_| ControlDeliveryError::SessionClosed),
+            DeviceConnection::Connected { control, .. } => {
+                control.try_send(frame).map_err(control_delivery_error)
+            }
             DeviceConnection::Disconnected { .. } => Err(ControlDeliveryError::Disconnected),
         }
+    }
+}
+
+fn control_delivery_error(error: TrySendError<Frame>) -> ControlDeliveryError {
+    match error {
+        TrySendError::Full(_) => ControlDeliveryError::QueueFull,
+        TrySendError::Closed(_) => ControlDeliveryError::SessionClosed,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ControlDeliveryError, Registry, CONTROL_BUFFER};
+    use protocol::{DeviceConfig, DeviceProvenance, DeviceTransport, FirmwareBuild, Frame};
+
+    fn register(registry: &Registry) -> super::DeviceHandle {
+        registry.register(
+            "opal-test".into(),
+            "Test device".into(),
+            DeviceTransport::Serial,
+            DeviceConfig {
+                gestures: 0,
+                keymap: Vec::new(),
+                wifi_ssid: None,
+                sensitivity: String::new(),
+                sensitivity_levels: Vec::new(),
+                tau: 0.0,
+                needed: 0,
+            },
+            DeviceProvenance {
+                firmware: FirmwareBuild {
+                    crate_version: String::new(),
+                    git_commit: String::new(),
+                    working_tree_modified: false,
+                    built_at: String::new(),
+                },
+                analog_front_ends: Vec::new(),
+            },
+        )
+    }
+
+    #[test]
+    fn stalled_device_control_queue_is_bounded_and_reports_saturation() {
+        let registry = Registry::new();
+        let mut handle = register(&registry);
+
+        for _ in 0..CONTROL_BUFFER {
+            assert_eq!(registry.send_control("opal-test", Frame::Probe {}), Ok(()));
+        }
+        assert_eq!(
+            registry.send_control("opal-test", Frame::Probe {}),
+            Err(ControlDeliveryError::QueueFull)
+        );
+
+        assert!(matches!(handle.control_rx.try_recv(), Ok(Frame::Probe {})));
+        assert_eq!(registry.send_control("opal-test", Frame::Probe {}), Ok(()));
+    }
+
+    #[test]
+    fn closed_device_writer_is_distinct_from_backpressure() {
+        let registry = Registry::new();
+        let handle = register(&registry);
+        drop(handle.control_rx);
+
+        assert_eq!(
+            registry.send_control("opal-test", Frame::Probe {}),
+            Err(ControlDeliveryError::SessionClosed)
+        );
     }
 }
