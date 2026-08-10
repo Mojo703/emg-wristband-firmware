@@ -1403,7 +1403,16 @@ impl Calibration {
                                     })
                             }
                             Err(error) => {
-                                self.refuse(&format!("anchored schedule chunk rejected: {error}"))
+                                let detail = format!("anchored schedule chunk rejected: {error}");
+                                if self.active_anchored_identity() == Some((run, schedule_revision))
+                                {
+                                    // This is a terminal rejection of the exact upload,
+                                    // not a lost ACK. Correlate it so the host stops
+                                    // retrying and can show the real contract failure.
+                                    self.fail_anchored_execution(&detail);
+                                } else {
+                                    self.refuse(&detail);
+                                }
                             }
                         }
                     }

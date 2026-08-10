@@ -41,11 +41,23 @@ after `. ~/export-esp.sh`. The host tool builds in
    with the radio off. On a wristband you intend to use over wifi,
    re-provision afterwards from the dashboard.
 
-3. On-device unit tests, when wanted: `cargo test-device` (wrap in
+3. Opal on-device unit tests, when wanted: `cargo test-device` (wrap in
    `script -qec "timeout 420 cargo test-device" /tmp/log` — the monitor
    never exits on its own). The cue-collision rules also run on the host
    now (`cargo test` in `feedback-vocabulary/`), so the device suite is
    for the ADC, transport and playback modules.
+
+4. Historical TDS SIMD checks, only when reproducing the superseded fixed-model work,
+   run from `emg-runtime/`:
+
+   ```sh
+   . ~/export-esp.sh
+   cargo +esp test-device
+   ```
+
+   This is not a product release gate: production firmware disables the `tds`
+   feature. Both device-test commands replace the wristband image. Restore it with
+   `cargo run --release` from `opal-firmware/` before continuing.
 
 ## Part 1 — bench rehearsal (bare board, scripted wearer)
 

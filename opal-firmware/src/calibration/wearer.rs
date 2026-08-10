@@ -1,19 +1,17 @@
 //! The band-feature pipeline on a wearer's own acquisition stream.
 //!
-//! The int8 model reads conditioned samples and knows nothing about band
-//! power; a calibration model reads band features and knows nothing about the
-//! int8 input. They are two different views of the same window, so a device
-//! that calibrates has to compute both — this is the second one, and it runs
-//! beside the int8 path without touching it.
+//! This is the production classification input. The former conditioned-int8 TDS
+//! view has been removed from the firmware; raw counts now take this one path to
+//! filter-bank log-power features and the resident linear classifier.
 //!
 //! It is off unless something wants it. Computing four bandpass cascades over
-//! sixteen channels costs about as much as the inference already in the loop,
+//! sixteen channels is the dominant live classification work,
 //! and a device with no calibration running and none installed has no use for
 //! the answer. [`WearerFeatures::wanted`] is what keeps that cost off the idle
 //! path.
 //!
 //! The samples arrive channel-major, because that is the layout the EMG frame
-//! ships and the acquisition path packs once for both consumers. The feature
+//! ships and the acquisition path packs once for telemetry and classification. The feature
 //! pipeline wants one sixteen-channel instant at a time, so the transpose
 //! happens here rather than by packing the stream twice.
 

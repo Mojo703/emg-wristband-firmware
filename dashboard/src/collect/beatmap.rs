@@ -467,6 +467,17 @@ fn load_track(directory: &Path) -> anyhow::Result<CatalogTrack> {
                 .levels
                 .get(super::calibration_level::CALIBRATION_SOURCE_LEVEL)
                 .ok_or_else(|| anyhow!("calibration product has no retained hard source level"))?;
+            let regenerated = (product.generator_version
+                == super::calibration_level::INCOMPATIBLE_CALIBRATION_LEVEL_GENERATOR_VERSION)
+                .then(|| {
+                    tracing::warn!(
+                        track = %entry.id,
+                        generator_version = product.generator_version,
+                        "regenerating incompatible calibration schedule in memory with the mandatory recovery interval"
+                    );
+                    CalibrationLevelProduct::generate(&source.map_notes, entry.duration_ms)
+                });
+            let product = regenerated.as_ref().unwrap_or(product);
             product.validate_against_source(&source.map_notes, entry.duration_ms)?;
             Ok(CalibrationAvailability {
                 cue_count: product.cue_count(),
@@ -916,6 +927,59 @@ mod tests {
     }
 
     #[test]
+    fn incompatible_zero_recovery_product_is_regenerated_before_it_reaches_firmware() {
+        let source = (0..80)
+            .map(|index| MapNote {
+                time_ms: 1_000 + index * 1_714,
+                cell: (index % 12) as u8,
+                hold_ms: 200,
+            })
+            .collect::<Vec<_>>();
+        let duration_ms = source.last().unwrap().time_ms + 10_000;
+        let mut entry = track_entry("recovered-v3", source.clone(), duration_ms);
+        let incompatible =
+            crate::collect::calibration_level::CalibrationLevelProduct::generate_with_version(
+                &source,
+                duration_ms,
+                crate::collect::calibration_level::INCOMPATIBLE_CALIBRATION_LEVEL_GENERATOR_VERSION,
+            );
+        assert!(incompatible.notes.windows(2).any(|pair| {
+            pair[1].map_note.time_ms
+                < pair[0].map_note.time_ms
+                    + crate::collect::calibration_level::HOLD_MILLISECONDS
+                    + crate::collect::calibration_level::MINIMUM_RECOVERY_MILLISECONDS
+        }));
+        entry.calibration = Some(incompatible.clone());
+
+        let directory = std::env::temp_dir().join(format!(
+            "dashboard-calibration-v3-migration-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join(TRACK_FILE_NAME),
+            serde_json::to_vec(&entry).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = load_track(&directory).unwrap();
+        let calibration = loaded
+            .calibration
+            .expect("retained source should repair the incompatible product");
+        assert_ne!(calibration.content_identity, incompatible.content_identity);
+        assert!(calibration.entries.windows(2).all(|pair| {
+            pair[1].track_offset.get()
+                >= pair[0].track_offset.get()
+                    + pair[0].hold.get()
+                    + crate::collect::calibration_level::MINIMUM_RECOVERY_MILLISECONDS
+        }));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
     fn calibration_tracks_project_only_supported_catalog_entries() {
         let legacy = track_entry("legacy", one_note_per_cell(), 60_000);
         let mut calibrated = track_entry("calibrated", one_note_per_cell(), 90_000);
@@ -967,6 +1031,50 @@ mod tests {
                     .collect(),
             }]
         );
+    }
+
+    #[test]
+    fn generated_track_uploads_through_the_actual_firmware_validator() {
+        let source = (0..240)
+            .map(|index| MapNote {
+                time_ms: 1_000 + index * 250,
+                cell: (index % 12) as u8,
+                hold_ms: 200,
+            })
+            .collect::<Vec<_>>();
+        let duration_ms = source.last().unwrap().time_ms + 10_000;
+        let mut entry = track_entry("firmware-boundary", source.clone(), duration_ms);
+        entry.calibration = Some(
+            crate::collect::calibration_level::CalibrationLevelProduct::generate(
+                &source,
+                duration_ms,
+            ),
+        );
+        let track = catalog_of(vec![entry])
+            .unwrap()
+            .calibration_tracks()
+            .pop()
+            .unwrap();
+        let run = protocol::CalibrationRunKey {
+            session_id: protocol::CalibrationSessionId::new(1).unwrap(),
+            run_id: protocol::CalibrationRunId::new(1).unwrap(),
+        };
+        let identity = calibration_flow::AnchoredSongIdentity::new(
+            run,
+            protocol::CalibrationScheduleRevision::new(1).unwrap(),
+            track.content_identity,
+            track.entries.len() as u32,
+        )
+        .unwrap();
+        let mut firmware_song = calibration_flow::AnchoredSong::new(run);
+        firmware_song.begin_upload(identity.clone()).unwrap();
+        for (chunk_index, chunk) in track.entries.chunks(8).enumerate() {
+            firmware_song
+                .upload_chunk(&identity, (chunk_index * 8) as u32, chunk)
+                .unwrap_or_else(|error| {
+                    panic!("dashboard schedule violated firmware upload contract: {error}")
+                });
+        }
     }
 
     #[test]

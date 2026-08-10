@@ -33,7 +33,7 @@ opt-level = 1
 debug = true
 
 [dependencies]
-emg-runtime = { path = "../emg-runtime" }
+emg-runtime = { path = "../emg-runtime", default-features = false }
 calibration-flow = { path = "../calibration-flow" }
 feedback-vocabulary = { path = "../feedback-vocabulary" }
 ble-media = { path = "../ble-media" }

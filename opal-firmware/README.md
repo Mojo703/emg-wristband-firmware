@@ -1,13 +1,14 @@
 # opal-firmware
 
-Firmware for the Opal EMG wristband (ESP32-S3): two ADS1298s sample EMG, the int8
-model classifies each window, the reject pipeline smooths it into a wake-gate
+Firmware for the Opal EMG wristband (ESP32-S3): two ADS1298s sample EMG, a
+wearer-calibrated 12-class linear model scores 64 filter-bank log-power features,
+and the reject pipeline smooths the five command classes into a wake-gate
 decision, and the frames stream to the dashboard over USB serial. BLE HID sends
 committed media keys when the dashboard enables Phone BLE. Wi-Fi remains dormant
 until a future explicit wireless-mode transition selects it.
 `src/main.rs` has the module-level docs.
 
-The model wants 16 channels and the front end carries two 8-channel ADS1298 boards.
+The feature pipeline wants 16 channels and the front end carries two 8-channel ADS1298 boards.
 "The two-device architecture" below records how they are clocked, started, and
 recovered, and why.
 
@@ -18,7 +19,7 @@ the bench procedure for new hardware.
 
 ## The two-device architecture
 
-The model learned a spatial pattern across 16 channels sampled at the same instant,
+The classifier learns a spatial pattern across 16 channels sampled at the same instant,
 so the pair's simultaneity is a design input, not an accident. Two questions decide
 it — where the conversion clock comes from, and how each device starts — and the
 conversion-death fault from the bring-up campaign decides both answers.
@@ -38,7 +39,7 @@ two-bus harness dropped the clock wire with the rest of the shared nets — the
 wire was one more failure point and a bus-adjacent aggressor that no run of the
 fault campaign had characterised.
 
-The cost is a time base 2.3% slow against the 2048 Hz the model trained at, and
+The cost is a time base 2.3% slow against the original 2048 Hz collection rate, and
 two oscillators that are *not* phase-locked: the inter-chip offset wanders
 within one sample period and wraps when the faster chip laps the slower one, at
 which point the grid aligner drops the surplus frame and counts a
@@ -126,8 +127,8 @@ Xtensa:
 cargo test-device
 ```
 
-The Xtensa SIMD model checks live in `../emg-runtime/examples/esp32s3-tests.rs`.
-Run them from `emg-runtime` with `cargo +esp test-device`.
+The former fixed TDS model and its Xtensa SIMD checks remain in `emg-runtime` as
+historical research code, but `opal-firmware` no longer embeds or executes that model.
 
 This is an alias (see `.cargo/config.toml`) for `cargo test` with
 `ESP_IDF_SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.test"`. The override

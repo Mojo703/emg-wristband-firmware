@@ -8,15 +8,17 @@ version = "0.1.0"
 edition = "2021"
 resolver = "2"
 rust-version = "1.77"
-description = "On-device EMG gesture inference (int8 + ESP32-S3 SIMD) and the reject pipeline"
+description = "On-device calibrated EMG classification, fitting, alignment, and historical TDS kernels"
 
 [features]
+default = ["tds"]
+tds = []
 esp32s3-tests = ["dep:esp-idf-svc"]
 
 [[example]]
 name = "esp32s3-tests"
 path = "examples/esp32s3-tests.rs"
-required-features = ["esp32s3-tests"]
+required-features = ["esp32s3-tests", "tds"]
 
 # no_std + alloc, no esp dependencies: pure compute plus the model-free decision
 # spine. Builds on the host (scalar kernels) for verification and on Xtensa (SIMD

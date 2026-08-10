@@ -5,11 +5,12 @@
 //! as a CBOR blob so adding a field is a struct change with no migration.
 
 use anyhow::Result;
-use emg_runtime::model::NUM_CLASSES;
 use emg_runtime::RejectPipeline;
 use esp_idf_svc::nvs::{EspDefaultNvs, EspDefaultNvsPartition};
 use protocol::{Binding, DeviceConfig, MediaKey, SensitivityLevel};
 use serde::{Deserialize, Serialize};
+
+use crate::CALIBRATION_COMMAND_CLASSES;
 
 #[toml_cfg::toml_config]
 pub struct CompileConfig {
@@ -86,7 +87,7 @@ impl Default for Settings {
         let cfg = COMPILE_CONFIG;
         Self {
             sensitivity: Sensitivity::Medium,
-            keymap: (0..NUM_CLASSES as u8)
+            keymap: (0..CALIBRATION_COMMAND_CLASSES as u8)
                 .map(|gesture| Binding {
                     gesture,
                     key: MediaKey::ALL[gesture as usize % MediaKey::ALL.len()],
@@ -112,7 +113,7 @@ impl Settings {
     /// Project the functional config onto the wire (no secrets).
     pub fn to_wire(&self) -> DeviceConfig {
         DeviceConfig {
-            gestures: NUM_CLASSES as u8,
+            gestures: CALIBRATION_COMMAND_CLASSES as u8,
             keymap: self.keymap.clone(),
             wifi_ssid: (!self.wifi_ssid.is_empty()).then(|| self.wifi_ssid.clone()),
             sensitivity: self.sensitivity.id().into(),

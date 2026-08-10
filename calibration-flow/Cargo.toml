@@ -26,4 +26,4 @@ protocol = { path = "../protocol" }
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
 ciborium = "0.2"
-emg-runtime = { path = "../emg-runtime" }
+emg-runtime = { path = "../emg-runtime", default-features = false }

@@ -1,28 +1,14 @@
-//! ADC codes to the model's int8 input, and to the raw counts the wire carries.
+//! ADC codes to the fixed-scale raw counts consumed by telemetry, recording, and the
+//! wearer-calibrated filter-bank classifier.
 //!
-//! One time step of model input is assembled here from one frame per device. The chain
-//! is: sign-extended code, to volts, to microvolts, through [`conditioning`] to the
-//! model's dimensionless footing, and only then to int8 at the model's `input_scale`.
-//!
-//! [`wire_time_step`] is the other half: the same sixteen slots as raw ADC counts at a
-//! fixed scale, for the dashboard and for recorded sessions. The two streams are
-//! deliberately separate. The model needs conditioned, per-channel-normalised input;
-//! a recording needs the measurement, at a scale that does not move, or it cannot be
-//! trained on later against anything else.
-//!
-//! # The conditioning stage is not optional
-//!
-//! This module used to go straight from microvolts to int8, on the assumption that
-//! `input_scale` was microvolts per count. It is not — it is *normalised* units per
-//! count, because the training windows are dimensionless and unit-variance.
-//! [`conditioning`] documents the measurement and what it implies. Skipping that stage
-//! puts the whole int8 range at ±4.87 µV, below both the signal and the electrode
-//! offset, and every sample saturates.
+//! The former TDS path also built a conditioned int8 stream here. Production no
+//! longer compiles that path; its arithmetic remains test-only so historical fixtures
+//! can still explain old recordings without spending device CPU or buffers.
 //!
 //! # The two boards and synchronisation
 //!
-//! [`time_step`](InputStage::time_step) takes one frame per device and [`model_slot`]
-//! owns the sixteen-slot layout. The devices self-clock from independent internal
+//! [`wire_time_step`] takes one frame per device and [`model_slot`] owns the
+//! sixteen-slot layout. The devices self-clock from independent internal
 //! oscillators (CLKSEL at 3V3), so the inter-device offset is *not* fixed: it
 //! wanders continuously within one sample period (≤500 µs). The grid aligner
 //! ([`emg_runtime::alignment`]) is what pairs the two streams: each device's frame
@@ -37,28 +23,34 @@
 //! measured.
 
 use super::channel::{model_slot, Channel, CHANNELS_PER_DEVICE, DEVICE_COUNT};
+#[cfg(test)]
 use super::conditioning::{Microvolts, NormalizedUnits, SignalConditioner};
-use super::convert::{
-    code_to_voltage, code_to_wire_count, GAIN, MICROVOLTS_PER_VOLT, REFERENCE_VOLTS,
-};
+use super::convert::code_to_wire_count;
+#[cfg(test)]
+use super::convert::{code_to_voltage, GAIN, MICROVOLTS_PER_VOLT, REFERENCE_VOLTS};
 use crate::adc::decode::Sample;
-use emg_runtime::model::INPUT_CH;
+use emg_runtime::band_features::CHANNEL_COUNT;
+
+#[cfg(test)]
+const INPUT_CH: usize = CHANNEL_COUNT;
 
 /// The model cannot be fed more channels than it has inputs. If a third device ever
 /// appears, the model has to grow first.
-const _: () = assert!(DEVICE_COUNT * CHANNELS_PER_DEVICE <= INPUT_CH);
+const _: () = assert!(DEVICE_COUNT * CHANNELS_PER_DEVICE <= CHANNEL_COUNT);
 
 /// Everything between a decoded ADC frame and the model's input vector.
 ///
 /// Stateful, because the conditioning is: each channel carries a filter and a running
 /// amplitude estimate across frames. One of these belongs to the acquisition thread
 /// and is not shared.
+#[cfg(test)]
 pub(super) struct InputStage {
     conditioner: SignalConditioner<INPUT_CH>,
     /// Normalised units per int8 count, from the model blob.
     input_scale: f32,
 }
 
+#[cfg(test)]
 impl InputStage {
     pub(super) fn new(input_scale: f32, sample_rate_hz: f32) -> Self {
         Self {
@@ -103,14 +95,6 @@ impl InputStage {
         }
         out
     }
-
-    /// Tells one device's eight slots that a break in their stream just happened,
-    /// after that device alone was warm-recovered. The other device's stream is
-    /// continuous and its filter state stays.
-    pub(super) fn reset_device_after_gap(&mut self, device_index: usize) {
-        self.conditioner
-            .reset_channels_after_gap(device_index * CHANNELS_PER_DEVICE, CHANNELS_PER_DEVICE);
-    }
 }
 
 /// One time step of the wire stream: the same sixteen slots, as raw ADC counts at
@@ -125,8 +109,8 @@ impl InputStage {
 /// flag says the electrode is not on skin, which makes the sample useless as model
 /// input but still a true statement about what the converter saw; a recording is the
 /// measurement record, and a railed channel is self-evident in it.
-pub(super) fn wire_time_step(devices: &[Option<Sample>; DEVICE_COUNT]) -> [i16; INPUT_CH] {
-    let mut out = [0i16; INPUT_CH];
+pub(super) fn wire_time_step(devices: &[Option<Sample>; DEVICE_COUNT]) -> [i16; CHANNEL_COUNT] {
+    let mut out = [0i16; CHANNEL_COUNT];
     for (device_index, frame) in devices.iter().enumerate() {
         let Some(sample) = frame else { continue };
         for channel in Channel::ALL {
@@ -142,6 +126,7 @@ pub(super) fn wire_time_step(devices: &[Option<Sample>; DEVICE_COUNT]) -> [i16; 
 ///
 /// Saturation matters: a wrapped sample turns a large positive excursion into a large
 /// negative one, which is a far worse lie than a clipped one.
+#[cfg(test)]
 fn quantize(NormalizedUnits(value): NormalizedUnits, scale: f32) -> i8 {
     if scale <= 0.0 || !value.is_finite() {
         return 0;

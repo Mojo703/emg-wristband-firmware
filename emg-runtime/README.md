@@ -1,10 +1,10 @@
 # emg-runtime
 
-The on-device inference path for the wristband: int8 kernels for the `emg-tds`
-classifier with hand-written ESP32-S3 SIMD and a scalar fallback off target, the
-model-free reject pipeline that turns one window's logits into a decision, and the
-grid aligner that puts the two ADS1298s' independently clocked sample streams on
-one time base. `opal-firmware` is the consumer.
+Shared on-device classification arithmetic for the wristband: filter-bank
+log-power features, wearer-calibrated linear scoring and fitting, the model-free
+reject pipeline, and the grid aligner. The crate also retains the former `emg-tds`
+int8 kernels and blobs for reproducibility and device benchmarks; production
+`opal-firmware` no longer embeds or executes them.
 
 The runtime library is `no_std` plus `alloc` and depends only on
 [`protocol`](../protocol), `libm`, and `half`. Its ESP dependency is target-specific
@@ -138,7 +138,7 @@ rather than manufactured all-zero data.
 
 | File | What it is |
 |------|------------|
-| `model_int8.bin` | The shipping blob, about 36 KB. `opal-firmware` embeds it with `include_bytes!` behind a 16-byte-aligned wrapper. |
+| `model_int8.bin` | Historical fixed TDS blob, about 36 KB. Retained for reproduction and kernel benchmarks; production firmware no longer embeds it. |
 | `model_int8_verify.bin` | The same blob with a balanced batch of 32 labeled test windows and their float logits appended, about 286 KB. It links only into the device test binary, where `VerifyBatch` streams the windows one at a time so the batch never has to fit in the device's heap. |
 
 Both are written by `emg-tds export-int8`, which targets these paths by default.

@@ -46,7 +46,7 @@ pub(crate) const fn front_end_core(board: Board) -> Core {
     }
 }
 
-/// The combiner drains both pipelines and runs conditioning and window packing.
+/// The combiner drains both pipelines and runs raw-window packing.
 /// It lives on core 0 with the other bulk work: measured on core 1, its packing
 /// bursts and heap traffic roughly doubled both chips' miss rates by adding
 /// latency to the GPIO dispatcher that shares that core.

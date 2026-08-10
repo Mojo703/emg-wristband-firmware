@@ -14,9 +14,10 @@
 //! [`acquisition`] document what that does to the sixteen-channel pairing.
 //!
 //! Layout. [`registers`] is the typed register map and [`ads1298`] the register-level
-//! driver; [`decode`]/[`status`]/[`convert`]/[`conditioning`] are the hardware-free
-//! frame and signal maths, and [`preprocess`] turns ADC codes into the model's int8
-//! input. [`bring_up`] does the wiring and hands back a configured, streaming pair.
+//! driver; [`decode`]/[`status`]/[`convert`] are the hardware-free frame and signal
+//! maths, and [`preprocess`] turns ADC codes into the raw-count stream consumed by
+//! the calibrated feature pipeline. [`bring_up`] does the wiring and hands back a
+//! configured, streaming pair.
 //!
 //! Threading. The frame read itself is not on a thread at all: [`frame_reader`]
 //! clocks each frame out inside the chip's DRDY interrupt, because a conversion
@@ -25,12 +26,13 @@
 //! [`acquisition::start`] spawns one [`acquisition::pipeline`] thread per chip — draining
 //! that chip's frame ring, validating it, and owning its health — plus a combiner
 //! thread that places both streams onto one time grid
-//! ([`emg_runtime::alignment`]) and builds the model and wire windows. Everything
+//! ([`emg_runtime::alignment`]) and builds raw-count windows. Everything
 //! here owns its peripherals at `'static` instead of borrowing them.
 
 pub(crate) mod acquisition;
 pub(crate) mod ads1298;
 pub(crate) mod channel;
+#[cfg(test)]
 mod conditioning;
 mod convert;
 mod decode;

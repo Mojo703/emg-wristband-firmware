@@ -1073,6 +1073,13 @@ pub struct CalibrationRunKey {
     pub run_id: CalibrationRunId,
 }
 
+/// Authored duration of every guided-calibration cue. Shared by schedule
+/// generation and the device validator so neither side can silently fork it.
+pub const CALIBRATION_CUE_HOLD_MILLISECONDS: u32 = 1_500;
+/// Required quiet interval after every guided-calibration cue, including a
+/// thumb-state change within the same gesture lane.
+pub const CALIBRATION_CUE_RECOVERY_MILLISECONDS: u32 = 500;
+
 /// The device-owned preparation lifecycle for one exact schedule revision.
 ///
 /// `Settling` and `EstimatingGains` carry the device's measured acquisition

@@ -20,7 +20,7 @@ Firmware (ESP32-S3, Xtensa toolchain):
 
 | Path | What it is |
 |------|------------|
-| [`opal-firmware/`](opal-firmware) | The device. Two ADS1298s sample 16 channels, each chip's frame clocked out inside its own data-ready interrupt, the int8 model classifies each window, and the result streams to the dashboard over USB serial. Wi-Fi support remains available behind an explicit future mode transition. `BRINGUP.md` is the bench procedure for new hardware. |
+| [`opal-firmware/`](opal-firmware) | The device. Two ADS1298s sample 16 channels, each chip's frame is clocked out inside its own data-ready interrupt, and the wearer-calibrated 64-feature linear classifier drives predictions and BLE commands. Wi-Fi support remains available behind an explicit future mode transition. `BRINGUP.md` is the bench procedure for new hardware. |
 | [`drv2605l/`](drv2605l) | TI DRV2605L haptic driver over I2C, plus a named bench example that plays candidate wristband feedback patterns. The library is `embedded-hal` generic, so the firmware can take it without the bench setup. |
 | [`ble-media/`](ble-media) | BLE HID media remote. The named bench example is serial-driven; `opal-firmware` dispatches calibrated gesture commits through the same library. |
 
@@ -28,10 +28,10 @@ Machine learning and tooling (host, plain Rust or Python):
 
 | Path | What it is |
 |------|------------|
-| [`emg-tds/`](emg-tds) | The current gesture model: a depthwise-separable (TDS) conv encoder in Rust/candle, with swappable classifier and pose heads. Trains, evaluates, and exports. The `.npy` training/eval/pose windows live in its `data/` directory. |
+| [`emg-tds/`](emg-tds) | Historical depthwise-separable convolution experiments and export tooling. The production firmware no longer runs this model. The `.npy` training/eval/pose windows live in its `data/` directory. |
 | [`dashboard/`](dashboard) | Web dashboard. An axum backend relays CBOR frames between the wristband and a Svelte frontend, and runs the training-data collection game: import a Beat Saber map, play the falling-notes track, record labelled EMG. |
 | [`pose-service/`](pose-service) | Python WebSocket service that turns EMG windows into 3-D hand pose. Runs a mock estimator or Meta's `emg2pose` model. |
-| [`emg-runtime/`](emg-runtime) | The on-device inference path: int8 kernels with hand-written ESP32-S3 SIMD and a scalar fallback off target, the reject pipeline, and the grid aligner that puts the two chips' independently clocked streams on one time base. `no_std`, and it builds on the host for verification. Its examples include the device-only SIMD checks; `data/` holds the exported model blobs. |
+| [`emg-runtime/`](emg-runtime) | Shared on-device classification arithmetic: filter-bank log-power features, wearer-model fitting/scoring, the reject pipeline, and the grid aligner. Historical int8 TDS kernels and blobs remain for reproducibility but are not linked into the production inference path. |
 | [`protocol/`](protocol) | A `no_std` crate of the CBOR frame types shared by the dashboard backend, the browser, and the firmware. |
 | [`engineering-logs/`](engineering-logs) | Dated log of the ML and on-device optimisation work, one goal, method, measurement, and analysis per entry. Read it first to learn why the model is what it is. |
 
@@ -90,8 +90,13 @@ For the shared Xtensa toolchain and Arch `libxml2` workaround, read
 [`opal-firmware/BRINGUP.md`](opal-firmware/BRINGUP.md); the deferred OTA proof and
 its end-to-end verification are in [`experiments/ota/`](experiments/ota).
 
-For the model and its history, read [`engineering-logs/`](engineering-logs) for the
-decisions and [`emg-tds/`](emg-tds) for the code.
+For end-to-end hardware validation, follow
+[`firmware-bench/TESTING.md`](firmware-bench/TESTING.md). Keep the one-page
+[`firmware-bench/DONNING.md`](firmware-bench/DONNING.md) checklist beside the wearer.
+
+For the current calibrated model and its history, read
+[`firmware-bench/ARITHMETIC.md`](firmware-bench/ARITHMETIC.md) and
+[`engineering-logs/`](engineering-logs). `emg-tds/` contains the superseded fixed-model work.
 
 To see it run without hardware, use [`dashboard/`](dashboard): run `./run.sh` and
 open <http://localhost:8090>.

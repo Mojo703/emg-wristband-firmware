@@ -1,14 +1,15 @@
 //! Opal EMG wristband firmware (ESP32-S3).
 //!
 //! Does the work of the final device: two ADS1298 ADCs sample 16 EMG channels on their
-//! own thread, the int8 model classifies each window, the reject pipeline smooths it
+//! own thread, the wearer-calibrated model classifies each window, and the reject
+//! pipeline smooths it
 //! into a wake-gate decision, and the result streams to the dashboard as EMG +
 //! prediction + event + log frames. The device owns its functional config
 //! (sensitivity, keymap, wifi) and persists those browser controls to NVS; runtime
 //! controls such as the default-off phone toggle are deliberately not persisted.
 //!
-//! The EMG frames carry raw ADC counts at a fixed scale, not the conditioned model
-//! input. A complete window is sent when the sole packed carrier has returned; if the
+//! The EMG frames carry the same fixed-scale raw ADC counts the calibrated feature
+//! path consumes. A complete window is sent when the sole packed carrier has returned; if the
 //! loop falls behind, acquisition records a drop before packing rather than allocating
 //! another carrier.
 //!
@@ -42,11 +43,9 @@ use adc::Channel;
 use calibration::{Calibration, CalibrationBuffers, WearerFeatureBuffers, WearerFeatures};
 use calibration_outbox::CalibrationOutbox;
 use config::{Sensitivity, Settings, Store};
-use emg_runtime::band_features::FEATURE_COUNT;
+use emg_runtime::band_features::{CHANNEL_COUNT, FEATURE_COUNT, WINDOW_SAMPLES};
 use emg_runtime::calibration::CalibrationModel;
-use emg_runtime::model::{Model, ModelBuffers, INPUT_CH, NUM_CLASSES};
-use emg_runtime::tensor::I8Activation;
-use emg_runtime::{softmax, Decision, ForwardResult, RejectPipeline};
+use emg_runtime::{Decision, RejectPipeline};
 use esp_idf_svc::hal::delay::FreeRtos;
 use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::hal::usb_serial::{UsbSerialConfig, UsbSerialDriver};
@@ -108,7 +107,8 @@ pub(crate) const SERIAL_RX_BUFFER_BYTES: usize = 16 * 1024;
 /// `ARITHMETIC.md`. Smaller than the model's own class count, which also holds
 /// the no-op and rest classes — their probability mass is never eligible to
 /// commit, which is the whole reason they are in the model.
-const CALIBRATION_COMMAND_CLASSES: usize = 5;
+pub(crate) const CALIBRATION_COMMAND_CLASSES: usize = 5;
+const CALIBRATION_CLASS_COUNT: usize = 12;
 
 /// How long the loop sleeps when no window is waiting.
 ///
@@ -151,37 +151,29 @@ struct LatencyRing {
     written: usize,
 }
 
-/// The two reject spines whose sensitivity must always move together.
-///
-/// The shipped spine drives streamed predictions; the wearer spine drives
-/// committed keys once a calibration is installed. Keeping both behind this
-/// setter prevents a live sensitivity change from reaching only one decision.
-struct DecisionPipelines {
-    shipped: RejectPipeline,
+/// The sole decision spine, fed by the active wearer-calibrated classifier.
+struct DecisionPipeline {
     wearer: RejectPipeline,
 }
 
-impl DecisionPipelines {
+impl DecisionPipeline {
     fn new(tau: f32) -> Self {
         Self {
-            shipped: RejectPipeline::new(NUM_CLASSES, tau),
             wearer: RejectPipeline::new(CALIBRATION_COMMAND_CLASSES, tau),
         }
     }
 
     fn set_tau(&mut self, tau: f32) {
-        self.shipped.tau = tau;
         self.wearer.tau = tau;
     }
 
     fn reset_decisions(&mut self) {
-        let tau = self.shipped.tau;
-        self.shipped = RejectPipeline::new(NUM_CLASSES, tau);
+        let tau = self.wearer.tau;
         self.wearer = RejectPipeline::new(CALIBRATION_COMMAND_CLASSES, tau);
     }
 
     fn tau(&self) -> f32 {
-        self.shipped.tau
+        self.wearer.tau
     }
 }
 
@@ -362,18 +354,6 @@ impl InferencePerformance {
     }
 }
 
-/// Alignment wrapper for the embedded blob. `include_bytes!` produces an align-1
-/// array, but `emg-runtime` borrows the weight tensors out of the blob in place —
-/// keeping ~35 KB of weights in flash instead of on the heap — and its SIMD kernels
-/// load weight rows with `ee.vld.128`, so the blob's base has to be 16-byte aligned
-/// for the rows to be.
-#[repr(align(16))]
-struct AlignedBlob<Bytes: ?Sized>(Bytes);
-
-/// The int8 model blob exported by `emg-tds export-int8`.
-static MODEL_BIN: &AlignedBlob<[u8]> =
-    &AlignedBlob(*include_bytes!("../../emg-runtime/data/model_int8.bin"));
-
 /// Microseconds since boot on the device clock — the same clock the acquisition
 /// thread stamps windows with and the logger stamps log lines with.
 fn device_now_us() -> u64 {
@@ -401,8 +381,7 @@ struct App {
     store: Store,
     settings: Settings,
     wireless: WirelessState,
-    model: Model<'static>,
-    pipelines: DecisionPipelines,
+    pipeline: DecisionPipeline,
     band_features: Box<WearerFeatures>,
     links: Links,
     feedback: Feedback,
@@ -414,7 +393,6 @@ struct App {
     source: Option<AdcSource>,
     #[cfg(feature = "playback")]
     playback: Option<playback::PlaybackEngine>,
-    model_input: I8Activation,
     seq: u32,
     prev_wake: WakeState,
     performance: InferencePerformance,
@@ -436,8 +414,6 @@ struct App {
 /// Deterministic application buffers reserved immediately after NimBLE has claimed
 /// its DMA-capable memory. Each field moves into the subsystem that owns it.
 struct AppMemory {
-    model: Model<'static>,
-    model_input: I8Activation,
     band_features: Box<WearerFeatures>,
     calibration: CalibrationBuffers,
     acquisition: adc::acquisition::AcquisitionBuffers,
@@ -446,25 +422,14 @@ struct AppMemory {
 
 impl AppMemory {
     fn reserve() -> Self {
-        let model_buffers = ModelBuffers::reserve(&MODEL_BIN.0);
-        let model_sizes = model_buffers.sizes();
-        let (model, model_input) = Model::load(&MODEL_BIN.0, model_buffers);
         let wearer_buffers = WearerFeatureBuffers::reserve();
         let wearer_bytes = wearer_buffers.reserved_bytes();
         let band_features = Box::new(WearerFeatures::new(wearer_buffers));
         let calibration = CalibrationBuffers::reserve(calibration_flow::Constants::DEFAULT);
-        let acquisition = adc::acquisition::AcquisitionBuffers::reserve(model.input_len);
-        let reserved_bytes = model_sizes.padded
-            + model_sizes.depthwise
-            + model_sizes.pointwise
-            + model_sizes.pooled
-            + model_sizes.input
-            + wearer_bytes
-            + calibration.reserved_bytes()
-            + acquisition.reserved_bytes();
+        let acquisition = adc::acquisition::AcquisitionBuffers::reserve(WINDOW_SAMPLES);
+        let reserved_bytes =
+            wearer_bytes + calibration.reserved_bytes() + acquisition.reserved_bytes();
         Self {
-            model,
-            model_input,
             band_features,
             calibration,
             acquisition,
@@ -473,11 +438,11 @@ impl AppMemory {
     }
 }
 
-struct InferenceOutcome {
+struct ClassificationOutcome {
     started_at: Instant,
     inference_us: u64,
-    logits: [f32; NUM_CLASSES],
-    probabilities: [f32; NUM_CLASSES],
+    logits: [f32; CALIBRATION_CLASS_COUNT],
+    probabilities: [f32; CALIBRATION_CLASS_COUNT],
     decision: Decision,
     t_us: u64,
 }
@@ -510,8 +475,6 @@ impl App {
         );
 
         let AppMemory {
-            model,
-            model_input,
             mut band_features,
             calibration: calibration_buffers,
             acquisition: acquisition_buffers,
@@ -541,11 +504,12 @@ impl App {
 
         let clock_probe = clock_probe::ClockProbeAdapter::new(peripherals.pins.gpio3.into());
 
-        let pipelines = DecisionPipelines::new(settings.sensitivity.tau());
+        let pipeline = DecisionPipeline::new(settings.sensitivity.tau());
 
-        info!("free heap after BLE and model load: {} KB", unsafe {
-            esp_idf_svc::sys::esp_get_free_heap_size() / 1024
-        });
+        info!(
+            "free heap after BLE and classifier reservations: {} KB",
+            unsafe { esp_idf_svc::sys::esp_get_free_heap_size() / 1024 }
+        );
 
         // ---------------------------------------------------------------------------
         // ADS1298 wiring for the two-board harness on the ESP32-S3-Zero. This block is
@@ -657,11 +621,6 @@ impl App {
             indicator: peripherals.pins.gpio21.into(),
         });
 
-        // Normalised units per count, not microvolts per count; `adc::conditioning`
-        // documents the difference and the acquisition path is what puts the signal on
-        // that footing.
-        let input_scale = model.input_scale;
-
         // Bring-up blocks ~2.5 s on the ADS1298's mandated settling delays, so it must run
         // before the code below registers the task watchdog.
         //
@@ -686,12 +645,7 @@ impl App {
             ADC_TEST_SIGNAL_CHANNEL,
         )
         .and_then(|front_ends| {
-            adc::acquisition::start(
-                front_ends,
-                model.input_len,
-                input_scale,
-                acquisition_buffers,
-            )
+            adc::acquisition::start(front_ends, WINDOW_SAMPLES, acquisition_buffers)
         });
         let source = match adc_result {
             Ok(source) => Some(source),
@@ -777,8 +731,7 @@ impl App {
             store,
             settings,
             wireless,
-            model,
-            pipelines,
+            pipeline,
             band_features,
             links,
             feedback,
@@ -789,7 +742,6 @@ impl App {
             source,
             #[cfg(feature = "playback")]
             playback,
-            model_input,
             seq,
             prev_wake,
             performance,
@@ -886,7 +838,7 @@ impl App {
             config_changed |= apply_control(
                 control,
                 &mut self.settings,
-                &mut self.pipelines,
+                &mut self.pipeline,
                 &mut self.wireless,
                 &self.store,
             );
@@ -1031,11 +983,7 @@ impl App {
     }
 
     fn apply_resident_runtime_update(&mut self, update: calibration::ResidentRuntimeUpdate) {
-        reset_command_state(
-            &mut self.committed,
-            &mut self.prev_wake,
-            &mut self.pipelines,
-        );
+        reset_command_state(&mut self.committed, &mut self.prev_wake, &mut self.pipeline);
         match update {
             calibration::ResidentRuntimeUpdate::Activated(activation) => {
                 self.band_features.adopt_gains(activation.gains);
@@ -1094,10 +1042,23 @@ impl App {
             self.publish_feedback_state();
             return;
         }
-        let inference = self.infer_window(&window);
+        let started_at = Instant::now();
         let streamed = self.stream_and_recycle_window(window);
-        self.publish_decision_frames(&inference, streamed.newest_seq, config_changed);
-        self.finish_processed_batch(inference, streamed);
+        let Some(features) = streamed.newest_features else {
+            if config_changed {
+                let hello = Frame::DeviceHello {
+                    device_id: self.device_id.clone(),
+                    config: self.settings.to_wire(),
+                    provenance: provenance::device(),
+                };
+                self.links.send_window(Some(&hello), &[]);
+            }
+            self.publish_feedback_state();
+            return;
+        };
+        let classification = self.classify_features(&features, started_at);
+        self.publish_decision_frames(&classification, streamed.newest_seq, config_changed);
+        self.finish_processed_batch(classification, streamed);
     }
 
     fn note_front_end_recovery(&mut self) {
@@ -1115,19 +1076,26 @@ impl App {
         }
     }
 
-    fn infer_window(&mut self, window: &AcquiredWindow) -> InferenceOutcome {
-        let started_at = Instant::now();
-        self.model_input
-            .copy_from_i8_slice(&window.samples, self.model.input_len, INPUT_CH);
-        let ForwardResult::Logits(raw_logits) = self.model.forward(&self.model_input);
-        let inference_us = started_at.elapsed().as_micros() as u64;
-        let logits = std::array::from_fn(|class| raw_logits[class] as f32 * self.model.logit_scale);
-        let probabilities = softmax(&logits);
-        let decision = self.pipelines.shipped.step(&probabilities);
+    fn classify_features(
+        &mut self,
+        features: &[f32; FEATURE_COUNT],
+        started_at: Instant,
+    ) -> ClassificationOutcome {
+        let scoring_started_at = Instant::now();
+        let model = self
+            .calibrated
+            .as_ref()
+            .expect("feature scoring requires a resident calibration");
+        assert_eq!(model.class_count, CALIBRATION_CLASS_COUNT);
+        let mut logits = [0.0f32; CALIBRATION_CLASS_COUNT];
+        let mut probabilities = [0.0f32; CALIBRATION_CLASS_COUNT];
+        model.scores(features, &mut logits, &mut probabilities);
+        let inference_us = scoring_started_at.elapsed().as_micros() as u64;
+        let decision = self.pipeline.wearer.step(&probabilities);
 
         // Decision events use the device clock, not nominal sample timing, because
         // the ADC oscillator drifts by several percent.
-        InferenceOutcome {
+        ClassificationOutcome {
             started_at,
             inference_us,
             logits,
@@ -1148,14 +1116,13 @@ impl App {
         let AcquiredWindow {
             started_us,
             end_sample,
-            samples: conditioned,
             packed_wire,
             missing,
         } = window;
         let frame = Frame::Emg {
             seq: newest_seq,
             t0_us: started_us,
-            channels: INPUT_CH as u16,
+            channels: CHANNEL_COUNT as u16,
             sample_rate: adc::ads1298::SAMPLE_RATE_HZ,
             scale_uv: adc::MICROVOLTS_PER_WIRE_COUNT,
             samples: packed_wire,
@@ -1186,7 +1153,7 @@ impl App {
             })
             .flatten();
         self.calibration.observe_acquisition(end_sample);
-        source.recycle(conditioned, packed_wire, missing);
+        source.recycle(packed_wire, missing);
 
         StreamOutcome {
             batch_size: 1,
@@ -1197,16 +1164,16 @@ impl App {
 
     fn publish_decision_frames(
         &mut self,
-        inference: &InferenceOutcome,
+        inference: &ClassificationOutcome,
         newest_seq: u32,
         config_changed: bool,
     ) {
         let mut frames = vec![frames::prediction(
             newest_seq,
-            inference.logits,
-            inference.probabilities,
+            &inference.logits,
+            &inference.probabilities,
             &inference.decision,
-            self.pipelines.tau(),
+            self.pipeline.tau(),
         )];
         frames.extend(frames::events(
             self.prev_wake,
@@ -1222,25 +1189,18 @@ impl App {
         self.links.send_window(hello.as_ref(), &frames);
     }
 
-    fn finish_processed_batch(&mut self, inference: InferenceOutcome, streamed: StreamOutcome) {
-        // Prediction frames intentionally remain the shipped model's output; an
-        // installed wearer model decides only which key commits.
-        let calibrated_decision = match (self.calibrated.as_ref(), streamed.newest_features) {
-            (Some(model), Some(features)) => {
-                let mut probabilities = vec![0.0f32; model.class_count];
-                model.probabilities(&features, &mut probabilities);
-                Some(self.pipelines.wearer.step(&probabilities))
-            }
-            _ => None,
-        };
-        let committing = calibrated_decision.as_ref().unwrap_or(&inference.decision);
+    fn finish_processed_batch(
+        &mut self,
+        inference: ClassificationOutcome,
+        streamed: StreamOutcome,
+    ) {
         // The calibrated model contains five command classes followed by their
         // paired thumb-down anti-gesture classes. Only the first five are ever
         // eligible to reach HID; an unbound anti class must not fall through to
         // Settings::key_for's default media action.
         let next_commit = calibrated_command_key(
-            committing.wake_state,
-            committing.argmax,
+            inference.decision.wake_state,
+            inference.decision.argmax,
             self.calibration.suppresses_commits(),
             &self.settings,
         );
@@ -1300,11 +1260,11 @@ fn calibrated_command_key(
 fn reset_command_state(
     committed: &mut Option<MediaKey>,
     previous_wake: &mut WakeState,
-    pipelines: &mut DecisionPipelines,
+    pipeline: &mut DecisionPipeline,
 ) {
     *committed = None;
     *previous_wake = WakeState::Idle;
-    pipelines.reset_decisions();
+    pipeline.reset_decisions();
 }
 
 /// Apply a control frame; returns true when it changed persisted config (so the
@@ -1312,7 +1272,7 @@ fn reset_command_state(
 fn apply_control(
     control: Control,
     settings: &mut Settings,
-    pipelines: &mut DecisionPipelines,
+    pipeline: &mut DecisionPipeline,
     wireless: &mut WirelessState,
     store: &Store,
 ) -> bool {
@@ -1320,7 +1280,7 @@ fn apply_control(
         Control::SetSensitivity { level } => match Sensitivity::from_id(&level) {
             Some(level) => {
                 settings.sensitivity = level;
-                pipelines.set_tau(level.tau());
+                pipeline.set_tau(level.tau());
                 store.save(settings);
                 true
             }
@@ -1410,16 +1370,14 @@ mod decision_pipeline_tests {
     }
 
     #[test]
-    fn sensitivity_updates_both_reject_spines_and_survives_activation_reset() {
-        let mut pipelines = DecisionPipelines::new(0.5);
+    fn sensitivity_updates_the_reject_spine_and_survives_activation_reset() {
+        let mut pipeline = DecisionPipeline::new(0.5);
 
-        pipelines.set_tau(0.75);
-        assert_eq!(pipelines.shipped.tau, 0.75);
-        assert_eq!(pipelines.wearer.tau, 0.75);
+        pipeline.set_tau(0.75);
+        assert_eq!(pipeline.wearer.tau, 0.75);
 
-        pipelines.reset_decisions();
-        assert_eq!(pipelines.shipped.tau, 0.75);
-        assert_eq!(pipelines.wearer.tau, 0.75);
+        pipeline.reset_decisions();
+        assert_eq!(pipeline.wearer.tau, 0.75);
     }
 
     #[test]
@@ -1441,16 +1399,15 @@ mod decision_pipeline_tests {
 
     #[test]
     fn activation_resets_latched_command_and_decision_state_without_link_mutation() {
-        let mut pipelines = DecisionPipelines::new(0.5);
+        let mut pipeline = DecisionPipeline::new(0.5);
         let mut committed = Some(MediaKey::NextTrack);
         let mut previous_wake = WakeState::Active;
-        reset_command_state(&mut committed, &mut previous_wake, &mut pipelines);
+        reset_command_state(&mut committed, &mut previous_wake, &mut pipeline);
         assert_eq!(committed, None);
         assert_eq!(previous_wake, WakeState::Idle);
         // The configured threshold is preserved while the decision histories
         // reset, so activation cannot silently change control sensitivity.
-        assert_eq!(pipelines.shipped.tau, 0.5);
-        assert_eq!(pipelines.wearer.tau, 0.5);
+        assert_eq!(pipeline.wearer.tau, 0.5);
     }
 
     #[test]
@@ -1507,18 +1464,6 @@ mod startup_memory_tests {
 
     #[test]
     fn every_startup_buffer_has_the_product_capacity() {
-        let model = ModelBuffers::reserve(&MODEL_BIN.0);
-        assert_eq!(
-            model.sizes(),
-            emg_runtime::model::ModelBufferSizes {
-                padded: 8_384,
-                depthwise: 4_096,
-                pointwise: 8_064,
-                pooled: 128,
-                logits: 20,
-                input: 8_000,
-            }
-        );
         assert_eq!(WearerFeatureBuffers::reserve().reserved_bytes(), 16_000);
         assert_eq!(
             CalibrationBuffers::reserve(calibration_flow::Constants::DEFAULT).reserved_bytes(),
@@ -1527,13 +1472,9 @@ mod startup_memory_tests {
     }
 
     #[test]
-    fn named_storage_total_includes_inline_logits() {
+    fn named_storage_excludes_the_removed_tds_buffers() {
         let memory = AppMemory::reserve();
-        assert_eq!(memory.reserved_bytes, 59_504);
-        assert_eq!(
-            memory.reserved_bytes + NUM_CLASSES * core::mem::size_of::<i32>(),
-            59_524
-        );
+        assert_eq!(memory.reserved_bytes, 71_084);
     }
 
     #[test]

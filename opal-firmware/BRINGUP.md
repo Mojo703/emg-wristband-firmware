@@ -126,7 +126,7 @@ fault.
 
 Set `ADC_TEST_SIGNAL_CHANNEL` back to `None`, flash, and put the band on someone.
 
-At rest each conditioned channel should sit near zero and drift slowly. Clench,
+At rest each raw channel should remain within range around its electrode offset. Clench,
 and the channels over the active muscle should jump. Check the dashboard's
 waveform, rail, offset, headroom, and noise measurements while seating each
 electrode.
@@ -138,34 +138,21 @@ separate build with scopes and the front-end recovery counters visible; earlier
 failure-rate measurements predate the current driver and hardware fixes and do
 not establish current behavior.
 
-## 5. Does the model see anything sensible?
+## 5. Does the calibrated classifier see anything sensible?
 
 Only now is it worth looking at predictions.
 
-Two things make this the step most likely to disappoint, and neither is a bug you can
-find by reading the log:
+The production path applies the frozen mains notches and four Butterworth bands,
+forms 64 per-channel log-power features, standardizes them with the resident
+calibration, and scores its 12-class linear head. The first five classes are commands;
+the five paired thumb-down classes and two rest classes can reject but never commit.
 
-**Preprocessing.** The training windows are dimensionless and unit-variance, so the
-model's `input_scale` is normalised units per count and not microvolts per count.
-`src/adc/preprocess.rs` and `src/adc/conditioning.rs` are what put a live sample on
-that footing: sign-extended code, to microvolts, through a direct-current blocker
-that removes the electrode offset and a per-channel amplitude tracker, and only then
-to int8. Both modules document the measurement behind every constant, and
-[engineering log 0016](../engineering-logs/0016-input-conditioning-units-and-direct-current.md)
-records how the unit error was found. Read them before adjusting anything in that
-chain: the failure mode is silent, since a mis-scaled input saturates and the
-predictions go poor with no error message.
-
-**Rate.** The ADCs run at 2000 Hz. The model was trained at 2048 Hz. That is a 2.3 %
-stretch in the time base, small enough to be harmless and large enough to be worth
-measuring rather than assuming. Nobody has measured it.
-
-To tell a model problem from an acquisition problem, feed the same model a window that is
-known good. Run `cargo test-device`: `device_forward_pass_matches_float_reference` runs the
-same int8 blob over the exporter's verification windows, on the same chip and in the same
-binary, and checks accuracy against the float reference. A pass there alongside poor
-predictions on live data puts the fault in acquisition or preprocessing rather than the
-model.
+No classification runs until a CRC-valid resident calibration is active. Complete and
+save calibration first, then inspect the 12-class `Prediction` frames. If they look
+wrong, replay the same recorded raw window through `emg-runtime::band_features`; the
+host fixtures pin the filter and feature arithmetic bit for bit. The former fixed TDS
+model, conditioned int8 input, and SIMD forward pass are no longer part of production
+firmware.
 
 ## What to write down
 

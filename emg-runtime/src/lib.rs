@@ -1,12 +1,10 @@
-//! On-device EMG gesture runtime: the int8 inference path (with hand-written
-//! ESP32-S3 SIMD kernels and a scalar fallback off-target) plus the model-free
-//! reject pipeline. Consumed by the device firmware (`opal-firmware`).
+//! On-device EMG gesture runtime: calibrated filter-bank classification, fitting,
+//! alignment, and the model-free reject pipeline. The optional `tds` feature retains
+//! the superseded int8 convolution path for research and reproduction; production
+//! `opal-firmware` disables it.
 //!
-//! `no_std` + `alloc`. The SIMD kernels in [`mac`]/[`layers`] compile only for
-//! Xtensa; every other target uses the scalar oracle, so the crate type-checks and
-//! runs on the host for verification. The architecture is fixed to the current
-//! emg-tds model (see [`model`]); the int8 weight blob is supplied by the caller via
-//! [`model::Model::load`] rather than embedded here, so the lib stays blob-agnostic.
+//! `no_std` + `alloc`. With `tds`, the SIMD kernels compile only for Xtensa and every
+//! other target uses the scalar oracle.
 
 // `no_std` everywhere except under `cargo test`, whose harness needs std on the host.
 #![cfg_attr(not(test), no_std)]
@@ -21,13 +19,18 @@ pub mod alignment;
 pub mod band_features;
 pub mod calibration;
 pub mod flash_image;
+#[cfg(feature = "tds")]
 pub mod layers;
+#[cfg(feature = "tds")]
 pub mod mac;
+#[cfg(feature = "tds")]
 pub mod model;
 pub mod pipeline;
 pub mod streaming_fit;
+#[cfg(feature = "tds")]
 pub mod tensor;
 
+#[cfg(feature = "tds")]
 pub use model::{ForwardResult, Model, ModelBufferSizes, ModelBuffers, VerifyBatch, VerifyWindow};
 pub use pipeline::{softmax, Decision, RejectPipeline};
 

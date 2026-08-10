@@ -18,6 +18,7 @@
 
 use core::fmt;
 
+#[cfg(test)]
 use super::channel::Channel;
 use super::registers::ChannelMask;
 
@@ -39,6 +40,7 @@ impl LeadOffFlags {
         LeadOffFlags(ChannelMask::from_bits(bits))
     }
 
+    #[cfg(test)]
     pub(super) const fn contains(self, channel: Channel) -> bool {
         self.0.contains(channel)
     }
@@ -88,6 +90,7 @@ impl StatusWord {
     /// True when either comparator flags this channel. The two banks watch the two ends
     /// of one differential pair, and either end coming off makes the channel useless,
     /// so callers that only care whether the channel is trustworthy ask this.
+    #[cfg(test)]
     pub(super) const fn lead_off(self, channel: Channel) -> bool {
         self.positive_lead_off.contains(channel) || self.negative_lead_off.contains(channel)
     }

@@ -31,8 +31,8 @@ pub(super) const MICROVOLTS_PER_VOLT: f32 = 1_000_000.0;
 const WIRE_SHIFT_BITS: u32 = 8;
 
 /// Microvolts per wire count. Fixed for the life of the configuration, unlike the
-/// conditioned model input, whose scale drifts with each channel's running amplitude
-/// estimate. Recorded sessions depend on this being a constant: a stored stream is
+/// historical conditioned TDS input, whose scale drifted with each channel's running
+/// amplitude estimate. Recorded sessions depend on this being a constant: a stored stream is
 /// only convertible back to real units if the conversion is not itself part of the
 /// data.
 pub(crate) const MICROVOLTS_PER_WIRE_COUNT: f32 = (REFERENCE_VOLTS / GAIN) / FULL_SCALE_CODE
@@ -40,6 +40,7 @@ pub(crate) const MICROVOLTS_PER_WIRE_COUNT: f32 = (REFERENCE_VOLTS / GAIN) / FUL
     * (1 << WIRE_SHIFT_BITS) as f32;
 
 // Converts a signed 24-bit ADC code to volts: `V = code * (VREF / gain) / 2^23`.
+#[cfg(test)]
 pub(super) fn code_to_voltage(code: i32, vref: f32, gain: f32) -> f32 {
     code as f32 * (vref / gain) / FULL_SCALE_CODE
 }

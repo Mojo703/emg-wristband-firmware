@@ -470,6 +470,30 @@ impl CalibrationModel {
     /// Class probabilities for one feature row; `probabilities` must hold
     /// `class_count` values.
     pub fn probabilities(&self, features: &[f32; FEATURE_COUNT], probabilities: &mut [f32]) {
+        let design = self.standardized_design(features);
+        let out = &mut probabilities[..self.class_count];
+        logits(&design, &self.weights, self.class_count, out);
+        softmax_in_place(out);
+    }
+
+    /// Raw linear scores and class probabilities for one feature row. This is the
+    /// device telemetry path; keeping both outputs here prevents the firmware from
+    /// reimplementing the calibrated model's standardization or softmax.
+    pub fn scores(
+        &self,
+        features: &[f32; FEATURE_COUNT],
+        raw_logits: &mut [f32],
+        probabilities: &mut [f32],
+    ) {
+        let design = self.standardized_design(features);
+        let raw = &mut raw_logits[..self.class_count];
+        logits(&design, &self.weights, self.class_count, raw);
+        let out = &mut probabilities[..self.class_count];
+        out.copy_from_slice(raw);
+        softmax_in_place(out);
+    }
+
+    fn standardized_design(&self, features: &[f32; FEATURE_COUNT]) -> [f32; INPUT_COUNT] {
         let mut design = [0.0f32; INPUT_COUNT];
         for (input, ((&value, &mean), &deviation)) in design
             .iter_mut()
@@ -478,9 +502,7 @@ impl CalibrationModel {
             *input = (value - mean) / deviation;
         }
         design[FEATURE_COUNT] = 1.0;
-        let out = &mut probabilities[..self.class_count];
-        logits(&design, &self.weights, self.class_count, out);
-        softmax_in_place(out);
+        design
     }
 
     /// Serialize to the same layout `from_bits` reads, for parity reporting.
@@ -934,6 +956,11 @@ mod tests {
         let scored = score_all(&model, &reference.probes);
         let delta = largest_delta(&scored, &reference.probe_probabilities);
         assert!(delta < 1e-6, "probability delta {delta:e}");
+        let mut raw_logits = vec![0.0; reference.class_count];
+        let mut probabilities = vec![0.0; reference.class_count];
+        model.scores(&reference.probes[0], &mut raw_logits, &mut probabilities);
+        assert!(raw_logits.iter().all(|value| value.is_finite()));
+        assert_eq!(probabilities, scored[..reference.class_count]);
         assert_eq!(model.to_bits(), bytes);
         assert!(
             CalibrationModel::from_bits(reference.class_count, &bytes[..bytes.len() - 4]).is_none()

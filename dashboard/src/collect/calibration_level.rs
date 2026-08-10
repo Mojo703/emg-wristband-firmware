@@ -5,8 +5,8 @@ use super::beatmap::MapNote;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub const HOLD_MILLISECONDS: u32 = 1_500;
-pub const MINIMUM_RECOVERY_MILLISECONDS: u32 = 500;
+pub const HOLD_MILLISECONDS: u32 = protocol::CALIBRATION_CUE_HOLD_MILLISECONDS;
+pub const MINIMUM_RECOVERY_MILLISECONDS: u32 = protocol::CALIBRATION_CUE_RECOVERY_MILLISECONDS;
 pub const COMMAND_SEMANTIC_COUNT: usize = 5;
 pub const COMMAND_CUES_PER_CLASS: usize = 10;
 pub const ANTI_CUES_PER_CLASS: usize = 16;
@@ -15,7 +15,11 @@ pub const MAXIMUM_CUES: usize =
 pub const SEMANTIC_COLUMN_COUNT: usize = 10;
 pub const CALIBRATION_LEVEL_SCHEMA_VERSION: u32 = 2;
 const LEGACY_CALIBRATION_LEVEL_GENERATOR_VERSION: u32 = 2;
-pub const CALIBRATION_LEVEL_GENERATOR_VERSION: u32 = 3;
+/// Version 3 allowed zero recovery for a paired thumb-state switch, but firmware's
+/// anchored-song contract still requires 500 ms after every cue. Catalog loading
+/// regenerates this version in memory from the retained source schedule.
+pub(crate) const INCOMPATIBLE_CALIBRATION_LEVEL_GENERATOR_VERSION: u32 = 3;
+pub const CALIBRATION_LEVEL_GENERATOR_VERSION: u32 = 4;
 pub const CALIBRATION_SOURCE_LEVEL: &str = "hard";
 
 /// Fixed measured order, beginning at command zero. No implicit song/session
@@ -48,7 +52,7 @@ impl CalibrationLevelProduct {
         )
     }
 
-    fn generate_with_version(
+    pub(crate) fn generate_with_version(
         source_notes: &[MapNote],
         source_duration_ms: u32,
         generator_version: u32,
@@ -226,11 +230,11 @@ fn select_notes(
     selected
 }
 
-/// Switching only the thumb state within one gesture lane needs no recovery
-/// beyond the completed 1.5 s labeled hold. Moving to another gesture retains
-/// the measured 0.5 s recovery interval. Version 2 used the latter globally.
+/// Firmware's anchored-song validator requires this recovery after every cue.
+/// Version 3 incorrectly made paired thumb-state switches exempt; preserve that
+/// behavior only so tests and catalog migration can identify its persisted products.
 const fn recovery_between(previous: u8, next: u8, generator_version: u32) -> u32 {
-    if generator_version >= CALIBRATION_LEVEL_GENERATOR_VERSION
+    if generator_version == INCOMPATIBLE_CALIBRATION_LEVEL_GENERATOR_VERSION
         && previous % COMMAND_SEMANTIC_COUNT as u8 == next % COMMAND_SEMANTIC_COUNT as u8
     {
         0
@@ -445,7 +449,7 @@ mod tests {
         let source = regular_source(300, 250);
         let level = generate(&source, source_duration(&source));
 
-        assert_eq!(level.notes().len(), 43);
+        assert_eq!(level.notes().len(), 38);
         assert!(level.notes().windows(2).all(|pair| {
             pair[0].map_note.time_ms
                 + pair[0].map_note.hold_ms
@@ -599,7 +603,7 @@ mod tests {
     }
 
     #[test]
-    fn paired_thumb_switches_fill_the_recipe_without_overlapping_holds() {
+    fn every_thumb_switch_keeps_the_firmware_recovery_contract() {
         let source = paired_thumb_source();
         let duration = source_duration(&source);
         let current = CalibrationLevelProduct::generate(&source, duration);
@@ -610,9 +614,13 @@ mod tests {
         );
 
         assert_eq!(current.cue_count(), MAXIMUM_CUES);
-        assert!(legacy.cue_count() < MAXIMUM_CUES);
+        assert_eq!(legacy.cue_count(), MAXIMUM_CUES);
         current.validate_against_source(&source, duration).unwrap();
         legacy.validate_against_source(&source, duration).unwrap();
+        assert!(current.notes.windows(2).all(|pair| {
+            pair[1].map_note.time_ms
+                >= pair[0].map_note.time_ms + HOLD_MILLISECONDS + MINIMUM_RECOVERY_MILLISECONDS
+        }));
     }
 
     #[test]
@@ -711,7 +719,7 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(CALIBRATION_LEVEL_SCHEMA_VERSION, 2);
-        assert_eq!(CALIBRATION_LEVEL_GENERATOR_VERSION, 3);
+        assert_eq!(CALIBRATION_LEVEL_GENERATOR_VERSION, 4);
         assert_eq!(first.schema_version, CALIBRATION_LEVEL_SCHEMA_VERSION);
         assert_eq!(first.generator_version, CALIBRATION_LEVEL_GENERATOR_VERSION);
         assert_eq!(first.source_level, CALIBRATION_SOURCE_LEVEL);

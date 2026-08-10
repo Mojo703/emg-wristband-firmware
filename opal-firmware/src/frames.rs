@@ -5,15 +5,14 @@
 //! cosmetics), so events carry none here — the device only states what happened.
 
 use crate::config::Settings;
-use emg_runtime::model::NUM_CLASSES;
 use emg_runtime::Decision;
 use protocol::{Frame, WakeState};
 
 /// The classifier output for one window.
 pub fn prediction(
     seq: u32,
-    logits: [f32; NUM_CLASSES],
-    softmax: [f32; NUM_CLASSES],
+    logits: &[f32],
+    softmax: &[f32],
     decision: &Decision,
     tau: f32,
 ) -> Frame {

@@ -11,6 +11,10 @@ use core::fmt;
 use protocol::{
     CalibrationRunKey, CalibrationScheduleEntry, CalibrationScheduleRevision, RepRejection,
 };
+pub use protocol::{
+    CALIBRATION_CUE_HOLD_MILLISECONDS as REQUIRED_CUE_HOLD_MILLISECONDS,
+    CALIBRATION_CUE_RECOVERY_MILLISECONDS as REQUIRED_CUE_RECOVERY_MILLISECONDS,
+};
 
 use crate::RepEvidence;
 
@@ -22,8 +26,6 @@ pub const MAX_ANCHORED_SONG_CHUNK_CUES: usize = 32;
 /// songs while keeping malformed input from consuming the device heap or
 /// flooding the 24-frame reliable acknowledgement outbox.
 pub const MAX_ANCHORED_SONG_CUES: u32 = 256;
-pub const REQUIRED_CUE_HOLD_MILLISECONDS: u32 = 1_500;
-pub const REQUIRED_CUE_RECOVERY_MILLISECONDS: u32 = 500;
 pub const HEARTBEAT_INTERVAL_MICROSECONDS: u64 = 500_000;
 pub const HEARTBEAT_TIMEOUT_MICROSECONDS: u64 = 2_000_000;
 pub const SONG_ANCHOR_LEAD_MICROSECONDS: u64 = 3_000_000;
