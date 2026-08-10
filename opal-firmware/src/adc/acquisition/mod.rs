@@ -126,6 +126,9 @@ pub(crate) struct AcquiredWindow {
     /// `seq × window_us` timeline would silently paper over. Consumers anchoring
     /// this timeline to their own clock see data stay put instead of drifting.
     pub(crate) started_us: u64,
+    /// One past the last emitted acquisition-grid sample in this window.
+    /// This counter advances in the combiner whether optional feature work runs.
+    pub(crate) end_sample: u64,
     /// Conditioned model input, time-major `[t, c]`. Never leaves the device; the
     /// buffer goes back via [`AdcSource::recycle`].
     pub(crate) samples: Vec<i8>,
@@ -216,9 +219,48 @@ pub(crate) struct AdcSource {
     recycled: SyncSender<(Vec<i8>, Vec<u8>, Vec<u8>)>,
     counters: Arc<HealthCounters>,
     window_length: usize,
+    acquisition_sample: Arc<MonotonicCounter>,
+}
+
+/// A single-writer u64 snapshot on targets that only provide 32-bit atomics.
+/// The odd/even revision prevents a reader from combining different writes.
+#[derive(Default)]
+struct MonotonicCounter {
+    revision: AtomicU32,
+    low: AtomicU32,
+    high: AtomicU32,
+}
+
+impl MonotonicCounter {
+    fn store(&self, value: u64) {
+        self.revision.fetch_add(1, Ordering::SeqCst);
+        self.low.store(value as u32, Ordering::Relaxed);
+        self.high.store((value >> 32) as u32, Ordering::Relaxed);
+        self.revision.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn load(&self) -> u64 {
+        loop {
+            let before = self.revision.load(Ordering::Acquire);
+            if before & 1 != 0 {
+                core::hint::spin_loop();
+                continue;
+            }
+            let low = self.low.load(Ordering::Relaxed);
+            let high = self.high.load(Ordering::Relaxed);
+            let after = self.revision.load(Ordering::Acquire);
+            if before == after {
+                return (u64::from(high) << 32) | u64::from(low);
+            }
+        }
+    }
 }
 
 impl AdcSource {
+    pub(crate) fn acquisition_sample(&self) -> u64 {
+        self.acquisition_sample.load()
+    }
+
     /// Windows lost outright, cumulative since boot: the channel was full at
     /// [`WINDOW_QUEUE_DEPTH`] when a window came ready, so it was never handed over.
     /// Since the consumer drains the whole backlog, this only moves when the main
@@ -347,6 +389,7 @@ pub(crate) fn start(
     let (recycle_sender, recycled) =
         sync_channel::<(Vec<i8>, Vec<u8>, Vec<u8>)>(RECYCLE_POOL_DEPTH);
     let counters = Arc::new(HealthCounters::default());
+    let acquisition_sample = Arc::new(MonotonicCounter::default());
 
     let FrontEnds {
         chips,
@@ -376,6 +419,7 @@ pub(crate) fn start(
     drop(event_sender); // the pipelines hold the only senders now
 
     let combiner_counters = counters.clone();
+    let combiner_acquisition_sample = acquisition_sample.clone();
     crate::cores::spawn_pinned(crate::cores::COMBINER_CORE, || {
         std::thread::Builder::new()
             .name("adc-combine".into())
@@ -389,6 +433,7 @@ pub(crate) fn start(
                     window_sender,
                     recycled,
                     combiner_counters,
+                    combiner_acquisition_sample,
                     window_length,
                     input_scale,
                     buffers,
@@ -401,6 +446,7 @@ pub(crate) fn start(
         recycled: recycle_sender,
         counters,
         window_length,
+        acquisition_sample,
     })
 }
 
@@ -413,6 +459,7 @@ fn combine(
     windows: SyncSender<AcquiredWindow>,
     recycled: Receiver<(Vec<i8>, Vec<u8>, Vec<u8>)>,
     counters: Arc<HealthCounters>,
+    acquisition_sample: Arc<MonotonicCounter>,
     window_length: usize,
     input_scale: f32,
     buffers: AcquisitionBuffers,
@@ -441,6 +488,9 @@ fn combine(
     let mut building_started_us: u64 = 0;
     // The previous emitted grid step, for spotting skipped stretches.
     let mut previous_step_us: Option<u64> = None;
+    // Device-time anchor for the acquisition counter. Unlike feature-pipeline
+    // state, this is established by the first aligned sample and never resets.
+    let mut acquisition_anchor_us: Option<u64> = None;
     let mut ticks_at_last_log: u64 = 0;
 
     loop {
@@ -473,6 +523,14 @@ fn combine(
                 frames.clear();
                 let _ = batch_recyclers[chip].try_send(frames);
                 while let Some(step) = aligner.poll() {
+                    let anchor_us = *acquisition_anchor_us.get_or_insert(step.at_us);
+                    let elapsed_us = step.at_us - anchor_us;
+                    let seconds = elapsed_us / 1_000_000;
+                    let subsecond_us = elapsed_us % 1_000_000;
+                    let current_sample = seconds * SAMPLE_RATE_HZ as u64
+                        + subsecond_us * SAMPLE_RATE_HZ as u64 / 1_000_000
+                        + 1;
+                    acquisition_sample.store(current_sample);
                     // Skipped ticks mean the emitted timeline has a hole (every
                     // present source gapped at once); a window must not span it.
                     if previous_step_us
@@ -526,8 +584,13 @@ fn combine(
                             }),
                         );
                         building_wire.clear();
+                        // Derive the acquisition index from the aligner's device-time
+                        // grid rather than from delivered-window count. Sustained gaps
+                        // skip emitted ticks, but they must still advance the clock a
+                        // future cue mapping is measured against.
                         let full = AcquiredWindow {
                             started_us: building_started_us,
+                            end_sample: current_sample,
                             samples: std::mem::replace(&mut building, next_building),
                             packed_wire,
                             missing: std::mem::replace(&mut building_missing, next_missing),

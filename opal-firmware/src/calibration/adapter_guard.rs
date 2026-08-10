@@ -1,5 +1,8 @@
 //! Pure ordering guards at the calibration-flow adapter boundary.
 
+use core::num::NonZeroU32;
+use emg_runtime::streaming_fit::FitPassProgress;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ActionGuard<S> {
     in_flight: Option<S>,
@@ -60,9 +63,51 @@ pub(crate) fn rows_ready_to_install(
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct FitPassSchedule {
+    remaining: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FitScheduleProgress {
+    PassInProgress,
+    PassComplete,
+    CheckpointComplete,
+}
+
+impl FitPassSchedule {
+    pub(crate) fn new(passes: NonZeroU32) -> Self {
+        Self {
+            remaining: passes.get(),
+        }
+    }
+
+    pub(crate) fn note_chunk(&mut self, progress: FitPassProgress) -> FitScheduleProgress {
+        if matches!(progress, FitPassProgress::InProgress { .. }) {
+            return FitScheduleProgress::PassInProgress;
+        }
+        debug_assert!(self.remaining > 0, "a completed fit has passes remaining");
+        self.remaining -= 1;
+        if self.remaining == 0 {
+            FitScheduleProgress::CheckpointComplete
+        } else {
+            FitScheduleProgress::PassComplete
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remaining(&self) -> u32 {
+        self.remaining
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{rows_ready_to_install, ActionGuard, BufferedRows};
+    use super::{
+        rows_ready_to_install, ActionGuard, BufferedRows, FitPassSchedule, FitScheduleProgress,
+    };
+    use core::num::NonZeroU32;
+    use emg_runtime::streaming_fit::FitPassProgress;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Step {
@@ -99,5 +144,35 @@ mod tests {
     fn buffered_rows_cannot_be_present_at_install() {
         assert_eq!(rows_ready_to_install(3, 45), Err(BufferedRows(3)));
         assert_eq!(rows_ready_to_install(0, 45).unwrap().count(), 45);
+    }
+
+    #[test]
+    fn fit_schedule_counts_only_complete_passes() {
+        let mut schedule = FitPassSchedule::new(NonZeroU32::new(2).unwrap());
+        let chunk = FitPassProgress::InProgress {
+            rows_processed: 64,
+            rows_total: 4000,
+        };
+        assert_eq!(
+            schedule.note_chunk(chunk),
+            FitScheduleProgress::PassInProgress
+        );
+        assert_eq!(schedule.remaining(), 2);
+
+        let pass = FitPassProgress::Complete {
+            rows_processed: 4000,
+            rows_total: 4000,
+        };
+        assert_eq!(schedule.note_chunk(pass), FitScheduleProgress::PassComplete);
+        assert_eq!(schedule.remaining(), 1);
+        assert_eq!(
+            schedule.note_chunk(chunk),
+            FitScheduleProgress::PassInProgress
+        );
+        assert_eq!(
+            schedule.note_chunk(pass),
+            FitScheduleProgress::CheckpointComplete
+        );
+        assert_eq!(schedule.remaining(), 0);
     }
 }

@@ -52,6 +52,11 @@ class Recipe:
     live_multiplier: float = 1.0
     prior_stride: int = 1
     weight_convention: str = "growing"
+    order: str = "blocked_rounds"
+    checkpoint_prompts: int = 5
+    order_seed: int = 20260809
+    fit_order: str = "collection"
+    fit_order_seed: int = 20260809
 
     def label(self):
         if self.schedule == "batch":
@@ -314,10 +319,9 @@ class Calibrator:
                             raw, labels, row_weight, [])
 
     def fit_streaming(self, kept_command_groups, kept_no_op_groups):
-        """Round by round, K passes each, K_final after the last."""
+        """Checkpoint by checkpoint, K passes each, K_final after the last."""
         recipe = self.recipe
-        rounds = self.corpus.rounds(kept_command_groups, kept_no_op_groups,
-                                    recipe.cue_floor)
+        rounds = self.checkpoint_groups(kept_command_groups, kept_no_op_groups)
         prior_count = len(self.prior_standardized)
         total_live = sum(len(cue.rows) for group in rounds for cue in group)
         design = np.empty((prior_count + total_live, FEATURES + 1),
@@ -334,13 +338,19 @@ class Calibrator:
         pass_index = 0
         self.checkpoints = []
         filled = 0
+        collected_cues = []
         self.clipped_live = 0
+        from interleaved_recipe import fit_order_cues
         for index, round_cues in enumerate(rounds):
-            for cue in round_cues:
-                live_raw[filled:filled + len(cue.rows)] = cue.rows
-                labels[prior_count + filled:prior_count + filled + len(cue.rows)] \
-                    = cue.label
-                filled += len(cue.rows)
+            collected_cues.extend(round_cues)
+            fit_cues = fit_order_cues(collected_cues, recipe.fit_order,
+                                      recipe.fit_order_seed)
+            filled = 0
+            for cue in fit_cues:
+                cue_stop = filled + len(cue.rows)
+                live_raw[filled:cue_stop] = cue.rows
+                labels[prior_count + filled:prior_count + cue_stop] = cue.label
+                filled = cue_stop
             mean, deviation = self.live_standardization(live_raw[:filled])
             block, clipped = quantize(
                 standardize(live_raw[:filled], mean, deviation),
@@ -364,9 +374,26 @@ class Calibrator:
                             None, labels[:prior_count + filled], None, [])
 
     def total_passes(self, kept_command_groups, kept_no_op_groups):
-        rounds = self.corpus.rounds(kept_command_groups, kept_no_op_groups,
-                                    self.recipe.cue_floor)
+        rounds = self.checkpoint_groups(kept_command_groups, kept_no_op_groups)
         if self.recipe.schedule == "batch":
             return self.recipe.batch_steps
         return (len(rounds) - 1) * self.recipe.passes_per_round \
             + self.recipe.final_passes
+
+    def checkpoint_groups(self, kept_command_groups, kept_no_op_groups):
+        if self.recipe.order == "blocked_rounds":
+            return self.corpus.rounds(kept_command_groups, kept_no_op_groups,
+                                      self.recipe.cue_floor)
+
+        # Imported lazily so the established recipe remains usable without the
+        # matrix experiment's ordering vocabulary.
+        from interleaved_recipe import checkpoint_groups
+        return checkpoint_groups(
+            self.corpus,
+            kept_command_groups,
+            kept_no_op_groups,
+            self.recipe.cue_floor,
+            self.recipe.order,
+            self.recipe.checkpoint_prompts,
+            self.recipe.order_seed,
+        )

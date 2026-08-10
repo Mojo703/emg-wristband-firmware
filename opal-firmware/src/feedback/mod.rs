@@ -34,6 +34,10 @@ use feedback_vocabulary::Cue;
 use haptics::{Haptics, Playback};
 use led::{Color, IndicatorLed, Shape};
 use log::{info, warn};
+use protocol::{
+    CalibrationTimingColor, CalibrationTimingLoopStatus, CalibrationTimingState,
+    CALIBRATION_TIMING_COLOR_PHASE_MILLISECONDS,
+};
 use std::sync::{Arc, Mutex};
 
 /// How often the thread does its one pass.
@@ -103,6 +107,18 @@ struct Mailbox {
     /// two — there is one motor, so a queue would only defer buzzes past the thing
     /// they describe.
     pending_cue: Option<Cue>,
+    /// Timing owns the indicator outright while it is active. It deliberately
+    /// travels through the feedback thread: no other task may write the RMT
+    /// driver, and stopping immediately restores the ordinary state renderer.
+    timing: Option<TimingCommand>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TimingCommand {
+    Start {
+        anchor_device_monotonic_microseconds: u64,
+    },
+    Stop,
 }
 
 impl Mailbox {
@@ -110,6 +126,7 @@ impl Mailbox {
         Self {
             state: None,
             pending_cue: None,
+            timing: None,
         }
     }
 }
@@ -165,6 +182,74 @@ impl Feedback {
                 _ => cue,
             });
         }
+    }
+
+    /// Start the device-fixed red → green → blue reference. `anchor` is on the
+    /// same ESP monotonic clock used by acquisition and protocol timestamps.
+    pub fn start_timing_loop(&self, anchor_device_monotonic_microseconds: u64) {
+        if let Ok(mut mailbox) = self.mailbox.lock() {
+            mailbox.timing = Some(TimingCommand::Start {
+                anchor_device_monotonic_microseconds,
+            });
+        }
+    }
+
+    /// Return the indicator to normal state feedback on the feedback thread's
+    /// next pass; no stale timing colour can survive a stop command.
+    pub fn stop_timing_loop(&self) {
+        if let Ok(mut mailbox) = self.mailbox.lock() {
+            mailbox.timing = Some(TimingCommand::Stop);
+        }
+    }
+
+    /// Dispatch the calibration snap from the same thread that writes the LED
+    /// and haptics bus. The caller supplies it at the device-owned cue instant.
+    pub fn calibration_prompt(&self, prompt: Prompt) {
+        if let Ok(mut mailbox) = self.mailbox.lock() {
+            mailbox.pending_cue = Some(Cue::RepPrompt(prompt));
+        }
+    }
+}
+
+/// The timing loop is intentionally arithmetic rather than tick-counted: a
+/// delayed feedback pass chooses the correct colour for device time instead of
+/// accumulating 5 ms rounding error over a song-length adjustment session.
+pub(crate) fn timing_loop_status(
+    anchor_device_monotonic_microseconds: Option<u64>,
+    observed_device_monotonic_microseconds: u64,
+) -> CalibrationTimingLoopStatus {
+    let Some(anchor_device_monotonic_microseconds) = anchor_device_monotonic_microseconds else {
+        return CalibrationTimingLoopStatus {
+            state: CalibrationTimingState::Stopped,
+            color: CalibrationTimingColor::Red,
+            color_elapsed_milliseconds: 0,
+            anchor_device_monotonic_microseconds: 0,
+            observed_device_monotonic_microseconds,
+        };
+    };
+    let phase_microseconds = u64::from(CALIBRATION_TIMING_COLOR_PHASE_MILLISECONDS) * 1_000;
+    let elapsed =
+        observed_device_monotonic_microseconds.saturating_sub(anchor_device_monotonic_microseconds);
+    let phase = (elapsed / phase_microseconds) % 3;
+    let color = match phase {
+        0 => CalibrationTimingColor::Red,
+        1 => CalibrationTimingColor::Green,
+        _ => CalibrationTimingColor::Blue,
+    };
+    CalibrationTimingLoopStatus {
+        state: CalibrationTimingState::Running,
+        color,
+        color_elapsed_milliseconds: ((elapsed % phase_microseconds) / 1_000) as u32,
+        anchor_device_monotonic_microseconds,
+        observed_device_monotonic_microseconds,
+    }
+}
+
+fn timing_color(status: CalibrationTimingLoopStatus) -> Color {
+    match status.color {
+        CalibrationTimingColor::Red => Color::RED,
+        CalibrationTimingColor::Green => Color::GREEN,
+        CalibrationTimingColor::Blue => Color::BLUE,
     }
 }
 
@@ -231,6 +316,7 @@ fn run(mailbox: Arc<Mutex<Mailbox>>, wiring: FeedbackWiring) {
     cores::log_stack_headroom("feedback thread");
 
     let mut current = DeviceState::BOOTING;
+    let mut timing_anchor = None;
     /// A cue's light, and how far into its shape it has got.
     struct Flash {
         color: Color,
@@ -246,10 +332,25 @@ fn run(mailbox: Arc<Mutex<Mailbox>>, wiring: FeedbackWiring) {
     // What the counters above advance by: how long the last pass slept.
     let mut tick = TICK_MILLISECONDS;
     loop {
-        let (state, cue) = match mailbox.lock() {
-            Ok(mut mailbox) => (mailbox.state.take(), mailbox.pending_cue.take()),
-            Err(_) => (None, None),
+        let (state, cue, timing) = match mailbox.lock() {
+            Ok(mut mailbox) => (
+                mailbox.state.take(),
+                mailbox.pending_cue.take(),
+                mailbox.timing.take(),
+            ),
+            Err(_) => (None, None, None),
         };
+        if let Some(timing) = timing {
+            timing_anchor = match timing {
+                TimingCommand::Start {
+                    anchor_device_monotonic_microseconds,
+                } => Some(anchor_device_monotonic_microseconds),
+                TimingCommand::Stop => None,
+            };
+            // Do not replay an ordinary calibration flash after timing takes
+            // ownership; it would make an extra unsynchronised colour edge.
+            flash = None;
+        }
         if let Some(state) = state {
             // A fault should not wait out the slow cadence it arrived during.
             if state.needs_attention() != current.needs_attention() {
@@ -303,30 +404,35 @@ fn run(mailbox: Arc<Mutex<Mailbox>>, wiring: FeedbackWiring) {
             HEARTBEAT_PERIOD_MILLISECONDS
         };
         into_heartbeat = (into_heartbeat + tick) % heartbeat_period;
-        let (color, level) = match flash.take() {
-            Some(Flash {
-                color,
-                shape,
-                elapsed,
-            }) => {
-                let duration = shape.duration_milliseconds();
-                let level = shape.level(elapsed, duration);
-                let elapsed = elapsed + tick;
-                flash = (elapsed < duration).then_some(Flash {
+        let (color, level) = if let Some(anchor) = timing_anchor {
+            let status = timing_loop_status(Some(anchor), crate::device_now_us());
+            (timing_color(status), u8::MAX)
+        } else {
+            match flash.take() {
+                Some(Flash {
                     color,
                     shape,
                     elapsed,
-                });
-                (color, level)
-            }
-            None => {
-                let shape = current.indicator_shape();
-                let level = shape.level(into_heartbeat, shape.duration_milliseconds());
-                // Scaled in perceived units, which keeps the eased shape intact
-                // rather than flattening its dim end away.
-                let level =
-                    (level as u32 * current.indicator_peak_level() as u32 / u8::MAX as u32) as u8;
-                (current.indicator_color(), level)
+                }) => {
+                    let duration = shape.duration_milliseconds();
+                    let level = shape.level(elapsed, duration);
+                    let elapsed = elapsed + tick;
+                    flash = (elapsed < duration).then_some(Flash {
+                        color,
+                        shape,
+                        elapsed,
+                    });
+                    (color, level)
+                }
+                None => {
+                    let shape = current.indicator_shape();
+                    let level = shape.level(into_heartbeat, shape.duration_milliseconds());
+                    // Scaled in perceived units, which keeps the eased shape intact
+                    // rather than flattening its dim end away.
+                    let level = (level as u32 * current.indicator_peak_level() as u32
+                        / u8::MAX as u32) as u8;
+                    (current.indicator_color(), level)
+                }
             }
         };
         if let Some(led) = indicator.as_mut() {
@@ -338,7 +444,7 @@ fn run(mailbox: Arc<Mutex<Mailbox>>, wiring: FeedbackWiring) {
         // Fast only while there is a fade to keep smooth; a pulse starting one idle
         // tick late is invisible against a rise measured in seconds.
         let pulse_running = into_heartbeat < current.indicator_shape().duration_milliseconds();
-        tick = if flash.is_some() || pulse_running {
+        tick = if timing_anchor.is_some() || flash.is_some() || pulse_running {
             TICK_MILLISECONDS
         } else {
             IDLE_TICK_MILLISECONDS
@@ -505,5 +611,22 @@ mod tests {
         };
         feedback.observe(linked);
         assert_eq!(taken(&feedback).0, Some(linked));
+    }
+
+    #[test]
+    fn timing_loop_is_device_clocked_and_has_no_off_phase() {
+        let anchor = 10_000_000;
+        let observed =
+            |milliseconds: u64| timing_loop_status(Some(anchor), anchor + milliseconds * 1_000);
+        assert_eq!(observed(0).color, CalibrationTimingColor::Red);
+        assert_eq!(observed(499).color, CalibrationTimingColor::Red);
+        assert_eq!(observed(500).color, CalibrationTimingColor::Green);
+        assert_eq!(observed(1_000).color, CalibrationTimingColor::Blue);
+        assert_eq!(observed(1_500).color, CalibrationTimingColor::Red);
+        assert_eq!(observed(1_999).color_elapsed_milliseconds, 499);
+        assert_eq!(
+            timing_loop_status(None, anchor).state,
+            CalibrationTimingState::Stopped
+        );
     }
 }

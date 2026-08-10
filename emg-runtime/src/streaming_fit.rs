@@ -115,6 +115,9 @@ const INT8_LIMIT: i32 = 127;
 pub const LEARNING_RATE: f32 = 1.0;
 pub const PENALTY: f32 = 1e-2;
 
+/// More than the product's prior-plus-live pair, without allocating pass state.
+const MAX_FIT_PASS_SOURCES: usize = 4;
+
 /// The schedule work package V's grid selected, from
 /// `fixtures/calibration_constants.json`.
 ///
@@ -337,6 +340,23 @@ impl<'a> RowSource<'a> {
         }
     }
 
+    fn visited_row_at_extent(
+        &self,
+        pass_index: u64,
+        visited_index: usize,
+        rows: usize,
+    ) -> Option<&'a [u8]> {
+        let row_index = self
+            .offset(pass_index)
+            .checked_add(visited_index.checked_mul(self.stride)?)?;
+        if row_index >= rows {
+            return None;
+        }
+        let at = row_index.checked_mul(ROW_STRIDE)?;
+        let end = at.checked_add(ROW_STRIDE)?;
+        self.bytes.get(at..end)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.bytes.is_empty()
     }
@@ -475,6 +495,44 @@ pub struct FitterBuffers {
     class_weight: Vec<f32>,
 }
 
+/// Progress from one bounded unit of a resumable optimizer pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FitPassProgress {
+    InProgress {
+        rows_processed: usize,
+        rows_total: usize,
+    },
+    Complete {
+        rows_processed: usize,
+        rows_total: usize,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct FitSourceExtent {
+    rows: usize,
+    stride: usize,
+}
+
+/// Owned state for one optimizer pass stopped between bounded row chunks.
+///
+/// Source extents, class counts, and normalization freeze when the pass begins.
+/// Callers may present larger sources later, but this pass walks only the frozen
+/// prefixes. The fitter retains the gradient in its boot-allocated buffer, and
+/// the checkpoint publishes nothing until the final row completes.
+#[derive(Debug)]
+pub struct FitPass {
+    source_extents: [FitSourceExtent; MAX_FIT_PASS_SOURCES],
+    source_count: usize,
+    pass_index: u64,
+    weight_normalization: f32,
+    rows_total: usize,
+    rows_processed: usize,
+    source_index: usize,
+    source_row: usize,
+    complete: bool,
+}
+
 impl FitterBuffers {
     pub fn reserve(class_capacity: usize) -> Self {
         Self {
@@ -536,6 +594,52 @@ impl Fitter {
 
     pub fn class_count(&self) -> usize {
         self.class_count
+    }
+
+    /// Start one optimizer pass over a frozen set of row sources.
+    ///
+    /// Returns `None` for the same unusable inputs as [`Self::resume_fit`]: no
+    /// rows, no classes, a pass that visits no rows, or an out-of-range label.
+    /// The returned pass performs no allocation and publishes the checkpoint's
+    /// new weights only after its complete row walk.
+    pub fn begin_pass(
+        &mut self,
+        checkpoint: &FitCheckpoint,
+        sources: &[RowSource<'_>],
+    ) -> Option<FitPass> {
+        assert_eq!(
+            checkpoint.class_count, self.class_count,
+            "checkpoint class count does not match the fitter's"
+        );
+        if sources.len() > MAX_FIT_PASS_SOURCES
+            || sources.iter().all(RowSource::is_empty)
+            || self.class_count == 0
+            || !self.prepare_class_weights(sources)
+        {
+            return None;
+        }
+
+        let pass_index = checkpoint.passes_run;
+        let (rows_total, weight_normalization) = self.pass_shape(sources, pass_index)?;
+        self.gradient.fill(0.0);
+        let mut source_extents = [FitSourceExtent::default(); MAX_FIT_PASS_SOURCES];
+        for (extent, source) in source_extents.iter_mut().zip(sources) {
+            *extent = FitSourceExtent {
+                rows: source.len(),
+                stride: source.stride(),
+            };
+        }
+        Some(FitPass {
+            source_extents,
+            source_count: sources.len(),
+            pass_index,
+            weight_normalization,
+            rows_total,
+            rows_processed: 0,
+            source_index: 0,
+            source_row: 0,
+            complete: false,
+        })
     }
 
     /// Run `passes` optimizer passes over `sources`, in the order given,
@@ -604,31 +708,8 @@ impl Fitter {
         // scoring worse. Only the equivalence test against V's checkpoints
         // would, and only because those checkpoints were produced the right
         // way.
-        self.class_rows.fill(0);
-        self.class_scale.fill(0.0);
-        for source in sources {
-            for row in source.visit_all() {
-                let label = RowSource::label(row);
-                // The one place a row's label is turned into an index. A label
-                // past the class count is corrupt flash — erased bytes read as
-                // 255 — and indexing on it would panic inside the fit, which on
-                // the device is a reboot mid-calibration. Refusing the whole
-                // call instead leaves the previous model installed and reports
-                // zero passes to a caller that expected some.
-                if label >= class_count {
-                    return 0;
-                }
-                self.class_rows[label] += 1;
-                self.class_scale[label] = RowSource::row_weight(row);
-            }
-        }
-        for ((weight, &rows), &scale) in self
-            .class_weight
-            .iter_mut()
-            .zip(self.class_rows.iter())
-            .zip(self.class_scale.iter())
-        {
-            *weight = if rows == 0 { 0.0 } else { scale / rows as f32 };
+        if !self.prepare_class_weights(sources) {
+            return 0;
         }
 
         let weights = &mut checkpoint.weights;
@@ -642,14 +723,10 @@ impl Fitter {
             // and recomputes the same bits; at stride S the visited set rotates,
             // so the factor has to move with it. The walk touches only the
             // weight word of each row — measured at 0.15% of a pass.
-            let mut row_count = 0usize;
-            let mut weight_total = 0.0f32;
-            for source in sources {
-                for row in source.visit(pass_index) {
-                    weight_total += self.class_weight[RowSource::label(row)];
-                    row_count += 1;
-                }
-            }
+            let Some((row_count, weight_normalization)) = self.pass_shape(sources, pass_index)
+            else {
+                break;
+            };
             // A pass that visits nothing cannot be run, and the ones after it
             // would visit nothing either — the row set does not change inside a
             // call. Stopping is right; stopping silently is not, so the count
@@ -658,49 +735,11 @@ impl Fitter {
                 break;
             }
             let count = row_count as f32;
-            let weight_normalization = count / weight_total;
 
             self.gradient.fill(0.0);
             for source in sources {
                 for row in source.visit(pass_index) {
-                    // Dequantize: one multiply-add per feature. The bias input
-                    // at index 64 was set to 1.0 at construction and is never
-                    // written again.
-                    for ((input, &code), (&scale, &offset)) in self.design[..FEATURE_COUNT]
-                        .iter_mut()
-                        .zip(row[..FEATURE_COUNT].iter())
-                        .zip(quantization.scale.iter().zip(quantization.offset.iter()))
-                    {
-                        *input = (code as i8) as f32 * scale + offset;
-                    }
-
-                    let probabilities = &mut self.probabilities[..class_count];
-                    probabilities.fill(0.0);
-                    for (&input, row_weights) in
-                        self.design.iter().zip(weights.chunks_exact(class_count))
-                    {
-                        for (accumulator, &weight) in probabilities.iter_mut().zip(row_weights) {
-                            *accumulator += input * weight;
-                        }
-                    }
-                    softmax_in_place(probabilities);
-
-                    let label = RowSource::label(row);
-                    let normalized = self.class_weight[label] * weight_normalization;
-                    probabilities[label] -= 1.0;
-                    for value in probabilities.iter_mut() {
-                        *value *= normalized;
-                    }
-
-                    for (&input, accumulator) in self
-                        .design
-                        .iter()
-                        .zip(self.gradient.chunks_exact_mut(class_count))
-                    {
-                        for (slot, &residual) in accumulator.iter_mut().zip(probabilities.iter()) {
-                            *slot += input * residual;
-                        }
-                    }
+                    self.accumulate_row_gradient(weights, quantization, row, weight_normalization);
                 }
             }
             for (weight, &accumulated) in weights.iter_mut().zip(self.gradient.iter()) {
@@ -711,6 +750,182 @@ impl Fitter {
             after_pass(pass_index as usize);
         }
         completed
+    }
+
+    fn prepare_class_weights(&mut self, sources: &[RowSource<'_>]) -> bool {
+        self.class_rows.fill(0);
+        self.class_scale.fill(0.0);
+        for source in sources {
+            for row in source.visit_all() {
+                let label = RowSource::label(row);
+                // Erased flash reads as label 255. Refuse corrupt rows rather
+                // than indexing past the class arrays and rebooting the device.
+                if label >= self.class_count {
+                    return false;
+                }
+                self.class_rows[label] += 1;
+                self.class_scale[label] = RowSource::row_weight(row);
+            }
+        }
+        for ((weight, &rows), &scale) in self
+            .class_weight
+            .iter_mut()
+            .zip(self.class_rows.iter())
+            .zip(self.class_scale.iter())
+        {
+            *weight = if rows == 0 { 0.0 } else { scale / rows as f32 };
+        }
+        true
+    }
+
+    fn pass_shape(&self, sources: &[RowSource<'_>], pass_index: u64) -> Option<(usize, f32)> {
+        let mut row_count = 0usize;
+        let mut weight_total = 0.0f32;
+        for source in sources {
+            for row in source.visit(pass_index) {
+                weight_total += self.class_weight[RowSource::label(row)];
+                row_count += 1;
+            }
+        }
+        if row_count == 0 {
+            return None;
+        }
+        Some((row_count, row_count as f32 / weight_total))
+    }
+
+    fn accumulate_row_gradient(
+        &mut self,
+        weights: &[f32],
+        quantization: &StandardizedQuantization,
+        row: &[u8],
+        weight_normalization: f32,
+    ) {
+        // Dequantize: one multiply-add per feature. The bias input at index 64
+        // was set to 1.0 at construction and is never written again.
+        for ((input, &code), (&scale, &offset)) in self.design[..FEATURE_COUNT]
+            .iter_mut()
+            .zip(row[..FEATURE_COUNT].iter())
+            .zip(quantization.scale.iter().zip(quantization.offset.iter()))
+        {
+            *input = (code as i8) as f32 * scale + offset;
+        }
+
+        let probabilities = &mut self.probabilities[..self.class_count];
+        probabilities.fill(0.0);
+        for (&input, row_weights) in self
+            .design
+            .iter()
+            .zip(weights.chunks_exact(self.class_count))
+        {
+            for (accumulator, &weight) in probabilities.iter_mut().zip(row_weights) {
+                *accumulator += input * weight;
+            }
+        }
+        softmax_in_place(probabilities);
+
+        let label = RowSource::label(row);
+        let normalized = self.class_weight[label] * weight_normalization;
+        probabilities[label] -= 1.0;
+        for value in probabilities.iter_mut() {
+            *value *= normalized;
+        }
+
+        for (&input, accumulator) in self
+            .design
+            .iter()
+            .zip(self.gradient.chunks_exact_mut(self.class_count))
+        {
+            for (slot, &residual) in accumulator.iter_mut().zip(probabilities.iter()) {
+                *slot += input * residual;
+            }
+        }
+    }
+
+    /// Process at most `maximum_rows` from a pass begun by [`Self::begin_pass`].
+    ///
+    /// `sources` may have grown since the pass began, but its original prefixes
+    /// and order must remain unchanged. A zero budget leaves the pass untouched.
+    pub fn advance_pass(
+        &mut self,
+        pass: &mut FitPass,
+        checkpoint: &mut FitCheckpoint,
+        quantization: &StandardizedQuantization,
+        sources: &[RowSource<'_>],
+        maximum_rows: usize,
+    ) -> FitPassProgress {
+        assert_eq!(
+            checkpoint.class_count, self.class_count,
+            "checkpoint class count does not match the fitter's"
+        );
+        if pass.complete {
+            return pass.progress();
+        }
+        assert_eq!(
+            checkpoint.passes_run, pass.pass_index,
+            "checkpoint changed while a resumable pass was in flight"
+        );
+        assert_eq!(
+            sources.len(),
+            pass.source_count,
+            "fit source count changed while a pass was in flight"
+        );
+        for (source, extent) in sources
+            .iter()
+            .zip(&pass.source_extents[..pass.source_count])
+        {
+            assert_eq!(
+                source.stride(),
+                extent.stride,
+                "fit source stride changed while a pass was in flight"
+            );
+            assert!(
+                source.len() >= extent.rows,
+                "fit source shrank while a pass was in flight"
+            );
+        }
+        let stop_at = pass
+            .rows_processed
+            .saturating_add(maximum_rows)
+            .min(pass.rows_total);
+        while pass.rows_processed < stop_at {
+            while pass.source_index < pass.source_count
+                && pass.source_row
+                    >= visited_len_at_extent(
+                        &sources[pass.source_index],
+                        pass.pass_index,
+                        pass.source_extents[pass.source_index].rows,
+                    )
+            {
+                pass.source_index += 1;
+                pass.source_row = 0;
+            }
+
+            let source = sources
+                .get(pass.source_index)
+                .expect("the frozen pass row count matches its sources");
+            let extent = pass.source_extents[pass.source_index];
+            let row = source
+                .visited_row_at_extent(pass.pass_index, pass.source_row, extent.rows)
+                .expect("the frozen source extent still contains this row");
+            pass.source_row += 1;
+            pass.rows_processed += 1;
+            self.accumulate_row_gradient(
+                &checkpoint.weights,
+                quantization,
+                row,
+                pass.weight_normalization,
+            );
+        }
+
+        if pass.rows_processed == pass.rows_total {
+            let count = pass.rows_total as f32;
+            for (weight, &accumulated) in checkpoint.weights.iter_mut().zip(self.gradient.iter()) {
+                *weight -= LEARNING_RATE * (accumulated / count + PENALTY * *weight);
+            }
+            checkpoint.passes_run += 1;
+            pass.complete = true;
+        }
+        pass.progress()
     }
 
     /// The model a checkpoint installs: the prior's standardization statistics
@@ -728,6 +943,27 @@ impl Fitter {
             &checkpoint.weights,
         )
     }
+}
+
+impl FitPass {
+    fn progress(&self) -> FitPassProgress {
+        if self.complete {
+            FitPassProgress::Complete {
+                rows_processed: self.rows_processed,
+                rows_total: self.rows_total,
+            }
+        } else {
+            FitPassProgress::InProgress {
+                rows_processed: self.rows_processed,
+                rows_total: self.rows_total,
+            }
+        }
+    }
+}
+
+fn visited_len_at_extent(source: &RowSource<'_>, pass_index: u64, rows: usize) -> usize {
+    let offset = source.offset(pass_index);
+    rows.saturating_sub(offset).div_ceil(source.stride)
 }
 
 /// Max-subtracted softmax, normalized by a reciprocal multiply rather than
@@ -804,6 +1040,26 @@ impl RowBuffer {
         );
         self.rows += 1;
         true
+    }
+
+    /// Append one live calibration row with the class scale used by the host recipe.
+    /// Command classes come first, followed by the same number of no-op classes.
+    pub fn push_calibration(
+        &mut self,
+        raw: &[f32; FEATURE_COUNT],
+        standardization: &Standardization,
+        quantization: &StandardizedQuantization,
+        label: u8,
+        command_classes: usize,
+    ) -> bool {
+        let class = label as usize;
+        let no_op_classes = command_classes..command_classes.saturating_mul(2);
+        let class_scale = if no_op_classes.contains(&class) {
+            0.4
+        } else {
+            1.0
+        };
+        self.push(raw, standardization, quantization, label, class_scale)
     }
 
     pub fn len(&self) -> usize {
@@ -1075,6 +1331,29 @@ mod tests {
     }
 
     #[test]
+    fn calibration_rows_pack_command_and_no_op_class_scales() {
+        let standardization = Standardization {
+            mean: [0.0; FEATURE_COUNT],
+            deviation: [1.0; FEATURE_COUNT],
+        };
+        let quantization = StandardizedQuantization::IDENTITY;
+        let features = [0.0; FEATURE_COUNT];
+        let mut rows = RowBuffer::with_capacity(10);
+
+        for label in 0..10 {
+            assert!(rows.push_calibration(&features, &standardization, &quantization, label, 5,));
+        }
+
+        let scales: Vec<f32> = rows
+            .source()
+            .visit_all()
+            .map(RowSource::row_weight)
+            .collect();
+        assert_eq!(scales[..5], [1.0; 5]);
+        assert_eq!(scales[5..], [0.4; 5]);
+    }
+
+    #[test]
     fn quantization_constants_round_trip_through_their_bits() {
         let mut quantization = StandardizedQuantization::IDENTITY;
         quantization.offset[3] = -0.125;
@@ -1173,6 +1452,137 @@ mod tests {
             seen.push(pass)
         });
         assert_eq!(seen, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn one_pass_resumed_at_many_row_boundaries_is_bit_identical() {
+        let class_count = 12;
+        let rows = 137;
+        let (standardized, labels, weights) = synthetic(rows, class_count);
+        let quantization = StandardizedQuantization::uniform(0.125);
+        let packed = pack(&standardized, &labels, &weights, &quantization, 0..rows);
+        let source_boundary = 79 * ROW_STRIDE;
+        let sources = [
+            RowSource::strided(&packed[..source_boundary], 2).unwrap(),
+            RowSource::new(&packed[source_boundary..]).unwrap(),
+        ];
+
+        let initial = vec![0.01f32; INPUT_COUNT * class_count];
+        let mut uninterrupted = FitCheckpoint::warm_start(class_count, &initial).unwrap();
+        Fitter::new(class_count).resume_fit(&mut uninterrupted, &quantization, &sources, 1);
+
+        for chunk_rows in [1, 2, 3, 7, 16, 31, 39, 40, 41, 97, 98, 137] {
+            let mut fitter = Fitter::new(class_count);
+            let mut resumed = FitCheckpoint::warm_start(class_count, &initial).unwrap();
+            {
+                let mut pass = fitter
+                    .begin_pass(&resumed, &sources)
+                    .expect("the frozen sources contain rows");
+                assert_eq!(
+                    fitter.advance_pass(&mut pass, &mut resumed, &quantization, &sources, 0,),
+                    FitPassProgress::InProgress {
+                        rows_processed: 0,
+                        rows_total: 98,
+                    }
+                );
+                assert_eq!(resumed.weights(), initial);
+
+                while let FitPassProgress::InProgress { .. } = fitter.advance_pass(
+                    &mut pass,
+                    &mut resumed,
+                    &quantization,
+                    &sources,
+                    chunk_rows,
+                ) {
+                    assert_eq!(resumed.weights(), initial);
+                    assert_eq!(resumed.passes_run(), 0);
+                }
+                let published = resumed.weights().to_vec();
+                assert!(matches!(
+                    fitter.advance_pass(
+                        &mut pass,
+                        &mut resumed,
+                        &quantization,
+                        &sources,
+                        chunk_rows,
+                    ),
+                    FitPassProgress::Complete { .. }
+                ));
+                assert_eq!(resumed.weights(), published);
+                assert_eq!(resumed.passes_run(), 1);
+            }
+
+            assert_eq!(
+                resumed.weights(),
+                uninterrupted.weights(),
+                "chunk size {chunk_rows} changed the fitted bits"
+            );
+            assert_eq!(resumed.passes_run(), 1);
+        }
+    }
+
+    #[test]
+    fn rows_collected_during_a_pass_wait_for_the_next_pass() {
+        let class_count = 12;
+        let standardization = Standardization {
+            mean: [0.0; FEATURE_COUNT],
+            deviation: [1.0; FEATURE_COUNT],
+        };
+        let quantization = StandardizedQuantization::uniform(0.125);
+        let mut existing = RowBuffer::with_capacity(17);
+        for label in 0..12 {
+            let features = [label as f32 * 0.125; FEATURE_COUNT];
+            assert!(existing.push_calibration(
+                &features,
+                &standardization,
+                &quantization,
+                label,
+                5,
+            ));
+        }
+
+        let initial = vec![0.01f32; INPUT_COUNT * class_count];
+        let mut expected_fitter = Fitter::new(class_count);
+        let mut expected = FitCheckpoint::warm_start(class_count, &initial).unwrap();
+        expected_fitter.resume_fit(&mut expected, &quantization, &[existing.source()], 1);
+        let after_existing = expected.weights().to_vec();
+
+        let mut fitter = Fitter::new(class_count);
+        let mut actual = FitCheckpoint::warm_start(class_count, &initial).unwrap();
+        let mut pass = {
+            let sources = [existing.source()];
+            let mut pass = fitter
+                .begin_pass(&actual, &sources)
+                .expect("the existing source contains rows");
+            assert!(matches!(
+                fitter.advance_pass(&mut pass, &mut actual, &quantization, &sources, 3),
+                FitPassProgress::InProgress { .. }
+            ));
+            pass
+        };
+
+        for label in 0..5 {
+            let features = [2.0 + label as f32 * 0.125; FEATURE_COUNT];
+            assert!(existing.push_calibration(
+                &features,
+                &standardization,
+                &quantization,
+                label,
+                5,
+            ));
+        }
+
+        let grown_sources = [existing.source()];
+        while !matches!(
+            fitter.advance_pass(&mut pass, &mut actual, &quantization, &grown_sources, 3,),
+            FitPassProgress::Complete { .. }
+        ) {}
+        assert_eq!(actual.weights(), after_existing);
+
+        expected_fitter.resume_fit(&mut expected, &quantization, &grown_sources, 1);
+        fitter.resume_fit(&mut actual, &quantization, &grown_sources, 1);
+        assert_eq!(actual.weights(), expected.weights());
+        assert_eq!(actual.passes_run(), 2);
     }
 
     /// A whole collection: warm start from prior weights, K passes after each

@@ -21,21 +21,24 @@ extern crate alloc;
 
 use core::num::NonZeroU32;
 
+mod anchored_song;
 mod gate;
 mod grid;
 mod machine;
-mod schedule;
 mod validity;
 
+pub use anchored_song::{
+    AnchoredSong, AnchoredSongAction, AnchoredSongError, AnchoredSongIdentity,
+    RetainedSongProgress, SongAnchor, SongInterruption, SongState, UploadEffect,
+    HEARTBEAT_INTERVAL_MICROSECONDS, HEARTBEAT_TIMEOUT_MICROSECONDS, MAX_ANCHORED_SONG_CHUNK_CUES,
+    REQUIRED_CUE_HOLD_MILLISECONDS, REQUIRED_CUE_RECOVERY_MILLISECONDS,
+    SONG_ANCHOR_LEAD_MICROSECONDS,
+};
 pub use gate::{ClassScore, GateVerdict, QualityGate};
 pub use grid::{LabeledSpan, WindowGrid};
 pub use machine::{
     Action, Elapsing, Ending, Erasing, Fitting, Flushing, Installing, Performing, Polishing,
     Prompting, RepOutcome, Run, RunOutcome,
-};
-pub use schedule::{
-    ScheduleError, ScheduledPrompt, ScriptedPoll, ScriptedSchedule, ScriptedWearer,
-    THUMB_DOWN_BLOCK, THUMB_UP_BLOCK,
 };
 pub use validity::RepEvidence;
 

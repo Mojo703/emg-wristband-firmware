@@ -1,9 +1,9 @@
-//! The v2 `training` partition: the shipped prior image and the two wearer
-//! slots, parsed and validated without touching flash.
+//! The v2 `training` partition: one prior and two physical calibration slots.
+//! Slot role, sequence and CRC recover one logical resident plus scratch.
 //!
 //! Parsing lives here rather than in the firmware so that every rule this file
 //! states — a torn slot is dead, a slot built against another prior is dead,
-//! an unwritten region is an absence and not a fault — is provable on the host.
+//! an unwritten region is an absence and not a fault, is provable on the host.
 //! `opal-firmware/src/calibration/training_rows.rs` owns the mapping, erase, and
 //! writes; it owns no layout knowledge.
 //!
@@ -25,6 +25,7 @@ pub const SLOT_BYTES: usize = 0x3_0000;
 /// else.
 pub const SLOT_OFFSETS: [usize; 2] = [0x9_0000, 0xC_0000];
 pub const SLOT_COUNT: usize = SLOT_OFFSETS.len();
+pub const CALIBRATION_RECIPE_ROW_CAPACITY: usize = 1_170;
 
 pub const PRIOR_MAGIC: [u8; 8] = *b"OPALROW2";
 pub const SLOT_MAGIC: [u8; 8] = *b"OPALSLOT";
@@ -49,11 +50,11 @@ pub const SLOT_CRC_OFFSET: usize = SLOT_BYTES - 4;
 const SEQUENCE_ERASED: u32 = u32::MAX;
 const SEQUENCE_UNSET: u32 = 0;
 
-pub fn prior_row_capacity() -> usize {
+pub const fn prior_row_capacity() -> usize {
     (PRIOR_REGION_BYTES - PRIOR_ROWS_OFFSET) / ROW_STRIDE
 }
 
-pub fn slot_row_capacity() -> usize {
+pub const fn slot_row_capacity() -> usize {
     (SLOT_CRC_OFFSET - SLOT_ROWS_OFFSET) / ROW_STRIDE
 }
 
@@ -233,7 +234,7 @@ pub fn build_prior(inputs: &PriorBuildInputs<'_>) -> Result<Vec<u8>, BuildError>
     Ok(image)
 }
 
-/// Append two erased wearer slots to a complete prior region.
+/// Append two erased calibration slots to a complete prior region.
 pub fn whole_partition(prior: &[u8]) -> Result<Vec<u8>, BuildError> {
     if prior.len() != PRIOR_REGION_BYTES {
         return Err(BuildError::WrongPriorRegionSize(prior.len()));
@@ -276,6 +277,7 @@ pub enum ImageError {
     },
     /// A sequence number erased flash could have produced.
     BadSequence(u32),
+    BadSlotRole(u32),
 }
 
 impl ImageError {
@@ -300,6 +302,7 @@ impl ImageError {
             ImageError::Torn => "the record's CRC does not match: the write was torn",
             ImageError::PriorMismatch { .. } => "the slot was fitted against a different prior",
             ImageError::BadSequence(_) => "the slot's sequence number is one erased flash produces",
+            ImageError::BadSlotRole(_) => "the slot names an unknown persistent role",
         }
     }
 }
@@ -524,6 +527,7 @@ impl<'a> PriorImage<'a> {
 #[derive(Clone, Debug)]
 pub struct SlotRecord {
     pub sequence: u32,
+    pub role: SlotRole,
     pub prior_hash: u32,
     pub class_count: usize,
     pub reference_gains: [f32; 16],
@@ -537,11 +541,38 @@ pub struct SlotRecord {
     pub weights: Vec<f32>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlotRole {
+    Resident,
+    ExportableCandidate,
+    Inactive,
+}
+
+impl SlotRole {
+    const fn value(self) -> u32 {
+        match self {
+            Self::Resident => 0,
+            Self::ExportableCandidate => 1,
+            Self::Inactive => 2,
+        }
+    }
+
+    fn from_value(value: u32) -> Result<Self, ImageError> {
+        match value {
+            0 => Ok(Self::Resident),
+            1 => Ok(Self::ExportableCandidate),
+            2 => Ok(Self::Inactive),
+            other => Err(ImageError::BadSlotRole(other)),
+        }
+    }
+}
+
 impl SlotRecord {
     /// A record sized for `class_count` with nothing fitted yet.
     pub fn empty(class_count: usize) -> SlotRecord {
         SlotRecord {
             sequence: 1,
+            role: SlotRole::Resident,
             prior_hash: 0,
             class_count,
             reference_gains: [0.0; 16],
@@ -626,7 +657,7 @@ impl SlotRecord {
             live_row_count as u32,
             ROW_STRIDE as u32,
             covered_bytes(live_row_count) as u32,
-            0,
+            self.role.value(),
         ] {
             push(
                 &word.to_le_bytes(),
@@ -713,7 +744,23 @@ pub fn parse_slot<'a>(
     bytes: &'a [u8],
     prior_hash: u32,
 ) -> Result<LiveSlot<'a>, ImageError> {
-    if bytes.len() < SLOT_BYTES {
+    parse_slot_layout(
+        index,
+        bytes,
+        prior_hash,
+        slot_row_capacity(),
+        SLOT_CRC_OFFSET,
+    )
+}
+
+fn parse_slot_layout<'a>(
+    index: usize,
+    bytes: &'a [u8],
+    prior_hash: u32,
+    row_capacity: usize,
+    crc_offset: usize,
+) -> Result<LiveSlot<'a>, ImageError> {
+    if bytes.len() < crc_offset + 4 {
         return Err(ImageError::Truncated);
     }
     if bytes[..SLOT_MAGIC.len()] != SLOT_MAGIC {
@@ -737,16 +784,17 @@ pub fn parse_slot<'a>(
     if class_count > MAX_CLASS_COUNT || slot_metadata_bytes(class_count) > SLOT_ROWS_OFFSET {
         return Err(ImageError::ClassCountPastMetadata(class_count as u32));
     }
-    if live_row_count > slot_row_capacity() {
+    if live_row_count > row_capacity {
         return Err(ImageError::RowCountPastRegion(live_row_count as u32));
     }
     let covered = covered_bytes(live_row_count);
     if read_u32(bytes, 32) as usize != covered {
         return Err(ImageError::Torn);
     }
-    if crc32(&bytes[..covered]) != read_u32(bytes, SLOT_CRC_OFFSET) {
+    if crc32(&bytes[..covered]) != read_u32(bytes, crc_offset) {
         return Err(ImageError::Torn);
     }
+    let role = SlotRole::from_value(read_u32(bytes, 36))?;
     // Only now, with the bytes proven whole, does the pairing matter.
     if stored_prior_hash != prior_hash {
         return Err(ImageError::PriorMismatch {
@@ -778,6 +826,7 @@ pub fn parse_slot<'a>(
         index,
         record: SlotRecord {
             sequence,
+            role,
             prior_hash: stored_prior_hash,
             class_count,
             reference_gains,
@@ -791,29 +840,8 @@ pub fn parse_slot<'a>(
     })
 }
 
-/// Which slot a new calibration should claim: the one whose sequence is lowest,
-/// counting a dead slot as lowest of all. No compaction, ever.
-pub fn slot_to_evict(sequences: [Option<u32>; SLOT_COUNT]) -> usize {
-    let mut chosen = 0;
-    let mut lowest = sequences[0];
-    for (index, sequence) in sequences.iter().enumerate().skip(1) {
-        let better = match (lowest, sequence) {
-            // A dead slot outranks any live one, but two dead slots keep the
-            // first: eviction has to be a function of the sequences alone.
-            (_, None) => lowest.is_some(),
-            (None, _) => false,
-            (Some(low), Some(other)) => *other < low,
-        };
-        if better {
-            chosen = index;
-            lowest = *sequence;
-        }
-    }
-    chosen
-}
-
 /// The sequence a new record takes, or `None` when the legal space is exhausted.
-pub fn next_sequence(sequences: [Option<u32>; SLOT_COUNT]) -> Option<u32> {
+pub fn next_sequence<const COUNT: usize>(sequences: [Option<u32>; COUNT]) -> Option<u32> {
     let highest = sequences.iter().flatten().copied().max().unwrap_or(0);
     highest
         .checked_add(1)
@@ -894,7 +922,10 @@ mod tests {
             PRIOR_REGION_BYTES + SLOT_COUNT * SLOT_BYTES,
             PARTITION_BYTES
         );
-        assert_eq!(SLOT_OFFSETS[0], PRIOR_REGION_BYTES);
+        assert_eq!(PRIOR_REGION_BYTES, 0x9_0000);
+        assert_eq!(SLOT_BYTES, 0x3_0000);
+        assert_eq!(SLOT_COUNT, 2);
+        assert_eq!(SLOT_OFFSETS[0], 0x9_0000);
         assert_eq!(SLOT_OFFSETS[1], SLOT_OFFSETS[0] + SLOT_BYTES);
         for offset in SLOT_OFFSETS {
             assert_eq!(offset % 4096, 0, "slots must erase without neighbours");
@@ -909,13 +940,48 @@ mod tests {
             prior_row_capacity() > 7704,
             "the product prior — four no-op sessions and two rest sessions — must fit"
         );
-        assert_eq!(slot_row_capacity(), 2559);
+        assert_eq!(CALIBRATION_RECIPE_ROW_CAPACITY, 1_170);
+        assert_eq!(slot_row_capacity(), 2_559);
         assert!(
-            slot_row_capacity() > 750,
-            "a calibration's live rows must fit"
+            slot_row_capacity() >= CALIBRATION_RECIPE_ROW_CAPACITY,
+            "the fixed calibration recipe must fit with physical headroom"
         );
         assert!(prior_metadata_bytes(12) <= PRIOR_ROWS_OFFSET);
         assert!(slot_metadata_bytes(12) <= SLOT_ROWS_OFFSET);
+    }
+
+    #[test]
+    fn slot_roles_roundtrip_and_legacy_zero_means_resident() {
+        for role in [
+            SlotRole::Resident,
+            SlotRole::ExportableCandidate,
+            SlotRole::Inactive,
+        ] {
+            let mut record = SlotRecord::empty(12);
+            record.role = role;
+            record.prior_hash = 0x1234;
+            let image = slot_bytes(&record, &some_rows(2));
+            assert_eq!(parse_slot(0, &image, 0x1234).unwrap().record.role, role);
+        }
+        let mut tombstone = SlotRecord::empty(0);
+        tombstone.role = SlotRole::Inactive;
+        tombstone.prior_hash = 0x1234;
+        let image = slot_bytes(&tombstone, &[]);
+        let parsed = parse_slot(0, &image, 0x1234).unwrap();
+        assert_eq!(parsed.record.role, SlotRole::Inactive);
+        assert_eq!(parsed.rows().len(), 0);
+
+        let mut unknown = SlotRecord::empty(12);
+        unknown.prior_hash = 0x1234;
+        let mut image = slot_bytes(&unknown, &some_rows(2));
+        image[36..40].copy_from_slice(&3u32.to_le_bytes());
+        let covered = covered_bytes(2);
+        let crc = crc32(&image[..covered]);
+        image[SLOT_CRC_OFFSET..].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(
+            parse_slot(0, &image, 0x1234).unwrap_err(),
+            ImageError::BadSlotRole(3)
+        );
     }
 
     #[test]
@@ -1308,13 +1374,7 @@ mod tests {
     }
 
     #[test]
-    fn eviction_takes_the_lowest_sequence_and_prefers_a_dead_slot() {
-        assert_eq!(slot_to_evict([Some(4), Some(9)]), 0);
-        assert_eq!(slot_to_evict([Some(9), Some(4)]), 1);
-        assert_eq!(slot_to_evict([Some(9), None]), 1);
-        assert_eq!(slot_to_evict([None, Some(9)]), 0);
-        assert_eq!(slot_to_evict([None, None]), 0);
-
+    fn sequence_advances_across_all_physical_slots() {
         assert_eq!(next_sequence([None, None]), Some(1));
         assert_eq!(next_sequence([Some(4), Some(9)]), Some(10));
         assert_eq!(next_sequence([Some(u32::MAX - 1), None]), None);
@@ -1415,7 +1475,7 @@ mod tests {
 
         // Five rounds of 24 rows, flushed between rounds and never inside one.
         let mut partition = vec![0xFFu8; PARTITION_BYTES];
-        let slot = slot_to_evict([None, None]);
+        let slot = 1;
         let slot_at = SLOT_OFFSETS[slot];
         let mut buffer = RowBuffer::with_capacity(64);
         let mut flushed = 0usize;
@@ -1470,39 +1530,5 @@ mod tests {
             prior_image.warm_start_weights().as_slice(),
             "the live rows did not move the weights"
         );
-    }
-
-    /// A whole eviction cycle: two calibrations land in different slots and the
-    /// older one survives until it is the lowest sequence.
-    #[test]
-    fn two_calibrations_fill_both_slots_before_either_is_evicted() {
-        let prior_hash = 0x5555_AAAA;
-        let mut partition = vec![0xFFu8; PARTITION_BYTES];
-
-        let mut live = [None, None];
-        for round in 0..3 {
-            let target = slot_to_evict(live);
-            let sequence = next_sequence(live).unwrap();
-            let mut record = SlotRecord::empty(12);
-            record.sequence = sequence;
-            record.prior_hash = prior_hash;
-            record.weights[0] = round as f32;
-            let image = slot_bytes(&record, &some_rows(16 + round));
-            let at = SLOT_OFFSETS[target];
-            partition[at..at + SLOT_BYTES].copy_from_slice(&image);
-
-            live = [0, 1].map(|index| {
-                let at = SLOT_OFFSETS[index];
-                parse_slot(index, &partition[at..at + SLOT_BYTES], prior_hash)
-                    .ok()
-                    .map(|slot| slot.record.sequence)
-            });
-        }
-        // Round 0 went to slot 0, round 1 to slot 1, round 2 evicted slot 0.
-        assert_eq!(live, [Some(3), Some(2)]);
-        let at = SLOT_OFFSETS[0];
-        let newest = parse_slot(0, &partition[at..at + SLOT_BYTES], prior_hash).unwrap();
-        assert_eq!(newest.record.weights[0], 2.0);
-        assert_eq!(newest.rows().len(), 18);
     }
 }

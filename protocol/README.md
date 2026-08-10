@@ -81,6 +81,24 @@ positions inside a track as `TrackMilliseconds`.
 | `PlaybackPosition` | backend → browser | Where the backend's audio output stands: `position_ms` is what the subject hears at `at_unix_ms`, which sits a little ahead of the send because it accounts for the output device's latency. The browser extrapolates between these and never derives the timeline itself; the same pair is the anchor every cue is logged against. |
 | `NoteResult` | backend → browser | One cued note's verdict from the activity detector: `session_id`, `index`, `hit`. It says muscle activity landed inside the note's window and makes no claim about which gesture was made. |
 
+### Tuesday calibration contract
+
+These frames define the confirmed calibration architecture.
+
+| Frame | Direction | What it carries |
+|-------|-----------|-----------------|
+| `CalibrationTimingLoopStart` / `CalibrationTimingLoopStop` | host → device | Start or stop the device-owned fixed timing reference: red 500 ms → green 500 ms → blue 500 ms, with no off interval. |
+| `CalibrationTimingLoopStatus` | device → host | Fixed-loop state, the current colour and phase progress, plus the device monotonic cycle anchor and observation instant. The backend uses this with its clock probes; the device never follows a host clock. |
+| `CalibrationTimingStatus` | backend → browser | Browser projection of timing state: fixed RGB phase, optional device anchor, automatic median midpoint estimate, median RTT and RTT spread, signed manual trim, total correction, and the bounded rolling-probe count/capacity. The capacity is 11; timing state is volatile per device. |
+| `CalibrationTimingIntent` | browser → backend | `start`, `stop`, `reset`, or signed-integer `adjust_host_timeline`. The visible controls only request ±5 ms or ±50 ms; the backend clamps the volatile trim to ±1,000 ms. |
+| `CalibrationScheduleBegin` / `CalibrationScheduleChunk` / `CalibrationScheduleCommit` | host → device | Exact run/session identity, revision, content identity, and total count on all upload frames. Chunks contain at most 32 ordered entries. Commit publishes the complete schedule atomically; entries carry cue id, gesture, modifier, track offset, and hold (1,500 ms in the Tuesday recipe). |
+| `CalibrationScheduleAccepted` | device → host | The accepted complete-song identity (run, revision, and content identity) plus acknowledgement time, device monotonic anchor, and acquisition-sample anchor. The anchor is exactly three seconds ahead of acknowledgement. It is never a one-cue identity. |
+| `CalibrationHeartbeat` | host → device | Calibration-specific heartbeat carrying run, schedule revision, and sequence. The host sends it every 500 ms while a song is active; after 2 seconds without one, firmware interrupts future work, rejects only an open cue, and preserves completed evidence/checkpoints. |
+| `CalibrationSongInterrupted` | device → host | Whole-song interruption reason, complete schedule identity, and optional open cue. Continue requires a new uploaded and anchored schedule. |
+| `CalibrationSongResult` | device → host | Per gesture/modifier accepted, rejected, target, and deficit counts plus candidate numerical/CRC validity. Short counts and quality warnings stay permissive; validity does not. |
+| `CalibrationContinue` / `CalibrationSave` / `CalibrationDiscard` | host → device | Retain completed evidence and prepare for another authored schedule; request candidate activation; or discard only the candidate. The browser requests these through the existing guided-session actions so its exact lease identity has one authoritative path. |
+| `CalibrationCandidateStatus` / `CalibrationResidentActivated` | device → host | Candidate presence and numerical/CRC validation; then acknowledgement that a valid candidate became the active resident calibration. |
+
 ## The EMG window
 
 `Frame::Emg` carries `seq`, `t0_us`, `channels`, `sample_rate`, `scale_uv`, the

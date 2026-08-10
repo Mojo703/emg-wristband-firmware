@@ -21,6 +21,7 @@
 mod adc;
 mod allocation;
 mod calibration;
+mod clock_probe;
 mod config;
 mod cores;
 mod feedback;
@@ -39,7 +40,7 @@ use adc::acquisition::AdcSource;
 use adc::Channel;
 use calibration::{Calibration, CalibrationBuffers, WearerFeatureBuffers, WearerFeatures};
 use config::{Sensitivity, Settings, Store};
-use emg_runtime::band_features::FEATURE_COUNT;
+use emg_runtime::band_features::{CHANNEL_COUNT, FEATURE_COUNT};
 use emg_runtime::calibration::CalibrationModel;
 use emg_runtime::model::{Model, ModelBuffers, INPUT_CH, NUM_CLASSES};
 use emg_runtime::tensor::I8Activation;
@@ -49,7 +50,7 @@ use esp_idf_svc::hal::delay::FreeRtos;
 use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::hal::usb_serial::{UsbSerialConfig, UsbSerialDriver};
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
-use feedback::{DeviceState, Feedback, FeedbackWiring, FrontEnd};
+use feedback::{DeviceState, Feedback, FeedbackWiring, FrontEnd, Prompt};
 use links::Links;
 use log::{error, info, warn};
 use protocol::{Frame, MediaKey, WakeState};
@@ -169,8 +170,10 @@ impl DecisionPipelines {
         self.wearer.tau = tau;
     }
 
-    fn reset_wearer(&mut self) {
-        self.wearer = RejectPipeline::new(CALIBRATION_COMMAND_CLASSES, self.shipped.tau);
+    fn reset_decisions(&mut self) {
+        let tau = self.shipped.tau;
+        self.shipped = RejectPipeline::new(NUM_CLASSES, tau);
+        self.wearer = RejectPipeline::new(CALIBRATION_COMMAND_CLASSES, tau);
     }
 
     fn tau(&self) -> f32 {
@@ -399,6 +402,10 @@ struct App {
     lead_off_frames: u32,
     config_generation: u32,
     committed: Option<MediaKey>,
+    /// Anchor of the feedback-thread-owned RGB timing loop, on the ESP
+    /// monotonic clock. `None` means ordinary indicator rendering owns the LED.
+    timing_loop_anchor: Option<u64>,
+    clock_probe: clock_probe::ClockProbeAdapter,
 }
 
 /// Deterministic application buffers reserved immediately after NimBLE has claimed
@@ -508,6 +515,8 @@ impl App {
 
         let links = Links::serial_only(serial, peripherals.modem, sysloop, nvs_partition);
 
+        let clock_probe = clock_probe::ClockProbeAdapter::new(peripherals.pins.gpio3.into());
+
         let pipelines = DecisionPipelines::new(settings.sensitivity.tau());
 
         info!("free heap after BLE and model load: {} KB", unsafe {
@@ -596,15 +605,23 @@ impl App {
             calibration_flow::Constants::DEFAULT,
             calibration_buffers,
         ));
-        // Now that the stored gains are readable, point the pipeline reserved above
-        // at them. The reservation happened before wifi for a reason — see there.
-        band_features.adopt_gains(calibration.stored_gains());
-        // A calibration installed on some previous boot. A device calibrated
-        // yesterday runs calibrated today; a device that never was runs the int8
-        // model alone, as it always has.
-        let calibrated = calibration.stored_model();
-        if calibrated.is_some() {
-            info!("a stored calibration is installed; it decides commits this boot");
+        let active_resident = calibration.active_resident_activation();
+        let calibrated = active_resident.map(|activation| {
+            band_features.adopt_gains(activation.gains);
+            info!(
+                "resident {:?} generation {} CRC {:08x} is active",
+                activation.identity.physical,
+                activation.identity.generation,
+                activation.identity.crc
+            );
+            activation.model
+        });
+        info!(
+            "resident selector persistence: {:?}",
+            calibration.selector_persistence_capability()
+        );
+        if calibrated.is_none() {
+            info!("no resident calibration is active; classification is disabled");
         }
 
         // The wearer's own view starts only after calibration has consumed its
@@ -708,6 +725,7 @@ impl App {
         let lead_off_frames: u32 = 0;
         let config_generation: u32 = 0;
         let committed: Option<MediaKey> = None;
+        let timing_loop_anchor = None;
 
         Ok(Box::new(Self {
             device_id,
@@ -735,6 +753,8 @@ impl App {
             lead_off_frames,
             config_generation,
             committed,
+            timing_loop_anchor,
+            clock_probe,
         }))
     }
 
@@ -770,6 +790,26 @@ impl App {
     fn apply_pending_controls(&mut self) -> bool {
         let mut config_changed = false;
         for control in self.links.poll(&self.device_id, &self.settings) {
+            let control = match control {
+                Control::ClockProbeRequest {
+                    sequence,
+                    host_send_nanoseconds,
+                } => {
+                    let acquisition_sample = self
+                        .source
+                        .as_ref()
+                        .map_or(0, AdcSource::acquisition_sample);
+                    let response = self.clock_probe.respond(
+                        sequence,
+                        host_send_nanoseconds,
+                        acquisition_sample,
+                    );
+                    self.links
+                        .send_window(None, std::slice::from_ref(&response));
+                    continue;
+                }
+                other => other,
+            };
             #[cfg(feature = "playback")]
             let control = match self.playback.as_ref() {
                 Some(engine) => match engine.accept(control) {
@@ -778,6 +818,10 @@ impl App {
                 },
                 None => control,
             };
+            if control.is_timing() {
+                self.apply_timing_control(control);
+                continue;
+            }
             let Some(control) = self.calibration.accept(control) else {
                 continue;
             };
@@ -791,6 +835,37 @@ impl App {
         }
         self.config_generation += u32::from(config_changed);
         config_changed
+    }
+
+    fn apply_timing_control(&mut self, control: Control) {
+        match control {
+            Control::CalibrationTimingLoopStart {} => {
+                // Timing is a dedicated idle-only reference. EMG may continue,
+                // but a guided song or the legacy collector must own feedback.
+                if self.calibration.suppresses_commits() {
+                    warn!("refusing timing loop while calibration owns feedback");
+                    return;
+                }
+                let anchor = device_now_us();
+                self.feedback.start_timing_loop(anchor);
+                self.timing_loop_anchor = Some(anchor);
+                self.report_timing_status();
+            }
+            Control::CalibrationTimingLoopStop {} => {
+                self.feedback.stop_timing_loop();
+                self.timing_loop_anchor = None;
+                self.report_timing_status();
+            }
+            _ => unreachable!("only timing controls reach timing routing"),
+        }
+    }
+
+    fn report_timing_status(&mut self) {
+        let status = feedback::timing_loop_status(self.timing_loop_anchor, device_now_us());
+        self.links.send_window(
+            None,
+            std::slice::from_ref(&Frame::CalibrationTimingLoopStatus { status }),
+        );
     }
 
     fn replay_phone_state(&mut self) {
@@ -828,6 +903,16 @@ impl App {
 
     fn advance_calibration(&mut self) {
         self.calibration.poll(&self.settings);
+        if let Some(gains) = self.calibration.take_pending_feature_gains() {
+            self.band_features.adopt_gains(gains);
+            info!("adopted anchored calibration reference gains for collection");
+        }
+        if let Some(gesture) = self.calibration.take_anchored_prompt() {
+            self.feedback.calibration_prompt(Prompt {
+                gesture,
+                key: self.settings.key_for(gesture.index()),
+            });
+        }
         let frames = self.calibration.drain_outbound();
         if !frames.is_empty() {
             self.links.send_window(None, &frames);
@@ -842,16 +927,33 @@ impl App {
                 }
             }
         }
-        if let Some(model) = self.calibration.take_installed_model() {
-            info!(
-                "calibration installed a {}-class model; it decides commits from here",
-                model.class_count
-            );
-            // Scoring must use the gains the installed model was fitted against.
-            self.band_features
-                .adopt_gains(self.calibration.stored_gains());
-            self.pipelines.reset_wearer();
-            self.calibrated = Some(model);
+        if let Some(update) = self.calibration.take_resident_runtime_update() {
+            self.apply_resident_runtime_update(update);
+        }
+    }
+
+    fn apply_resident_runtime_update(&mut self, update: calibration::ResidentRuntimeUpdate) {
+        reset_command_state(
+            &mut self.committed,
+            &mut self.prev_wake,
+            &mut self.pipelines,
+        );
+        match update {
+            calibration::ResidentRuntimeUpdate::Activated(activation) => {
+                self.band_features.adopt_gains(activation.gains);
+                self.calibrated = Some(activation.model);
+                info!(
+                    "resident {:?} generation {} CRC {:08x} activated",
+                    activation.identity.physical,
+                    activation.identity.generation,
+                    activation.identity.crc
+                );
+            }
+            calibration::ResidentRuntimeUpdate::Inactive => {
+                self.band_features.adopt_gains([1.0; CHANNEL_COUNT]);
+                self.calibrated = None;
+                info!("resident selection cleared; classification disabled");
+            }
         }
     }
 
@@ -886,6 +988,19 @@ impl App {
 
     fn process_window(&mut self, window: AcquiredWindow, config_changed: bool) {
         self.note_front_end_recovery();
+        if self.calibrated.is_none() {
+            self.stream_and_recycle_window(window);
+            if config_changed {
+                let hello = Frame::DeviceHello {
+                    device_id: self.device_id.clone(),
+                    config: self.settings.to_wire(),
+                    provenance: provenance::device(),
+                };
+                self.links.send_window(Some(&hello), &[]);
+            }
+            self.publish_feedback_state();
+            return;
+        }
         let inference = self.infer_window(&window);
         let streamed = self.stream_and_recycle_window(window);
         self.publish_decision_frames(&inference, streamed.newest_seq, config_changed);
@@ -939,6 +1054,7 @@ impl App {
         let wants_features = WearerFeatures::wanted(&self.calibration, self.calibrated.is_some());
         let AcquiredWindow {
             started_us,
+            end_sample,
             samples: conditioned,
             packed_wire,
             missing,
@@ -968,6 +1084,7 @@ impl App {
                 self.lead_off_frames = lead_off_now;
                 self.band_features.push_window(
                     &packed_wire,
+                    end_sample,
                     lead_off,
                     self.front_end == FrontEnd::Stalled,
                     &mut self.calibration,
@@ -975,6 +1092,7 @@ impl App {
                 )
             })
             .flatten();
+        self.calibration.observe_acquisition(end_sample);
         source.recycle(conditioned, packed_wire, missing);
 
         StreamOutcome {
@@ -1023,9 +1141,16 @@ impl App {
             _ => None,
         };
         let committing = calibrated_decision.as_ref().unwrap_or(&inference.decision);
-        let next_commit = (committing.wake_state == WakeState::Active
-            && !self.calibration.suppresses_commits())
-        .then(|| self.settings.key_for(committing.argmax));
+        // The calibrated model contains five command classes followed by their
+        // paired thumb-down anti-gesture classes. Only the first five are ever
+        // eligible to reach HID; an unbound anti class must not fall through to
+        // Settings::key_for's default media action.
+        let next_commit = calibrated_command_key(
+            committing.wake_state,
+            committing.argmax,
+            self.calibration.suppresses_commits(),
+            &self.settings,
+        );
         let dispatch = changed_commit(self.committed, next_commit);
         self.committed = next_commit;
         self.publish_feedback_state();
@@ -1065,6 +1190,28 @@ impl App {
 /// A commit is a level in `DeviceState`, but a media key is a one-shot output.
 fn changed_commit(previous: Option<MediaKey>, current: Option<MediaKey>) -> Option<MediaKey> {
     (current != previous).then_some(current).flatten()
+}
+
+fn calibrated_command_key(
+    wake_state: WakeState,
+    class: u8,
+    calibration_suppressed: bool,
+    settings: &Settings,
+) -> Option<MediaKey> {
+    (wake_state == WakeState::Active
+        && !calibration_suppressed
+        && usize::from(class) < CALIBRATION_COMMAND_CLASSES)
+        .then(|| settings.key_for(class))
+}
+
+fn reset_command_state(
+    committed: &mut Option<MediaKey>,
+    previous_wake: &mut WakeState,
+    pipelines: &mut DecisionPipelines,
+) {
+    *committed = None;
+    *previous_wake = WakeState::Idle;
+    pipelines.reset_decisions();
 }
 
 /// Apply a control frame; returns true when it changed persisted config (so the
@@ -1108,13 +1255,20 @@ fn apply_control(
             wireless.set_phone_enabled(enabled);
             false
         }
-        Control::Probe {} | Control::Heartbeat {} => false, // handled by the caller
+        Control::Probe {}
+        | Control::Heartbeat {}
+        | Control::CalibrationTimingLoopStart {}
+        | Control::CalibrationTimingLoopStop {} => false, // handled by the caller
+        Control::ClockProbeRequest { .. } => false, // handled by the USB probe adapter
         // The serve loop routes these to the calibration state machine before
         // they reach here; nothing about a calibration is persisted config.
-        Control::CalibrationStart { .. }
-        | Control::CalibrationAbort {}
-        | Control::CalibrationCueSchedule { .. }
-        | Control::CalibrationRowsRequest { .. } => false,
+        Control::CalibrationScheduleBegin { .. }
+        | Control::CalibrationScheduleChunk { .. }
+        | Control::CalibrationScheduleCommit { .. }
+        | Control::CalibrationHeartbeat { .. }
+        | Control::CalibrationContinue { .. }
+        | Control::CalibrationSave { .. }
+        | Control::CalibrationDiscard { .. } => false,
         // The serve loop routes these to the playback engine before they reach
         // here, and a build without the feature has no engine to route them to.
         // Listed rather than caught by a wildcard so a new control frame still
@@ -1138,14 +1292,14 @@ mod decision_pipeline_tests {
     use super::*;
 
     #[test]
-    fn sensitivity_updates_both_reject_spines_and_survives_reinstall() {
+    fn sensitivity_updates_both_reject_spines_and_survives_activation_reset() {
         let mut pipelines = DecisionPipelines::new(0.5);
 
         pipelines.set_tau(0.75);
         assert_eq!(pipelines.shipped.tau, 0.75);
         assert_eq!(pipelines.wearer.tau, 0.75);
 
-        pipelines.reset_wearer();
+        pipelines.reset_decisions();
         assert_eq!(pipelines.shipped.tau, 0.75);
         assert_eq!(pipelines.wearer.tau, 0.75);
     }
@@ -1165,6 +1319,20 @@ mod decision_pipeline_tests {
             Some(MediaKey::NextTrack)
         );
         assert_eq!(changed_commit(Some(MediaKey::NextTrack), None), None);
+    }
+
+    #[test]
+    fn activation_resets_latched_command_and_decision_state_without_link_mutation() {
+        let mut pipelines = DecisionPipelines::new(0.5);
+        let mut committed = Some(MediaKey::NextTrack);
+        let mut previous_wake = WakeState::Active;
+        reset_command_state(&mut committed, &mut previous_wake, &mut pipelines);
+        assert_eq!(committed, None);
+        assert_eq!(previous_wake, WakeState::Idle);
+        // The configured threshold is preserved while the decision histories
+        // reset, so activation cannot silently change control sensitivity.
+        assert_eq!(pipelines.shipped.tau, 0.5);
+        assert_eq!(pipelines.wearer.tau, 0.5);
     }
 
     #[test]
@@ -1206,6 +1374,24 @@ mod startup_memory_tests {
         assert_eq!(
             memory.reserved_bytes + NUM_CLASSES * core::mem::size_of::<i32>(),
             59_524
+        );
+    }
+
+    #[test]
+    fn paired_thumb_down_classes_cannot_reach_hid() {
+        let settings = Settings::default();
+        for anti_gesture in CALIBRATION_COMMAND_CLASSES as u8..CALIBRATION_COMMAND_CLASSES as u8 * 2
+        {
+            assert_eq!(
+                calibrated_command_key(WakeState::Active, anti_gesture, false, &settings),
+                None,
+                "anti-gesture class {anti_gesture} must never choose a media key"
+            );
+        }
+        assert!(calibrated_command_key(WakeState::Active, 0, false, &settings).is_some());
+        assert_eq!(
+            calibrated_command_key(WakeState::Active, 0, true, &settings),
+            None
         );
     }
 }

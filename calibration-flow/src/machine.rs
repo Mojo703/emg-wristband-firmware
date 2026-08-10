@@ -252,13 +252,8 @@ impl Elapsing {
             return Run::Elapsing(self);
         }
         // Cross the boundary and stop. Crossing a phase boundary and asking for
-        // a rep are two different things, and doing both from one poll is what
-        // put a scripted run's first prompt in the quiet head: the driver
-        // decides *where* to poll from the gesture the machine is waiting for,
-        // and while a phase is only elapsing it is waiting for no gesture at
-        // all — so a poll that also issued the prompt issued it at the
-        // transition sample rather than at the recording's first cue. The next
-        // poll is one window later and asks properly.
+        // a rep are separate polls so prompt emission always has an unambiguous
+        // device-clock instant.
         self.progress.begin(self.begins);
         Run::Prompting(Prompting {
             progress: self.progress,
@@ -551,26 +546,9 @@ impl Run {
     /// is the whole reason that phase is announced.
     pub fn start(constants: Constants, at_sample: u64) -> Self {
         let settling = constants.samples_in(constants.settling_milliseconds);
-        Self::settling_until(constants, at_sample, at_sample + settling)
-    }
-
-    /// Begin with the still phase cut to `settle_until`, an absolute sample.
-    ///
-    /// For the scripted wearer only. A recording has whatever quiet head it
-    /// has — the thumb-up session's first cue is at sample 40,786 and its only
-    /// quiet region is the 12.4 s before it — so a still phase that ran the
-    /// wearer protocol's sixty seconds would compute a rest baseline over a
-    /// window containing real gestures, and then reject genuine reps for
-    /// sitting at a baseline that was never rest.
-    ///
-    /// Taken at construction because that is when the driver knows it: it reads
-    /// the recording's first cue before it has issued the erase. As a setter
-    /// this was nine lines of argument about which side of the erase it might
-    /// arrive from, for a number that never changes once a run has begun.
-    pub fn settling_until(constants: Constants, at_sample: u64, settle_until: u64) -> Self {
         Run::Erasing(Erasing {
             progress: Progress::new(constants, at_sample),
-            settle_until,
+            settle_until: at_sample + settling,
         })
     }
 
@@ -733,21 +711,6 @@ impl Run {
     /// The gesture being asked for, if a rep is open.
     pub fn prompt(&self) -> Option<CalibrationGesture> {
         match self {
-            Run::Performing(phase) => Some(phase.in_flight.gesture),
-            _ => None,
-        }
-    }
-
-    /// The gesture the next prompt will ask for, if the machine is waiting on
-    /// a rep at all.
-    ///
-    /// The scripted wearer needs this before the prompt exists: it has to find
-    /// the recording's own cue for that gesture and poll at *its* sample, so
-    /// the labeled span lands on samples where the gesture was really
-    /// performed. A wearer-paced run never asks.
-    pub fn next_gesture(&self) -> Option<CalibrationGesture> {
-        match self {
-            Run::Prompting(phase) => Some(phase.gesture()),
             Run::Performing(phase) => Some(phase.in_flight.gesture),
             _ => None,
         }
@@ -1008,31 +971,6 @@ mod tests {
         let (run, action) = run.poll(100 + settle_samples / 2);
         assert!(action.is_none());
         assert_eq!(run.phase_remaining_samples(), Some(settle_samples / 2));
-    }
-
-    #[test]
-    fn a_scripted_run_can_cut_the_still_phase_to_the_recordings_head() {
-        // A recording has whatever quiet head it has. Settling that ran the
-        // wearer protocol's full length would average real gestures into the
-        // rest baseline, and every genuine rep would then read as sitting at
-        // rest — which is exactly how one scripted run aborted.
-        //
-        // The end is fixed when the run is constructed, so there is no ordering
-        // left to get wrong: the driver knows the recording's head before it
-        // has issued the erase, and no later call can move a boundary the
-        // labeling has been computed against.
-        let constants = constants();
-        let head = constants.samples_in(400);
-        let (run, action) = Run::settling_until(constants, 0, head).poll(0);
-        assert_eq!(action, Some(Action::EraseSlot));
-
-        let (run, action) = run.verified().poll(head - 1);
-        assert_eq!(action, None);
-        let (run, action) = run.poll(head);
-        assert_eq!(action, None, "crossing the boundary is its own poll");
-        assert_eq!(run.phase(), CalibrationPhase::ThumbUpRounds);
-        let (_, action) = run.poll(head);
-        assert!(matches!(action, Some(Action::Prompt { .. })));
     }
 
     #[test]

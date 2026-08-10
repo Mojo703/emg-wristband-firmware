@@ -100,6 +100,7 @@ impl WearerFeatures {
     pub fn push_window(
         &mut self,
         packed_wire: &[u8],
+        acquisition_end_sample: u64,
         lead_off: bool,
         adc_recovery: bool,
         calibration: &mut Calibration,
@@ -109,7 +110,14 @@ impl WearerFeatures {
         // see the field's note, and the abort it is there to prevent.
         let mut samples = core::mem::take(&mut self.unpacked);
         protocol::unpack_samples_into(&mut samples, packed_wire);
-        let features = self.push_unpacked(&samples, lead_off, adc_recovery, calibration, settings);
+        let features = self.push_unpacked(
+            &samples,
+            acquisition_end_sample,
+            lead_off,
+            adc_recovery,
+            calibration,
+            settings,
+        );
         self.unpacked = samples;
         features
     }
@@ -118,6 +126,7 @@ impl WearerFeatures {
     fn push_unpacked(
         &mut self,
         samples: &[u8],
+        acquisition_end_sample: u64,
         lead_off: bool,
         adc_recovery: bool,
         calibration: &mut Calibration,
@@ -151,9 +160,12 @@ impl WearerFeatures {
             // labeling see the extra three.
             let emitted = self.pipeline.push_sliding(&self.instant);
             if let Some(window) = emitted {
+                let end_sample = acquisition_end_sample
+                    .saturating_sub(per_channel as u64)
+                    .saturating_add(step as u64 + 1);
                 calibration.observe_window(
                     &CalibrationWindow {
-                        end_sample: window.end_sample,
+                        end_sample,
                         features: window.features,
                         lead_off,
                         adc_recovery,

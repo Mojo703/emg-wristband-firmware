@@ -215,6 +215,24 @@ pub enum Frame {
     /// entry, so dismissal is the browser's way of saying it is done reading the logs.
     DismissDevice { device_id: String },
 
+    /// Browser → backend: declare which wearer-guided mode this connection is
+    /// visibly presenting, or `None` when hidden or on an unrelated panel.
+    GuidedViewPresence { mode: Option<GuidedMode> },
+
+    /// Backend → browser: the complete current guided-session projection. Every
+    /// update is self-contained, so reconnects and lag never replay edge history.
+    GuidedSessionSnapshot { snapshot: GuidedSessionSnapshot },
+
+    /// Browser → backend: one action rendered from an authoritative guided
+    /// snapshot. All three identities must still match before the mode adapter
+    /// may act, so a delayed browser cannot control a replacement run.
+    GuidedSessionIntent {
+        expected_revision: u64,
+        expected_run_revision: u64,
+        expected_session_id: Option<u64>,
+        action: GuidedSessionAction,
+    },
+
     /// Select a sensitivity preset by id (browser → backend). The backend forwards it
     /// to the selected device, which owns the preset → threshold mapping.
     SetSensitivity { level: String },
@@ -316,6 +334,24 @@ pub enum Frame {
     /// the device releases the serial claim. The current runtime does not start
     /// Wi-Fi automatically. The data stream itself is the reply-side liveness signal.
     Heartbeat {},
+
+    /// Host → device: one experimental serial clock sample. This frame is not
+    /// part of the browser protocol or the production clock mapper.
+    ClockProbeRequest {
+        sequence: u32,
+        /// Host monotonic time immediately before writing the request.
+        host_send_nanoseconds: u64,
+    },
+
+    /// Device → host: observations made while GPIO3 is high in an experiment
+    /// build. No production clock mapping consumes this response.
+    ClockProbeResponse {
+        sequence: u32,
+        host_send_nanoseconds: u64,
+        device_receive_microseconds: u64,
+        device_send_microseconds: u64,
+        acquisition_sample: u64,
+    },
 
     // ------------------------------------------------------------------
     // Training-data collection (the rhythm game). These frames travel only
@@ -467,6 +503,25 @@ pub enum Frame {
         hit: bool,
     },
 
+    /// Backend → browser: authoritative state for the dedicated timing page.
+    CalibrationTimingStatus { status: CalibrationTimingStatus },
+
+    /// Browser → backend: timing-page intent. These values never cross the
+    /// device link; the backend owns the host-wide correction.
+    CalibrationTimingIntent { intent: CalibrationTimingIntent },
+
+    /// Host → device: start the device-owned, fixed RGB timing loop.
+    CalibrationTimingLoopStart {},
+
+    /// Host → device: stop the device-owned timing loop and restore ordinary
+    /// LED state.
+    CalibrationTimingLoopStop {},
+
+    /// Device → host: an observation of the fixed RGB timing loop. The device
+    /// reports its own monotonic anchor; the backend projects it to the browser
+    /// with the timing estimate it owns.
+    CalibrationTimingLoopStatus { status: CalibrationTimingLoopStatus },
+
     // ------------------------------------------------------------------
     // On-device calibration (`firmware-bench/CALIBRATION-PLAN.md`).
     //
@@ -482,38 +537,75 @@ pub enum Frame {
     // percentages either way, and keeping them integral means the whole
     // calibration vocabulary survives a device that cannot decode a CBOR float.
     // ------------------------------------------------------------------
-    /// Host → device: begin a calibration run. Refused if one is already
-    /// running; the previous calibration stays installed either way.
-    CalibrationStart {
-        /// Drive the run from a scripted cue schedule instead of a wearer, for
-        /// the bench board that has no front end. The schedule arrives in
-        /// [`Frame::CalibrationCueSchedule`] frames before this one.
-        scripted_wearer: bool,
+    /// Host → device: start an explicitly identified schedule upload.
+    CalibrationScheduleBegin {
+        run: CalibrationRunKey,
+        schedule_revision: CalibrationScheduleRevision,
+        content_identity: String,
+        total_count: u32,
     },
 
-    /// Host → device: stop the run now. The slot under construction is
-    /// abandoned without a CRC, so the previous calibration stays installed.
-    CalibrationAbort {},
-
-    /// Host → device: part of the scripted-wearer prompt schedule, which
-    /// replaces a person for the playback test mode. Entries are
-    /// [`CALIBRATION_SCHEDULE_ENTRY_BYTES`] each, little-endian, in prompt
-    /// order: `start_sample` u32, `sample_count` u32, `gesture` u8, `round` u8,
-    /// `block` u8 (0 thumb-up, 1 thumb-down), one reserved zero byte. Sample
-    /// indices, not milliseconds, so the schedule lines up with the streamed
-    /// session exactly and carries no float.
-    ///
-    /// `block` exists because a spliced run holds both modifier states in one
-    /// sample space: without it a rejected thumb-up rep would take its retry
-    /// from the next cue for that gesture, which is a thumb-down cue, and
-    /// label it as a command.
-    CalibrationCueSchedule {
-        /// Index of the first entry in this frame, counting from zero across
-        /// the whole schedule. A gap means the schedule is incomplete and the
-        /// device refuses to start scripted.
+    /// Host → device: one bounded, ordered part of the schedule. The device
+    /// does not expose or use a partial schedule.
+    CalibrationScheduleChunk {
+        run: CalibrationRunKey,
+        schedule_revision: CalibrationScheduleRevision,
+        content_identity: String,
+        total_count: u32,
         first_entry: u32,
-        #[serde(with = "serde_bytes")]
-        entries: Vec<u8>,
+        entries: Vec<CalibrationScheduleEntry>,
+    },
+
+    /// Host → device: atomically publish the complete uploaded schedule.
+    CalibrationScheduleCommit {
+        run: CalibrationRunKey,
+        schedule_revision: CalibrationScheduleRevision,
+        content_identity: String,
+        total_count: u32,
+    },
+
+    /// Device → host: atomically accepted complete schedule and its exact
+    /// device/acquisition anchor, three seconds ahead of the acknowledgement.
+    CalibrationScheduleAccepted {
+        accepted: CalibrationScheduleAccepted,
+    },
+
+    /// Host → device: calibration-specific liveness signal. The host sends it
+    /// every 500 ms while a committed song is active; the device interrupts
+    /// after two seconds without one.
+    CalibrationHeartbeat { heartbeat: CalibrationHeartbeat },
+
+    /// Device → host: a song was interrupted before its ordinary result. Any
+    /// completed rows and fitting checkpoints remain available to Continue.
+    CalibrationSongInterrupted {
+        interruption: CalibrationSongInterruption,
+    },
+
+    /// Device → host: counts, deficits, and candidate validity after a song.
+    CalibrationSongResult { result: CalibrationSongResult },
+
+    /// Host → device: retain accepted rows and prepare for another authored
+    /// schedule. The browser reaches this through the existing guided-session
+    /// action so there is only one browser lease/identity path.
+    CalibrationContinue { run: CalibrationRunKey },
+
+    /// Host → device: request candidate activation. Firmware refuses it unless
+    /// both numerical fitting and record CRC validation succeeded.
+    CalibrationSave { run: CalibrationRunKey },
+
+    /// Host → device: discard the candidate while leaving the resident
+    /// calibration untouched.
+    CalibrationDiscard { run: CalibrationRunKey },
+
+    /// Device → host: the candidate's validation state, including states that
+    /// keep Save disabled even though count/quality warnings stay permissive.
+    CalibrationCandidateStatus {
+        candidate: CalibrationCandidateStatus,
+    },
+
+    /// Device → host: a candidate was made resident and activated immediately.
+    CalibrationResidentActivated {
+        activation: CalibrationResidentActivation,
     },
 
     /// Host → device: send back a stored slot's record and rows. The one thing
@@ -869,8 +961,377 @@ pub enum Frame {
 // own table of what code 3 means is a table that goes stale.
 // ------------------------------------------------------------------
 
-/// Bytes one entry of [`Frame::CalibrationCueSchedule`] occupies.
-pub const CALIBRATION_SCHEDULE_ENTRY_BYTES: usize = 12;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuidedMode {
+    Collection,
+    Calibration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuidedSessionBinding {
+    pub session_id: u64,
+    pub run_revision: u64,
+    pub mode: GuidedMode,
+    pub device_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuidedFailureKind {
+    DependencyFailed,
+    TaskFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuidedSessionFailure {
+    pub run_revision: u64,
+    pub mode: GuidedMode,
+    pub kind: GuidedFailureKind,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuidedSessionSnapshot {
+    pub revision: u64,
+    pub run_revision: u64,
+    pub active: Option<GuidedSessionBinding>,
+    pub visible_collection_views: u64,
+    pub visible_calibration_views: u64,
+    pub failure: Option<GuidedSessionFailure>,
+    pub calibration: Option<GuidedCalibrationSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "name", rename_all = "snake_case")]
+pub enum GuidedSessionAction {
+    SelectCalibrationTrack { track_id: String },
+    StartCalibration,
+    PauseCalibration,
+    ResumeCalibration,
+    SaveCalibration,
+    ContinueCalibration,
+    DiscardCalibration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuidedCalibrationTrack {
+    pub id: String,
+    pub title: String,
+    pub beats_per_minute: u16,
+    pub duration_ms: u64,
+    pub cue_count: u32,
+    pub content_identity: String,
+    pub cue_shortfall: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuidedCalibrationLane {
+    pub visual_lane: u8,
+    pub id: String,
+    pub label: String,
+    pub color_name: String,
+    pub motion: Option<GestureMotion>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuidedThumbVariant {
+    Up,
+    Down,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuidedCalibrationCue {
+    pub visual_lane: u8,
+    pub at: u64,
+    pub hold: u64,
+    pub thumb_variant: GuidedThumbVariant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuidedCalibrationCount {
+    pub class_id: String,
+    pub label: String,
+    pub thumb_up: u32,
+    pub thumb_down: u32,
+    pub invalid: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "phase", rename_all = "snake_case")]
+pub enum GuidedCalibrationSnapshot {
+    Setup {
+        tracks: Vec<GuidedCalibrationTrack>,
+        selected_track_id: Option<String>,
+    },
+    Playing {
+        track: GuidedCalibrationTrack,
+        lanes: Vec<GuidedCalibrationLane>,
+        cues: Vec<GuidedCalibrationCue>,
+        position_ms: u64,
+        valid_reps: u32,
+        invalid_reps: u32,
+        paused_reason: Option<String>,
+        counts: Vec<GuidedCalibrationCount>,
+    },
+    BetweenSongs {
+        track_title: String,
+        candidate_available: bool,
+        continue_available: bool,
+        valid_reps: u32,
+        invalid_reps: u32,
+        deficits: Vec<String>,
+    },
+    TechnicalFailure {
+        detail: String,
+    },
+}
+
+macro_rules! calibration_nonzero_id {
+    ($(#[$doc:meta])* $name:ident, $inner:ty, $nonzero:ty) => {
+        $(#[$doc])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+        #[serde(transparent)]
+        pub struct $name($nonzero);
+
+        impl $name {
+            pub const fn new(value: $inner) -> Option<Self> {
+                match <$nonzero>::new(value) {
+                    Some(value) => Some(Self(value)),
+                    None => None,
+                }
+            }
+
+            pub const fn get(self) -> $inner {
+                self.0.get()
+            }
+        }
+    };
+}
+
+calibration_nonzero_id! {
+    /// One backend-authoritative guided calibration session. `u64` keeps the
+    /// identity bounded on every target without relying on a string format.
+    CalibrationSessionId, u64, core::num::NonZeroU64
+}
+calibration_nonzero_id! {
+    /// One firmware run inside a guided session.
+    CalibrationRunId, u32, core::num::NonZeroU32
+}
+calibration_nonzero_id! {
+    /// One cue inside a firmware run.
+    CalibrationCueId, u32, core::num::NonZeroU32
+}
+calibration_nonzero_id! {
+    /// Revision of the backend schedule. A pause or re-anchor mints a new one.
+    CalibrationScheduleRevision, u32, core::num::NonZeroU32
+}
+
+/// Identity shared by every command and event belonging to one firmware run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct CalibrationRunKey {
+    pub session_id: CalibrationSessionId,
+    pub run_id: CalibrationRunId,
+}
+
+/// The browser-visible RGB cycle is fixed by the device: red, green, blue,
+/// 500 ms per colour. No RGB values are configurable on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CalibrationTimingColor {
+    Red,
+    Green,
+    Blue,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CalibrationTimingState {
+    Stopped,
+    Running,
+}
+
+/// The device's own fixed RGB-loop observation. `anchor` is the instant the
+/// current red → green → blue cycle began; colour and elapsed are sampled at
+/// `observed_device_monotonic_microseconds`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CalibrationTimingLoopStatus {
+    pub state: CalibrationTimingState,
+    pub color: CalibrationTimingColor,
+    pub color_elapsed_milliseconds: u32,
+    pub anchor_device_monotonic_microseconds: u64,
+    pub observed_device_monotonic_microseconds: u64,
+}
+
+/// Bounded state of the rolling automatic timing estimate. The samples stay in
+/// the dashboard process; this projection intentionally exposes only enough to
+/// explain how much evidence the median contains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CalibrationTimingProbeWindow {
+    pub sample_count: u8,
+    pub capacity: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CalibrationTimingStatus {
+    pub state: CalibrationTimingState,
+    pub color: CalibrationTimingColor,
+    pub color_elapsed_milliseconds: u32,
+    pub anchor_device_monotonic_microseconds: Option<u64>,
+    pub automatic_offset_milliseconds: Option<OffsetMilliseconds>,
+    pub median_round_trip_milliseconds: Option<DurationMilliseconds>,
+    pub round_trip_spread_milliseconds: Option<DurationMilliseconds>,
+    pub manual_trim_milliseconds: OffsetMilliseconds,
+    pub total_correction_milliseconds: Option<OffsetMilliseconds>,
+    pub probe_window: CalibrationTimingProbeWindow,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "name", rename_all = "snake_case")]
+pub enum CalibrationTimingIntent {
+    Start,
+    Stop,
+    Reset,
+    /// The Timing page exposes only +/-5 ms and +/-50 ms buttons. The backend
+    /// enforces those increments and the +/-1,000 ms bound before it changes
+    /// the volatile per-device trim.
+    AdjustHostTimeline {
+        delta_milliseconds: OffsetMilliseconds,
+    },
+}
+
+/// One semantic cue in the committed song schedule. `track_offset` is the
+/// heard-time position; `hold` is deliberately carried per entry so the
+/// device never has to infer a label span from a song.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CalibrationScheduleEntry {
+    pub cue_id: CalibrationCueId,
+    pub gesture: CalibrationGesture,
+    pub modifier: CalibrationModifier,
+    pub track_offset: TrackMilliseconds,
+    pub hold: DurationMilliseconds,
+}
+
+/// A complete generated song has 130 cues, so chunks must be large enough to
+/// keep serial setup bounded without fragmenting a normal upload excessively.
+pub const CALIBRATION_SCHEDULE_CHUNK_MAX_ENTRIES: usize = 32;
+pub const CALIBRATION_CUE_ANCHOR_LEAD_MICROSECONDS: u64 = 3_000_000;
+pub const CALIBRATION_TIMING_COLOR_PHASE_MILLISECONDS: u32 = 500;
+pub const CALIBRATION_TIMING_PROBE_WINDOW_CAPACITY: u8 = 11;
+pub const CALIBRATION_HEARTBEAT_INTERVAL_MILLISECONDS: u32 = 500;
+pub const CALIBRATION_HEARTBEAT_TIMEOUT_MILLISECONDS: u32 = 2_000;
+pub const CALIBRATION_TIMING_MANUAL_TRIM_LIMIT_MILLISECONDS: i64 = 1_000;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CalibrationScheduleAccepted {
+    pub run: CalibrationRunKey,
+    pub schedule_revision: CalibrationScheduleRevision,
+    pub content_identity: String,
+    pub acknowledged_device_monotonic_microseconds: u64,
+    pub anchor_device_monotonic_microseconds: u64,
+    pub acquisition_sample: u64,
+}
+
+impl CalibrationScheduleAccepted {
+    pub fn is_exactly_three_seconds_ahead(&self) -> bool {
+        match self
+            .acknowledged_device_monotonic_microseconds
+            .checked_add(CALIBRATION_CUE_ANCHOR_LEAD_MICROSECONDS)
+        {
+            Some(expected) => expected == self.anchor_device_monotonic_microseconds,
+            None => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CalibrationHeartbeat {
+    pub run: CalibrationRunKey,
+    pub schedule_revision: CalibrationScheduleRevision,
+    pub sequence: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CalibrationSongInterruptionReason {
+    Operator,
+    HeartbeatTimeout,
+    DeviceLinkLost,
+    ScheduleReplaced,
+}
+
+/// A device interruption rejects the open cue, if any, and never rolls back
+/// completed evidence or fitting checkpoints.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CalibrationSongInterruption {
+    pub run: CalibrationRunKey,
+    pub schedule_revision: CalibrationScheduleRevision,
+    pub content_identity: String,
+    pub reason: CalibrationSongInterruptionReason,
+    pub open_cue: Option<CalibrationCueId>,
+}
+
+/// Counts for one command or paired anti-gesture class. `deficit_count` is
+/// explicit so Continue can fill only the short classes without guessing from
+/// a fixed recipe on the host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CalibrationClassCounts {
+    pub gesture: CalibrationGesture,
+    pub modifier: CalibrationModifier,
+    pub accepted_count: u32,
+    pub rejected_count: u32,
+    pub target_count: u32,
+    pub deficit_count: u32,
+}
+
+/// The two storage/model conditions that make activation safe. Quality and
+/// count warnings are intentionally absent: they remain visible but permissive
+/// for Tuesday's operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CalibrationCandidateValidity {
+    pub model_numerically_valid: bool,
+    pub record_crc_valid: bool,
+}
+
+impl CalibrationCandidateValidity {
+    pub const fn permits_activation(self) -> bool {
+        self.model_numerically_valid && self.record_crc_valid
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CalibrationCandidateStatus {
+    pub run: CalibrationRunKey,
+    pub schedule_revision: CalibrationScheduleRevision,
+    pub validity: CalibrationCandidateValidity,
+    pub candidate_present: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CalibrationSongResult {
+    pub run: CalibrationRunKey,
+    pub schedule_revision: CalibrationScheduleRevision,
+    pub content_identity: String,
+    pub counts: Vec<CalibrationClassCounts>,
+    pub validity: CalibrationCandidateValidity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CalibrationResidentActivation {
+    pub run: CalibrationRunKey,
+    pub schedule_revision: CalibrationScheduleRevision,
+    pub validity: CalibrationCandidateValidity,
+    pub resident_sequence: u32,
+}
+
+/// Thumb state paired with the wrist gesture in an interleaved schedule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CalibrationModifier {
+    ThumbUp,
+    ThumbDown,
+}
 
 /// The gestures a calibration collects, in the fixed order they are always
 /// prompted in. The order is part of the protocol: it is what carries a
@@ -3224,18 +3685,52 @@ mod tests {
         }
 
         let inbound = [
-            Frame::CalibrationStart {
-                scripted_wearer: true,
-            },
-            Frame::CalibrationAbort {},
-            Frame::CalibrationCueSchedule {
-                first_entry: 0,
-                entries: alloc::vec![0u8; 3 * CALIBRATION_SCHEDULE_ENTRY_BYTES],
-            },
             Frame::CalibrationRowsRequest {
                 slot: 1,
                 first_row: 0,
                 max_rows: 64,
+            },
+            Frame::CalibrationScheduleBegin {
+                run: run_key(),
+                schedule_revision: schedule_revision(),
+                content_identity: "sha256:test".into(),
+                total_count: u32::MAX,
+            },
+            Frame::CalibrationScheduleChunk {
+                run: run_key(),
+                schedule_revision: schedule_revision(),
+                content_identity: "sha256:test".into(),
+                total_count: u32::MAX,
+                first_entry: u32::MAX,
+                entries: vec![CalibrationScheduleEntry {
+                    cue_id: CalibrationCueId::new(11).unwrap(),
+                    gesture: CalibrationGesture::ThumbExtension,
+                    modifier: CalibrationModifier::ThumbDown,
+                    track_offset: TrackMilliseconds::new(u32::MAX),
+                    hold: DurationMilliseconds::new(u32::MAX),
+                }],
+            },
+            Frame::CalibrationScheduleCommit {
+                run: run_key(),
+                schedule_revision: schedule_revision(),
+                content_identity: "sha256:test".into(),
+                total_count: u32::MAX,
+            },
+            Frame::CalibrationTimingLoopStart {},
+            Frame::CalibrationTimingLoopStop {},
+            Frame::CalibrationHeartbeat {
+                heartbeat: CalibrationHeartbeat {
+                    run: run_key(),
+                    schedule_revision: schedule_revision(),
+                    sequence: u32::MAX,
+                },
+            },
+            Frame::CalibrationContinue { run: run_key() },
+            Frame::CalibrationSave { run: run_key() },
+            Frame::CalibrationDiscard { run: run_key() },
+            Frame::ClockProbeRequest {
+                sequence: u32::MAX,
+                host_send_nanoseconds: u64::MAX,
             },
             Frame::PlaybackBegin {
                 session: "2026-08-07T16-38-35_Matthew".into(),
@@ -3278,6 +3773,156 @@ mod tests {
                 !field_types(frame).contains(&"float"),
                 "float field in {frame:?}"
             );
+        }
+    }
+
+    #[test]
+    fn replacement_calibration_frames_roundtrip_at_limits() {
+        let run = run_key();
+        let timing = Frame::CalibrationTimingStatus {
+            status: CalibrationTimingStatus {
+                state: CalibrationTimingState::Running,
+                color: CalibrationTimingColor::Blue,
+                color_elapsed_milliseconds: 499,
+                anchor_device_monotonic_microseconds: Some(u64::MAX),
+                automatic_offset_milliseconds: Some(OffsetMilliseconds::new(i64::MIN)),
+                median_round_trip_milliseconds: Some(DurationMilliseconds::new(u32::MAX)),
+                round_trip_spread_milliseconds: Some(DurationMilliseconds::new(u32::MAX)),
+                manual_trim_milliseconds: OffsetMilliseconds::new(i64::MAX),
+                total_correction_milliseconds: Some(OffsetMilliseconds::new(i64::MAX)),
+                probe_window: CalibrationTimingProbeWindow {
+                    sample_count: CALIBRATION_TIMING_PROBE_WINDOW_CAPACITY,
+                    capacity: CALIBRATION_TIMING_PROBE_WINDOW_CAPACITY,
+                },
+            },
+        };
+        assert_eq!(
+            core::mem::discriminant(&roundtrip(&timing)),
+            core::mem::discriminant(&timing)
+        );
+
+        let frames = [
+            Frame::CalibrationTimingLoopStatus {
+                status: CalibrationTimingLoopStatus {
+                    state: CalibrationTimingState::Running,
+                    color: CalibrationTimingColor::Red,
+                    color_elapsed_milliseconds: 0,
+                    anchor_device_monotonic_microseconds: 1,
+                    observed_device_monotonic_microseconds: u64::MAX,
+                },
+            },
+            Frame::CalibrationScheduleAccepted {
+                accepted: CalibrationScheduleAccepted {
+                    run,
+                    schedule_revision: schedule_revision(),
+                    content_identity: "sha256:test".into(),
+                    acknowledged_device_monotonic_microseconds: u64::MAX
+                        - CALIBRATION_CUE_ANCHOR_LEAD_MICROSECONDS,
+                    anchor_device_monotonic_microseconds: u64::MAX,
+                    acquisition_sample: u64::MAX,
+                },
+            },
+            Frame::CalibrationHeartbeat {
+                heartbeat: CalibrationHeartbeat {
+                    run,
+                    schedule_revision: schedule_revision(),
+                    sequence: u32::MAX,
+                },
+            },
+            Frame::CalibrationSongInterrupted {
+                interruption: CalibrationSongInterruption {
+                    run,
+                    schedule_revision: schedule_revision(),
+                    content_identity: "sha256:test".into(),
+                    reason: CalibrationSongInterruptionReason::HeartbeatTimeout,
+                    open_cue: Some(CalibrationCueId::new(11).unwrap()),
+                },
+            },
+            Frame::CalibrationSongResult {
+                result: CalibrationSongResult {
+                    run,
+                    schedule_revision: schedule_revision(),
+                    content_identity: "sha256:test".into(),
+                    counts: vec![CalibrationClassCounts {
+                        gesture: CalibrationGesture::ThumbExtension,
+                        modifier: CalibrationModifier::ThumbDown,
+                        accepted_count: u32::MAX,
+                        rejected_count: u32::MAX,
+                        target_count: u32::MAX,
+                        deficit_count: u32::MAX,
+                    }],
+                    validity: CalibrationCandidateValidity {
+                        model_numerically_valid: true,
+                        record_crc_valid: true,
+                    },
+                },
+            },
+            Frame::CalibrationCandidateStatus {
+                candidate: CalibrationCandidateStatus {
+                    run,
+                    schedule_revision: schedule_revision(),
+                    validity: CalibrationCandidateValidity {
+                        model_numerically_valid: true,
+                        record_crc_valid: true,
+                    },
+                    candidate_present: true,
+                },
+            },
+            Frame::CalibrationResidentActivated {
+                activation: CalibrationResidentActivation {
+                    run,
+                    schedule_revision: schedule_revision(),
+                    validity: CalibrationCandidateValidity {
+                        model_numerically_valid: true,
+                        record_crc_valid: true,
+                    },
+                    resident_sequence: u32::MAX,
+                },
+            },
+        ];
+        if let Frame::CalibrationScheduleAccepted { accepted } = roundtrip(&frames[1]) {
+            assert!(accepted.is_exactly_three_seconds_ahead());
+        }
+        for frame in frames {
+            assert_eq!(
+                core::mem::discriminant(&roundtrip(&frame)),
+                core::mem::discriminant(&frame)
+            );
+        }
+    }
+
+    #[test]
+    fn schedule_chunks_have_bounded_contract_and_order_shape() {
+        assert_eq!(CALIBRATION_SCHEDULE_CHUNK_MAX_ENTRIES, 32);
+        let chunk = Frame::CalibrationScheduleChunk {
+            run: run_key(),
+            schedule_revision: schedule_revision(),
+            content_identity: "sha256:test".into(),
+            total_count: 32,
+            first_entry: 32,
+            entries: (0..32)
+                .map(|index| CalibrationScheduleEntry {
+                    cue_id: CalibrationCueId::new(index + 1).unwrap(),
+                    gesture: CalibrationGesture::ALL
+                        [(index as usize) % CalibrationGesture::ALL.len()],
+                    modifier: CalibrationModifier::ThumbUp,
+                    track_offset: TrackMilliseconds::new(index * 500),
+                    hold: DurationMilliseconds::new(1_500),
+                })
+                .collect(),
+        };
+        match roundtrip(&chunk) {
+            Frame::CalibrationScheduleChunk {
+                first_entry,
+                entries,
+                ..
+            } => {
+                assert_eq!(first_entry, 32);
+                assert_eq!(entries.len(), CALIBRATION_SCHEDULE_CHUNK_MAX_ENTRIES);
+                assert_eq!(entries[0].cue_id.get(), 1);
+                assert_eq!(entries[31].cue_id.get(), 32);
+            }
+            other => panic!("wrong variant: {other:?}"),
         }
     }
 
@@ -3677,6 +4322,131 @@ mod tests {
                 assert_eq!(largest_free_block_bytes, 31_000);
             }
             other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    fn run_key() -> CalibrationRunKey {
+        CalibrationRunKey {
+            session_id: CalibrationSessionId::new(7).unwrap(),
+            run_id: CalibrationRunId::new(3).unwrap(),
+        }
+    }
+
+    fn schedule_revision() -> CalibrationScheduleRevision {
+        CalibrationScheduleRevision::new(5).unwrap()
+    }
+
+    #[test]
+    fn calibration_transaction_identifiers_are_nonzero_bounded_integers() {
+        assert_eq!(CalibrationSessionId::new(0), None);
+        assert_eq!(CalibrationRunId::new(0), None);
+        assert_eq!(CalibrationCueId::new(0), None);
+        assert_eq!(CalibrationScheduleRevision::new(0), None);
+
+        assert_eq!(CalibrationSessionId::new(u64::MAX).unwrap().get(), u64::MAX);
+        assert_eq!(CalibrationRunId::new(u32::MAX).unwrap().get(), u32::MAX);
+        assert_eq!(CalibrationCueId::new(u32::MAX).unwrap().get(), u32::MAX);
+
+        let mut zero = Vec::new();
+        ciborium::into_writer(&0u32, &mut zero).unwrap();
+        let decoded: Result<CalibrationCueId, _> = ciborium::from_reader(zero.as_slice());
+        assert!(decoded.is_err());
+    }
+
+    #[test]
+    fn clock_probe_frames_roundtrip_at_integer_limits() {
+        let request = Frame::ClockProbeRequest {
+            sequence: u32::MAX,
+            host_send_nanoseconds: u64::MAX,
+        };
+        match roundtrip(&request) {
+            Frame::ClockProbeRequest {
+                sequence,
+                host_send_nanoseconds,
+            } => {
+                assert_eq!(sequence, u32::MAX);
+                assert_eq!(host_send_nanoseconds, u64::MAX);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        let response = Frame::ClockProbeResponse {
+            sequence: u32::MAX,
+            host_send_nanoseconds: u64::MAX,
+            device_receive_microseconds: u64::MAX - 1,
+            device_send_microseconds: u64::MAX,
+            acquisition_sample: u64::MAX,
+        };
+        match roundtrip(&response) {
+            Frame::ClockProbeResponse {
+                sequence,
+                host_send_nanoseconds,
+                device_receive_microseconds,
+                device_send_microseconds,
+                acquisition_sample,
+            } => {
+                assert_eq!(sequence, u32::MAX);
+                assert_eq!(host_send_nanoseconds, u64::MAX);
+                assert_eq!(device_receive_microseconds, u64::MAX - 1);
+                assert_eq!(device_send_microseconds, u64::MAX);
+                assert_eq!(acquisition_sample, u64::MAX);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn guided_presence_and_full_snapshot_roundtrip() {
+        let binding = GuidedSessionBinding {
+            session_id: 9,
+            run_revision: 4,
+            mode: GuidedMode::Collection,
+            device_id: Some("opal-1".into()),
+        };
+        let calibration = GuidedCalibrationSnapshot::Setup {
+            tracks: vec![GuidedCalibrationTrack {
+                id: "track-1".into(),
+                title: "Calibration Song".into(),
+                beats_per_minute: 128,
+                duration_ms: 96_000,
+                cue_count: 110,
+                content_identity: "a".repeat(64),
+                cue_shortfall: 0,
+            }],
+            selected_track_id: Some("track-1".into()),
+        };
+        let frames = [
+            Frame::GuidedViewPresence {
+                mode: Some(GuidedMode::Collection),
+            },
+            Frame::GuidedViewPresence { mode: None },
+            Frame::GuidedSessionSnapshot {
+                snapshot: GuidedSessionSnapshot {
+                    revision: 12,
+                    run_revision: 4,
+                    active: Some(binding),
+                    visible_collection_views: 2,
+                    visible_calibration_views: 1,
+                    failure: Some(GuidedSessionFailure {
+                        run_revision: 3,
+                        mode: GuidedMode::Calibration,
+                        kind: GuidedFailureKind::DependencyFailed,
+                        detail: "device link ended".into(),
+                    }),
+                    calibration: Some(calibration),
+                },
+            },
+            Frame::GuidedSessionIntent {
+                expected_revision: 12,
+                expected_run_revision: 4,
+                expected_session_id: Some(9),
+                action: GuidedSessionAction::StartCalibration,
+            },
+        ];
+
+        for frame in frames {
+            let before = alloc::format!("{frame:?}");
+            assert_eq!(alloc::format!("{:?}", roundtrip(&frame)), before);
         }
     }
 }

@@ -1,16 +1,14 @@
 # Single-app layout (4 MB flash). One large app partition + nvs (device settings)
-# + flash-resident calibration training rows.
+# + one flash-resident calibration store.
 #
-# `training` holds the packed training rows a calibration fit joins with the
-# rows it collected live. They live in flash because they do not fit anywhere
-# else: the full training set is 9654 rows, which is 604 KB even at int8, well
-# past SRAM. The fit reads them through a memory-mapped view rather than copying
-# them in, so the cost is flash-cache bandwidth rather than heap.
+# `training` keeps the v2 map: one shipped prior followed by two 192 KB physical
+# slots. Slot sequence, role and CRC recover one logical resident plus one
+# candidate or scratch without a separate selector region.
 #
 # 0xF0000 fills the rest of the 4 MB part exactly (0x310000 + 0xF0000 =
-# 0x400000) and holds ~14000 int8 rows. Written separately with
-# `espflash write-bin`, not by the app; `firmware-bench/PROTOCOL.md` documents
-# the image layout and `playback-host build-partition` produces one.
+# 0x400000). `firmware-bench/FLASH-FORMATS.md` fixes every internal
+# offset. `playback-host build-partition-v2` produces the separately flashed
+# image.
 #
 # Name,     Type, SubType,   Offset,   Size,    Flags
 nvs,        data, nvs,       0x9000,   0x6000,

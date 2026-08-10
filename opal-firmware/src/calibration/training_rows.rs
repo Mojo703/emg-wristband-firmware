@@ -24,6 +24,8 @@ use emg_runtime::streaming_fit::{RowSource, ROW_STRIDE};
 use esp_idf_svc::sys::EspError;
 use log::{info, warn};
 
+use super::resident_selector::{PhysicalSlot, StoredIdentity, StoredRole};
+
 /// Marks the partition as carrying a row image at all. A partition that was
 /// never written reads as erased flash (`0xFF`), and a fit that took that for
 /// rows would train on 14000 rows of garbage and report a plausible wall time
@@ -220,7 +222,7 @@ fn find_partition() -> Option<*const esp_idf_svc::sys::esp_partition_t> {
     (!partition.is_null()).then_some(partition)
 }
 
-/// The v2 calibration partition: the shipped prior and the two wearer slots.
+/// The v2 calibration partition: shipped prior and two physical slots.
 ///
 /// The whole partition is mapped as one read-only window, so the prior's rows
 /// and a slot's rows are the same kind of borrow and the fit walks both in
@@ -267,7 +269,7 @@ impl CalibrationPartition {
         };
         let size = unsafe { (*partition).size } as usize;
         if size < PARTITION_BYTES {
-            bail!("training partition is {size} bytes, the v2 layout needs {PARTITION_BYTES}");
+            bail!("training partition is {size} bytes, the calibration layout needs {PARTITION_BYTES}");
         }
         let mut mapped = Self {
             partition,
@@ -360,12 +362,22 @@ impl CalibrationPartition {
         flash_image::parse_slot(index, self.slot_bytes(index), self.prior().hash())
     }
 
-    /// The stored calibration to run, if any: the live slot with the highest
-    /// sequence.
-    pub(super) fn newest_slot(&self) -> Option<LiveSlot<'_>> {
-        (0..SLOT_COUNT)
-            .filter_map(|index| self.slot(index).ok())
-            .max_by_key(|slot| slot.record.sequence)
+    pub(super) fn stored_identity(&self, physical: PhysicalSlot) -> Option<StoredIdentity> {
+        let live = self.slot(physical.index()).ok()?;
+        Some(StoredIdentity {
+            physical,
+            generation: live.record.sequence,
+            crc: read_u32(self.slot_bytes(physical.index()), SLOT_CRC_OFFSET),
+            role: match live.record.role {
+                flash_image::SlotRole::Resident => StoredRole::Resident,
+                flash_image::SlotRole::ExportableCandidate => StoredRole::ExportableCandidate,
+                flash_image::SlotRole::Inactive => StoredRole::Inactive,
+            },
+        })
+    }
+
+    pub(super) fn stored_identities(&self) -> [Option<StoredIdentity>; SLOT_COUNT] {
+        PhysicalSlot::ALL.map(|physical| self.stored_identity(physical))
     }
 
     /// The sequence each slot carries, or `None` where the slot is empty or its
@@ -378,7 +390,7 @@ impl CalibrationPartition {
     /// Whether a slot is already erased, so a calibration can start without
     /// erasing anything.
     ///
-    /// A read, and the reason the erase moved to boot: erasing 128 KB is
+    /// A read, and the reason the erase moved to boot: erasing 192 KB is
     /// roughly forty-eight sector erases, each of which suspends the other core
     /// and takes the flash cache down with it for tens of milliseconds. That is
     /// survivable with nothing else running and fatal beside a front end
@@ -391,7 +403,7 @@ impl CalibrationPartition {
     /// Erase a whole slot in one call, before collection begins.
     ///
     /// This is the only erase in a calibration and the longest stall in it —
-    /// 32 sectors of 4 KB. Nothing else may run during it, which is why the
+    /// 48 sectors of 4 KB. Nothing else may run during it, which is why the
     /// protocol puts it inside the announced settling phase. Returns the
     /// microseconds it took.
     pub(super) fn erase_slot_region(&mut self, index: usize) -> Result<u32> {
@@ -412,6 +424,16 @@ impl CalibrationPartition {
         Ok(elapsed)
     }
 
+    /// Make a committed candidate invalid without erasing its region. The next
+    /// boot erases the resulting scratch before acquisition starts.
+    pub(super) fn invalidate_slot(&mut self, physical: PhysicalSlot) -> Result<u32> {
+        self.write(
+            SLOT_OFFSETS[physical.index()] + SLOT_CRC_OFFSET,
+            &0u32.to_le_bytes(),
+        )
+        .with_context(|| format!("invalidate calibration slot {}", physical.index()))
+    }
+
     /// Flush buffered rows into a pre-erased slot, starting at row
     /// `first_row`.
     ///
@@ -426,6 +448,13 @@ impl CalibrationPartition {
         let rows = bytes.len() / ROW_STRIDE;
         let first_row = self.flushed[index];
         let capacity = flash_image::slot_row_capacity();
+        if first_row + rows > flash_image::CALIBRATION_RECIPE_ROW_CAPACITY {
+            bail!(
+                "rows {first_row}..{} past the calibration recipe's {}-row budget",
+                first_row + rows,
+                flash_image::CALIBRATION_RECIPE_ROW_CAPACITY
+            );
+        }
         if first_row + rows > capacity {
             bail!(
                 "rows {first_row}..{} past the slot's {capacity}",
@@ -450,7 +479,7 @@ impl CalibrationPartition {
     /// This is the live half of the training set during a calibration. The
     /// wearer's rows live in flash from the moment they are flushed, so the
     /// only RAM the collection needs is one round's worth of buffer — a whole
-    /// slot is 184 KB and does not fit beside wifi and acquisition.
+    /// slot can hold 2,559 rows and does not fit beside wifi and acquisition.
     ///
     /// The record is not committed yet and there is nothing to validate
     /// against: no magic, no CRC, no sequence. The extent comes from this

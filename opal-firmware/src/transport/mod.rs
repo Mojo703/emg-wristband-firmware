@@ -3,166 +3,18 @@
 //! USB-Serial-JTAG CDC channel ([`serial`]), both carrying `protocol`'s magic +
 //! length + CBOR framing, so the rest of the firmware is transport-agnostic.
 
+mod control;
 mod serial;
 mod tcp;
 
+pub use control::Control;
 pub use serial::{
     SerialTransport, SERIAL_CLAIM_TIMEOUT, SERIAL_HOST_ABSENCE_GRACE, SERIAL_RECLAIM_COOLDOWN,
 };
 pub use tcp::TcpTransport;
 
 use anyhow::Result;
-use protocol::{Binding, Frame};
-use serde::Deserialize;
-
-/// The control frames the device accepts (browser → backend → device, plus the
-/// backend's serial link-management frames). A dedicated, float-free mirror of the
-/// relevant `protocol::Frame` variants: decoding the full `Frame` would force
-/// ciborium's f16→f32 float path to compile, which the Xtensa LLVM backend cannot
-/// codegen. The device never receives float-bearing frames, so this subset is
-/// sufficient and keeps that path out of the firmware entirely.
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum Control {
-    SetSensitivity {
-        level: String,
-    },
-    SetKeymap {
-        bindings: Vec<Binding>,
-    },
-    SetWifi {
-        ssid: String,
-        psk: String,
-    },
-    SetServer {
-        addr: String,
-    },
-    /// Runtime-only and float-free. Off remains the default after every boot.
-    SetPhone {
-        enabled: bool,
-    },
-    /// A dashboard opened the serial link: announce and make serial the data link.
-    Probe {},
-    /// Serial-link keepalive; silence for a few seconds means the dashboard is gone.
-    Heartbeat {},
-
-    // On-device calibration (`firmware-bench/CALIBRATION-PLAN.md`). Not behind
-    // the playback feature: calibration is what a wearer's firmware does, and
-    // the scripted schedule is refused rather than absent in a build that
-    // cannot replay one.
-    CalibrationStart {
-        scripted_wearer: bool,
-    },
-    CalibrationAbort {},
-    CalibrationCueSchedule {
-        first_entry: u32,
-        #[serde(with = "serde_bytes")]
-        entries: Vec<u8>,
-    },
-    CalibrationRowsRequest {
-        slot: u32,
-        first_row: u32,
-        max_rows: u32,
-    },
-
-    // The firmware validation bench (`firmware-bench/PROTOCOL.md`). Mirrors of
-    // the `protocol::Frame` variants of the same names, decoded here for the
-    // same float-free reason as everything above: the byte blobs carry `f32`
-    // payloads as little-endian bits and are widened by hand, so no ciborium
-    // float path is ever instantiated.
-    //
-    // Behind the feature, so a firmware built for a wearer neither decodes nor
-    // allocates for a frame it has nothing to do with.
-    #[cfg(feature = "playback")]
-    PlaybackBegin {
-        session: String,
-        sample_count: u32,
-        chunk_samples: u32,
-        #[serde(with = "serde_bytes")]
-        constants: Vec<u8>,
-    },
-    #[cfg(feature = "playback")]
-    PlaybackSamples {
-        sequence: u32,
-        #[serde(with = "serde_bytes")]
-        samples: Vec<u8>,
-    },
-    #[cfg(feature = "playback")]
-    PlaybackEnd {},
-    #[cfg(feature = "playback")]
-    BenchModelLoad {
-        class_count: u32,
-        #[serde(with = "serde_bytes")]
-        model: Vec<u8>,
-    },
-    #[cfg(feature = "playback")]
-    BenchReplayRows {
-        first_window: u32,
-        #[serde(with = "serde_bytes")]
-        rows: Vec<u8>,
-    },
-    #[cfg(feature = "playback")]
-    BenchFitBegin {
-        row_capacity: u32,
-        precision: u8,
-        class_count: u32,
-        #[serde(with = "serde_bytes")]
-        quantization: Vec<u8>,
-    },
-    #[cfg(feature = "playback")]
-    BenchFitRows {
-        #[serde(with = "serde_bytes")]
-        labels: Vec<u8>,
-        #[serde(with = "serde_bytes")]
-        row_weights: Vec<u8>,
-        #[serde(with = "serde_bytes")]
-        rows: Vec<u8>,
-    },
-    #[cfg(feature = "playback")]
-    BenchFitRun {
-        use_static_rows: bool,
-    },
-    #[cfg(feature = "playback")]
-    BenchStatusRequest {},
-    #[cfg(feature = "playback")]
-    BenchReset {},
-}
-
-impl Control {
-    /// Whether the calibration state machine owns this frame. The serve loop
-    /// routes on it so a calibration control never reaches the settings store.
-    pub fn is_calibration(&self) -> bool {
-        matches!(
-            self,
-            Control::CalibrationStart { .. }
-                | Control::CalibrationAbort {}
-                | Control::CalibrationCueSchedule { .. }
-                | Control::CalibrationRowsRequest { .. }
-        )
-    }
-}
-
-#[cfg(feature = "playback")]
-impl Control {
-    /// Whether this is a bench frame the playback engine owns, as opposed to a
-    /// config or link-management control. The serve loop routes on this so a
-    /// bench frame never reaches the settings store.
-    pub fn is_bench(&self) -> bool {
-        matches!(
-            self,
-            Control::PlaybackBegin { .. }
-                | Control::PlaybackSamples { .. }
-                | Control::PlaybackEnd {}
-                | Control::BenchModelLoad { .. }
-                | Control::BenchReplayRows { .. }
-                | Control::BenchFitBegin { .. }
-                | Control::BenchFitRows { .. }
-                | Control::BenchFitRun { .. }
-                | Control::BenchStatusRequest {}
-                | Control::BenchReset {}
-        )
-    }
-}
+use protocol::Frame;
 
 /// One end of a dashboard link.
 pub trait Transport {
@@ -211,6 +63,11 @@ fn decode(bytes: &[u8]) -> Option<Control> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use protocol::{
+        CalibrationCueId, CalibrationGesture, CalibrationModifier, CalibrationRunId,
+        CalibrationRunKey, CalibrationScheduleEntry, CalibrationScheduleRevision,
+        CalibrationSessionId, DurationMilliseconds, TrackMilliseconds,
+    };
 
     #[test]
     fn set_phone_decodes_through_the_float_free_control_mirror() {
@@ -221,6 +78,69 @@ mod tests {
                 decode(&bytes),
                 Some(Control::SetPhone { enabled: decoded }) if decoded == enabled
             ));
+        }
+    }
+
+    #[test]
+    fn anchored_song_controls_accept_the_complete_130_cue_upload_shape() {
+        let run = CalibrationRunKey {
+            session_id: CalibrationSessionId::new(7).unwrap(),
+            run_id: CalibrationRunId::new(3).unwrap(),
+        };
+        let schedule_revision = CalibrationScheduleRevision::new(9).unwrap();
+        let content_identity = "track-content-sha256".to_owned();
+        let entries: Vec<_> = (0..130)
+            .map(|index| CalibrationScheduleEntry {
+                cue_id: CalibrationCueId::new(index + 1).unwrap(),
+                gesture: CalibrationGesture::ALL[index as usize % CalibrationGesture::ALL.len()],
+                modifier: if index % 2 == 0 {
+                    CalibrationModifier::ThumbUp
+                } else {
+                    CalibrationModifier::ThumbDown
+                },
+                track_offset: TrackMilliseconds::new(index * 2_000),
+                hold: DurationMilliseconds::new(1_500),
+            })
+            .collect();
+        let mut frames = vec![Frame::CalibrationScheduleBegin {
+            run,
+            schedule_revision,
+            content_identity: content_identity.clone(),
+            total_count: entries.len() as u32,
+        }];
+        for first_entry in (0..entries.len()).step_by(32) {
+            let end = (first_entry + 32).min(entries.len());
+            frames.push(Frame::CalibrationScheduleChunk {
+                run,
+                schedule_revision,
+                content_identity: content_identity.clone(),
+                total_count: entries.len() as u32,
+                first_entry: first_entry as u32,
+                entries: entries[first_entry..end].to_vec(),
+            });
+        }
+        frames.push(Frame::CalibrationScheduleCommit {
+            run,
+            schedule_revision,
+            content_identity,
+            total_count: entries.len() as u32,
+        });
+        frames.push(Frame::CalibrationHeartbeat {
+            heartbeat: protocol::CalibrationHeartbeat {
+                run,
+                schedule_revision,
+                sequence: 1,
+            },
+        });
+        assert_eq!(
+            frames.len(),
+            8,
+            "begin + 32/32/32/32/2 + commit + heartbeat"
+        );
+        for frame in frames {
+            let mut bytes = Vec::new();
+            ciborium::into_writer(&frame, &mut bytes).unwrap();
+            assert!(decode(&bytes).is_some_and(|control| control.is_calibration()));
         }
     }
 

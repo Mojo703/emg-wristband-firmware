@@ -1,4 +1,4 @@
-# Flash formats for on-device calibration (v2)
+# Flash formats for on-device calibration
 
 Every byte the `training` partition holds, and the rules that make a torn write
 detectable. This file is the contract between the host builder
@@ -26,27 +26,18 @@ version word makes the refusal explicit rather than silent.
 
 | region | offset | size | contents |
 |---|---|---|---|
-| prior | `0x00000` | 589,824 B | the shipped prior: statistics, warm-start weights, standardized rows |
-| wearer slot 0 | `0x90000` | 196,608 B | one stored calibration |
-| wearer slot 1 | `0xC0000` | 196,608 B | one stored calibration |
+| prior | `0x00000` | 589,824 B (`0x90000`) | shipped prior, statistics, warm-start weights and standardized rows |
+| physical slot 0 | `0x90000` | 196,608 B (`0x30000`) | logical resident or candidate/scratch |
+| physical slot 1 | `0xC0000` | 196,608 B (`0x30000`) | logical resident or candidate/scratch |
 
-Both slot offsets and both slot sizes are multiples of the 4,096 B erase
-sector, so a slot can be erased without touching the prior or the other slot.
+Every region boundary is a multiple of the 4,096 B erase sector. Erasing one
+slot therefore leaves the prior and the other slot intact.
 
 The split is driven by what each side has to hold. The prior is 7,704 rows —
 four base no-op sessions (6,264) and two rest sessions (1,440) — which is
-554,688 B of rows, and the region holds 8,078. A successful fixed schedule
-collects 990 rows: 450 thumb-up command rows and 540 thumb-down no-op rows.
-A slot holds 2,559. The format retains the original slot headroom without
-making collection length adaptive. The headroom is deliberately biased toward
-the slots: a prior that
-outgrows its region fails at build time with a message, while a slot that
-overflows fails during a wearer's calibration.
-
-A 128 KB slot was the first shape tried and does not work. 1,950 rows do not fit
-one at any per-row size — not at 72 B, not at 68 B with the row weight dropped,
-not even at 64 B with nothing but features — so the region split had to move
-rather than the row.
+554,688 B of rows, and the region holds 8,078. The fixed storage recipe reserves
+1,170 rows. One physical slot holds 2,559 rows. The firmware refuses appends
+beyond the recipe budget while the parser retains the full physical ceiling.
 
 ## The row
 
@@ -171,11 +162,11 @@ weights carry counts that include the two live sessions and must not be reused.
 the end of the header to there — the constants, the statistics, the weights and
 every row — so a slot that names a hash names one exact prior image.
 
-## Wearer slot
+## Calibration slots
 
-Two slots at fixed offsets, 131,072 B each. A slot holds one complete stored
-calibration. There is no compaction and no wear-levelling beyond the two
-slots: **eviction is overwrite-lowest-sequence**.
+Two physical slots sit at fixed offsets, 196,608 B each. Together they hold one
+logical resident calibration and one candidate or scratch region. Recovery
+uses committed sequence numbers and slot roles rather than a separate selector.
 
 ### Header, 64 B at offset 0
 
@@ -189,7 +180,7 @@ slots: **eviction is overwrite-lowest-sequence**.
 | 24 | 4 | live row count |
 | 28 | 4 | row stride, `72` |
 | 32 | 4 | covered bytes: the length the CRC is taken over |
-| 36 | 4 | flags, reserved, zero |
+| 36 | 4 | role: `0` resident, `1` exportable candidate, `2` inactive tombstone |
 | 40 | 24 | reserved, zero |
 
 ### Body
@@ -207,10 +198,10 @@ slots: **eviction is overwrite-lowest-sequence**.
 
 Rows start at a fixed `0x3000` — sector-aligned, and past the 9,904 B the
 metadata occupies at 12 classes — so appending rows never writes a sector the
-metadata lives in. The row area holds 2,559 rows against a protocol that
-collects up to 1,950, or around 2,340 if the gate extends it.
+metadata lives in. The row area holds 2,559 rows. The firmware's fixed recipe
+budget is 1,170 rows.
 
-The CRC sits at a fixed offset at the very end of the slot rather than
+The CRC sits at a fixed offset at the end of the slot rather than
 immediately after the last row. That keeps the final write 4-byte aligned
 regardless of row count, and it is the write that makes the slot live.
 Covered bytes is `12288 + 72 * live_row_count`; the CRC is taken over
@@ -221,6 +212,38 @@ PNG use; both sides pin it against the standard check value
 `crc32("123456789") == 0xCBF43926`. It is a torn-write and mismatched-pairing
 detector, not a security boundary.
 
+### Logical store recovery
+
+Role `0` records and role `2` tombstones form one sequence. Recovery takes the
+highest valid sequence from those two roles. A resident record yields
+`Some(resident)`; a newer tombstone yields `None`. Existing v2 records have zero
+in the former flags word, so they decode as residents. If both legacy slots are
+live, recovery keeps the newer one and erases the older region as scratch during
+boot preparation.
+
+An exportable candidate does not participate in resident selection. Firmware
+exposes one only when its sequence is newer than the resident or tombstone.
+This permits host transfer while classification continues from the resident.
+After transfer, firmware invalidates the candidate CRC. The next boot erases
+that physical region before another acquisition run.
+
+### Lifecycle
+
+At boot, firmware identifies at most one resident and one scratch region. It
+erases scratch before acquisition starts. A calibration writes rows and
+metadata there while the CRC remains erased.
+
+Saving to resident writes a role `0` CRC last. Until that write completes, the
+old resident remains the highest valid record. Once it completes, the candidate
+becomes resident and the old resident becomes future scratch.
+
+Discard leaves the candidate CRC invalid and preserves the resident. Saving to
+host commits role `1`, leaving the resident active until transfer completes.
+Deleting or archiving the resident commits a newer role `2` tombstone in
+scratch; classification then recovers as `None`, and the old resident region
+becomes scratch. Restoring an archive writes it through scratch and commits it
+as a newer role `0` resident.
+
 ## Write discipline
 
 The flash cache stall is real: on the ESP32-S3 every write and erase stalls the
@@ -228,9 +251,9 @@ other core and blocks all non-IRAM code. The rules follow from that, and
 **scheduling them is the caller's job** — this layer exposes the operations and
 documents their cost, it does not decide when they run.
 
-1. **Erase once, at boot.** `erase_slot_region` erases the next target slot
-   before acquisition starts. A calibration run only verifies that the region
-   is blank. This is the only slot erase before that run.
+1. **Erase scratch at boot.** `erase_slot_region` erases the physical scratch
+   slot before acquisition starts. A calibration run only verifies that the
+   region is blank.
 2. **Buffer rows in RAM, flush between rounds.** One round is around 2 KB at 72
    bytes a row. `append_rows_buffered` costs nothing; `flush` writes the
    buffered rows into the pre-erased row area. **A flush stalls the other core
@@ -240,11 +263,9 @@ documents their cost, it does not decide when they run.
    A write invalidates the cache under it, so the mapping is dropped before a
    flush and `remap` is called after — at the same inter-round points, so no
    borrow spans a write.
-4. **Commit last.** `commit_record` writes the metadata block, then the rows'
-   final state, then the CRC word. A crash before the CRC leaves an erased CRC
-   word, which cannot match; a crash before the metadata leaves an erased
-   magic. Either way the slot is dead and the device runs the previous
-   calibration or the prior alone.
+4. **Commit the role last.** `commit_record` writes metadata and then the CRC
+   word. A crash before the CRC leaves the candidate invalid. Recovery therefore
+   keeps the prior resident or tombstone.
 
 A slot is **live** only if all of: magic matches, version is 2, sequence is
 neither `0` nor `0xFFFFFFFF`, the row count and covered bytes fit the slot, the
