@@ -138,6 +138,7 @@ fn delivery_for(frame: &Frame) -> Delivery {
         // transition that explains the state currently on screen.
         Frame::CalibrationPreparationStatus { .. }
         | Frame::CalibrationScheduleAccepted { .. }
+        | Frame::CalibrationScheduleCommitDeferred { .. }
         | Frame::CalibrationSongInterrupted { .. }
         | Frame::CalibrationSongResult { .. }
         | Frame::CalibrationCandidateStatus { .. }

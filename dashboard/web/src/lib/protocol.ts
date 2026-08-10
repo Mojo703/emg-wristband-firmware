@@ -857,7 +857,22 @@ export interface CalibrationScheduleUploadAcknowledgedFrame {
     readonly schedule_revision: number;
     readonly content_identity: string;
     readonly total_count: number;
-    readonly first_entry: number | null;
+    readonly operation:
+      | { readonly kind: 'begin'; readonly operation_fingerprint: number }
+      | {
+          readonly kind: 'chunk';
+          readonly first_entry: number;
+          readonly operation_fingerprint: number;
+        };
+  };
+}
+
+export interface CalibrationScheduleCommitDeferredFrame {
+  readonly type: 'calibration_schedule_commit_deferred';
+  readonly deferred: {
+    readonly run: CalibrationRunKey;
+    readonly schedule_revision: number;
+    readonly reason: 'preparation_incomplete' | 'schedule_not_anchored';
   };
 }
 
@@ -953,8 +968,14 @@ export interface CalibrationCandidateStatusFrame {
   readonly candidate: {
     readonly run: CalibrationRunKey;
     readonly schedule_revision: number;
-    readonly validity: CalibrationCandidateValidity;
-    readonly candidate_present: boolean;
+    readonly presence:
+      | { readonly state: 'absent' }
+      | {
+          readonly state: 'present';
+          readonly content_identity: string;
+          readonly total_count: number;
+          readonly validity: CalibrationCandidateValidity;
+        };
   };
 }
 
@@ -1301,6 +1322,7 @@ export type IncomingFrame =
   | CalibrationTimingLoopStatusFrame
   | CalibrationPreparationStatusFrame
   | CalibrationScheduleUploadAcknowledgedFrame
+  | CalibrationScheduleCommitDeferredFrame
   | CalibrationScheduleAcceptedFrame
   | CalibrationSongInterruptedFrame
   | CalibrationSongResultFrame
@@ -2379,8 +2401,30 @@ export function isCalibrationScheduleUploadAcknowledgedFrame(
     isReplacementCalibrationIdentity(value['acknowledgement']) &&
     isContentIdentity(value['acknowledgement']['content_identity']) &&
     isNonnegativeInteger(value['acknowledgement']['total_count']) &&
-    (value['acknowledgement']['first_entry'] === null ||
-      isNonnegativeInteger(value['acknowledgement']['first_entry']))
+    isObject(value['acknowledgement']['operation']) &&
+    ((value['acknowledgement']['operation']['kind'] === 'begin' &&
+      hasExactlyKeys(value['acknowledgement']['operation'], ['kind', 'operation_fingerprint']) &&
+      isNonnegativeInteger(value['acknowledgement']['operation']['operation_fingerprint'])) ||
+      (value['acknowledgement']['operation']['kind'] === 'chunk' &&
+        hasExactlyKeys(value['acknowledgement']['operation'], [
+          'kind',
+          'first_entry',
+          'operation_fingerprint',
+        ]) &&
+        isNonnegativeInteger(value['acknowledgement']['operation']['first_entry']) &&
+        isNonnegativeInteger(value['acknowledgement']['operation']['operation_fingerprint'])))
+  );
+}
+
+export function isCalibrationScheduleCommitDeferredFrame(
+  value: unknown,
+): value is CalibrationScheduleCommitDeferredFrame {
+  return (
+    hasType(value, 'calibration_schedule_commit_deferred') && isObject(value) &&
+    isObject(value['deferred']) &&
+    isReplacementCalibrationIdentity(value['deferred']) &&
+    (value['deferred']['reason'] === 'preparation_incomplete' ||
+      value['deferred']['reason'] === 'schedule_not_anchored')
   );
 }
 
@@ -2446,8 +2490,19 @@ export function isCalibrationCandidateStatusFrame(
     hasType(value, 'calibration_candidate_status') && isObject(value) &&
     isObject(value['candidate']) &&
     isReplacementCalibrationIdentity(value['candidate']) &&
-    isCalibrationCandidateValidity(value['candidate']['validity']) &&
-    isBoolean(value['candidate']['candidate_present'])
+    isObject(value['candidate']['presence']) &&
+    ((value['candidate']['presence']['state'] === 'absent' &&
+      hasExactlyKeys(value['candidate']['presence'], ['state'])) ||
+      (value['candidate']['presence']['state'] === 'present' &&
+        hasExactlyKeys(value['candidate']['presence'], [
+          'state',
+          'content_identity',
+          'total_count',
+          'validity',
+        ]) &&
+        isContentIdentity(value['candidate']['presence']['content_identity']) &&
+        isNonnegativeInteger(value['candidate']['presence']['total_count']) &&
+        isCalibrationCandidateValidity(value['candidate']['presence']['validity'])))
   );
 }
 
@@ -2571,6 +2626,7 @@ export function asIncomingFrame(value: unknown): IncomingFrame | null {
   if (isCalibrationTimingLoopStatusFrame(value)) return value;
   if (isCalibrationPreparationStatusFrame(value)) return value;
   if (isCalibrationScheduleUploadAcknowledgedFrame(value)) return value;
+  if (isCalibrationScheduleCommitDeferredFrame(value)) return value;
   if (isCalibrationScheduleAcceptedFrame(value)) return value;
   if (isCalibrationSongInterruptedFrame(value)) return value;
   if (isCalibrationSongResultFrame(value)) return value;

@@ -572,6 +572,14 @@ pub enum Frame {
         acknowledgement: CalibrationScheduleUploadAcknowledgement,
     },
 
+    /// Device → host: a Commit reached the exact transaction but cannot be
+    /// accepted until the named device-owned prerequisite becomes true. The
+    /// host may retry only these typed deferrals; free-form BenchError detail
+    /// is never control-flow authority.
+    CalibrationScheduleCommitDeferred {
+        deferred: CalibrationScheduleCommitDeferral,
+    },
+
     /// Device → host: authoritative progress through the acquisition-driven
     /// preparation that precedes an anchored calibration schedule.  The host
     /// must never manufacture this progress from its own clock: the device is
@@ -1064,24 +1072,64 @@ pub struct CalibrationScheduleUploadAcknowledgement {
     pub schedule_revision: CalibrationScheduleRevision,
     pub content_identity: String,
     pub total_count: u32,
-    /// `None` acknowledges Begin.  A value acknowledges the chunk beginning
-    /// at that exact entry index.
-    pub first_entry: Option<u32>,
-    /// Canonical semantic CRC of the decoded Begin or Chunk operation. The
-    /// host advances only when this matches what it sent.
-    pub operation_fingerprint: u32,
+    /// The exact applied operation and its canonical semantic CRC. Keeping the
+    /// fingerprint inside the tagged operation makes an acknowledgement
+    /// structurally either Begin or Chunk; there is no sentinel index that can
+    /// disagree with the operation whose fingerprint was calculated.
+    pub operation: CalibrationScheduleUploadOperationAcknowledgement,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CalibrationScheduleCommitDeferral {
+    pub run: CalibrationRunKey,
+    pub schedule_revision: CalibrationScheduleRevision,
+    pub reason: CalibrationScheduleCommitDeferralReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CalibrationScheduleCommitDeferralReason {
+    PreparationIncomplete,
+    ScheduleNotAnchored,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CalibrationScheduleUploadOperationAcknowledgement {
+    Begin {
+        operation_fingerprint: u32,
+    },
+    Chunk {
+        first_entry: u32,
+        operation_fingerprint: u32,
+    },
+}
+
+impl CalibrationScheduleUploadOperationAcknowledgement {
+    pub const fn operation_fingerprint(self) -> u32 {
+        match self {
+            Self::Begin {
+                operation_fingerprint,
+            }
+            | Self::Chunk {
+                operation_fingerprint,
+                ..
+            } => operation_fingerprint,
+        }
+    }
 }
 
 /// A canonical integrity token for one logical Begin or Chunk operation. This
 /// is deliberately independent of CBOR map ordering and transport framing: a
 /// device ACK proves it decoded and applied the exact semantic payload the host
 /// intended, including every cue label and timestamp.
-pub fn calibration_schedule_operation_fingerprint(
+fn calibration_schedule_operation_fingerprint(
     run: CalibrationRunKey,
     schedule_revision: CalibrationScheduleRevision,
     content_identity: &str,
     total_count: u32,
-    first_entry: Option<u32>,
+    operation_tag: u8,
+    first_entry: u32,
     entries: &[CalibrationScheduleEntry],
 ) -> u32 {
     let mut crc = WireCrc32::new();
@@ -1092,12 +1140,9 @@ pub fn calibration_schedule_operation_fingerprint(
     crc.update(&(content_identity.len() as u64).to_le_bytes());
     crc.update(content_identity.as_bytes());
     crc.update(&total_count.to_le_bytes());
-    match first_entry {
-        None => crc.update(&[0]),
-        Some(first_entry) => {
-            crc.update(&[1]);
-            crc.update(&first_entry.to_le_bytes());
-        }
+    crc.update(&[operation_tag]);
+    if operation_tag == 1 {
+        crc.update(&first_entry.to_le_bytes());
     }
     crc.update(&(entries.len() as u32).to_le_bytes());
     for entry in entries {
@@ -1111,6 +1156,42 @@ pub fn calibration_schedule_operation_fingerprint(
         crc.update(&entry.hold.get().to_le_bytes());
     }
     crc.finish()
+}
+
+pub fn calibration_schedule_begin_fingerprint(
+    run: CalibrationRunKey,
+    schedule_revision: CalibrationScheduleRevision,
+    content_identity: &str,
+    total_count: u32,
+) -> u32 {
+    calibration_schedule_operation_fingerprint(
+        run,
+        schedule_revision,
+        content_identity,
+        total_count,
+        0,
+        0,
+        &[],
+    )
+}
+
+pub fn calibration_schedule_chunk_fingerprint(
+    run: CalibrationRunKey,
+    schedule_revision: CalibrationScheduleRevision,
+    content_identity: &str,
+    total_count: u32,
+    first_entry: u32,
+    entries: &[CalibrationScheduleEntry],
+) -> u32 {
+    calibration_schedule_operation_fingerprint(
+        run,
+        schedule_revision,
+        content_identity,
+        total_count,
+        1,
+        first_entry,
+        entries,
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1325,12 +1406,22 @@ impl CalibrationCandidateValidity {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CalibrationCandidateStatus {
     pub run: CalibrationRunKey,
     pub schedule_revision: CalibrationScheduleRevision,
-    pub validity: CalibrationCandidateValidity,
-    pub candidate_present: bool,
+    pub presence: CalibrationCandidatePresence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CalibrationCandidatePresence {
+    Absent,
+    Present {
+        content_identity: String,
+        total_count: u32,
+        validity: CalibrationCandidateValidity,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -4387,11 +4478,14 @@ mod tests {
                 candidate: CalibrationCandidateStatus {
                     run,
                     schedule_revision: schedule_revision(),
-                    validity: CalibrationCandidateValidity {
-                        model_numerically_valid: true,
-                        record_crc_valid: true,
+                    presence: CalibrationCandidatePresence::Present {
+                        content_identity: "sha256:test".into(),
+                        total_count: 90,
+                        validity: CalibrationCandidateValidity {
+                            model_numerically_valid: true,
+                            record_crc_valid: true,
+                        },
                     },
-                    candidate_present: true,
                 },
             },
             Frame::CalibrationResidentActivated {
@@ -4403,6 +4497,43 @@ mod tests {
                         record_crc_valid: true,
                     },
                     resident_sequence: u32::MAX,
+                },
+            },
+            Frame::CalibrationScheduleUploadAcknowledged {
+                acknowledgement: CalibrationScheduleUploadAcknowledgement {
+                    run,
+                    schedule_revision: schedule_revision(),
+                    content_identity: "sha256:test".into(),
+                    total_count: 90,
+                    operation: CalibrationScheduleUploadOperationAcknowledgement::Begin {
+                        operation_fingerprint: u32::MAX,
+                    },
+                },
+            },
+            Frame::CalibrationScheduleUploadAcknowledged {
+                acknowledgement: CalibrationScheduleUploadAcknowledgement {
+                    run,
+                    schedule_revision: schedule_revision(),
+                    content_identity: "sha256:test".into(),
+                    total_count: 90,
+                    operation: CalibrationScheduleUploadOperationAcknowledgement::Chunk {
+                        first_entry: 32,
+                        operation_fingerprint: u32::MAX,
+                    },
+                },
+            },
+            Frame::CalibrationScheduleCommitDeferred {
+                deferred: CalibrationScheduleCommitDeferral {
+                    run,
+                    schedule_revision: schedule_revision(),
+                    reason: CalibrationScheduleCommitDeferralReason::ScheduleNotAnchored,
+                },
+            },
+            Frame::CalibrationCandidateStatus {
+                candidate: CalibrationCandidateStatus {
+                    run,
+                    schedule_revision: schedule_revision(),
+                    presence: CalibrationCandidatePresence::Absent,
                 },
             },
         ];
@@ -4534,20 +4665,28 @@ mod tests {
             track_offset: TrackMilliseconds::new(2_000),
             hold: DurationMilliseconds::new(1_500),
         };
-        let fingerprint = |identity: &str, first, entry: CalibrationScheduleEntry| {
-            calibration_schedule_operation_fingerprint(
+        let fingerprint = |identity: &str, first_entry, entry: CalibrationScheduleEntry| {
+            calibration_schedule_chunk_fingerprint(
                 run_key(),
                 schedule_revision(),
                 identity,
                 90,
-                first,
+                first_entry,
                 &[entry],
             )
         };
-        let baseline = fingerprint("sha256:test", Some(8), entry);
-        assert_ne!(baseline, fingerprint("sha256:other", Some(8), entry));
-        assert_ne!(baseline, fingerprint("sha256:test", Some(16), entry));
-        assert_ne!(baseline, fingerprint("sha256:test", None, entry));
+        let baseline = fingerprint("sha256:test", 8, entry);
+        assert_ne!(baseline, fingerprint("sha256:other", 8, entry));
+        assert_ne!(baseline, fingerprint("sha256:test", 16, entry));
+        assert_ne!(
+            baseline,
+            calibration_schedule_begin_fingerprint(
+                run_key(),
+                schedule_revision(),
+                "sha256:test",
+                90,
+            )
+        );
 
         for changed in [
             CalibrationScheduleEntry {
@@ -4571,7 +4710,7 @@ mod tests {
                 ..entry
             },
         ] {
-            assert_ne!(baseline, fingerprint("sha256:test", Some(8), changed));
+            assert_ne!(baseline, fingerprint("sha256:test", 8, changed));
         }
     }
 

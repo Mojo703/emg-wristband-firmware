@@ -30,6 +30,7 @@ socket.onmessage = ({ data }) => {
   const traceFrame = new Set([
     'hello', 'log', 'calibration_timing_status', 'guided_session_snapshot',
     'calibration_preparation_status', 'calibration_schedule_upload_acknowledged',
+    'calibration_schedule_commit_deferred',
     'calibration_schedule_accepted', 'calibration_song_interrupted',
     'calibration_song_result', 'calibration_candidate_status', 'bench_error',
   ]);
@@ -66,13 +67,24 @@ async function waitFor(label, predicate, timeoutMilliseconds = 15_000) {
 
 function guided(action) {
   if (!snapshot) fail(`no guided snapshot for ${action.name}`);
+  const lifecycle = snapshot.lifecycle;
   send({
     type: 'guided_session_intent',
     expected_revision: snapshot.revision,
     expected_run_revision: snapshot.run_revision,
-    expected_session_id: snapshot.active?.session_id ?? null,
+    expected_session_id:
+      lifecycle.state === 'calibration' || lifecycle.state === 'collection'
+        ? lifecycle.session_id
+        : null,
     action,
   });
+}
+
+function calibration(snapshotValue) {
+  const lifecycle = snapshotValue?.lifecycle;
+  return lifecycle?.state === 'idle' || lifecycle?.state === 'calibration' || lifecycle?.state === 'calibration_failed'
+    ? lifecycle.calibration
+    : null;
 }
 
 async function main() {
@@ -114,14 +126,16 @@ async function main() {
   await waitFor('calibration setup after visible presence', frame =>
     frame.type === 'guided_session_snapshot' &&
     frame.snapshot.revision > beforePresenceRevision &&
-    frame.snapshot.calibration?.phase === 'setup');
-  const tracks = snapshot.calibration.tracks.filter(track => track.cue_count > 0);
+    calibration(frame.snapshot)?.phase === 'setup');
+  const setup = calibration(snapshot);
+  if (setup?.phase !== 'setup') fail('calibration setup disappeared after presence');
+  const tracks = setup.tracks.filter(track => track.cue_count > 0);
   if (tracks.length === 0) fail('no nonempty calibration track');
   const track = tracks.sort((left, right) => left.duration_ms - right.duration_ms)[0];
   guided({ name: 'select_calibration_track', track_id: track.id });
-  await waitFor('selected calibration track', frame => frame.type === 'guided_session_snapshot' && frame.snapshot.calibration?.phase === 'setup' && frame.snapshot.calibration.selected_track_id === track.id);
+  await waitFor('selected calibration track', frame => frame.type === 'guided_session_snapshot' && calibration(frame.snapshot)?.phase === 'setup' && calibration(frame.snapshot).selected_track_id === track.id);
   guided({ name: 'start_calibration' });
-  await waitFor('immediate Preparing snapshot', frame => frame.type === 'guided_session_snapshot' && frame.snapshot.calibration?.phase === 'preparing', 5_000);
+  await waitFor('immediate Preparing snapshot', frame => frame.type === 'guided_session_snapshot' && calibration(frame.snapshot)?.phase === 'preparing', 5_000);
 
   const preparation = [];
   while (!preparation.some(value => value.status.phase.phase === 'ready_for_schedule')) {
@@ -142,8 +156,10 @@ async function main() {
     const frame = await waitFor('schedule transaction acknowledgement', value => value.type === 'calibration_schedule_upload_acknowledged', 15_000);
     acknowledgements.push(frame.acknowledgement);
   }
-  if (acknowledgements[0].first_entry !== null) fail('first upload acknowledgement was not Begin');
-  const firstEntries = acknowledgements.slice(1).map(value => value.first_entry);
+  if (acknowledgements[0].operation.kind !== 'begin') fail('first upload acknowledgement was not Begin');
+  const chunkOperations = acknowledgements.slice(1).map(value => value.operation);
+  if (chunkOperations.some(value => value.kind !== 'chunk')) fail('non-chunk acknowledgement followed Begin');
+  const firstEntries = chunkOperations.map(value => value.first_entry);
   const expectedEntries = Array.from({ length: Math.ceil(track.cue_count / operationalChunkEntries) }, (_, index) => index * operationalChunkEntries);
   if (JSON.stringify(firstEntries) !== JSON.stringify(expectedEntries)) fail(`wrong chunk acknowledgements: ${firstEntries}`);
   const accepted = await waitFor('ScheduleAccepted', value => value.type === 'calibration_schedule_accepted', 15_000);
@@ -151,7 +167,7 @@ async function main() {
   if (schedule.content_identity !== track.content_identity || schedule.anchor_device_monotonic_microseconds - schedule.acknowledged_device_monotonic_microseconds !== 3_000_000) {
     fail('ScheduleAccepted did not echo content identity and exact 3-second anchor');
   }
-  await waitFor('device-anchored playback snapshot', value => value.type === 'guided_session_snapshot' && value.snapshot.calibration?.phase === 'playing', 8_000);
+  await waitFor('device-anchored playback snapshot', value => value.type === 'guided_session_snapshot' && calibration(value.snapshot)?.phase === 'playing', 8_000);
 
   // Let the first authored cue become eligible, then use the UI pause intent
   // to withhold the backend heartbeat.  The device must authoritatively interrupt.
@@ -159,9 +175,12 @@ async function main() {
   guided({ name: 'pause_calibration' });
   const interruption = await waitFor('heartbeat-timeout interruption', value => value.type === 'calibration_song_interrupted', 8_000);
   if (interruption.interruption.reason !== 'heartbeat_timeout') fail(`unexpected interruption ${interruption.interruption.reason}`);
-  await waitFor('between-songs snapshot', value => value.type === 'guided_session_snapshot' && value.snapshot.calibration?.phase === 'between_songs', 8_000);
+  await waitFor('between-songs snapshot', value => value.type === 'guided_session_snapshot' && calibration(value.snapshot)?.phase === 'between_songs', 8_000);
   guided({ name: 'discard_calibration' });
-  await waitFor('Discard completion', value => value.type === 'guided_session_snapshot' && value.snapshot.active === null, 8_000);
+  await waitFor('Discard completion', value =>
+    value.type === 'guided_session_snapshot' &&
+    value.snapshot.lifecycle.state === 'idle' &&
+    calibration(value.snapshot)?.phase === 'setup', 8_000);
   record('success', { device, track: track.id, acknowledgements: acknowledgements.length, preparation: preparation.length });
 }
 

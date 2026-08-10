@@ -7,7 +7,10 @@ import {
   asTrackMilliseconds,
   asIncomingFrame,
   isCalibrationScheduleAcceptedFrame,
+  isCalibrationCandidateStatusFrame,
+  isCalibrationScheduleCommitDeferredFrame,
   isCalibrationScheduleChunkFrame,
+  isCalibrationScheduleUploadAcknowledgedFrame,
   isOutgoingFrame,
   type CalibrationScheduleChunkFrame,
 } from './protocol.ts';
@@ -40,6 +43,94 @@ test('replacement calibration browser mirrors accept 32-entry schedule chunks', 
     false,
   );
   assert.equal(isOutgoingFrame({ ...frame, content_identity: '' }), false);
+});
+
+test('upload acknowledgements cannot represent a Begin with a chunk index', () => {
+  const begin = {
+    type: 'calibration_schedule_upload_acknowledged',
+    acknowledgement: {
+      run,
+      schedule_revision: 1,
+      content_identity: 'a'.repeat(64),
+      total_count: 90,
+      operation: { kind: 'begin', operation_fingerprint: 123 },
+    },
+  };
+  assert.equal(isCalibrationScheduleUploadAcknowledgedFrame(begin), true);
+  assert.equal(
+    isCalibrationScheduleUploadAcknowledgedFrame({
+      ...begin,
+      acknowledgement: {
+        ...begin.acknowledgement,
+        operation: { kind: 'chunk', operation_fingerprint: 123 },
+      },
+    }),
+    false,
+  );
+});
+
+test('only typed device prerequisites authorize a schedule commit retry', () => {
+  const deferred = {
+    type: 'calibration_schedule_commit_deferred',
+    deferred: { run, schedule_revision: 1, reason: 'preparation_incomplete' },
+  };
+  assert.equal(isCalibrationScheduleCommitDeferredFrame(deferred), true);
+  assert.equal(
+    isCalibrationScheduleCommitDeferredFrame({
+      ...deferred,
+      deferred: { ...deferred.deferred, reason: 'electrodes not making contact' },
+    }),
+    false,
+  );
+});
+
+test('an absent calibration candidate cannot carry independent validity', () => {
+  const absent = {
+    type: 'calibration_candidate_status',
+    candidate: { run, schedule_revision: 1, presence: { state: 'absent' } },
+  };
+  assert.equal(isCalibrationCandidateStatusFrame(absent), true);
+  assert.equal(
+    isCalibrationCandidateStatusFrame({
+      ...absent,
+      candidate: {
+        ...absent.candidate,
+        presence: {
+          state: 'present',
+          content_identity: 'a'.repeat(64),
+          total_count: 90,
+          validity: { model_numerically_valid: true, record_crc_valid: true },
+        },
+      },
+    }),
+    true,
+  );
+  assert.equal(
+    isCalibrationCandidateStatusFrame({
+      ...absent,
+      candidate: {
+        ...absent.candidate,
+        presence: {
+          state: 'absent',
+          validity: { model_numerically_valid: false, record_crc_valid: false },
+        },
+      },
+    }),
+    false,
+  );
+  assert.equal(
+    isCalibrationCandidateStatusFrame({
+      ...absent,
+      candidate: {
+        ...absent.candidate,
+        presence: {
+          state: 'present',
+          validity: { model_numerically_valid: true },
+        },
+      },
+    }),
+    false,
+  );
 });
 
 test('replacement browser mirrors expose bounded integer timing state', () => {

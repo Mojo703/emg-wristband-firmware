@@ -89,6 +89,15 @@ fn enqueue_run_action(
 enum ScheduleCommitPhase {
     AwaitingDeviceReadiness,
     Sent,
+    /// The exact run/revision/identity was accepted. Late preparation
+    /// narration can no longer project the UI back before this boundary.
+    Accepted,
+}
+
+impl ScheduleCommitPhase {
+    fn projects_preparation(&self) -> bool {
+        matches!(self, Self::AwaitingDeviceReadiness | Self::Sent)
+    }
 }
 
 /// One upload exists only on the connection captured by the guided lease.  It
@@ -124,16 +133,24 @@ enum EvidenceState {
 
 #[derive(Clone, Copy)]
 enum CandidateState {
-    Absent(protocol::CalibrationCandidateValidity),
+    Absent,
     Present(protocol::CalibrationCandidateValidity),
 }
 
 impl CandidateState {
-    fn update(self, present: bool, validity: protocol::CalibrationCandidateValidity) -> Self {
-        if present {
-            Self::Present(validity)
-        } else {
-            Self::Absent(validity)
+    fn from_presence(presence: protocol::CalibrationCandidatePresence) -> Self {
+        match presence {
+            protocol::CalibrationCandidatePresence::Absent => Self::Absent,
+            protocol::CalibrationCandidatePresence::Present { validity, .. } => {
+                Self::Present(validity)
+            }
+        }
+    }
+
+    fn with_validity(self, validity: protocol::CalibrationCandidateValidity) -> Self {
+        match self {
+            Self::Absent => Self::Absent,
+            Self::Present(_) => Self::Present(validity),
         }
     }
 
@@ -143,7 +160,11 @@ impl CandidateState {
 
     fn validity(self) -> protocol::CalibrationCandidateValidity {
         match self {
-            Self::Absent(validity) | Self::Present(validity) => validity,
+            Self::Absent => protocol::CalibrationCandidateValidity {
+                model_numerically_valid: false,
+                record_crc_valid: false,
+            },
+            Self::Present(validity) => validity,
         }
     }
 
@@ -158,12 +179,8 @@ impl CalibrationModeAdapter {
         coordinator: GuidedSessionCoordinator,
         tracks: Vec<crate::collect::beatmap::CalibrationTrack>,
     ) -> Arc<Self> {
-        let wire_tracks = tracks.iter().map(guided_track).collect::<Vec<_>>();
         coordinator
-            .update_idle_calibration(GuidedCalibrationSnapshot::Setup {
-                tracks: wire_tracks,
-                selected_track_id: None,
-            })
+            .update_idle_calibration(setup_snapshot(&tracks, None))
             .expect("initial calibration projection uses the current coordinator revision");
         Arc::new_cyclic(|this| Self {
             registry,
@@ -305,10 +322,7 @@ impl CalibrationModeAdapter {
         };
         let mut song_counts = Vec::new();
         let mut evidence = EvidenceState::Fresh;
-        let mut candidate = CandidateState::Absent(protocol::CalibrationCandidateValidity {
-            model_numerically_valid: false,
-            record_crc_valid: false,
-        });
+        let mut candidate = CandidateState::Absent;
         // Opening an output sink may allocate or negotiate with the host. Do it
         // after the device acceptance, then start the already-opened playback
         // from its own deadline instead of from the 500 ms heartbeat cadence.
@@ -402,6 +416,7 @@ impl CalibrationModeAdapter {
                                 "the device accepted a schedule that this host did not commit".into(),
                             );
                         }
+                        commit_phase = ScheduleCommitPhase::Accepted;
                         heartbeat_mode = HeartbeatMode::Sending {
                             schedule_revision,
                             next_sequence: 0,
@@ -437,7 +452,7 @@ impl CalibrationModeAdapter {
                                 schedule_revision,
                                 &track,
                                 &upload,
-                            ) == Some(acknowledgement.operation_fingerprint) => {
+                            ) == Some(acknowledgement.operation) => {
                         match advance_upload(
                             &self.registry,
                             &device,
@@ -445,7 +460,7 @@ impl CalibrationModeAdapter {
                             schedule_revision,
                             &track,
                             &mut upload,
-                            acknowledgement.first_entry,
+                            acknowledgement.operation,
                         ) {
                             Ok(()) => {}
                             Err(error) => break delivery_failure(error),
@@ -478,10 +493,12 @@ impl CalibrationModeAdapter {
                             protocol::CalibrationPreparationPhase::Settling { .. }
                             | protocol::CalibrationPreparationPhase::EstimatingGains { .. }
                             | protocol::CalibrationPreparationPhase::ReadyForSchedule => {
-                                let _ = self.coordinator.update_calibration(
-                                    &binding,
-                                    preparing_snapshot_from_device(&track, status.phase),
-                                );
+                                if commit_phase.projects_preparation() {
+                                    let _ = self.coordinator.update_calibration(
+                                        &binding,
+                                        preparing_snapshot_from_device(&track, status.phase),
+                                    );
+                                }
                             }
                             protocol::CalibrationPreparationPhase::Failed { detail } => {
                                 break SessionExit::DependencyFailed(detail);
@@ -520,7 +537,7 @@ impl CalibrationModeAdapter {
                         if result.run == run => {
                         song_counts = result.counts;
                         evidence = EvidenceState::Retained;
-                        candidate = candidate.update(candidate.present(), result.validity);
+                        candidate = candidate.with_validity(result.validity);
                         let _ = self.coordinator.update_calibration(
                             &binding,
                             between_songs_snapshot(
@@ -533,8 +550,10 @@ impl CalibrationModeAdapter {
                         );
                     }
                     Ok(Frame::CalibrationCandidateStatus { candidate: status })
-                        if status.run == run => {
-                        candidate = candidate.update(status.candidate_present, status.validity);
+                        if status.run == run
+                            && status.schedule_revision == schedule_revision
+                            && candidate_presence_matches_track(&status.presence, &track) => {
+                        candidate = CandidateState::from_presence(status.presence);
                         if matches!(heartbeat_mode, HeartbeatMode::Withheld)
                             && matches!(evidence, EvidenceState::Retained) {
                             let _ = self.coordinator.update_calibration(
@@ -549,9 +568,10 @@ impl CalibrationModeAdapter {
                             );
                             }
                         }
-                    Ok(Frame::BenchError { stage, detail })
-                        if stage == "calibration" && retryable_schedule_commit_error(&detail) =>
-                    {
+                    Ok(Frame::CalibrationScheduleCommitDeferred { deferred })
+                        if deferred.run == run
+                            && deferred.schedule_revision == schedule_revision
+                            && matches!(commit_phase, ScheduleCommitPhase::Sent) => {
                         // The preparation status is the retry authority.  A
                         // retryable refusal returns to its explicit ready
                         // phase; no backend stopwatch recreates that phase.
@@ -670,6 +690,12 @@ impl CalibrationModeAdapter {
             }
         };
 
+        if matches!(outcome, SessionExit::Completed) {
+            let selected_track_id = self.selected_track_id.lock().unwrap().clone();
+            let _ = self
+                .coordinator
+                .update_calibration(&binding, setup_snapshot(&self.tracks, selected_track_id));
+        }
         if matches!(
             outcome,
             SessionExit::DependencyFailed(_) | SessionExit::TaskFailed(_)
@@ -738,10 +764,7 @@ impl CalibrationModeAdapter {
             request.expected_revision,
             request.expected_run_revision,
             request.expected_session_id,
-            GuidedCalibrationSnapshot::Setup {
-                tracks: self.tracks.iter().map(guided_track).collect(),
-                selected_track_id: Some(track_id),
-            },
+            setup_snapshot(&self.tracks, Some(track_id)),
         )?;
         Ok(())
     }
@@ -848,6 +871,33 @@ fn guided_track(
     }
 }
 
+fn setup_snapshot(
+    tracks: &[crate::collect::beatmap::CalibrationTrack],
+    selected_track_id: Option<String>,
+) -> GuidedCalibrationSnapshot {
+    GuidedCalibrationSnapshot::Setup {
+        tracks: tracks.iter().map(guided_track).collect(),
+        selected_track_id,
+    }
+}
+
+fn candidate_presence_matches_track(
+    presence: &protocol::CalibrationCandidatePresence,
+    track: &crate::collect::beatmap::CalibrationTrack,
+) -> bool {
+    match presence {
+        protocol::CalibrationCandidatePresence::Absent => true,
+        protocol::CalibrationCandidatePresence::Present {
+            content_identity,
+            total_count,
+            ..
+        } => {
+            content_identity == &track.content_identity
+                && *total_count == track.entries.len() as u32
+        }
+    }
+}
+
 fn next_schedule_revision(
     revision: CalibrationScheduleRevision,
 ) -> Option<CalibrationScheduleRevision> {
@@ -859,10 +909,6 @@ fn next_schedule_revision(
 
 fn delivery_failure(error: ControlDeliveryError) -> SessionExit {
     SessionExit::DependencyFailed(error.calibration_message().into())
-}
-
-fn retryable_schedule_commit_error(detail: &str) -> bool {
-    detail.contains("requires 10 s stillness") || detail.contains("schedule not anchored")
 }
 
 fn playback_deadline(
@@ -915,19 +961,17 @@ fn advance_upload(
     revision: CalibrationScheduleRevision,
     track: &crate::collect::beatmap::CalibrationTrack,
     upload: &mut UploadPhase,
-    acknowledged_first_entry: Option<u32>,
+    acknowledged_operation: protocol::CalibrationScheduleUploadOperationAcknowledgement,
 ) -> Result<(), ControlDeliveryError> {
-    let expected = match upload {
-        UploadPhase::AwaitingBeginAcknowledgement => None,
-        UploadPhase::AwaitingChunkAcknowledgement { first_entry } => Some(*first_entry),
-        UploadPhase::Complete => return Ok(()),
-    };
-    if acknowledged_first_entry != expected {
+    if expected_upload_fingerprint(run, revision, track, upload) != Some(acknowledged_operation) {
         return Ok(());
     }
-    let next_first_entry = match expected {
-        None => 0,
-        Some(first_entry) => first_entry.saturating_add(OPERATIONAL_SCHEDULE_UPLOAD_ENTRIES as u32),
+    let next_first_entry = match upload {
+        UploadPhase::AwaitingBeginAcknowledgement => 0,
+        UploadPhase::AwaitingChunkAcknowledgement { first_entry } => {
+            first_entry.saturating_add(OPERATIONAL_SCHEDULE_UPLOAD_ENTRIES as u32)
+        }
+        UploadPhase::Complete => return Ok(()),
     };
     if next_first_entry as usize >= track.entries.len() {
         *upload = UploadPhase::Complete;
@@ -955,24 +999,38 @@ fn expected_upload_fingerprint(
     revision: CalibrationScheduleRevision,
     track: &crate::collect::beatmap::CalibrationTrack,
     upload: &UploadPhase,
-) -> Option<u32> {
-    let (first_entry, entries) = match upload {
-        UploadPhase::AwaitingBeginAcknowledgement => (None, &[][..]),
+) -> Option<protocol::CalibrationScheduleUploadOperationAcknowledgement> {
+    match upload {
+        UploadPhase::AwaitingBeginAcknowledgement => Some(
+            protocol::CalibrationScheduleUploadOperationAcknowledgement::Begin {
+                operation_fingerprint: protocol::calibration_schedule_begin_fingerprint(
+                    run,
+                    revision,
+                    &track.content_identity,
+                    track.entries.len() as u32,
+                ),
+            },
+        ),
         UploadPhase::AwaitingChunkAcknowledgement { first_entry } => {
             let start = *first_entry as usize;
             let end = (start + OPERATIONAL_SCHEDULE_UPLOAD_ENTRIES).min(track.entries.len());
-            (Some(*first_entry), track.entries.get(start..end)?)
+            let entries = track.entries.get(start..end)?;
+            Some(
+                protocol::CalibrationScheduleUploadOperationAcknowledgement::Chunk {
+                    first_entry: *first_entry,
+                    operation_fingerprint: protocol::calibration_schedule_chunk_fingerprint(
+                        run,
+                        revision,
+                        &track.content_identity,
+                        track.entries.len() as u32,
+                        *first_entry,
+                        entries,
+                    ),
+                },
+            )
         }
-        UploadPhase::Complete => return None,
-    };
-    Some(protocol::calibration_schedule_operation_fingerprint(
-        run,
-        revision,
-        &track.content_identity,
-        track.entries.len() as u32,
-        first_entry,
-        entries,
-    ))
+        UploadPhase::Complete => None,
+    }
 }
 
 fn send_schedule_chunk(
@@ -1398,11 +1456,7 @@ mod tests {
                 candidate: protocol::CalibrationCandidateStatus {
                     run,
                     schedule_revision: CalibrationScheduleRevision::new(1).unwrap(),
-                    validity: protocol::CalibrationCandidateValidity {
-                        model_numerically_valid: false,
-                        record_crc_valid: true,
-                    },
-                    candidate_present: false,
+                    presence: protocol::CalibrationCandidatePresence::Absent,
                 },
             })
             .unwrap();
@@ -1503,6 +1557,13 @@ mod tests {
         .unwrap();
         // Begin is delivered first, and every next chunk is released only by
         // the matching device acknowledgement.
+        let acknowledgement = expected_upload_fingerprint(
+            run,
+            CalibrationScheduleRevision::new(1).unwrap(),
+            &track,
+            &upload,
+        )
+        .unwrap();
         advance_upload(
             &registry,
             &identity,
@@ -1510,10 +1571,17 @@ mod tests {
             CalibrationScheduleRevision::new(1).unwrap(),
             &track,
             &mut upload,
-            None,
+            acknowledgement,
         )
         .unwrap();
-        for first_entry in (0..130).step_by(OPERATIONAL_SCHEDULE_UPLOAD_ENTRIES) {
+        for _ in (0..130).step_by(OPERATIONAL_SCHEDULE_UPLOAD_ENTRIES) {
+            let acknowledgement = expected_upload_fingerprint(
+                run,
+                CalibrationScheduleRevision::new(1).unwrap(),
+                &track,
+                &upload,
+            )
+            .unwrap();
             advance_upload(
                 &registry,
                 &identity,
@@ -1521,7 +1589,7 @@ mod tests {
                 CalibrationScheduleRevision::new(1).unwrap(),
                 &track,
                 &mut upload,
-                Some(first_entry),
+                acknowledgement,
             )
             .unwrap();
         }
@@ -1550,6 +1618,7 @@ mod tests {
         };
         let revision = CalibrationScheduleRevision::new(1).unwrap();
         let mut upload = begin_upload(&registry, &identity, run, revision, &track).unwrap();
+        let acknowledgement = expected_upload_fingerprint(run, revision, &track, &upload).unwrap();
         advance_upload(
             &registry,
             &identity,
@@ -1557,7 +1626,7 @@ mod tests {
             revision,
             &track,
             &mut upload,
-            None,
+            acknowledgement,
         )
         .unwrap();
         let _begin = device.control_rx.try_recv().unwrap();
@@ -1640,7 +1709,10 @@ mod tests {
             CalibrationScheduleRevision::new(1).unwrap(),
             &track,
             &mut upload,
-            Some(0),
+            protocol::CalibrationScheduleUploadOperationAcknowledgement::Chunk {
+                first_entry: 0,
+                operation_fingerprint: 0,
+            },
         )
         .unwrap();
         assert!(matches!(upload, UploadPhase::AwaitingBeginAcknowledgement));
@@ -1669,13 +1741,51 @@ mod tests {
     }
 
     #[test]
-    fn prep_commit_refusal_is_retryable_but_other_calibration_errors_are_not() {
-        assert!(retryable_schedule_commit_error(
-            "anchored schedule commit requires 10 s stillness and 20 s gain estimation"
+    fn accepted_schedule_is_a_one_way_boundary_for_preparation_projection() {
+        assert!(ScheduleCommitPhase::AwaitingDeviceReadiness.projects_preparation());
+        assert!(ScheduleCommitPhase::Sent.projects_preparation());
+        assert!(!ScheduleCommitPhase::Accepted.projects_preparation());
+    }
+
+    #[test]
+    fn candidate_presence_is_bound_to_the_exact_current_track_identity() {
+        let track = track();
+        let valid = protocol::CalibrationCandidateValidity {
+            model_numerically_valid: true,
+            record_crc_valid: true,
+        };
+        assert!(candidate_presence_matches_track(
+            &protocol::CalibrationCandidatePresence::Absent,
+            &track,
         ));
-        assert!(retryable_schedule_commit_error("schedule not anchored yet"));
-        assert!(!retryable_schedule_commit_error(
-            "electrodes not making contact"
+        assert!(candidate_presence_matches_track(
+            &protocol::CalibrationCandidatePresence::Present {
+                content_identity: track.content_identity.clone(),
+                total_count: track.entries.len() as u32,
+                validity: valid,
+            },
+            &track,
+        ));
+        assert!(!candidate_presence_matches_track(
+            &protocol::CalibrationCandidatePresence::Present {
+                content_identity: "different-content".into(),
+                total_count: track.entries.len() as u32,
+                validity: valid,
+            },
+            &track,
+        ));
+    }
+
+    #[test]
+    fn terminal_setup_retains_selection_without_retaining_song_actions() {
+        let track = track();
+        let snapshot = setup_snapshot(core::slice::from_ref(&track), Some(track.id.0.clone()));
+        assert!(matches!(
+            snapshot,
+            GuidedCalibrationSnapshot::Setup {
+                selected_track_id: Some(selected),
+                tracks,
+            } if selected == track.id.0 && tracks.len() == 1
         ));
     }
 }

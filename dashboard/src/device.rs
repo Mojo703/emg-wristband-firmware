@@ -595,16 +595,17 @@ async fn device_session(
                 }
                 if let Frame::CalibrationScheduleUploadAcknowledged { acknowledgement } = &other {
                     tracing::info!(
-                        "{device_id} received calibration upload acknowledgement run {:?} revision {:?} first {:?}",
+                        "{device_id} received calibration upload acknowledgement run {:?} revision {:?} operation {:?}",
                         acknowledgement.run,
                         acknowledgement.schedule_revision,
-                        acknowledgement.first_entry,
+                        acknowledgement.operation,
                     );
                 }
                 if matches!(
                     other,
                     Frame::CalibrationPreparationStatus { .. }
                         | Frame::CalibrationScheduleAccepted { .. }
+                        | Frame::CalibrationScheduleCommitDeferred { .. }
                         | Frame::CalibrationSongInterrupted { .. }
                         | Frame::CalibrationSongResult { .. }
                         | Frame::CalibrationCandidateStatus { .. }

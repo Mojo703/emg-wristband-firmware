@@ -35,7 +35,8 @@ use crate::transport::Control;
 use adapter_guard::{rows_ready_to_install, ActionGuard, FitPassSchedule, FitScheduleProgress};
 use calibration_flow::{Action, Constants, LabeledSpan, RepEvidence, Run, RunOutcome};
 use calibration_flow::{
-    AnchoredSong, AnchoredSongAction, AnchoredSongIdentity, SongInterruption, SongState,
+    AnchoredSong, AnchoredSongAction, AnchoredSongError, AnchoredSongIdentity, SongInterruption,
+    SongState,
 };
 use core::num::NonZeroU32;
 use emg_runtime::band_features::{CHANNEL_COUNT, FEATURE_COUNT};
@@ -47,12 +48,13 @@ use emg_runtime::streaming_fit::{
 use gains::GainEstimator;
 use log::{info, warn};
 use protocol::{
-    CalibrationCandidateStatus, CalibrationCandidateValidity, CalibrationClassCounts,
-    CalibrationGesture, CalibrationModifier, CalibrationOutcome, CalibrationPreparationPhase,
-    CalibrationPreparationStatus, CalibrationResidentActivation, CalibrationRunKey,
-    CalibrationScheduleAccepted, CalibrationScheduleRevision,
-    CalibrationScheduleUploadAcknowledgement, CalibrationSongInterruption,
-    CalibrationSongInterruptionReason, CalibrationSongResult, Frame,
+    CalibrationCandidatePresence, CalibrationCandidateStatus, CalibrationCandidateValidity,
+    CalibrationClassCounts, CalibrationGesture, CalibrationModifier, CalibrationOutcome,
+    CalibrationPreparationPhase, CalibrationPreparationStatus, CalibrationResidentActivation,
+    CalibrationRunKey, CalibrationScheduleAccepted, CalibrationScheduleCommitDeferral,
+    CalibrationScheduleCommitDeferralReason, CalibrationScheduleRevision,
+    CalibrationScheduleUploadAcknowledgement, CalibrationScheduleUploadOperationAcknowledgement,
+    CalibrationSongInterruption, CalibrationSongInterruptionReason, CalibrationSongResult, Frame,
 };
 use training_rows::CalibrationPartition;
 
@@ -629,6 +631,9 @@ enum AnchoredPreparation {
 enum PreparationStatusReport {
     Never,
     AtSample(u64),
+    /// The current schedule was accepted. Preparation remains reusable by a
+    /// Continue, but it no longer narrates a phase that precedes playback.
+    SuspendedAfterAcceptance,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1165,6 +1170,7 @@ impl Calibration {
                         .constants
                         .samples_in(protocol::CALIBRATION_HEARTBEAT_INTERVAL_MILLISECONDS)
             }
+            PreparationStatusReport::SuspendedAfterAcceptance => false,
         }
     }
 
@@ -1237,16 +1243,16 @@ impl Calibration {
                                     schedule_revision,
                                     content_identity: identity.content_identity.clone(),
                                     total_count: identity.total_count,
-                                    first_entry: None,
-                                    operation_fingerprint:
-                                        protocol::calibration_schedule_operation_fingerprint(
-                                            run,
-                                            schedule_revision,
-                                            &identity.content_identity,
-                                            identity.total_count,
-                                            None,
-                                            &[],
-                                        ),
+                                    operation:
+                                        CalibrationScheduleUploadOperationAcknowledgement::Begin {
+                                            operation_fingerprint:
+                                                protocol::calibration_schedule_begin_fingerprint(
+                                                    run,
+                                                    schedule_revision,
+                                                    &identity.content_identity,
+                                                    identity.total_count,
+                                                ),
+                                        },
                                 },
                             });
                         self.emit_anchored_preparation_status();
@@ -1299,15 +1305,17 @@ impl Calibration {
                                             schedule_revision,
                                             content_identity: identity.content_identity.clone(),
                                             total_count: identity.total_count,
-                                            first_entry: Some(first_entry),
-                                            operation_fingerprint: protocol::calibration_schedule_operation_fingerprint(
+                                            operation: CalibrationScheduleUploadOperationAcknowledgement::Chunk {
+                                                first_entry,
+                                                operation_fingerprint: protocol::calibration_schedule_chunk_fingerprint(
                                                 run,
                                                 schedule_revision,
                                                 &identity.content_identity,
                                                 identity.total_count,
-                                                Some(first_entry),
+                                                first_entry,
                                                 &entries,
                                             ),
+                                            },
                                         },
                                     })
                             }
@@ -1329,8 +1337,10 @@ impl Calibration {
                 total_count,
             } => {
                 if !self.anchored_preparation_ready() {
-                    self.refuse(
-                        "anchored schedule commit requires 10 s stillness and 20 s gain estimation",
+                    self.defer_schedule_commit(
+                        run,
+                        schedule_revision,
+                        CalibrationScheduleCommitDeferralReason::PreparationIncomplete,
                     );
                     return None;
                 }
@@ -1344,18 +1354,28 @@ impl Calibration {
                 match (self.anchored.song_mut(), identity) {
                     (Some(song), Ok(identity)) => {
                         match song.commit(&identity, acknowledged, self.acquisition_sample) {
-                            Ok(anchor) => self.outbound.push(Frame::CalibrationScheduleAccepted {
-                                accepted: CalibrationScheduleAccepted {
+                            Ok(anchor) => {
+                                self.outbound.push(Frame::CalibrationScheduleAccepted {
+                                    accepted: CalibrationScheduleAccepted {
+                                        run,
+                                        schedule_revision,
+                                        content_identity: identity.content_identity,
+                                        acknowledged_device_monotonic_microseconds: anchor
+                                            .acknowledged_device_monotonic_microseconds,
+                                        anchor_device_monotonic_microseconds: anchor
+                                            .device_monotonic_microseconds,
+                                        acquisition_sample: anchor.acquisition_sample,
+                                    },
+                                });
+                                self.preparation_status_report =
+                                    PreparationStatusReport::SuspendedAfterAcceptance;
+                            }
+                            Err(AnchoredSongError::ScheduleNotAnchored) => self
+                                .defer_schedule_commit(
                                     run,
                                     schedule_revision,
-                                    content_identity: identity.content_identity,
-                                    acknowledged_device_monotonic_microseconds: anchor
-                                        .acknowledged_device_monotonic_microseconds,
-                                    anchor_device_monotonic_microseconds: anchor
-                                        .device_monotonic_microseconds,
-                                    acquisition_sample: anchor.acquisition_sample,
-                                },
-                            }),
+                                    CalibrationScheduleCommitDeferralReason::ScheduleNotAnchored,
+                                ),
                             Err(error) => {
                                 self.refuse(&format!("anchored schedule commit rejected: {error}"))
                             }
@@ -2110,30 +2130,33 @@ impl Calibration {
         owner.matches(schedule, stored).then_some(owner.stored)
     }
 
-    fn anchored_candidate_validity(
+    fn anchored_candidate_presence(
         &self,
         schedule: &AnchoredSongIdentity,
-    ) -> (bool, CalibrationCandidateValidity) {
-        let candidate_present = self.owned_candidate(schedule);
-        let model_numerically_valid = candidate_present
-            .and_then(|identity| {
-                self.partition
-                    .as_ref()?
-                    .slot(identity.physical.index())
+    ) -> CalibrationCandidatePresence {
+        let Some(candidate) = self.owned_candidate(schedule) else {
+            return CalibrationCandidatePresence::Absent;
+        };
+        let model_numerically_valid = self
+            .partition
+            .as_ref()
+            .and_then(|partition| {
+                partition
+                    .slot(candidate.physical.index())
                     .ok()
                     .map(|slot| record_is_numerically_valid(&slot.record))
             })
             .unwrap_or(false);
         // `StoreSelector` only sees a candidate after `parse_slot` has checked
         // its CRC against the active prior hash.
-        let record_crc_valid = candidate_present.is_some();
-        (
-            candidate_present.is_some(),
-            CalibrationCandidateValidity {
+        CalibrationCandidatePresence::Present {
+            content_identity: schedule.content_identity.clone(),
+            total_count: schedule.total_count,
+            validity: CalibrationCandidateValidity {
                 model_numerically_valid,
-                record_crc_valid,
+                record_crc_valid: true,
             },
-        )
+        }
     }
 
     fn emit_anchored_candidate_status(
@@ -2147,22 +2170,16 @@ impl Calibration {
             .and_then(|song| song.identity())
             .filter(|identity| identity.run == run && identity.revision == schedule_revision)
             .cloned();
-        let (candidate_present, validity) = owned_schedule.as_ref().map_or(
-            (
-                false,
-                CalibrationCandidateValidity {
-                    model_numerically_valid: false,
-                    record_crc_valid: false,
-                },
-            ),
-            |identity| self.anchored_candidate_validity(identity),
-        );
+        let presence = owned_schedule
+            .as_ref()
+            .map_or(CalibrationCandidatePresence::Absent, |identity| {
+                self.anchored_candidate_presence(identity)
+            });
         self.outbound.push(Frame::CalibrationCandidateStatus {
             candidate: CalibrationCandidateStatus {
                 run,
                 schedule_revision,
-                validity,
-                candidate_present,
+                presence,
             },
         });
     }
@@ -2177,8 +2194,14 @@ impl Calibration {
             self.refuse("Save did not identify the retained calibration run");
             return;
         };
-        let (candidate_present, validity) = self.anchored_candidate_validity(&identity);
-        if !candidate_present || !validity.permits_activation() {
+        let CalibrationCandidatePresence::Present { validity, .. } =
+            self.anchored_candidate_presence(&identity)
+        else {
+            self.emit_anchored_candidate_status(identity.run, identity.revision);
+            self.refuse("Save requires a numerically valid, CRC-validated candidate model");
+            return;
+        };
+        if !validity.permits_activation() {
             self.emit_anchored_candidate_status(identity.run, identity.revision);
             self.refuse("Save requires a numerically valid, CRC-validated candidate model");
             return;
@@ -2894,6 +2917,23 @@ impl Calibration {
             stage: "calibration".into(),
             detail: detail.into(),
         });
+    }
+
+    fn defer_schedule_commit(
+        &mut self,
+        run: CalibrationRunKey,
+        schedule_revision: CalibrationScheduleRevision,
+        reason: CalibrationScheduleCommitDeferralReason,
+    ) {
+        warn!("calibration schedule commit deferred: {reason:?}");
+        self.outbound
+            .push(Frame::CalibrationScheduleCommitDeferred {
+                deferred: CalibrationScheduleCommitDeferral {
+                    run,
+                    schedule_revision,
+                    reason,
+                },
+            });
     }
 
     /// What the feedback outputs should show. A terminal transition is consumed
