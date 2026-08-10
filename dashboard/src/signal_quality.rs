@@ -13,7 +13,7 @@
 //! reported separately, because a high mains figure and a high broadband figure
 //! point at different repairs.
 
-use protocol::{ChannelQuality, Frame, TelemetryMetric};
+use protocol::{ChannelQuality, Frame, LeadOffStatus, TelemetryMetric};
 use std::collections::VecDeque;
 use std::f64::consts::PI;
 use std::time::{Duration, Instant};
@@ -318,7 +318,7 @@ impl SignalQualityMonitor {
                     } else {
                         saturated as f32 / history_samples as f32
                     },
-                    lead_off: self.lead_off_at(channel),
+                    lead_off: LeadOffStatus::from(self.lead_off_at(channel)),
                 }
             })
             .collect();

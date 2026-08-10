@@ -1519,9 +1519,30 @@ pub struct ChannelQuality {
     /// Samples at or near full scale over the last several seconds. A railed
     /// channel reads 1.0; one that wanders on and off reads in between.
     pub saturated_fraction: f32,
-    /// The device's own lead-off comparator for this channel, or `None` while no
-    /// usable status word has arrived.
-    pub lead_off: Option<bool>,
+    /// The device's own lead-off comparator for this channel.
+    pub lead_off: LeadOffStatus,
+}
+
+/// Whether the ADC lead-off comparator has a usable reading for one channel.
+///
+/// This is deliberately not an `Option<bool>`: both boolean values are easy to
+/// read backwards at call sites, while `Unknown` is a real acquisition state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LeadOffStatus {
+    Unknown,
+    Contact,
+    LeadOff,
+}
+
+impl From<Option<bool>> for LeadOffStatus {
+    fn from(value: Option<bool>) -> Self {
+        match value {
+            None => Self::Unknown,
+            Some(false) => Self::Contact,
+            Some(true) => Self::LeadOff,
+        }
+    }
 }
 
 /// An instant on the wall clock browser and backend share (unix epoch
@@ -3092,7 +3113,7 @@ mod tests {
     }
 
     #[test]
-    fn signal_quality_frame_roundtrips_with_an_absent_lead_off_reading() {
+    fn signal_quality_frame_roundtrips_with_explicit_lead_off_states() {
         let frame = Frame::SignalQuality {
             mains_fundamental_hertz: 59.977,
             noise_floor_limit_microvolts: 10.0,
@@ -3103,7 +3124,7 @@ mod tests {
                     offset_millivolts: -18.4,
                     headroom_millivolts: 81.6,
                     saturated_fraction: 0.0,
-                    lead_off: Some(false),
+                    lead_off: LeadOffStatus::Contact,
                 },
                 ChannelQuality {
                     noise_floor_microvolts: 0.0,
@@ -3111,7 +3132,7 @@ mod tests {
                     offset_millivolts: -100.0,
                     headroom_millivolts: 0.0,
                     saturated_fraction: 1.0,
-                    lead_off: None,
+                    lead_off: LeadOffStatus::Unknown,
                 },
             ],
         };
@@ -3123,8 +3144,8 @@ mod tests {
             } => {
                 assert_eq!(mains_fundamental_hertz, 59.977);
                 assert_eq!(channels.len(), 2);
-                assert_eq!(channels[0].lead_off, Some(false));
-                assert_eq!(channels[1].lead_off, None);
+                assert_eq!(channels[0].lead_off, LeadOffStatus::Contact);
+                assert_eq!(channels[1].lead_off, LeadOffStatus::Unknown);
                 assert_eq!(channels[1].saturated_fraction, 1.0);
             }
             other => panic!("wrong variant: {other:?}"),

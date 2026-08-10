@@ -544,9 +544,11 @@ export interface ChannelQuality {
   readonly headroom_millivolts: number;
   /** Samples at or near full scale over the last several seconds. */
   readonly saturated_fraction: number;
-  /** The device's lead-off comparator, or null while no status word has arrived. */
-  readonly lead_off: boolean | null;
+  /** The device's lead-off comparator, including an explicit unavailable state. */
+  readonly lead_off: LeadOffStatus;
 }
+
+export type LeadOffStatus = 'unknown' | 'contact' | 'lead_off';
 
 export interface SelectDeviceFrame {
   readonly type: 'select_device';
@@ -1599,7 +1601,9 @@ function isChannelQuality(value: unknown): value is ChannelQuality {
     isNumber(value['offset_millivolts']) &&
     isNumber(value['headroom_millivolts']) &&
     isNumber(value['saturated_fraction']) &&
-    (value['lead_off'] === null || isBoolean(value['lead_off']))
+    (value['lead_off'] === 'unknown' ||
+      value['lead_off'] === 'contact' ||
+      value['lead_off'] === 'lead_off')
   );
 }
 

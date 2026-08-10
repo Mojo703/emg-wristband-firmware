@@ -92,7 +92,7 @@
     const quiet = quality.channels.filter(
       (channel) => channel.saturated_fraction <= 0.5 && channel.noise_floor_microvolts <= limit,
     ).length;
-    const leadOff = quality.channels.filter((channel) => channel.lead_off === true).length;
+    const leadOff = quality.channels.filter((channel) => channel.lead_off === 'lead_off').length;
     return `${quiet}/${quality.channels.length} under ${limit.toFixed(0)} µV · ${railed} railed · ${leadOff} lead-off`;
   });
 
