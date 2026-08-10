@@ -64,8 +64,13 @@ pub(crate) enum SelectorPersistenceCapability {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StoreSelector {
     resident: Option<ResidentIdentity>,
-    exportable: Option<StoredIdentity>,
-    scratch: Option<PhysicalSlot>,
+    writable: WritableSlot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WritableSlot {
+    Scratch(PhysicalSlot),
+    ExportableCandidate(StoredIdentity),
 }
 
 impl StoreSelector {
@@ -90,16 +95,13 @@ impl StoreSelector {
         let occupied = exportable
             .map(|stored| stored.physical)
             .or_else(|| newest_state.map(|stored| stored.physical));
-        let scratch = if exportable.is_some() {
-            None
-        } else {
-            Some(occupied.map_or(PhysicalSlot::First, PhysicalSlot::other))
+        let writable = match exportable {
+            Some(candidate) => WritableSlot::ExportableCandidate(candidate),
+            None => {
+                WritableSlot::Scratch(occupied.map_or(PhysicalSlot::First, PhysicalSlot::other))
+            }
         };
-        Self {
-            resident,
-            exportable,
-            scratch,
-        }
+        Self { resident, writable }
     }
 
     pub(crate) const fn resident(&self) -> Option<ResidentIdentity> {
@@ -107,11 +109,17 @@ impl StoreSelector {
     }
 
     pub(crate) const fn exportable(&self) -> Option<StoredIdentity> {
-        self.exportable
+        match self.writable {
+            WritableSlot::Scratch(_) => None,
+            WritableSlot::ExportableCandidate(candidate) => Some(candidate),
+        }
     }
 
     pub(crate) const fn scratch(&self) -> Option<PhysicalSlot> {
-        self.scratch
+        match self.writable {
+            WritableSlot::Scratch(slot) => Some(slot),
+            WritableSlot::ExportableCandidate(_) => None,
+        }
     }
 
     pub(crate) const fn classification_enabled(&self) -> bool {
@@ -182,5 +190,65 @@ mod tests {
             Some(ResidentIdentity::from_stored(resident))
         );
         assert!(after_discard.classification_enabled());
+    }
+
+    #[test]
+    fn recovery_always_exposes_exactly_one_writable_slot_state() {
+        let layouts = [
+            [None, None],
+            [
+                Some(stored(PhysicalSlot::First, 3, StoredRole::Inactive)),
+                None,
+            ],
+            [
+                Some(stored(PhysicalSlot::First, 3, StoredRole::Resident)),
+                None,
+            ],
+            [
+                Some(stored(PhysicalSlot::First, 3, StoredRole::Resident)),
+                Some(stored(
+                    PhysicalSlot::Second,
+                    4,
+                    StoredRole::ExportableCandidate,
+                )),
+            ],
+            [
+                Some(stored(
+                    PhysicalSlot::First,
+                    2,
+                    StoredRole::ExportableCandidate,
+                )),
+                Some(stored(PhysicalSlot::Second, 3, StoredRole::Inactive)),
+            ],
+        ];
+
+        for layout in layouts {
+            let selector = StoreSelector::recover(layout);
+            assert_ne!(
+                selector.exportable().is_some(),
+                selector.scratch().is_some()
+            );
+        }
+
+        let erased = StoreSelector::recover([None, None]);
+        assert_eq!(erased.scratch(), Some(PhysicalSlot::First));
+
+        let inactive = StoreSelector::recover([
+            Some(stored(PhysicalSlot::First, 3, StoredRole::Inactive)),
+            None,
+        ]);
+        assert_eq!(inactive.resident(), None);
+        assert_eq!(inactive.scratch(), Some(PhysicalSlot::Second));
+
+        let stale_candidate = StoreSelector::recover([
+            Some(stored(
+                PhysicalSlot::First,
+                2,
+                StoredRole::ExportableCandidate,
+            )),
+            Some(stored(PhysicalSlot::Second, 3, StoredRole::Inactive)),
+        ]);
+        assert_eq!(stale_candidate.exportable(), None);
+        assert_eq!(stale_candidate.scratch(), Some(PhysicalSlot::First));
     }
 }
