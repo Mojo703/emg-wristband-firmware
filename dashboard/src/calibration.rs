@@ -2014,14 +2014,16 @@ mod tests {
     #[test]
     fn run_action_queue_is_bounded_and_distinguishes_full_from_closed() {
         let (actions, mut receiver) = mpsc::channel(2);
-        enqueue_run_action(&actions, RunAction::Continue).unwrap();
-        enqueue_run_action(&actions, RunAction::Save).unwrap();
+        enqueue_nonterminal_run_action(&actions, RunAction::Continue).unwrap();
         assert_eq!(
-            enqueue_run_action(&actions, RunAction::Discard),
+            enqueue_nonterminal_run_action(&actions, RunAction::Save),
             Err(CoordinatorError::AdapterTaskBusy)
         );
+        enqueue_run_action(&actions, RunAction::Exit)
+            .expect("the reserved terminal slot remains available");
 
         assert!(matches!(receiver.try_recv(), Ok(RunAction::Continue)));
+        assert!(matches!(receiver.try_recv(), Ok(RunAction::Exit)));
         drop(receiver);
         assert_eq!(
             enqueue_run_action(&actions, RunAction::Discard),
