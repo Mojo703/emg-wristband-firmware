@@ -192,10 +192,13 @@ enum PlaybackState {
 
 fn enter_between_songs(
     evidence: &mut EvidenceState,
+    completed_track_title: &str,
     heartbeat: &mut HeartbeatMode,
     playback: &mut PlaybackState,
 ) {
-    *evidence = EvidenceState::Retained;
+    *evidence = EvidenceState::Retained {
+        completed_track_title: completed_track_title.to_owned(),
+    };
     *heartbeat = HeartbeatMode::Withheld;
     *playback = PlaybackState::Dormant;
 }
@@ -253,10 +256,30 @@ async fn consume_playback_preparation(
     }
 }
 
-#[derive(Clone, Copy)]
 enum EvidenceState {
     Fresh,
-    Retained,
+    /// Evidence remains owned by the schedule that just ended even when the
+    /// operator selects a different track for Continue. Keeping that identity
+    /// in this variant prevents the projection from relabelling an old
+    /// candidate as the newly selected song.
+    Retained {
+        completed_track_title: String,
+    },
+}
+
+impl EvidenceState {
+    fn is_retained(&self) -> bool {
+        matches!(self, Self::Retained { .. })
+    }
+
+    fn completed_track_title(&self) -> Option<&str> {
+        match self {
+            Self::Fresh => None,
+            Self::Retained {
+                completed_track_title,
+            } => Some(completed_track_title),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -307,7 +330,7 @@ impl TerminalDecision {
 
 fn run_action_is_authorized(
     action: &RunAction,
-    evidence: EvidenceState,
+    evidence: &EvidenceState,
     candidate: CandidateState,
     terminal: &TerminalDecision,
 ) -> bool {
@@ -315,12 +338,8 @@ fn run_action_is_authorized(
         return false;
     }
     match action {
-        RunAction::Continue | RunAction::SelectNextTrack(_) => {
-            matches!(evidence, EvidenceState::Retained)
-        }
-        RunAction::Save => {
-            matches!(evidence, EvidenceState::Retained) && candidate.permits_activation()
-        }
+        RunAction::Continue | RunAction::SelectNextTrack(_) => evidence.is_retained(),
+        RunAction::Save => evidence.is_retained() && candidate.permits_activation(),
         RunAction::Discard => true,
     }
 }
@@ -716,7 +735,7 @@ impl CalibrationModeAdapter {
                     Ok(Frame::CalibrationPreparationStatus { status })
                         if status.run == run
                             && status.schedule_revision == schedule_revision
-                            && matches!(evidence, EvidenceState::Fresh) => {
+                            && matches!(&evidence, EvidenceState::Fresh) => {
                         let ready_for_schedule = matches!(
                             &status.phase,
                             protocol::CalibrationPreparationPhase::ReadyForSchedule
@@ -755,13 +774,18 @@ impl CalibrationModeAdapter {
                         if interruption.run == run
                             && interruption.schedule_revision == schedule_revision
                             && interruption.content_identity == track.content_identity => {
-                        enter_between_songs(&mut evidence, &mut heartbeat_mode, &mut playback);
+                        enter_between_songs(
+                            &mut evidence,
+                            &track.title,
+                            &mut heartbeat_mode,
+                            &mut playback,
+                        );
                         let _ = self.coordinator.update_calibration(
                             &binding,
                             between_songs_snapshot(
                                 &track,
                                 &song_counts,
-                                evidence,
+                                &evidence,
                                 candidate,
                                 &self.tracks,
                             ),
@@ -778,13 +802,18 @@ impl CalibrationModeAdapter {
                         // the UI entered BetweenSongs while the actor kept
                         // heartbeating and playing; SelectNextTrack therefore
                         // rejected the very state the UI advertised.
-                        enter_between_songs(&mut evidence, &mut heartbeat_mode, &mut playback);
+                        enter_between_songs(
+                            &mut evidence,
+                            &track.title,
+                            &mut heartbeat_mode,
+                            &mut playback,
+                        );
                         let _ = self.coordinator.update_calibration(
                             &binding,
                             between_songs_snapshot(
                                 &track,
                                 &song_counts,
-                                evidence,
+                                &evidence,
                                 candidate,
                                 &self.tracks,
                             ),
@@ -796,13 +825,13 @@ impl CalibrationModeAdapter {
                             && candidate_presence_matches_track(&status.presence, &track) => {
                         candidate = CandidateState::from_presence(status.presence);
                         if matches!(heartbeat_mode, HeartbeatMode::Withheld)
-                            && matches!(evidence, EvidenceState::Retained) {
+                            && evidence.is_retained() {
                             let _ = self.coordinator.update_calibration(
                                 &binding,
                                 between_songs_snapshot(
                                     &track,
                                     &song_counts,
-                                    evidence,
+                                    &evidence,
                                     candidate,
                                     &self.tracks,
                                 ),
@@ -891,7 +920,7 @@ impl CalibrationModeAdapter {
                     // Re-check the actor-owned boundary so a racing or forged
                     // Continue cannot replace an upload that is still being
                     // prepared, acknowledged, or played.
-                    if !run_action_is_authorized(&command, evidence, candidate, &terminal) {
+                    if !run_action_is_authorized(&command, &evidence, candidate, &terminal) {
                         continue;
                     }
                     let save_requested = matches!(&command, RunAction::Save);
@@ -932,7 +961,7 @@ impl CalibrationModeAdapter {
                             // A live song owns its authored identity until its
                             // result/interruption is projected. Retargeting is
                             // deliberately restricted to that boundary.
-                            if !matches!(evidence, EvidenceState::Retained)
+                            if !evidence.is_retained()
                                 || !matches!(heartbeat_mode, HeartbeatMode::Withheld) {
                                 continue;
                             }
@@ -943,7 +972,7 @@ impl CalibrationModeAdapter {
                                 between_songs_snapshot(
                                     &track,
                                     &song_counts,
-                                    evidence,
+                                    &evidence,
                                     candidate,
                                     &self.tracks,
                                 ),
@@ -1494,7 +1523,7 @@ fn preparing_snapshot_from_device(
 fn between_songs_snapshot(
     track: &crate::collect::beatmap::CalibrationTrack,
     counts: &[protocol::CalibrationClassCounts],
-    evidence: EvidenceState,
+    evidence: &EvidenceState,
     candidate: CandidateState,
     tracks: &[crate::collect::beatmap::CalibrationTrack],
 ) -> GuidedCalibrationSnapshot {
@@ -1511,11 +1540,14 @@ fn between_songs_snapshot(
         })
         .collect();
     GuidedCalibrationSnapshot::BetweenSongs {
-        track_title: track.title.clone(),
+        track_title: evidence
+            .completed_track_title()
+            .expect("BetweenSongs requires retained evidence")
+            .to_owned(),
         tracks: tracks.iter().map(guided_track).collect(),
         selected_track_id: Some(track.id.0.clone()),
         candidate_available: candidate.permits_activation(),
-        continue_available: matches!(evidence, EvidenceState::Retained),
+        continue_available: evidence.is_retained(),
         valid_reps,
         invalid_reps,
         deficits,
@@ -1553,37 +1585,43 @@ mod tests {
 
         assert!(!run_action_is_authorized(
             &RunAction::Continue,
-            evidence,
+            &evidence,
             absent,
             &TerminalDecision::Open,
         ));
         assert!(!run_action_is_authorized(
             &RunAction::Save,
-            evidence,
+            &evidence,
             valid,
             &TerminalDecision::Open,
         ));
 
-        enter_between_songs(&mut evidence, &mut heartbeat, &mut playback);
+        enter_between_songs(
+            &mut evidence,
+            "Completed Track",
+            &mut heartbeat,
+            &mut playback,
+        );
 
-        assert!(matches!(evidence, EvidenceState::Retained));
+        assert!(matches!(evidence, EvidenceState::Retained { .. }));
+        assert_eq!(evidence.completed_track_title(), Some("Completed Track"));
         assert!(matches!(heartbeat, HeartbeatMode::Withheld));
         assert!(matches!(playback, PlaybackState::Dormant));
         assert!(run_action_is_authorized(
             &RunAction::Continue,
-            evidence,
+            &evidence,
             absent,
             &TerminalDecision::Open,
         ));
         assert!(run_action_is_authorized(
             &RunAction::Save,
-            evidence,
+            &evidence,
             valid,
             &TerminalDecision::Open,
         ));
         assert!(!run_action_is_authorized(
             &RunAction::Discard,
-            evidence,
+            &evidence,
             valid,
             &TerminalDecision::AwaitingSave {
                 deadline: tokio::time::Instant::now(),
@@ -2391,6 +2429,41 @@ mod tests {
                 validity: valid,
             },
             &track,
+        ));
+    }
+
+    #[test]
+    fn selecting_a_continue_track_does_not_relabel_completed_evidence() {
+        let completed = track();
+        let mut next = track();
+        next.id = protocol::TrackId("next-track".into());
+        next.title = "Next Track".into();
+        next.content_identity = "next-content".into();
+        let evidence = EvidenceState::Retained {
+            completed_track_title: completed.title.clone(),
+        };
+        let candidate = CandidateState::Present(protocol::CalibrationCandidateValidity {
+            model_numerically_valid: true,
+            record_crc_valid: true,
+        });
+
+        let snapshot = between_songs_snapshot(
+            &next,
+            &[],
+            &evidence,
+            candidate,
+            &[completed.clone(), next.clone()],
+        );
+
+        assert!(matches!(
+            snapshot,
+            GuidedCalibrationSnapshot::BetweenSongs {
+                track_title,
+                selected_track_id: Some(selected),
+                candidate_available: true,
+                continue_available: true,
+                ..
+            } if track_title == completed.title && selected == next.id.0
         ));
     }
 
