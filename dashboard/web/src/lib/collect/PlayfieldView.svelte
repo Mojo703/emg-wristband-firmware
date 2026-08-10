@@ -2,12 +2,11 @@
   import { onMount } from 'svelte';
   import { theme } from '../theme.svelte';
   import type { CollectionClass, TrackMilliseconds } from '../protocol';
-  import GestureArrow from './GestureArrow.svelte';
   import { renderField, type FieldChrome, type Playfield } from './field';
 
   interface Props {
     playfield: Playfield;
-    lanes: readonly Pick<CollectionClass, 'id' | 'label' | 'motion'>[];
+    lanes: readonly Pick<CollectionClass, 'id' | 'label'>[];
     laneColors: readonly string[];
     currentPosition: () => TrackMilliseconds;
     streak?: number;
@@ -101,9 +100,6 @@
 <div class="lane-labels">
   {#each lanes as lane, index (lane.id)}
     <span class="lane-label" style:color={laneColors[index]}>
-      {#if lane.motion !== null}
-        <GestureArrow motion={lane.motion} size={15} />
-      {/if}
       {lane.label}
       <span class="tally muted">
         {laneHits[lane.id] ?? 0}/{(laneHits[lane.id] ?? 0) + (laneMisses[lane.id] ?? 0)}

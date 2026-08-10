@@ -18,7 +18,13 @@
 // Future: model evaluation will render *predicted* gesture segments as a second
 // block layer beside the cued one (same geometry, distinct styling), so keep
 // block drawing generic over its source.
-import type { CollectionClass, Note, TrackMilliseconds } from '../protocol';
+import type {
+  CollectionClass,
+  GestureMotion,
+  MotionArrow,
+  Note,
+  TrackMilliseconds,
+} from '../protocol';
 
 /** How long a block's leading edge is on screen before it reaches the hit line. */
 export const FALL_DURATION_MILLISECONDS = 3000;
@@ -69,6 +75,8 @@ export interface Block {
 export interface Lane {
   readonly classId: string;
   readonly label: string;
+  /** Null is the stationary Tip center gesture, rendered as a plus sign. */
+  readonly motion: GestureMotion | null;
   /** Palette name from the backend — resolve with `theme.color()`, never a literal. */
   readonly colorName: string;
   readonly blocks: readonly Block[];
@@ -83,6 +91,7 @@ export interface VisualLanePresentation {
   readonly visualLane: VisualLane;
   readonly classId: string;
   readonly label: string;
+  readonly motion: GestureMotion | null;
   readonly colorName: string;
 }
 
@@ -127,6 +136,7 @@ export function buildPlayfield(
   const lanes = classes.map((collectionClass): Lane => ({
     classId: collectionClass.id,
     label: collectionClass.label,
+    motion: collectionClass.motion,
     colorName: collectionClass.color,
     blocks: byClassId.get(collectionClass.id) ?? [],
   }));
@@ -156,6 +166,7 @@ export function buildPresentedPlayfield(
     lanes: lanes.map((lane) => ({
       classId: lane.classId,
       label: lane.label,
+      motion: lane.motion,
       colorName: lane.colorName,
       blocks: blocks.get(lane.visualLane) ?? [],
     })),
@@ -186,6 +197,15 @@ export interface ThumbDownMarkerGeometry {
   readonly shadowLineWidth: number;
   readonly blackLineWidth: number;
   readonly shadowOutlineWidth: number;
+}
+
+export type GestureSymbol =
+  | { readonly kind: 'plus' }
+  | { readonly kind: 'arrow'; readonly arrow: MotionArrow };
+
+/** The stationary fifth gesture still needs a compact visual identity. */
+export function gestureSymbol(motion: GestureMotion | null): GestureSymbol {
+  return motion === null ? { kind: 'plus' } : { kind: 'arrow', arrow: motion.arrow };
 }
 
 export function thumbDownMarkerGeometry(bounds: BlockBounds): ThumbDownMarkerGeometry {
@@ -404,6 +424,18 @@ export function renderField(context: CanvasRenderingContext2D, frame: FieldFrame
             top: bottom - blockHeight,
             bottom,
           }),
+          lane.motion,
+          alpha,
+        );
+      } else {
+        drawThumbUpMarker(
+          context,
+          {
+            centerX: blockLeft + blockWidth / 2,
+            centerY: bottom,
+            radius: Math.min(11, blockWidth / 2),
+          },
+          lane.motion,
           alpha,
         );
       }
@@ -422,13 +454,52 @@ export function renderField(context: CanvasRenderingContext2D, frame: FieldFrame
       brightness,
       // The ring glows for the whole hold — it is the "keep holding" cue.
       impact: holding,
+      motion: lane.motion,
     });
   }
+}
+
+interface CircleMarkerGeometry {
+  readonly centerX: number;
+  readonly centerY: number;
+  readonly radius: number;
+}
+
+function drawThumbUpMarker(
+  context: CanvasRenderingContext2D,
+  marker: CircleMarkerGeometry,
+  motion: GestureMotion | null,
+  alpha: number,
+): void {
+  // A manually painted shadow is deterministic across browsers and subtler
+  // than canvas shadowBlur, which expands unpredictably at high DPI.
+  context.fillStyle = `rgb(0 0 0 / ${0.22 * alpha})`;
+  context.beginPath();
+  context.arc(marker.centerX, marker.centerY + 1.5, marker.radius + 1, 0, Math.PI * 2);
+  context.fill();
+
+  context.fillStyle = `rgb(255 255 255 / ${alpha})`;
+  context.beginPath();
+  context.arc(marker.centerX, marker.centerY, marker.radius, 0, Math.PI * 2);
+  context.fill();
+  context.strokeStyle = `rgb(0 0 0 / ${0.18 * alpha})`;
+  context.lineWidth = 1;
+  context.stroke();
+
+  drawGestureSymbol(
+    context,
+    gestureSymbol(motion),
+    marker.centerX,
+    marker.centerY,
+    marker.radius * 1.15,
+    `rgb(0 0 0 / ${alpha})`,
+  );
 }
 
 function drawThumbDownMarker(
   context: CanvasRenderingContext2D,
   geometry: ThumbDownMarkerGeometry,
+  motion: GestureMotion | null,
   alpha: number,
 ): void {
   context.lineCap = 'round';
@@ -455,6 +526,84 @@ function drawThumbDownMarker(
   context.strokeStyle = `rgb(255 255 255 / ${0.9 * alpha})`;
   context.lineWidth = geometry.shadowOutlineWidth;
   context.stroke();
+
+  drawGestureSymbol(
+    context,
+    gestureSymbol(motion),
+    geometry.line.x,
+    geometry.line.bottom,
+    (geometry.diamond.right.x - geometry.diamond.left.x) * 0.62,
+    `rgb(255 255 255 / ${alpha})`,
+  );
+}
+
+function drawGestureSymbol(
+  context: CanvasRenderingContext2D,
+  symbol: GestureSymbol,
+  centerX: number,
+  centerY: number,
+  size: number,
+  color: string,
+): void {
+  context.save();
+  context.translate(centerX, centerY);
+  context.strokeStyle = color;
+  context.lineWidth = Math.max(1.5, size * 0.14);
+  context.lineCap = 'round';
+  context.lineJoin = 'round';
+
+  if (symbol.kind === 'plus') {
+    const half = size * 0.34;
+    context.beginPath();
+    context.moveTo(-half, 0);
+    context.lineTo(half, 0);
+    context.moveTo(0, -half);
+    context.lineTo(0, half);
+    context.stroke();
+    context.restore();
+    return;
+  }
+
+  const straightRotations: Partial<Record<MotionArrow, number>> = {
+    right: 0,
+    down: Math.PI / 2,
+    left: Math.PI,
+    up: -Math.PI / 2,
+  };
+  const rotation = straightRotations[symbol.arrow];
+  if (rotation !== undefined) {
+    context.rotate(rotation);
+    const tail = -size * 0.34;
+    const tip = size * 0.34;
+    const wing = size * 0.2;
+    context.beginPath();
+    context.moveTo(tail, 0);
+    context.lineTo(tip, 0);
+    context.moveTo(tip - wing, -wing);
+    context.lineTo(tip, 0);
+    context.lineTo(tip - wing, wing);
+    context.stroke();
+    context.restore();
+    return;
+  }
+
+  // Draw one clockwise turn, mirroring it for counter-clockwise. The open arc
+  // and tangent head stay readable even inside an eleven-pixel note marker.
+  if (symbol.arrow === 'counter_clockwise') context.scale(-1, 1);
+  const radius = size * 0.29;
+  context.beginPath();
+  context.arc(0, 0, radius, -Math.PI * 0.2, Math.PI * 1.35);
+  context.stroke();
+  const end = Math.PI * 1.35;
+  const endX = Math.cos(end) * radius;
+  const endY = Math.sin(end) * radius;
+  const head = size * 0.18;
+  context.beginPath();
+  context.moveTo(endX - head * 0.15, endY - head);
+  context.lineTo(endX, endY);
+  context.lineTo(endX + head, endY - head * 0.12);
+  context.stroke();
+  context.restore();
 }
 
 interface TargetRing {
@@ -465,10 +614,11 @@ interface TargetRing {
   readonly delivered: number;
   readonly brightness: number;
   readonly impact: number;
+  readonly motion: GestureMotion | null;
 }
 
 function drawTargetRing(context: CanvasRenderingContext2D, ring: TargetRing): void {
-  const { centerX, centerY, color, chrome, delivered, brightness, impact } = ring;
+  const { centerX, centerY, color, chrome, delivered, brightness, impact, motion } = ring;
   const bright = towardWhite(color, brightness);
 
   // Track.
@@ -498,4 +648,13 @@ function drawTargetRing(context: CanvasRenderingContext2D, ring: TargetRing): vo
   context.beginPath();
   context.arc(centerX, centerY, core * (0.55 + 0.35 * impact), 0, Math.PI * 2);
   context.fill();
+
+  drawGestureSymbol(
+    context,
+    gestureSymbol(motion),
+    centerX,
+    centerY,
+    22,
+    chrome.textStrong,
+  );
 }

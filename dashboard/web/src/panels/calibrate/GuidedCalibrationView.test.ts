@@ -102,15 +102,17 @@ test('strict authoritative wire snapshot reaches the real guided component', asy
   assert.match(body, /Fixture Track/);
 });
 
-test('playing renders a persistent thumb legend and accessible cue narration', async () => {
+test('playing renders a persistent cue-variant legend and accessible cue narration', async () => {
   const { fixtures } = await modules();
   const playing = fixtures['calibrationPlayingFixture'];
   assert.ok(playing?.phase === 'playing');
   const body = await render(playing);
 
-  assert.match(body, /aria-label="Thumb cue legend"/);
-  assert.match(body, /Thumb up/);
-  assert.match(body, /Thumb down/);
+  assert.match(body, /aria-label="Cue variant legend"/);
+  assert.match(body, /Command/);
+  assert.match(body, /No-op/);
+  assert.match(body, /white symbol circle/);
+  assert.match(body, /white symbol diamond/);
   assert.match(body, /Current cue:/);
   assert.match(body, /Next cue:/);
   assert.match(body, /<canvas[^>]*aria-hidden="true"/);

@@ -74,6 +74,7 @@
         visualLane: lane.visualLane,
         classId: lane.id,
         label: lane.label,
+        motion: lane.motion,
         colorName: lane.colorName,
       };
     };
@@ -152,9 +153,9 @@
         {snapshot.paused_reason === null ? 'Pause' : 'Resume'}
       </Button>
     </div>
-    <div class="thumb-legend" aria-label="Thumb cue legend">
-      <span><i class="up-swatch"></i><strong>Thumb up</strong> colored hold block</span>
-      <span><i class="down-swatch">◆</i><strong>Thumb down</strong> diamond and black line</span>
+    <div class="thumb-legend" aria-label="Cue variant legend">
+      <span><i class="up-swatch">→</i><strong>Command</strong> white symbol circle</span>
+      <span><i class="down-swatch">→</i><strong>No-op</strong> white symbol diamond</span>
     </div>
     {#if announcements !== null}
       <div class="cue-text" aria-live="polite" aria-atomic="true">
@@ -263,8 +264,30 @@
   .thumb-legend, .cue-text { display: flex; align-items: center; gap: 10px 18px; flex-wrap: wrap; }
   .thumb-legend { padding: 8px 10px; border: 1px solid var(--border); border-radius: var(--radius); font-size: 12px; }
   .thumb-legend span { display: inline-flex; align-items: center; gap: 5px; }
-  .up-swatch { width: 12px; height: 12px; border-radius: 3px; background: var(--brand); }
-  .down-swatch { width: 12px; height: 12px; display: inline-flex; align-items: center; justify-content: center; color: #000; text-shadow: 0 0 1px #fff; font-style: normal; }
+  .up-swatch, .down-swatch {
+    width: 18px;
+    height: 18px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 12px;
+    font-style: normal;
+    font-weight: 800;
+    line-height: 1;
+  }
+  .up-swatch {
+    border: 1px solid rgb(0 0 0 / 18%);
+    border-radius: 50%;
+    background: #fff;
+    color: #000;
+    box-shadow: 0 1px 2px rgb(0 0 0 / 28%);
+  }
+  .down-swatch {
+    background: #000;
+    color: #fff;
+    clip-path: polygon(50% 0, 100% 50%, 50% 100%, 0 50%);
+    filter: drop-shadow(0 0 1px #fff);
+  }
   .cue-text { justify-content: space-between; min-height: 2.5rem; padding: 8px 10px; background: var(--muted); border-radius: var(--radius); }
   .field { position: relative; }
   .gate { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; background: var(--canvas-dim-overlay); text-align: center; }
