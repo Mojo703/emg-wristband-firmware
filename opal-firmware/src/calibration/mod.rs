@@ -2914,7 +2914,7 @@ impl Calibration {
     fn refuse(&mut self, detail: &str) {
         warn!("calibration request refused: {detail}");
         self.outbound.push(Frame::BenchError {
-            stage: "calibration".into(),
+            source: protocol::BenchErrorSource::Calibration,
             detail: detail.into(),
         });
     }

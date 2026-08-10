@@ -803,32 +803,14 @@ pub enum Frame {
 
     /// Device → host: where the playback engine stands. Sent periodically while
     /// streaming, at the end of a session, and on request.
-    BenchStatus {
-        mode: BenchMode,
-        session: String,
-        samples_received: u64,
-        windows_processed: u32,
-        /// Per-window feature compute cost, microseconds. Zero across all three
-        /// until a window completes.
-        feature_minimum_microseconds: u32,
-        feature_mean_microseconds: u32,
-        feature_maximum_microseconds: u32,
-        heap_free_bytes: u32,
-        largest_free_block_bytes: u32,
-        /// Chunks the ingress queue refused because it was full — a flow
-        /// control failure, and a reason to distrust the run.
-        dropped_chunks: u32,
-        /// Chunks that arrived out of sequence, same.
-        sequence_gaps: u32,
-        /// Rows held for the pending fit.
-        stored_rows: u32,
-        /// Rows the flash training partition offers, zero when none is mapped.
-        flash_rows: u32,
-    },
+    BenchStatus { status: BenchStatus },
 
     /// Device → host: a bench request was refused or a run was abandoned.
-    /// `stage` names the frame or phase; `detail` says what was wrong.
-    BenchError { stage: String, detail: String },
+    /// `source` is finite and machine-readable; `detail` is diagnostic text.
+    BenchError {
+        source: BenchErrorSource,
+        detail: String,
+    },
 
     /// Host → device: drop the session, the model, and the stored rows. The
     /// orchestrator sends this between cases so nothing carries over.
@@ -1590,24 +1572,96 @@ pub struct BenchDecision {
     pub reject_score_bits: u32,
 }
 
-/// The finite execution phase of the firmware playback/fit bench.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BenchMode {
-    Idle,
-    Streaming,
-    Replaying,
-    Fitting,
+/// A playback session's counters. This payload exists only while a named
+/// session is streaming or after it completed; idle status cannot carry a
+/// fabricated empty session identifier.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BenchSessionStatus {
+    pub session: String,
+    pub samples_received: u64,
+    pub windows_processed: u32,
+    /// Per-window feature compute cost, microseconds. Zero across all three
+    /// until a window completes.
+    pub feature_minimum_microseconds: u32,
+    pub feature_mean_microseconds: u32,
+    pub feature_maximum_microseconds: u32,
+    /// Chunks that arrived out of sequence, making the run untrustworthy.
+    pub sequence_gaps: u32,
 }
 
-impl core::fmt::Display for BenchMode {
+/// The observable playback lifecycle. Replay and fitting operations execute
+/// synchronously on the worker and never service a status request while they
+/// run, so claiming those transient modes on the wire was misleading.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", content = "session", rename_all = "snake_case")]
+pub enum BenchPhase {
+    Idle,
+    Streaming(BenchSessionStatus),
+    Complete(BenchSessionStatus),
+}
+
+impl core::fmt::Display for BenchPhase {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         formatter.write_str(match self {
             Self::Idle => "idle",
-            Self::Streaming => "streaming",
-            Self::Replaying => "replaying",
-            Self::Fitting => "fitting",
+            Self::Streaming(_) => "streaming",
+            Self::Complete(_) => "complete",
         })
+    }
+}
+
+/// Device-owned bench status. Resource counters apply in every phase; session
+/// counters are structurally confined to the session-bearing phases.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BenchStatus {
+    pub phase: BenchPhase,
+    pub heap_free_bytes: u32,
+    pub largest_free_block_bytes: u32,
+    /// Chunks the ingress queue refused because it was full.
+    pub dropped_chunks: u32,
+    /// Rows held for the pending fit.
+    pub stored_rows: u32,
+    /// Rows the flash training partition offers, zero when none is mapped.
+    pub flash_rows: u32,
+}
+
+/// The finite subsystem or command that produced a [`Frame::BenchError`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BenchErrorSource {
+    Calibration,
+    Timing,
+    DeviceControl,
+    PlaybackBegin,
+    PlaybackSamples,
+    CalibrationWindows,
+    BenchFeatures,
+    BenchCommits,
+    BenchModelLoad,
+    BenchReplayRows,
+    BenchFitBegin,
+    BenchFitRows,
+    BenchFitRun,
+}
+
+impl core::fmt::Display for BenchErrorSource {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let encoded = match self {
+            Self::Calibration => "calibration",
+            Self::Timing => "timing",
+            Self::DeviceControl => "device_control",
+            Self::PlaybackBegin => "playback_begin",
+            Self::PlaybackSamples => "playback_samples",
+            Self::CalibrationWindows => "calibration_windows",
+            Self::BenchFeatures => "bench_features",
+            Self::BenchCommits => "bench_commits",
+            Self::BenchModelLoad => "bench_model_load",
+            Self::BenchReplayRows => "bench_replay_rows",
+            Self::BenchFitBegin => "bench_fit_begin",
+            Self::BenchFitRows => "bench_fit_rows",
+            Self::BenchFitRun => "bench_fit_run",
+        };
+        formatter.write_str(encoded)
     }
 }
 
@@ -4851,35 +4905,110 @@ mod tests {
     #[test]
     fn bench_status_roundtrips() {
         let frame = Frame::BenchStatus {
-            mode: BenchMode::Streaming,
-            session: "2026-08-07T16-38-35_Matthew".into(),
-            samples_received: 120_000,
-            windows_processed: 240,
-            feature_minimum_microseconds: 4_100,
-            feature_mean_microseconds: 4_400,
-            feature_maximum_microseconds: 6_900,
-            heap_free_bytes: 180_000,
-            largest_free_block_bytes: 31_000,
-            dropped_chunks: 0,
-            sequence_gaps: 0,
-            stored_rows: 0,
-            flash_rows: 9_654,
+            status: BenchStatus {
+                phase: BenchPhase::Streaming(BenchSessionStatus {
+                    session: "2026-08-07T16-38-35_Matthew".into(),
+                    samples_received: 120_000,
+                    windows_processed: 240,
+                    feature_minimum_microseconds: 4_100,
+                    feature_mean_microseconds: 4_400,
+                    feature_maximum_microseconds: 6_900,
+                    sequence_gaps: 0,
+                }),
+                heap_free_bytes: 180_000,
+                largest_free_block_bytes: 31_000,
+                dropped_chunks: 0,
+                stored_rows: 0,
+                flash_rows: 9_654,
+            },
         };
         match roundtrip(&frame) {
-            Frame::BenchStatus {
-                mode,
-                windows_processed,
-                feature_mean_microseconds,
-                largest_free_block_bytes,
-                ..
-            } => {
-                assert_eq!(mode, BenchMode::Streaming);
-                assert_eq!(windows_processed, 240);
-                assert_eq!(feature_mean_microseconds, 4_400);
-                assert_eq!(largest_free_block_bytes, 31_000);
+            Frame::BenchStatus { status } => {
+                assert_eq!(status.largest_free_block_bytes, 31_000);
+                let BenchPhase::Streaming(session) = status.phase else {
+                    panic!("streaming status lost its phase");
+                };
+                assert_eq!(session.windows_processed, 240);
+                assert_eq!(session.feature_mean_microseconds, 4_400);
             }
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn idle_bench_status_has_no_session_sentinel() {
+        let frame = Frame::BenchStatus {
+            status: BenchStatus {
+                phase: BenchPhase::Idle,
+                heap_free_bytes: 180_000,
+                largest_free_block_bytes: 31_000,
+                dropped_chunks: 0,
+                stored_rows: 12,
+                flash_rows: 9_654,
+            },
+        };
+        let Frame::BenchStatus { status } = roundtrip(&frame) else {
+            panic!("wrong frame variant");
+        };
+        assert_eq!(status.phase, BenchPhase::Idle);
+    }
+
+    #[test]
+    fn every_bench_error_source_and_terminal_session_phase_roundtrips() {
+        let sources = [
+            BenchErrorSource::Calibration,
+            BenchErrorSource::Timing,
+            BenchErrorSource::DeviceControl,
+            BenchErrorSource::PlaybackBegin,
+            BenchErrorSource::PlaybackSamples,
+            BenchErrorSource::CalibrationWindows,
+            BenchErrorSource::BenchFeatures,
+            BenchErrorSource::BenchCommits,
+            BenchErrorSource::BenchModelLoad,
+            BenchErrorSource::BenchReplayRows,
+            BenchErrorSource::BenchFitBegin,
+            BenchErrorSource::BenchFitRows,
+            BenchErrorSource::BenchFitRun,
+        ];
+        for source in sources {
+            let frame = Frame::BenchError {
+                source,
+                detail: "diagnostic".into(),
+            };
+            assert!(matches!(
+                roundtrip(&frame),
+                Frame::BenchError {
+                    source: decoded,
+                    ..
+                } if decoded == source
+            ));
+        }
+
+        let completed = BenchPhase::Complete(BenchSessionStatus {
+            session: "recording-7".into(),
+            samples_received: 500,
+            windows_processed: 1,
+            feature_minimum_microseconds: 10,
+            feature_mean_microseconds: 11,
+            feature_maximum_microseconds: 12,
+            sequence_gaps: 0,
+        });
+        let frame = Frame::BenchStatus {
+            status: BenchStatus {
+                phase: completed.clone(),
+                heap_free_bytes: 1,
+                largest_free_block_bytes: 1,
+                dropped_chunks: 0,
+                stored_rows: 0,
+                flash_rows: 0,
+            },
+        };
+        assert!(matches!(
+            roundtrip(&frame),
+            Frame::BenchStatus {
+                status: BenchStatus { phase, .. }
+            } if phase == completed
+        ));
     }
 
     fn run_key() -> CalibrationRunKey {

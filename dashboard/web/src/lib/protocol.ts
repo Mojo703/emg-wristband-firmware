@@ -1272,32 +1272,57 @@ export interface BenchFitResultFrame {
   readonly model: Uint8Array;
 }
 
-/** Where the playback engine stands. `mode` is idle/streaming/replaying/fitting. */
+/** Device-owned playback bench status. */
 export interface BenchStatusFrame {
   readonly type: 'bench_status';
-  readonly mode: BenchMode;
+  readonly status: BenchStatus;
+}
+
+export interface BenchStatus {
+  readonly phase: BenchPhase;
+  readonly heap_free_bytes: number;
+  readonly largest_free_block_bytes: number;
+  /** Non-zero means the ingress queue lost a chunk. */
+  readonly dropped_chunks: number;
+  readonly stored_rows: number;
+  /** Rows the flash training partition offers, zero when none is mapped. */
+  readonly flash_rows: number;
+}
+
+export type BenchPhase =
+  | { readonly mode: 'idle' }
+  | { readonly mode: 'streaming'; readonly session: BenchSessionStatus }
+  | { readonly mode: 'complete'; readonly session: BenchSessionStatus };
+
+export interface BenchSessionStatus {
   readonly session: string;
   readonly samples_received: number;
   readonly windows_processed: number;
   readonly feature_minimum_microseconds: number;
   readonly feature_mean_microseconds: number;
   readonly feature_maximum_microseconds: number;
-  readonly heap_free_bytes: number;
-  readonly largest_free_block_bytes: number;
-  /** Non-zero means the run lost samples and its numbers cannot be trusted. */
-  readonly dropped_chunks: number;
   readonly sequence_gaps: number;
-  readonly stored_rows: number;
-  /** Rows the flash training partition offers, zero when none is mapped. */
-  readonly flash_rows: number;
 }
 
-export type BenchMode = 'idle' | 'streaming' | 'replaying' | 'fitting';
+export type BenchErrorSource =
+  | 'calibration'
+  | 'timing'
+  | 'device_control'
+  | 'playback_begin'
+  | 'playback_samples'
+  | 'calibration_windows'
+  | 'bench_features'
+  | 'bench_commits'
+  | 'bench_model_load'
+  | 'bench_replay_rows'
+  | 'bench_fit_begin'
+  | 'bench_fit_rows'
+  | 'bench_fit_run';
 
 /** A bench request the device refused, or a run it abandoned. */
 export interface BenchErrorFrame {
   readonly type: 'bench_error';
-  readonly stage: string;
+  readonly source: BenchErrorSource;
   readonly detail: string;
 }
 
@@ -2577,22 +2602,42 @@ export function isBenchStatusFrame(value: unknown): value is BenchStatusFrame {
   return (
     hasType(value, 'bench_status') &&
     isObject(value) &&
-    (value['mode'] === 'idle' ||
-      value['mode'] === 'streaming' ||
-      value['mode'] === 'replaying' ||
-      value['mode'] === 'fitting') &&
+    isBenchStatus(value['status'])
+  );
+}
+
+function isBenchStatus(value: unknown): value is BenchStatus {
+  return (
+    isObject(value) &&
+    isBenchPhase(value['phase']) &&
+    isNumber(value['heap_free_bytes']) &&
+    isNumber(value['largest_free_block_bytes']) &&
+    isNumber(value['dropped_chunks']) &&
+    isNumber(value['stored_rows']) &&
+    isNumber(value['flash_rows'])
+  );
+}
+
+function isBenchPhase(value: unknown): value is BenchPhase {
+  if (!isObject(value)) return false;
+  if (value['mode'] === 'idle') return true;
+  return (
+    (value['mode'] === 'streaming' || value['mode'] === 'complete') &&
+    isBenchSessionStatus(value['session'])
+  );
+}
+
+function isBenchSessionStatus(value: unknown): value is BenchSessionStatus {
+  return (
+    isObject(value) &&
     isString(value['session']) &&
+    value['session'].length > 0 &&
     isNumber(value['samples_received']) &&
     isNumber(value['windows_processed']) &&
     isNumber(value['feature_minimum_microseconds']) &&
     isNumber(value['feature_mean_microseconds']) &&
     isNumber(value['feature_maximum_microseconds']) &&
-    isNumber(value['heap_free_bytes']) &&
-    isNumber(value['largest_free_block_bytes']) &&
-    isNumber(value['dropped_chunks']) &&
-    isNumber(value['sequence_gaps']) &&
-    isNumber(value['stored_rows']) &&
-    isNumber(value['flash_rows'])
+    isNumber(value['sequence_gaps'])
   );
 }
 
@@ -2600,7 +2645,19 @@ export function isBenchErrorFrame(value: unknown): value is BenchErrorFrame {
   return (
     hasType(value, 'bench_error') &&
     isObject(value) &&
-    isString(value['stage']) &&
+    (value['source'] === 'calibration' ||
+      value['source'] === 'timing' ||
+      value['source'] === 'device_control' ||
+      value['source'] === 'playback_begin' ||
+      value['source'] === 'playback_samples' ||
+      value['source'] === 'calibration_windows' ||
+      value['source'] === 'bench_features' ||
+      value['source'] === 'bench_commits' ||
+      value['source'] === 'bench_model_load' ||
+      value['source'] === 'bench_replay_rows' ||
+      value['source'] === 'bench_fit_begin' ||
+      value['source'] === 'bench_fit_rows' ||
+      value['source'] === 'bench_fit_run') &&
     isString(value['detail'])
   );
 }

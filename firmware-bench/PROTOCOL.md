@@ -69,9 +69,9 @@ per-window timing is exact rather than smeared; and at that size the credit
 window is three chunks deep, enough to cover a credit round trip.
 
 If the host outruns its credit anyway, the device's bounded command queue
-refuses the chunk and counts it in `bench_status.dropped_chunks`. A run with a
-non-zero `dropped_chunks` or `sequence_gaps` is a failed run, not a degraded
-one.
+refuses the chunk and counts it in `bench_status.status.dropped_chunks`. A run
+with non-zero `dropped_chunks` or session `sequence_gaps` is a failed run, not
+a degraded one.
 
 ## Frames
 
@@ -128,8 +128,8 @@ mirrors and guards for all six in `dashboard/web/src/lib/protocol.ts`.
 | `bench_features` | `first_window` u32, `window_count` u32, `features` blob |
 | `bench_commits` | `decisions`: list of `{window, command, accepted, reject_score_bits}` |
 | `bench_fit_result` | wall ms, live rows, flash rows, flash walk µs, class count, heap free and largest block either side, `model` blob |
-| `bench_status` | mode, session, samples, windows, feature µs min/mean/max, heap free, largest block, dropped chunks, sequence gaps, stored rows, flash rows |
-| `bench_error` | `stage`, `detail` |
+| `bench_status` | `status`: common heap/drop/row counters plus a tagged `phase` |
+| `bench_error` | finite `source`, diagnostic `detail` |
 
 - `features` — `window_count * 64` `f32` bits, window-major. Batched 16 windows
   (4 KB) per frame, which stays well inside the device's single 18 KB encode
@@ -144,7 +144,11 @@ mirrors and guards for all six in `dashboard/web/src/lib/protocol.ts`.
   one as invalid.
 
 `bench_status` arrives every 64 windows while streaming, at `playback_end`, and
-on request.
+on request. Its `phase` is `idle`, `streaming { session }`, or
+`complete { session }`; only the two session-bearing phases carry identity,
+sample/window/feature timing, and sequence-gap counters. Idle has no empty
+session sentinel. Replay and fitting are synchronous worker operations and
+therefore are not advertised as status modes that no request can observe.
 
 `flash_walk_microseconds` is one pass over the flash rows' bytes, timed
 immediately before the fit. A fit rereads every row once per step — 250 steps —

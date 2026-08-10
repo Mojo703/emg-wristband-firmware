@@ -33,7 +33,10 @@ use emg_runtime::calibration::{
 };
 use emg_runtime::pipeline::RejectPipeline;
 use log::{info, warn};
-use protocol::{BenchDecision, BenchMode, Frame, PLAYBACK_MAX_CHUNK_SAMPLES};
+use protocol::{
+    BenchDecision, BenchErrorSource, BenchPhase, BenchSessionStatus, BenchStatus, Frame,
+    PLAYBACK_MAX_CHUNK_SAMPLES,
+};
 
 use crate::calibration::training_rows::TrainingRows;
 use crate::transport::Control;
@@ -410,7 +413,14 @@ impl ComputeCost {
 }
 
 /// One session being replayed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SessionPhase {
+    Streaming,
+    Complete,
+}
+
 struct Session {
+    phase: SessionPhase,
     identifier: String,
     features: BandFeaturePipeline,
     /// The chunk sequence number the next `PlaybackSamples` must carry.
@@ -468,7 +478,6 @@ struct Bench {
     /// Set at each `playback_begin` from what the previous sessions
     /// contributed, which is what splices them.
     published_base: u64,
-    mode: BenchMode,
 }
 
 impl Bench {
@@ -494,7 +503,6 @@ impl Bench {
             probabilities: Vec::new(),
             published_samples: 0,
             published_base: 0,
-            mode: BenchMode::Idle,
         }
     }
 
@@ -546,7 +554,7 @@ impl Bench {
         const EXPECTED_CONSTANTS: usize = (1 + CHANNEL_COUNT) * 4;
         if constants.len() != EXPECTED_CONSTANTS {
             self.fail(
-                "playback_begin",
+                BenchErrorSource::PlaybackBegin,
                 format!(
                     "constants blob is {} bytes, want {EXPECTED_CONSTANTS}",
                     constants.len()
@@ -556,7 +564,7 @@ impl Bench {
         }
         if chunk_samples == 0 || chunk_samples as usize > PLAYBACK_MAX_CHUNK_SAMPLES {
             self.fail(
-                "playback_begin",
+                BenchErrorSource::PlaybackBegin,
                 format!("chunk_samples {chunk_samples} outside 1..={PLAYBACK_MAX_CHUNK_SAMPLES}"),
             );
             return;
@@ -577,6 +585,7 @@ impl Bench {
         // across a whole session and must start from zero for the next, and
         // `BandFeaturePipeline` allocates only in `new`.
         self.session = Some(Session {
+            phase: SessionPhase::Streaming,
             identifier,
             features: BandFeaturePipeline::new(microvolts_per_count, reference_gains),
             expected_sequence: 0,
@@ -597,7 +606,6 @@ impl Bench {
         // A new session's windows number from zero again, so the run's own
         // space carries on from where the last one stopped.
         self.published_base = self.published_samples;
-        self.mode = BenchMode::Streaming;
         info!("playback session begins: {sample_count} samples in chunks of {chunk_samples}");
         self.grant_credit(0);
     }
@@ -605,7 +613,7 @@ impl Bench {
     fn handle_samples(&mut self, sequence: u32, samples: &[u8]) {
         if self.session.is_none() {
             self.fail(
-                "playback_samples",
+                BenchErrorSource::PlaybackSamples,
                 "no session; send playback_begin first".into(),
             );
             return;
@@ -689,7 +697,7 @@ impl Bench {
         }
 
         if let Some(detail) = refusal {
-            self.fail("playback_samples", detail);
+            self.fail(BenchErrorSource::PlaybackSamples, detail);
             return;
         }
         for (end_sample, features) in sliding {
@@ -776,7 +784,7 @@ impl Bench {
             | WindowDelivery::SuppressedDisconnected => {}
             WindowDelivery::Saturated { dropped } => {
                 self.fail(
-                    "calibration_windows",
+                    BenchErrorSource::CalibrationWindows,
                     format!(
                         "calibration window queue saturated; replay calibration abandoned ({dropped} dropped)"
                     ),
@@ -810,7 +818,9 @@ impl Bench {
     fn handle_end(&mut self) {
         self.flush_features();
         self.flush_decisions();
-        self.mode = BenchMode::Idle;
+        if let Some(session) = self.session.as_mut() {
+            session.phase = SessionPhase::Complete;
+        }
         self.send_status();
         if let Some(session) = self.session.as_ref() {
             info!(
@@ -833,7 +843,7 @@ impl Bench {
                 );
             }
             None => self.fail(
-                "bench_model_load",
+                BenchErrorSource::BenchModelLoad,
                 format!("{} bytes do not describe {class_count} classes", bits.len()),
             ),
         }
@@ -842,7 +852,7 @@ impl Bench {
     fn handle_replay_rows(&mut self, first_window: u32, rows: &[u8]) {
         if self.model.is_none() {
             self.fail(
-                "bench_replay_rows",
+                BenchErrorSource::BenchReplayRows,
                 "no model; send bench_model_load first".into(),
             );
             return;
@@ -850,7 +860,7 @@ impl Bench {
         const ROW_BYTES: usize = FEATURE_COUNT * 4;
         if rows.len() % ROW_BYTES != 0 {
             self.fail(
-                "bench_replay_rows",
+                BenchErrorSource::BenchReplayRows,
                 format!(
                     "{} bytes is not whole {FEATURE_COUNT}-feature rows",
                     rows.len()
@@ -858,14 +868,12 @@ impl Bench {
             );
             return;
         }
-        self.mode = BenchMode::Replaying;
         for (index, row) in rows.chunks_exact(ROW_BYTES).enumerate() {
             let features: [f32; FEATURE_COUNT] =
                 std::array::from_fn(|feature| float_at(row, feature));
             self.score_row(first_window + index as u32, &features);
         }
         self.flush_decisions();
-        self.mode = BenchMode::Idle;
     }
 
     fn handle_fit_begin(
@@ -880,13 +888,16 @@ impl Bench {
             1 => FeaturePrecision::Float16,
             2 => FeaturePrecision::Int8,
             other => {
-                self.fail("bench_fit_begin", format!("precision selector {other}"));
+                self.fail(
+                    BenchErrorSource::BenchFitBegin,
+                    format!("precision selector {other}"),
+                );
                 return;
             }
         };
         if precision == FeaturePrecision::Int8 && quantization.len() != FEATURE_COUNT * 2 * 4 {
             self.fail(
-                "bench_fit_begin",
+                BenchErrorSource::BenchFitBegin,
                 format!(
                     "i8 precision wants {} bytes of offset/scale, got {}",
                     FEATURE_COUNT * 2 * 4,
@@ -902,7 +913,10 @@ impl Bench {
         self.store = Some(match precision {
             FeaturePrecision::Int8 => {
                 let Some(constants) = Int8Quantization::from_bits(&quantization) else {
-                    self.fail("bench_fit_begin", "i8 constants did not decode".into());
+                    self.fail(
+                        BenchErrorSource::BenchFitBegin,
+                        "i8 constants did not decode".into(),
+                    );
                     return;
                 };
                 FeatureStore::with_int8_capacity(row_capacity as usize, constants)
@@ -918,7 +932,7 @@ impl Bench {
         const ROW_BYTES: usize = FEATURE_COUNT * 4;
         if self.store.is_none() {
             self.fail(
-                "bench_fit_rows",
+                BenchErrorSource::BenchFitRows,
                 "no store; send bench_fit_begin first".into(),
             );
             return;
@@ -926,7 +940,7 @@ impl Bench {
         if row_weights.len() != labels.len() * 4 || rows.len() != labels.len() * ROW_BYTES {
             let count = labels.len();
             self.fail(
-                "bench_fit_rows",
+                BenchErrorSource::BenchFitRows,
                 format!(
                     "{count} labels want {} weight bytes and {} row bytes, got {} and {}",
                     count * 4,
@@ -954,7 +968,7 @@ impl Bench {
         self.stored_rows += stored;
         if full {
             self.fail(
-                "bench_fit_rows",
+                BenchErrorSource::BenchFitRows,
                 format!("store full after {} rows", self.stored_rows),
             );
         }
@@ -964,20 +978,18 @@ impl Bench {
         match self.store.as_ref() {
             None => {
                 self.fail(
-                    "bench_fit_run",
+                    BenchErrorSource::BenchFitRun,
                     "no store; send bench_fit_begin first".into(),
                 );
                 return;
             }
             Some(store) if store.is_empty() => {
-                self.fail("bench_fit_run", "no rows stored".into());
+                self.fail(BenchErrorSource::BenchFitRun, "no rows stored".into());
                 return;
             }
             Some(_) => {}
         }
         let store = self.store.as_ref().expect("checked above");
-        self.mode = BenchMode::Fitting;
-
         // Which experiment this is. Live-only measures how many rows RAM can
         // hold; live-plus-flash measures the split the full training matrix
         // actually needs. A run that asked for flash and did not get it would
@@ -987,10 +999,9 @@ impl Bench {
             (false, _) => None,
             (true, None) => {
                 self.fail(
-                    "bench_fit_run",
+                    BenchErrorSource::BenchFitRun,
                     "asked for flash rows, none are mapped".into(),
                 );
-                self.mode = BenchMode::Idle;
                 return;
             }
             (true, Some(flash)) => Some(flash),
@@ -1015,10 +1026,9 @@ impl Bench {
             // live-plus-flash name, which is the one outcome no reader of the
             // results could detect.
             self.fail(
-                "bench_fit_run",
+                BenchErrorSource::BenchFitRun,
                 "flash rows are not a whole number of rows at their own precision".into(),
             );
-            self.mode = BenchMode::Idle;
             return;
         }
         let flash_row_count = static_rows
@@ -1041,7 +1051,6 @@ impl Bench {
         let class_count = model.class_count as u32;
         self.model = Some(model);
         self.reject = RejectPipeline::new(COMMAND_CLASSES, REJECT_TAU);
-        self.mode = BenchMode::Idle;
         self.send(Frame::BenchFitResult {
             wall_milliseconds,
             rows: self.stored_rows,
@@ -1069,7 +1078,6 @@ impl Bench {
         self.windows.reset();
         self.reject = RejectPipeline::new(COMMAND_CLASSES, REJECT_TAU);
         self.refused.store(0, Ordering::Relaxed);
-        self.mode = BenchMode::Idle;
         self.send_status();
     }
 
@@ -1095,7 +1103,7 @@ impl Bench {
                     session.abandoned = true;
                 }
                 self.fail(
-                    "bench_features",
+                    BenchErrorSource::BenchFeatures,
                     "feature output queue saturated; session abandoned".into(),
                 );
             }
@@ -1116,7 +1124,7 @@ impl Bench {
         self.decisions = Vec::with_capacity(DECISION_BATCH_WINDOWS);
         if self.send(Frame::BenchCommits { decisions }) == Delivery::Full {
             self.fail(
-                "bench_commits",
+                BenchErrorSource::BenchCommits,
                 "decision output queue saturated; comparison is incomplete".into(),
             );
         }
@@ -1135,48 +1143,41 @@ impl Bench {
     }
 
     fn send_status(&self) {
-        let (identifier, samples_received, windows, gaps, compute) = match self.session.as_ref() {
-            Some(session) => (
-                session.identifier.clone(),
-                session.samples_received,
-                session.windows,
-                session.sequence_gaps,
-                (
-                    session.compute.minimum_microseconds,
-                    session.compute.mean_microseconds(),
-                    session.compute.maximum_microseconds,
-                ),
-            ),
-            None => (String::new(), 0, 0, 0, (0, 0, 0)),
-        };
+        let phase = self.session.as_ref().map_or(BenchPhase::Idle, |session| {
+            let status = BenchSessionStatus {
+                session: session.identifier.clone(),
+                samples_received: session.samples_received,
+                windows_processed: session.windows,
+                feature_minimum_microseconds: session.compute.minimum_microseconds,
+                feature_mean_microseconds: session.compute.mean_microseconds(),
+                feature_maximum_microseconds: session.compute.maximum_microseconds,
+                sequence_gaps: session.sequence_gaps,
+            };
+            match session.phase {
+                SessionPhase::Streaming => BenchPhase::Streaming(status),
+                SessionPhase::Complete => BenchPhase::Complete(status),
+            }
+        });
         let heap = crate::allocation::heap_snapshot();
         self.send(Frame::BenchStatus {
-            mode: self.mode,
-            session: identifier,
-            samples_received,
-            windows_processed: windows,
-            feature_minimum_microseconds: compute.0,
-            feature_mean_microseconds: compute.1,
-            feature_maximum_microseconds: compute.2,
-            heap_free_bytes: heap.free_bytes,
-            largest_free_block_bytes: heap.largest_free_block_bytes,
-            dropped_chunks: self.refused.load(Ordering::Relaxed),
-            sequence_gaps: gaps,
-            stored_rows: self.stored_rows,
-            flash_rows: self
-                .flash_rows
-                .as_ref()
-                .map(TrainingRows::row_count)
-                .unwrap_or(0) as u32,
+            status: BenchStatus {
+                phase,
+                heap_free_bytes: heap.free_bytes,
+                largest_free_block_bytes: heap.largest_free_block_bytes,
+                dropped_chunks: self.refused.load(Ordering::Relaxed),
+                stored_rows: self.stored_rows,
+                flash_rows: self
+                    .flash_rows
+                    .as_ref()
+                    .map(TrainingRows::row_count)
+                    .unwrap_or(0) as u32,
+            },
         });
     }
 
-    fn fail(&self, stage: &str, detail: String) {
-        warn!("bench {stage}: {detail}");
-        self.send(Frame::BenchError {
-            stage: stage.into(),
-            detail,
-        });
+    fn fail(&self, source: BenchErrorSource, detail: String) {
+        warn!("bench {source}: {detail}");
+        self.send(Frame::BenchError { source, detail });
     }
 
     /// A closed outbound channel means the serve loop is gone, which means the
@@ -1268,7 +1269,7 @@ mod tests {
 
         assert_eq!(
             output.send(Frame::BenchError {
-                stage: "saturation".into(),
+                source: BenchErrorSource::BenchFeatures,
                 detail: "payload full".into(),
             }),
             Delivery::Queued
@@ -1295,7 +1296,7 @@ mod tests {
         assert_eq!(output.send(feature_frame(7)), Delivery::Queued);
         assert_eq!(
             output.send(Frame::BenchError {
-                stage: "after_features".into(),
+                source: BenchErrorSource::BenchFeatures,
                 detail: "ordered".into(),
             }),
             Delivery::Queued
@@ -1339,7 +1340,7 @@ mod tests {
         drop(payload);
         assert_eq!(
             output.send(Frame::BenchError {
-                stage: "worker_stop".into(),
+                source: BenchErrorSource::BenchCommits,
                 detail: "test".into(),
             }),
             Delivery::Disconnected

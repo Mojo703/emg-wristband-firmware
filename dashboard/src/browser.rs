@@ -542,7 +542,7 @@ pub async fn handle_browser(
                             let Some(device_id) = selection.device_id() else { continue };
                             if guided_sessions.snapshot().active().is_some() {
                                 let refusal = Frame::BenchError {
-                                    stage: "timing".into(),
+                                    source: protocol::BenchErrorSource::Timing,
                                     detail: "Timing is available only while collection and calibration are idle.".into(),
                                 };
                                 if send_reliable(&browser_tx, Message::Binary(frame::encode(&refusal))).await.is_err() { break; }
@@ -552,7 +552,7 @@ pub async fn handle_browser(
                                 Ok(result) => result,
                                 Err(error) => {
                                     let refusal = Frame::BenchError {
-                                        stage: "timing".into(),
+                                        source: protocol::BenchErrorSource::Timing,
                                         detail: error.to_string(),
                                     };
                                     if send_reliable(&browser_tx, Message::Binary(frame::encode(&refusal))).await.is_err() { break; }
@@ -563,7 +563,7 @@ pub async fn handle_browser(
                                 if let Err(error) = registry.send_control(device_id, control) {
                                     let status = timing.control_failed(device_id, error.operator_message().into());
                                     let refusal = Frame::BenchError {
-                                        stage: "timing".into(),
+                                        source: protocol::BenchErrorSource::Timing,
                                         detail: error.operator_message().into(),
                                     };
                                     if send_reliable(&browser_tx, Message::Binary(frame::encode(&refusal))).await.is_err() { break; }
@@ -605,7 +605,7 @@ pub async fn handle_browser(
                             if let Err(error) = delivery {
                                 tracing::warn!(?error, "device control was not delivered");
                                 let refusal = Frame::BenchError {
-                                    stage: "device-control".into(),
+                                    source: protocol::BenchErrorSource::DeviceControl,
                                     detail: error.operator_message().into(),
                                 };
                                 if send_reliable(

@@ -9,7 +9,7 @@
 //! because that is what a person reading the file needs.
 
 use anyhow::{Context, Result};
-use protocol::{BenchMode, Frame, BENCH_FEATURE_COUNT};
+use protocol::{BenchErrorSource, BenchPhase, BenchStatus, Frame, BENCH_FEATURE_COUNT};
 use serde::Serialize;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -24,25 +24,8 @@ struct DecisionRecord {
 }
 
 #[derive(Serialize)]
-struct StatusRecord {
-    mode: BenchMode,
-    session: String,
-    samples_received: u64,
-    windows_processed: u32,
-    feature_minimum_microseconds: u32,
-    feature_mean_microseconds: u32,
-    feature_maximum_microseconds: u32,
-    heap_free_bytes: u32,
-    largest_free_block_bytes: u32,
-    dropped_chunks: u32,
-    sequence_gaps: u32,
-    stored_rows: u32,
-    flash_rows: u32,
-}
-
-#[derive(Serialize)]
 struct ErrorRecord {
-    stage: String,
+    source: BenchErrorSource,
     detail: String,
 }
 
@@ -80,7 +63,7 @@ pub struct Capture {
     features: Vec<u8>,
     windows_received: Vec<u32>,
     decisions: Vec<DecisionRecord>,
-    statuses: Vec<StatusRecord>,
+    statuses: Vec<BenchStatus>,
     errors: Vec<ErrorRecord>,
     fit: Option<FitRecord>,
     fitted_model: Option<Vec<u8>>,
@@ -226,45 +209,33 @@ impl Capture {
                 });
                 self.fitted_model = Some(model);
             }
-            Frame::BenchStatus {
-                mode,
-                session,
-                samples_received,
-                windows_processed,
-                feature_minimum_microseconds,
-                feature_mean_microseconds,
-                feature_maximum_microseconds,
-                heap_free_bytes,
-                largest_free_block_bytes,
-                dropped_chunks,
-                sequence_gaps,
-                stored_rows,
-                flash_rows,
-            } => {
-                eprintln!(
-                    "status: {mode} {windows_processed} windows, feature {feature_mean_microseconds} us mean \
-                     ({feature_minimum_microseconds}/{feature_maximum_microseconds}), heap {heap_free_bytes} \
-                     free / {largest_free_block_bytes} largest block, {dropped_chunks} dropped, {sequence_gaps} gaps"
-                );
-                self.statuses.push(StatusRecord {
-                    mode,
-                    session,
-                    samples_received,
-                    windows_processed,
-                    feature_minimum_microseconds,
-                    feature_mean_microseconds,
-                    feature_maximum_microseconds,
-                    heap_free_bytes,
-                    largest_free_block_bytes,
-                    dropped_chunks,
-                    sequence_gaps,
-                    stored_rows,
-                    flash_rows,
-                });
+            Frame::BenchStatus { status } => {
+                match &status.phase {
+                    BenchPhase::Idle => eprintln!(
+                        "status: idle, heap {} free / {} largest block, {} dropped",
+                        status.heap_free_bytes,
+                        status.largest_free_block_bytes,
+                        status.dropped_chunks,
+                    ),
+                    BenchPhase::Streaming(session) | BenchPhase::Complete(session) => eprintln!(
+                        "status: {} {} windows, feature {} us mean ({}/{}), heap {} free / {} \
+                         largest block, {} dropped, {} gaps",
+                        status.phase,
+                        session.windows_processed,
+                        session.feature_mean_microseconds,
+                        session.feature_minimum_microseconds,
+                        session.feature_maximum_microseconds,
+                        status.heap_free_bytes,
+                        status.largest_free_block_bytes,
+                        status.dropped_chunks,
+                        session.sequence_gaps,
+                    ),
+                }
+                self.statuses.push(status);
             }
-            Frame::BenchError { stage, detail } => {
-                eprintln!("device refused {stage}: {detail}");
-                self.errors.push(ErrorRecord { stage, detail });
+            Frame::BenchError { source, detail } => {
+                eprintln!("device refused {source}: {detail}");
+                self.errors.push(ErrorRecord { source, detail });
             }
             frame @ Frame::CalibrationSongResult { .. }
             | frame @ Frame::CalibrationSongInterrupted { .. } => {
