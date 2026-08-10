@@ -1054,6 +1054,9 @@ pub struct CalibrationScheduleUploadAcknowledgement {
     /// `None` acknowledges Begin.  A value acknowledges the chunk beginning
     /// at that exact entry index.
     pub first_entry: Option<u32>,
+    /// Canonical semantic CRC of the decoded Begin or Chunk operation. The
+    /// host advances only when this matches what it sent.
+    pub operation_fingerprint: u32,
 }
 
 /// A canonical integrity token for one logical Begin or Chunk operation. This

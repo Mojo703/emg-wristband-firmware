@@ -391,7 +391,13 @@ impl CalibrationModeAdapter {
                         if acknowledgement.run == run
                             && acknowledgement.schedule_revision == schedule_revision
                             && acknowledgement.content_identity == track.content_identity
-                            && acknowledgement.total_count == track.entries.len() as u32 => {
+                            && acknowledgement.total_count == track.entries.len() as u32
+                            && expected_upload_fingerprint(
+                                run,
+                                schedule_revision,
+                                &track,
+                                &upload,
+                            ) == Some(acknowledgement.operation_fingerprint) => {
                         match advance_upload(
                             &self.registry,
                             &device,
@@ -905,6 +911,31 @@ fn advance_upload(
         first_entry: next_first_entry,
     };
     Ok(())
+}
+
+fn expected_upload_fingerprint(
+    run: CalibrationRunKey,
+    revision: CalibrationScheduleRevision,
+    track: &crate::collect::beatmap::CalibrationTrack,
+    upload: &UploadPhase,
+) -> Option<u32> {
+    let (first_entry, entries) = match upload {
+        UploadPhase::AwaitingBeginAcknowledgement => (None, &[][..]),
+        UploadPhase::AwaitingChunkAcknowledgement { first_entry } => {
+            let start = *first_entry as usize;
+            let end = (start + OPERATIONAL_SCHEDULE_UPLOAD_ENTRIES).min(track.entries.len());
+            (Some(*first_entry), track.entries.get(start..end)?)
+        }
+        UploadPhase::Complete => return None,
+    };
+    Some(protocol::calibration_schedule_operation_fingerprint(
+        run,
+        revision,
+        &track.content_identity,
+        track.entries.len() as u32,
+        first_entry,
+        entries,
+    ))
 }
 
 fn send_schedule_chunk(
@@ -1458,6 +1489,48 @@ mod tests {
             Frame::CalibrationScheduleChunk { first_entry: 0, entries, .. }
                 if entries.len() == track.entries.len().min(OPERATIONAL_SCHEDULE_UPLOAD_ENTRIES)
         ));
+    }
+
+    #[test]
+    fn awaited_ack_fingerprint_names_the_exact_begin_or_chunk_payload() {
+        let track = track();
+        let run = CalibrationRunKey {
+            session_id: CalibrationSessionId::new(1).unwrap(),
+            run_id: CalibrationRunId::new(1).unwrap(),
+        };
+        let revision = CalibrationScheduleRevision::new(1).unwrap();
+        let begin = expected_upload_fingerprint(
+            run,
+            revision,
+            &track,
+            &UploadPhase::AwaitingBeginAcknowledgement,
+        )
+        .unwrap();
+        let chunk = expected_upload_fingerprint(
+            run,
+            revision,
+            &track,
+            &UploadPhase::AwaitingChunkAcknowledgement { first_entry: 0 },
+        )
+        .unwrap();
+        assert_ne!(begin, chunk);
+
+        let mut changed = track.clone();
+        changed.entries[0].track_offset = protocol::TrackMilliseconds::new(1);
+        assert_ne!(
+            chunk,
+            expected_upload_fingerprint(
+                run,
+                revision,
+                &changed,
+                &UploadPhase::AwaitingChunkAcknowledgement { first_entry: 0 },
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            expected_upload_fingerprint(run, revision, &track, &UploadPhase::Complete),
+            None
+        );
     }
 
     #[test]

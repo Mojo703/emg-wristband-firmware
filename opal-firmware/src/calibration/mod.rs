@@ -1238,6 +1238,15 @@ impl Calibration {
                                     content_identity: identity.content_identity.clone(),
                                     total_count: identity.total_count,
                                     first_entry: None,
+                                    operation_fingerprint:
+                                        protocol::calibration_schedule_operation_fingerprint(
+                                            run,
+                                            schedule_revision,
+                                            &identity.content_identity,
+                                            identity.total_count,
+                                            None,
+                                            &[],
+                                        ),
                                 },
                             });
                         self.emit_anchored_preparation_status();
@@ -1291,6 +1300,14 @@ impl Calibration {
                                             content_identity: identity.content_identity.clone(),
                                             total_count: identity.total_count,
                                             first_entry: Some(first_entry),
+                                            operation_fingerprint: protocol::calibration_schedule_operation_fingerprint(
+                                                run,
+                                                schedule_revision,
+                                                &identity.content_identity,
+                                                identity.total_count,
+                                                Some(first_entry),
+                                                &entries,
+                                            ),
                                         },
                                     })
                             }
