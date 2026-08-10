@@ -34,6 +34,13 @@ use tokio_serial::SerialPortType;
 /// produces DeviceHello. Bound the anonymous phase so it cannot pin a path.
 const DEVICE_HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 const V2_PROBE_FALLBACK: Duration = Duration::from_millis(250);
+/// Enough room for several seconds of acquisition jitter without allowing a
+/// stalled consumer to turn a device stream into unbounded process memory.
+const DEVICE_INGRESS_BUFFER: usize = 256;
+/// Control frames are already bounded at the registry. This second bound
+/// covers transport maintenance plus the writer handoff itself.
+const DEVICE_OUTBOUND_BUFFER: usize = 64;
+const RELIABLE_OUTBOUND_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// One local USB path's lifecycle. A path claim is not equivalent to a device
 /// connection: only a `DeviceHello` after the flushed Probe reaches Connected.
@@ -211,26 +218,136 @@ struct OutboundFrame {
 }
 
 #[derive(Clone)]
-struct DeviceSender(mpsc::UnboundedSender<OutboundFrame>);
+struct DeviceSender {
+    reliable: mpsc::Sender<OutboundFrame>,
+    latest_lossy: Arc<Mutex<Option<OutboundFrame>>>,
+}
+
+struct DeviceReceiver {
+    reliable: mpsc::Receiver<OutboundFrame>,
+    latest_lossy: Arc<Mutex<Option<OutboundFrame>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutboundDeliveryError {
+    Full,
+    Closed,
+    TimedOut,
+}
 
 impl DeviceSender {
-    fn send(&self, frame: Frame) -> Result<(), ()> {
-        self.0
-            .send(OutboundFrame {
-                frame,
-                forced_wire: None,
-            })
-            .map_err(|_| ())
+    fn channel() -> (Self, DeviceReceiver) {
+        Self::channel_with_capacity(DEVICE_OUTBOUND_BUFFER)
     }
 
-    fn send_as(&self, frame: Frame, wire: WireVersion) -> Result<(), ()> {
-        self.0
-            .send(OutboundFrame {
-                frame,
-                forced_wire: Some(wire),
-            })
-            .map_err(|_| ())
+    fn channel_with_capacity(capacity: usize) -> (Self, DeviceReceiver) {
+        let (reliable, receiver) = mpsc::channel(capacity);
+        let latest_lossy = Arc::new(Mutex::new(None));
+        (
+            Self {
+                reliable,
+                latest_lossy: latest_lossy.clone(),
+            },
+            DeviceReceiver {
+                reliable: receiver,
+                latest_lossy,
+            },
+        )
     }
+
+    fn send_lossy(&self, frame: Frame) -> Result<(), OutboundDeliveryError> {
+        match self.reliable.try_send(OutboundFrame {
+            frame,
+            forced_wire: None,
+        }) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(outbound)) => {
+                *self.latest_lossy.lock().unwrap() = Some(outbound);
+                Err(OutboundDeliveryError::Full)
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(OutboundDeliveryError::Closed),
+        }
+    }
+
+    async fn send_reliable(&self, frame: Frame) -> Result<(), OutboundDeliveryError> {
+        self.send_outbound_reliable(OutboundFrame {
+            frame,
+            forced_wire: None,
+        })
+        .await
+    }
+
+    async fn send_as_reliable(
+        &self,
+        frame: Frame,
+        wire: WireVersion,
+    ) -> Result<(), OutboundDeliveryError> {
+        self.send_outbound_reliable(OutboundFrame {
+            frame,
+            forced_wire: Some(wire),
+        })
+        .await
+    }
+
+    async fn send_outbound_reliable(
+        &self,
+        outbound: OutboundFrame,
+    ) -> Result<(), OutboundDeliveryError> {
+        self.send_outbound_reliable_with_timeout(outbound, RELIABLE_OUTBOUND_TIMEOUT)
+            .await
+    }
+
+    async fn send_outbound_reliable_with_timeout(
+        &self,
+        outbound: OutboundFrame,
+        timeout: Duration,
+    ) -> Result<(), OutboundDeliveryError> {
+        match tokio::time::timeout(timeout, self.reliable.send(outbound)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(OutboundDeliveryError::Closed),
+            Err(_) => Err(OutboundDeliveryError::TimedOut),
+        }
+    }
+}
+
+impl DeviceReceiver {
+    fn take_latest_lossy(&self) -> Option<OutboundFrame> {
+        self.latest_lossy.lock().unwrap().take()
+    }
+
+    /// Reliable FIFO always drains before the coalesced maintenance slot, so a
+    /// dropped clock probe or heartbeat cannot reorder schedule transactions.
+    async fn recv(&mut self) -> Option<OutboundFrame> {
+        match self.reliable.try_recv() {
+            Ok(outbound) => Some(outbound),
+            Err(mpsc::error::TryRecvError::Disconnected) => self.take_latest_lossy(),
+            Err(mpsc::error::TryRecvError::Empty) => {
+                if let Some(outbound) = self.take_latest_lossy() {
+                    Some(outbound)
+                } else {
+                    self.reliable.recv().await
+                }
+            }
+        }
+    }
+
+    fn blocking_recv(&mut self) -> Option<OutboundFrame> {
+        match self.reliable.try_recv() {
+            Ok(outbound) => Some(outbound),
+            Err(mpsc::error::TryRecvError::Disconnected) => self.take_latest_lossy(),
+            Err(mpsc::error::TryRecvError::Empty) => {
+                if let Some(outbound) = self.take_latest_lossy() {
+                    Some(outbound)
+                } else {
+                    self.reliable.blocking_recv()
+                }
+            }
+        }
+    }
+}
+
+fn device_ingress_channel() -> (mpsc::Sender<Frame>, mpsc::Receiver<Frame>) {
+    mpsc::channel(DEVICE_INGRESS_BUFFER)
 }
 
 /// Small dependency-free wire fingerprint for matching a host's encoded payload
@@ -299,7 +416,7 @@ fn device_log_echo_enabled() -> bool {
 /// frames out to viewers, and funnel control frames back. `incoming` yields decoded
 /// frames from the device; `outgoing` is written back to it.
 async fn device_session(
-    mut incoming: mpsc::UnboundedReceiver<Frame>,
+    mut incoming: mpsc::Receiver<Frame>,
     outgoing: DeviceSender,
     registry: Arc<Registry>,
     transport: DeviceTransport,
@@ -358,14 +475,12 @@ async fn device_session(
     let probe_task = tokio::spawn(async move {
         let mut sequence = 0u32;
         for _ in 0..5 {
-            if probe_outgoing
-                .send(Frame::ClockProbeRequest {
-                    sequence,
-                    host_send_nanoseconds: crate::timing::host_monotonic_nanoseconds(),
-                })
-                .is_err()
-            {
-                return;
+            match probe_outgoing.send_lossy(Frame::ClockProbeRequest {
+                sequence,
+                host_send_nanoseconds: crate::timing::host_monotonic_nanoseconds(),
+            }) {
+                Ok(()) | Err(OutboundDeliveryError::Full) => {}
+                Err(OutboundDeliveryError::Closed | OutboundDeliveryError::TimedOut) => return,
             }
             sequence = sequence.wrapping_add(1);
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -376,14 +491,12 @@ async fn device_session(
         interval.tick().await;
         loop {
             interval.tick().await;
-            if probe_outgoing
-                .send(Frame::ClockProbeRequest {
-                    sequence,
-                    host_send_nanoseconds: crate::timing::host_monotonic_nanoseconds(),
-                })
-                .is_err()
-            {
-                return;
+            match probe_outgoing.send_lossy(Frame::ClockProbeRequest {
+                sequence,
+                host_send_nanoseconds: crate::timing::host_monotonic_nanoseconds(),
+            }) {
+                Ok(()) | Err(OutboundDeliveryError::Full) => {}
+                Err(OutboundDeliveryError::Closed | OutboundDeliveryError::TimedOut) => return,
             }
             sequence = sequence.wrapping_add(1);
         }
@@ -392,7 +505,8 @@ async fn device_session(
     // Forward control frames (browser → device) to the transport writer.
     let control_task = tokio::spawn(async move {
         while let Some(frame) = control_rx.recv().await {
-            if outgoing.send(frame).is_err() {
+            if let Err(error) = outgoing.send_reliable(frame).await {
+                tracing::warn!(?error, "device transport control delivery failed");
                 break;
             }
         }
@@ -551,9 +665,8 @@ async fn framed_session<R, W>(
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let (in_tx, in_rx) = mpsc::unbounded_channel();
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<OutboundFrame>();
-    let outgoing = DeviceSender(out_tx);
+    let (in_tx, in_rx) = device_ingress_channel();
+    let (outgoing, mut out_rx) = DeviceSender::channel();
     let wire = Arc::new(ConnectionWire::default());
 
     let read_wire = wire.clone();
@@ -570,7 +683,7 @@ async fn framed_session<R, W>(
             while let Some(envelope) = scanner.next_envelope() {
                 if let Some(frame) = decode_wire_frame(&envelope.payload) {
                     read_wire.observe(envelope.version);
-                    if in_tx.send(frame).is_err() {
+                    if in_tx.send(frame).await.is_err() {
                         return;
                     }
                 }
@@ -819,9 +932,8 @@ async fn serial_session(
     };
     tracing::info!("probing serial device at {path}");
 
-    let (in_tx, in_rx) = mpsc::unbounded_channel();
-    let (out_tx, out_rx) = mpsc::unbounded_channel::<OutboundFrame>();
-    let outgoing = DeviceSender(out_tx);
+    let (in_tx, in_rx) = device_ingress_channel();
+    let (outgoing, out_rx) = DeviceSender::channel();
     let wire = Arc::new(ConnectionWire::default());
 
     // Claim the link, then keep the claim alive. A quiet port needs no idle timeout:
@@ -830,13 +942,18 @@ async fn serial_session(
         let outgoing = outgoing.clone();
         let heartbeat_wire = wire.clone();
         tokio::spawn(async move {
-            if outgoing.send_as(Frame::Probe {}, WireVersion::V2).is_err() {
+            if outgoing
+                .send_as_reliable(Frame::Probe {}, WireVersion::V2)
+                .await
+                .is_err()
+            {
                 return;
             }
             tokio::time::sleep(V2_PROBE_FALLBACK).await;
             if matches!(heartbeat_wire.selected(), WireVersion::Legacy)
                 && outgoing
-                    .send_as(Frame::Probe {}, WireVersion::Legacy)
+                    .send_as_reliable(Frame::Probe {}, WireVersion::Legacy)
+                    .await
                     .is_err()
             {
                 return;
@@ -844,8 +961,9 @@ async fn serial_session(
             let mut ticks = tokio::time::interval(Duration::from_secs(2));
             loop {
                 ticks.tick().await;
-                if outgoing.send(Frame::Heartbeat {}).is_err() {
-                    return;
+                match outgoing.send_lossy(Frame::Heartbeat {}) {
+                    Ok(()) | Err(OutboundDeliveryError::Full) => {}
+                    Err(OutboundDeliveryError::Closed | OutboundDeliveryError::TimedOut) => return,
                 }
             }
         })
@@ -892,7 +1010,7 @@ async fn serial_session(
                                     );
                                     connections.hello(&reader_path);
                                 }
-                                if in_tx.send(frame).is_err() {
+                                if in_tx.blocking_send(frame).is_err() {
                                     return;
                                 }
                             }
@@ -1051,6 +1169,81 @@ mod tests {
     use std::io::{Read, Seek, SeekFrom};
     #[cfg(unix)]
     use std::os::fd::FromRawFd;
+
+    #[tokio::test]
+    async fn reliable_outbound_distinguishes_timeout_from_closed() {
+        let (sender, receiver) = DeviceSender::channel_with_capacity(1);
+        sender.send_reliable(Frame::Probe {}).await.unwrap();
+        let error = sender
+            .send_outbound_reliable_with_timeout(
+                OutboundFrame {
+                    frame: Frame::Heartbeat {},
+                    forced_wire: None,
+                },
+                Duration::from_millis(10),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error, OutboundDeliveryError::TimedOut);
+
+        drop(receiver);
+        assert_eq!(
+            sender.send_reliable(Frame::Probe {}).await,
+            Err(OutboundDeliveryError::Closed)
+        );
+    }
+
+    #[tokio::test]
+    async fn lossy_transport_status_coalesces_behind_reliable_fifo() {
+        let (sender, mut receiver) = DeviceSender::channel_with_capacity(1);
+        sender.send_reliable(Frame::Probe {}).await.unwrap();
+        assert_eq!(
+            sender.send_lossy(Frame::ClockProbeRequest {
+                sequence: 1,
+                host_send_nanoseconds: 10,
+            }),
+            Err(OutboundDeliveryError::Full)
+        );
+        assert_eq!(
+            sender.send_lossy(Frame::ClockProbeRequest {
+                sequence: 2,
+                host_send_nanoseconds: 20,
+            }),
+            Err(OutboundDeliveryError::Full)
+        );
+
+        assert!(matches!(
+            receiver.recv().await,
+            Some(OutboundFrame {
+                frame: Frame::Probe {},
+                ..
+            })
+        ));
+        assert!(matches!(
+            receiver.recv().await,
+            Some(OutboundFrame {
+                frame: Frame::ClockProbeRequest { sequence: 2, .. },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn production_ingress_is_bounded_and_closure_is_observable() {
+        let (sender, receiver) = device_ingress_channel();
+        for _ in 0..DEVICE_INGRESS_BUFFER {
+            sender.try_send(Frame::Heartbeat {}).unwrap();
+        }
+        assert!(matches!(
+            sender.try_send(Frame::Heartbeat {}),
+            Err(mpsc::error::TrySendError::Full(_))
+        ));
+        drop(receiver);
+        assert!(matches!(
+            sender.try_send(Frame::Heartbeat {}),
+            Err(mpsc::error::TrySendError::Closed(_))
+        ));
+    }
 
     #[test]
     fn forced_path_reconciliation_keeps_retrying_across_unplug_and_replug() {
