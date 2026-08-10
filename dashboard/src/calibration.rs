@@ -21,6 +21,7 @@ const OPERATIONAL_SCHEDULE_UPLOAD_ENTRIES: usize = 8;
 const UPLOAD_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_CHUNK_ACK_RETRIES: u8 = 3;
 const SCHEDULE_ACCEPTANCE_TIMEOUT: Duration = Duration::from_secs(2);
+const TERMINAL_DECISION_TIMEOUT: Duration = Duration::from_secs(5);
 const RUN_ACTION_CAPACITY: usize = 8;
 
 pub struct CalibrationModeAdapter {
@@ -264,11 +265,55 @@ enum CandidateState {
     Present(protocol::CalibrationCandidateValidity),
 }
 
+/// Save and Discard are durable device operations, not fire-and-forget UI
+/// events.  Keep the actor alive until the exact device acknowledgement
+/// arrives, while making a duplicate/racing terminal action unrepresentable.
+enum TerminalDecision {
+    Open,
+    AwaitingSave { deadline: tokio::time::Instant },
+    AwaitingDiscard { deadline: tokio::time::Instant },
+}
+
+impl TerminalDecision {
+    fn deadline(&self) -> Option<tokio::time::Instant> {
+        match self {
+            Self::Open => None,
+            Self::AwaitingSave { deadline } | Self::AwaitingDiscard { deadline } => Some(*deadline),
+        }
+    }
+
+    fn acknowledges(
+        &self,
+        frame: &Frame,
+        run: CalibrationRunKey,
+        schedule_revision: CalibrationScheduleRevision,
+    ) -> bool {
+        match (self, frame) {
+            (Self::AwaitingSave { .. }, Frame::CalibrationResidentActivated { activation }) => {
+                activation.run == run && activation.schedule_revision == schedule_revision
+            }
+            (Self::AwaitingDiscard { .. }, Frame::CalibrationCandidateStatus { candidate }) => {
+                candidate.run == run
+                    && candidate.schedule_revision == schedule_revision
+                    && matches!(
+                        candidate.presence,
+                        protocol::CalibrationCandidatePresence::Absent
+                    )
+            }
+            _ => false,
+        }
+    }
+}
+
 fn run_action_is_authorized(
     action: &RunAction,
     evidence: EvidenceState,
     candidate: CandidateState,
+    terminal: &TerminalDecision,
 ) -> bool {
+    if !matches!(terminal, TerminalDecision::Open) {
+        return false;
+    }
     match action {
         RunAction::Continue | RunAction::SelectNextTrack(_) => {
             matches!(evidence, EvidenceState::Retained)
@@ -463,6 +508,7 @@ impl CalibrationModeAdapter {
         let mut song_counts = Vec::new();
         let mut evidence = EvidenceState::Fresh;
         let mut candidate = CandidateState::Absent;
+        let mut terminal = TerminalDecision::Open;
         // Opening an output sink may allocate or negotiate with the host. Do it
         // after the device acceptance, then start the already-opened playback
         // from its own deadline instead of from the 500 ms heartbeat cadence.
@@ -489,6 +535,9 @@ impl CalibrationModeAdapter {
                 commit_phase.acceptance_deadline().unwrap_or_else(|| {
                     tokio::time::Instant::now() + std::time::Duration::from_secs(365 * 24 * 60 * 60)
                 });
+            let terminal_deadline = terminal.deadline().unwrap_or_else(|| {
+                tokio::time::Instant::now() + std::time::Duration::from_secs(365 * 24 * 60 * 60)
+            });
             tokio::select! {
                 biased;
                 changed = gate.changed() => match changed {
@@ -574,9 +623,7 @@ impl CalibrationModeAdapter {
                             "the device link restarted during calibration; restart explicitly before any retained evidence can be continued".into(),
                         );
                     }
-                    Ok(Frame::CalibrationResidentActivated { activation })
-                        if activation.run == run
-                            && activation.schedule_revision == schedule_revision => {
+                    Ok(frame) if terminal.acknowledges(&frame, run, schedule_revision) => {
                         break SessionExit::Completed;
                     }
                     Ok(Frame::CalibrationScheduleAccepted { accepted })
@@ -825,6 +872,17 @@ impl CalibrationModeAdapter {
                         "calibration schedule acceptance timed out after Commit; restart before playback".into(),
                     );
                 }
+                _ = tokio::time::sleep_until(terminal_deadline),
+                    if !matches!(terminal, TerminalDecision::Open) => {
+                    let operation = match terminal {
+                        TerminalDecision::AwaitingSave { .. } => "Save",
+                        TerminalDecision::AwaitingDiscard { .. } => "Discard",
+                        TerminalDecision::Open => unreachable!(),
+                    };
+                    break SessionExit::DependencyFailed(format!(
+                        "calibration {operation} acknowledgement timed out; reconnect before making another durable decision"
+                    ));
+                }
                 command = actions.recv() => {
                     let Some(command) = command else {
                         break SessionExit::TaskFailed("calibration actor action channel closed".into());
@@ -833,10 +891,10 @@ impl CalibrationModeAdapter {
                     // Re-check the actor-owned boundary so a racing or forged
                     // Continue cannot replace an upload that is still being
                     // prepared, acknowledged, or played.
-                    if !run_action_is_authorized(&command, evidence, candidate) {
+                    if !run_action_is_authorized(&command, evidence, candidate, &terminal) {
                         continue;
                     }
-                    let terminal_discard = matches!(&command, RunAction::Discard);
+                    let save_requested = matches!(&command, RunAction::Save);
                     let frame = match command {
                         RunAction::Continue => {
                             let Some(next_revision) = next_schedule_revision(schedule_revision) else {
@@ -898,9 +956,15 @@ impl CalibrationModeAdapter {
                     if let Err(error) = self.registry.send_bound_control(&device, frame) {
                         break delivery_failure(error);
                     }
-                    if terminal_discard {
-                        break SessionExit::Completed;
-                    }
+                    terminal = if save_requested {
+                        TerminalDecision::AwaitingSave {
+                            deadline: tokio::time::Instant::now() + TERMINAL_DECISION_TIMEOUT,
+                        }
+                    } else {
+                        TerminalDecision::AwaitingDiscard {
+                            deadline: tokio::time::Instant::now() + TERMINAL_DECISION_TIMEOUT,
+                        }
+                    };
                 }
                 _ = &mut playback_alarm,
                     if matches!(gate_state, RunGate::Running)
@@ -1491,8 +1555,14 @@ mod tests {
             &RunAction::Continue,
             evidence,
             absent,
+            &TerminalDecision::Open,
         ));
-        assert!(!run_action_is_authorized(&RunAction::Save, evidence, valid));
+        assert!(!run_action_is_authorized(
+            &RunAction::Save,
+            evidence,
+            valid,
+            &TerminalDecision::Open,
+        ));
 
         enter_between_songs(&mut evidence, &mut heartbeat, &mut playback);
 
@@ -1503,8 +1573,22 @@ mod tests {
             &RunAction::Continue,
             evidence,
             absent,
+            &TerminalDecision::Open,
         ));
-        assert!(run_action_is_authorized(&RunAction::Save, evidence, valid));
+        assert!(run_action_is_authorized(
+            &RunAction::Save,
+            evidence,
+            valid,
+            &TerminalDecision::Open,
+        ));
+        assert!(!run_action_is_authorized(
+            &RunAction::Discard,
+            evidence,
+            valid,
+            &TerminalDecision::AwaitingSave {
+                deadline: tokio::time::Instant::now(),
+            },
+        ));
     }
 
     #[test]
@@ -1522,6 +1606,53 @@ mod tests {
         assert_eq!(
             enqueue_run_action(&actions, RunAction::Discard),
             Err(CoordinatorError::AdapterTaskUnavailable)
+        );
+    }
+
+    #[test]
+    fn durable_terminal_decisions_require_their_exact_device_acknowledgement() {
+        let run = CalibrationRunKey {
+            session_id: CalibrationSessionId::new(8).unwrap(),
+            run_id: CalibrationRunId::new(3).unwrap(),
+        };
+        let revision = CalibrationScheduleRevision::new(2).unwrap();
+        let deadline = tokio::time::Instant::now() + TERMINAL_DECISION_TIMEOUT;
+        let discarded = Frame::CalibrationCandidateStatus {
+            candidate: protocol::CalibrationCandidateStatus {
+                run,
+                schedule_revision: revision,
+                presence: protocol::CalibrationCandidatePresence::Absent,
+            },
+        };
+        let activated = Frame::CalibrationResidentActivated {
+            activation: protocol::CalibrationResidentActivation {
+                run,
+                schedule_revision: revision,
+                validity: protocol::CalibrationCandidateValidity {
+                    model_numerically_valid: true,
+                    record_crc_valid: true,
+                },
+                resident_sequence: 4,
+            },
+        };
+
+        assert!(
+            TerminalDecision::AwaitingDiscard { deadline }.acknowledges(&discarded, run, revision)
+        );
+        assert!(
+            !TerminalDecision::AwaitingDiscard { deadline }.acknowledges(&activated, run, revision)
+        );
+        assert!(TerminalDecision::AwaitingSave { deadline }.acknowledges(&activated, run, revision));
+        assert!(
+            !TerminalDecision::AwaitingSave { deadline }.acknowledges(&discarded, run, revision)
+        );
+        let next_revision = CalibrationScheduleRevision::new(3).unwrap();
+        assert!(
+            !TerminalDecision::AwaitingDiscard { deadline }.acknowledges(
+                &discarded,
+                run,
+                next_revision
+            )
         );
     }
 

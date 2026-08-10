@@ -644,6 +644,31 @@ enum PreparationBeginDisposition {
 }
 
 impl AnchoredPreparation {
+    fn identity(&self) -> Option<(CalibrationRunKey, CalibrationScheduleRevision)> {
+        match self {
+            Self::Settling {
+                run,
+                schedule_revision,
+                ..
+            }
+            | Self::EstimatingGains {
+                run,
+                schedule_revision,
+                ..
+            }
+            | Self::ReadyForSchedule {
+                run,
+                schedule_revision,
+            }
+            | Self::Failed {
+                run,
+                schedule_revision,
+                ..
+            } => Some((*run, *schedule_revision)),
+            Self::Idle => None,
+        }
+    }
+
     fn begin_disposition(&self, requested: CalibrationRunKey) -> PreparationBeginDisposition {
         match self {
             Self::Settling { run, .. }
@@ -2244,6 +2269,17 @@ impl Calibration {
     }
 
     fn discard_anchored_candidate(&mut self, run: protocol::CalibrationRunKey) {
+        let decision_identity = self
+            .anchored
+            .song()
+            .and_then(|song| song.identity())
+            .map(|identity| (identity.run, identity.revision))
+            .filter(|(active_run, _)| *active_run == run)
+            .or_else(|| {
+                self.anchored_preparation
+                    .identity()
+                    .filter(|(active_run, _)| *active_run == run)
+            });
         let schedule_matches_run = self
             .anchored
             .song()
@@ -2260,6 +2296,15 @@ impl Calibration {
         // diagnostic/operator Discard cannot touch the resident slot.
         if !schedule_matches_run {
             self.queue_resident_gain_restore();
+            if let Some((run, schedule_revision)) = decision_identity {
+                self.outbound.push(Frame::CalibrationCandidateStatus {
+                    candidate: CalibrationCandidateStatus {
+                        run,
+                        schedule_revision,
+                        presence: CalibrationCandidatePresence::Absent,
+                    },
+                });
+            }
             self.reset_anchored_lifecycle();
             return;
         }
@@ -2297,6 +2342,15 @@ impl Calibration {
                     return;
                 }
             }
+        }
+        if let Some((run, schedule_revision)) = decision_identity {
+            self.outbound.push(Frame::CalibrationCandidateStatus {
+                candidate: CalibrationCandidateStatus {
+                    run,
+                    schedule_revision,
+                    presence: CalibrationCandidatePresence::Absent,
+                },
+            });
         }
         self.reset_anchored_lifecycle();
     }
@@ -3409,11 +3463,13 @@ mod anchored_lifecycle_tests {
         for phase in phases {
             assert!(anchored_preparation_matches_run(&phase, run));
             assert!(!anchored_preparation_matches_run(&phase, other));
+            assert_eq!(phase.identity(), Some((run, revision)));
         }
         assert!(!anchored_preparation_matches_run(
             &AnchoredPreparation::Idle,
             run
         ));
+        assert_eq!(AnchoredPreparation::Idle.identity(), None);
     }
 
     #[test]
