@@ -24,23 +24,6 @@ struct ProbeSample {
     round_trip_milliseconds: u64,
 }
 
-/// Lifecycle of the device-owned RGB reference loop.  A requested transition
-/// is distinct from its device acknowledgement, so no frontend click can
-/// paint a Running/Stopped mode optimistically.
-#[derive(Debug, Clone)]
-enum TimingLoopPhase {
-    Stopped,
-    Starting,
-    Running(CalibrationTimingObservation),
-    Stopping {
-        last_observation: CalibrationTimingObservation,
-    },
-    Error {
-        detail: String,
-        last_observation: Option<CalibrationTimingObservation>,
-    },
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimingTransitionError {
     StartRequiresStopped,
@@ -70,7 +53,10 @@ struct TimingOffsets {
     clock_epoch_offset_milliseconds: Option<i64>,
     last_device_microseconds: Option<u64>,
     manual_trim_milliseconds: i64,
-    loop_phase: TimingLoopPhase,
+    /// Requested transitions and device acknowledgements share the protocol's
+    /// tagged phase directly, so the internal lifecycle cannot drift from the
+    /// browser projection.
+    loop_phase: CalibrationTimingPhase,
 }
 
 impl Default for TimingOffsets {
@@ -81,7 +67,7 @@ impl Default for TimingOffsets {
             clock_epoch_offset_milliseconds: None,
             last_device_microseconds: None,
             manual_trim_milliseconds: 0,
-            loop_phase: TimingLoopPhase::Stopped,
+            loop_phase: CalibrationTimingPhase::Stopped,
         }
     }
 }
@@ -200,9 +186,9 @@ impl TimingService {
         self.with_device(device_id, |timing| {
             timing.loop_phase = match status {
                 CalibrationTimingLoopStatus::Running { observation } => {
-                    TimingLoopPhase::Running(observation)
+                    CalibrationTimingPhase::Running { observation }
                 }
-                CalibrationTimingLoopStatus::Stopped { .. } => TimingLoopPhase::Stopped,
+                CalibrationTimingLoopStatus::Stopped { .. } => CalibrationTimingPhase::Stopped,
             };
             Frame::CalibrationTimingStatus {
                 status: timing.status(),
@@ -214,7 +200,7 @@ impl TimingService {
     /// the volatile per-device probe evidence and manual trim.
     pub fn reset_loop(&self, device_id: &str) -> Frame {
         self.with_device(device_id, |timing| {
-            timing.loop_phase = TimingLoopPhase::Stopped;
+            timing.loop_phase = CalibrationTimingPhase::Stopped;
             Frame::CalibrationTimingStatus {
                 status: timing.status(),
             }
@@ -261,7 +247,7 @@ impl TimingService {
             CalibrationTimingIntent::Start => self.with_device(device_id, |timing| {
                 if !matches!(
                     timing.loop_phase,
-                    TimingLoopPhase::Stopped | TimingLoopPhase::Error { .. }
+                    CalibrationTimingPhase::Stopped | CalibrationTimingPhase::Error { .. }
                 ) {
                     return Err(TimingTransitionError::StartRequiresStopped);
                 }
@@ -273,7 +259,7 @@ impl TimingService {
                 ))
             }),
             CalibrationTimingIntent::Stop => self.with_device(device_id, |timing| {
-                if !matches!(timing.loop_phase, TimingLoopPhase::Running(_)) {
+                if !matches!(timing.loop_phase, CalibrationTimingPhase::Running { .. }) {
                     return Err(TimingTransitionError::StopRequiresRunning);
                 }
                 Ok((
@@ -295,12 +281,14 @@ impl TimingService {
     pub fn control_delivered(&self, device_id: &str, intent: CalibrationTimingIntent) -> Frame {
         self.with_device(device_id, |timing| {
             timing.loop_phase = match intent {
-                CalibrationTimingIntent::Start => TimingLoopPhase::Starting,
+                CalibrationTimingIntent::Start => CalibrationTimingPhase::Starting,
                 CalibrationTimingIntent::Stop => match &timing.loop_phase {
-                    TimingLoopPhase::Running(status) => TimingLoopPhase::Stopping {
-                        last_observation: *status,
-                    },
-                    _ => TimingLoopPhase::Error {
+                    CalibrationTimingPhase::Running { observation } => {
+                        CalibrationTimingPhase::Stopping {
+                            last_observation: *observation,
+                        }
+                    }
+                    _ => CalibrationTimingPhase::Error {
                         detail: "timing Stop delivery did not originate from Running".into(),
                         last_observation: None,
                     },
@@ -321,7 +309,7 @@ impl TimingService {
     pub fn control_failed(&self, device_id: &str, detail: String) -> Frame {
         self.with_device(device_id, |timing| {
             let last_observation = timing.last_observation();
-            timing.loop_phase = TimingLoopPhase::Error {
+            timing.loop_phase = CalibrationTimingPhase::Error {
                 detail,
                 last_observation,
             };
@@ -357,23 +345,6 @@ impl TimingOffsets {
             let spread = rtts.last().unwrap() - rtts.first().unwrap();
             (Some(median), Some(rtt), Some(spread))
         };
-        let phase = match &self.loop_phase {
-            TimingLoopPhase::Stopped => CalibrationTimingPhase::Stopped,
-            TimingLoopPhase::Starting => CalibrationTimingPhase::Starting,
-            TimingLoopPhase::Running(observation) => CalibrationTimingPhase::Running {
-                observation: *observation,
-            },
-            TimingLoopPhase::Stopping { last_observation } => CalibrationTimingPhase::Stopping {
-                last_observation: *last_observation,
-            },
-            TimingLoopPhase::Error {
-                detail,
-                last_observation,
-            } => CalibrationTimingPhase::Error {
-                detail: detail.clone(),
-                last_observation: *last_observation,
-            },
-        };
         let estimate = match (automatic_offset, median_rtt, spread) {
             (Some(automatic), Some(rtt), Some(spread)) => CalibrationTimingEstimate::Measured {
                 automatic_offset_milliseconds: OffsetMilliseconds::new(automatic),
@@ -388,7 +359,7 @@ impl TimingOffsets {
             _ => unreachable!("timing estimate statistics are computed atomically"),
         };
         CalibrationTimingStatus {
-            phase,
+            phase: self.loop_phase.clone(),
             estimate,
             manual_trim_milliseconds: OffsetMilliseconds::new(self.manual_trim_milliseconds),
         }
@@ -396,12 +367,12 @@ impl TimingOffsets {
 
     fn last_observation(&self) -> Option<CalibrationTimingObservation> {
         match &self.loop_phase {
-            TimingLoopPhase::Running(status) => Some(*status),
-            TimingLoopPhase::Stopping { last_observation } => Some(*last_observation),
-            TimingLoopPhase::Error {
+            CalibrationTimingPhase::Running { observation } => Some(*observation),
+            CalibrationTimingPhase::Stopping { last_observation } => Some(*last_observation),
+            CalibrationTimingPhase::Error {
                 last_observation, ..
             } => *last_observation,
-            TimingLoopPhase::Stopped | TimingLoopPhase::Starting => None,
+            CalibrationTimingPhase::Stopped | CalibrationTimingPhase::Starting => None,
         }
     }
 }
