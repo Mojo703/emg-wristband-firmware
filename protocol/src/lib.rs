@@ -24,7 +24,7 @@
 
 extern crate alloc;
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
@@ -2325,6 +2325,107 @@ impl MediaKey {
 /// ASCII, so console text can never begin a frame.
 pub const FRAME_MAGIC: [u8; 2] = [0xA5, 0x5A];
 
+/// Integrity-protected framing uses a distinct sync word so a new reader can
+/// coexist with deployed legacy firmware without mistaking one header for the
+/// other. The final two bytes are the first pair reversed, making truncated
+/// prefixes unlikely to alias console output or the legacy marker.
+pub const V2_FRAME_MAGIC: [u8; 4] = [0xA5, 0x5B, 0x5B, 0xA5];
+pub const V2_WIRE_VERSION: u8 = 2;
+pub const V2_FRAME_HEADER_LEN: usize = 4 + 1 + 1 + 4 + 4 + 4 + 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WireVersion {
+    Legacy,
+    V2,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireEnvelope {
+    pub version: WireVersion,
+    pub flags: u8,
+    pub sequence: Option<u32>,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameScanEvent {
+    Oversize {
+        version: WireVersion,
+        declared: usize,
+        maximum: usize,
+    },
+    UnsupportedVersion {
+        received: u8,
+    },
+    ChecksumMismatch {
+        sequence: u32,
+        expected: u32,
+        received: u32,
+    },
+    HeaderChecksumMismatch {
+        sequence: u32,
+        expected: u32,
+        received: u32,
+    },
+    SequenceDiscontinuity {
+        expected: u32,
+        received: u32,
+    },
+    DuplicateSequence {
+        sequence: u32,
+    },
+    InputOverflow {
+        discarded: usize,
+    },
+}
+
+/// Incremental reflected CRC-32 (IEEE-802.3/zlib/PNG). The 16-word nibble
+/// table keeps this usable in `no_std` firmware without a platform-specific
+/// dependency or a 1 KiB lookup table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WireCrc32(u32);
+
+impl Default for WireCrc32 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WireCrc32 {
+    pub const fn new() -> Self {
+        Self(0xFFFF_FFFF)
+    }
+
+    pub fn update(&mut self, bytes: &[u8]) {
+        const NIBBLE: [u32; 16] = [
+            0x0000_0000,
+            0x1DB7_1064,
+            0x3B6E_20C8,
+            0x26D9_30AC,
+            0x76DC_4190,
+            0x6B6B_51F4,
+            0x4DB2_6158,
+            0x5005_713C,
+            0xEDB8_8320,
+            0xF00F_9344,
+            0xD6D6_A3E8,
+            0xCB61_B38C,
+            0x9B64_C2B0,
+            0x86D3_D2D4,
+            0xA00A_E278,
+            0xBDBD_F21C,
+        ];
+        for &byte in bytes {
+            self.0 = NIBBLE[((self.0 ^ u32::from(byte)) & 0x0F) as usize] ^ (self.0 >> 4);
+            self.0 = NIBBLE[((self.0 ^ (u32::from(byte) >> 4)) & 0x0F) as usize] ^ (self.0 >> 4);
+        }
+    }
+
+    pub const fn finish(self) -> u32 {
+        !self.0
+    }
+}
+
 /// Upper bound a reader accepts for one frame's length; anything larger is treated as
 /// garbage from a failed resync and scanning continues. Generously above the largest
 /// real frame (an EMG window is ~16 KB raw).
@@ -2337,6 +2438,8 @@ pub const FRAME_MAX_LEN: usize = 1 << 20;
 pub struct FrameScanner {
     buffer: Vec<u8>,
     max_len: usize,
+    events: VecDeque<FrameScanEvent>,
+    last_v2_sequence: Option<u32>,
 }
 
 impl Default for FrameScanner {
@@ -2355,11 +2458,27 @@ impl FrameScanner {
         Self {
             buffer: Vec::new(),
             max_len: max_len.min(FRAME_MAX_LEN),
+            events: VecDeque::new(),
+            last_v2_sequence: None,
         }
     }
 
     pub fn extend(&mut self, bytes: &[u8]) {
         self.buffer.extend_from_slice(bytes);
+        // Readers normally drain after each bounded transport read. Keep a
+        // hard ceiling anyway: a caller that does not drain cannot turn noise
+        // into unbounded retained memory. Two maximum frames allow a complete
+        // candidate followed by the recovery frame that proves resync.
+        let maximum_retained = self
+            .max_len
+            .saturating_mul(2)
+            .saturating_add(V2_FRAME_HEADER_LEN.saturating_mul(2));
+        if self.buffer.len() > maximum_retained {
+            let discarded = self.buffer.len() - maximum_retained;
+            self.buffer.drain(..discarded);
+            self.events
+                .push_back(FrameScanEvent::InputOverflow { discarded });
+        }
     }
 
     /// Number of raw bytes retained while waiting for the next complete frame.
@@ -2373,55 +2492,209 @@ impl FrameScanner {
     /// six-byte header has arrived. This is diagnostic-only: [`next_frame`]
     /// remains the sole operation that consumes/resynchronizes the buffer.
     pub fn pending_payload_len(&self) -> Option<usize> {
-        let start = self
-            .buffer
-            .windows(2)
-            .position(|pair| pair == FRAME_MAGIC)?;
-        let header_end = start.checked_add(6)?;
-        let header = self.buffer.get(start..header_end)?;
-        Some(u32::from_le_bytes([header[2], header[3], header[4], header[5]]) as usize)
+        let (start, candidate) = first_wire_candidate(&self.buffer)?;
+        match candidate {
+            WireCandidate::Legacy => {
+                let header = self.buffer.get(start..start + 6)?;
+                Some(u32::from_le_bytes([header[2], header[3], header[4], header[5]]) as usize)
+            }
+            WireCandidate::V2 => {
+                let header = self.buffer.get(start..start + V2_FRAME_HEADER_LEN)?;
+                Some(u32::from_le_bytes([header[10], header[11], header[12], header[13]]) as usize)
+            }
+        }
+    }
+
+    pub fn next_event(&mut self) -> Option<FrameScanEvent> {
+        self.events.pop_front()
+    }
+
+    pub fn next_envelope(&mut self) -> Option<WireEnvelope> {
+        loop {
+            let Some((start, candidate)) = first_wire_candidate(&self.buffer) else {
+                retain_possible_sync_suffix(&mut self.buffer);
+                return None;
+            };
+            self.buffer.drain(..start);
+
+            match candidate {
+                WireCandidate::Legacy => {
+                    const HEADER: usize = 2 + 4;
+                    if self.buffer.len() < HEADER {
+                        return None;
+                    }
+                    let length = u32::from_le_bytes([
+                        self.buffer[2],
+                        self.buffer[3],
+                        self.buffer[4],
+                        self.buffer[5],
+                    ]) as usize;
+                    if length > self.max_len {
+                        self.events.push_back(FrameScanEvent::Oversize {
+                            version: WireVersion::Legacy,
+                            declared: length,
+                            maximum: self.max_len,
+                        });
+                        self.buffer.drain(..FRAME_MAGIC.len());
+                        continue;
+                    }
+                    if self.buffer.len() < HEADER + length {
+                        return None;
+                    }
+                    let payload = self.buffer[HEADER..HEADER + length].to_vec();
+                    self.buffer.drain(..HEADER + length);
+                    return Some(WireEnvelope {
+                        version: WireVersion::Legacy,
+                        flags: 0,
+                        sequence: None,
+                        payload,
+                    });
+                }
+                WireCandidate::V2 => {
+                    if self.buffer.len() < V2_FRAME_HEADER_LEN {
+                        return None;
+                    }
+                    let version = self.buffer[4];
+                    if version != V2_WIRE_VERSION {
+                        self.events
+                            .push_back(FrameScanEvent::UnsupportedVersion { received: version });
+                        self.buffer.drain(..1);
+                        continue;
+                    }
+                    let flags = self.buffer[5];
+                    let sequence = u32::from_le_bytes([
+                        self.buffer[6],
+                        self.buffer[7],
+                        self.buffer[8],
+                        self.buffer[9],
+                    ]);
+                    let length = u32::from_le_bytes([
+                        self.buffer[10],
+                        self.buffer[11],
+                        self.buffer[12],
+                        self.buffer[13],
+                    ]) as usize;
+                    if length > self.max_len {
+                        self.events.push_back(FrameScanEvent::Oversize {
+                            version: WireVersion::V2,
+                            declared: length,
+                            maximum: self.max_len,
+                        });
+                        self.buffer.drain(..1);
+                        continue;
+                    }
+                    let received_header_checksum = u32::from_le_bytes([
+                        self.buffer[14],
+                        self.buffer[15],
+                        self.buffer[16],
+                        self.buffer[17],
+                    ]);
+                    let expected_header_checksum =
+                        v2_header_checksum(flags, sequence, length as u32);
+                    if received_header_checksum != expected_header_checksum {
+                        self.events
+                            .push_back(FrameScanEvent::HeaderChecksumMismatch {
+                                sequence,
+                                expected: expected_header_checksum,
+                                received: received_header_checksum,
+                            });
+                        self.buffer.drain(..1);
+                        continue;
+                    }
+                    let frame_len = V2_FRAME_HEADER_LEN.checked_add(length)?;
+                    if self.buffer.len() < frame_len {
+                        return None;
+                    }
+                    let received = u32::from_le_bytes([
+                        self.buffer[18],
+                        self.buffer[19],
+                        self.buffer[20],
+                        self.buffer[21],
+                    ]);
+                    let payload = &self.buffer[V2_FRAME_HEADER_LEN..frame_len];
+                    let expected = v2_frame_checksum(flags, sequence, payload);
+                    if received != expected {
+                        self.events.push_back(FrameScanEvent::ChecksumMismatch {
+                            sequence,
+                            expected,
+                            received,
+                        });
+                        // Do not consume the declared candidate: missing bytes
+                        // may have made a later valid frame look like its tail.
+                        // Advancing one byte lets the sync scan recover that
+                        // embedded frame instead.
+                        self.buffer.drain(..1);
+                        continue;
+                    }
+                    let payload = payload.to_vec();
+                    self.buffer.drain(..frame_len);
+                    self.observe_v2_sequence(sequence);
+                    return Some(WireEnvelope {
+                        version: WireVersion::V2,
+                        flags,
+                        sequence: Some(sequence),
+                        payload,
+                    });
+                }
+            }
+        }
     }
 
     /// The next complete frame's CBOR payload, if the buffer holds one.
     pub fn next_frame(&mut self) -> Option<Vec<u8>> {
-        loop {
-            // Drop everything before the first magic byte pair (or keep a trailing
-            // lone first-magic-byte, which may be the start of a pair still arriving).
-            let start = self
-                .buffer
-                .windows(2)
-                .position(|pair| pair == FRAME_MAGIC)
-                .unwrap_or_else(|| {
-                    if self.buffer.last() == Some(&FRAME_MAGIC[0]) {
-                        self.buffer.len() - 1
-                    } else {
-                        self.buffer.len()
-                    }
-                });
-            self.buffer.drain(0..start);
+        self.next_envelope().map(|envelope| envelope.payload)
+    }
 
-            const HEADER: usize = 2 + 4; // magic + little-endian u32 length
-            if self.buffer.len() < HEADER {
-                return None;
+    fn observe_v2_sequence(&mut self, sequence: u32) {
+        if let Some(previous) = self.last_v2_sequence {
+            let expected = previous.wrapping_add(1);
+            if sequence == previous {
+                self.events
+                    .push_back(FrameScanEvent::DuplicateSequence { sequence });
+            } else if sequence != expected {
+                self.events
+                    .push_back(FrameScanEvent::SequenceDiscontinuity {
+                        expected,
+                        received: sequence,
+                    });
             }
-            let length = u32::from_le_bytes([
-                self.buffer[2],
-                self.buffer[3],
-                self.buffer[4],
-                self.buffer[5],
-            ]) as usize;
-            if length > self.max_len {
-                // Not a real header — a magic pair inside garbage. Skip it, rescan.
-                self.buffer.drain(0..2);
-                continue;
-            }
-            if self.buffer.len() < HEADER + length {
-                return None;
-            }
-            let payload = self.buffer[HEADER..HEADER + length].to_vec();
-            self.buffer.drain(0..HEADER + length);
-            return Some(payload);
         }
+        self.last_v2_sequence = Some(sequence);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WireCandidate {
+    Legacy,
+    V2,
+}
+
+fn first_wire_candidate(buffer: &[u8]) -> Option<(usize, WireCandidate)> {
+    let legacy = buffer
+        .windows(FRAME_MAGIC.len())
+        .position(|window| window == FRAME_MAGIC)
+        .map(|start| (start, WireCandidate::Legacy));
+    let v2 = buffer
+        .windows(V2_FRAME_MAGIC.len())
+        .position(|window| window == V2_FRAME_MAGIC)
+        .map(|start| (start, WireCandidate::V2));
+    match (legacy, v2) {
+        (Some(legacy), Some(v2)) => Some(if legacy.0 <= v2.0 { legacy } else { v2 }),
+        (Some(candidate), None) | (None, Some(candidate)) => Some(candidate),
+        (None, None) => None,
+    }
+}
+
+fn retain_possible_sync_suffix(buffer: &mut Vec<u8>) {
+    let keep = (1..=buffer.len().min(V2_FRAME_MAGIC.len() - 1))
+        .rev()
+        .find(|&length| {
+            let suffix = &buffer[buffer.len() - length..];
+            FRAME_MAGIC.starts_with(suffix) || V2_FRAME_MAGIC.starts_with(suffix)
+        })
+        .unwrap_or(0);
+    if buffer.len() > keep {
+        buffer.drain(..buffer.len() - keep);
     }
 }
 
@@ -2431,6 +2704,55 @@ pub fn frame_bytes(payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(2 + 4 + payload.len());
     out.extend_from_slice(&FRAME_MAGIC);
     out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
+pub fn v2_frame_checksum(flags: u8, sequence: u32, payload: &[u8]) -> u32 {
+    let length = u32::try_from(payload.len()).unwrap_or(u32::MAX);
+    let mut crc = WireCrc32::new();
+    crc.update(&[V2_WIRE_VERSION, flags]);
+    crc.update(&sequence.to_le_bytes());
+    crc.update(&length.to_le_bytes());
+    crc.update(payload);
+    crc.finish()
+}
+
+pub fn v2_header_checksum(flags: u8, sequence: u32, payload_len: u32) -> u32 {
+    let mut crc = WireCrc32::new();
+    crc.update(&[V2_WIRE_VERSION, flags]);
+    crc.update(&sequence.to_le_bytes());
+    crc.update(&payload_len.to_le_bytes());
+    crc.finish()
+}
+
+pub fn v2_frame_header(
+    flags: u8,
+    sequence: u32,
+    payload_len: u32,
+    checksum: u32,
+) -> [u8; V2_FRAME_HEADER_LEN] {
+    let mut header = [0; V2_FRAME_HEADER_LEN];
+    header[..4].copy_from_slice(&V2_FRAME_MAGIC);
+    header[4] = V2_WIRE_VERSION;
+    header[5] = flags;
+    header[6..10].copy_from_slice(&sequence.to_le_bytes());
+    header[10..14].copy_from_slice(&payload_len.to_le_bytes());
+    header[14..18].copy_from_slice(&v2_header_checksum(flags, sequence, payload_len).to_le_bytes());
+    header[18..22].copy_from_slice(&checksum.to_le_bytes());
+    header
+}
+
+pub fn v2_frame_bytes(flags: u8, sequence: u32, payload: &[u8]) -> Vec<u8> {
+    let payload_len = u32::try_from(payload.len()).expect("wire payload length fits u32");
+    let header = v2_frame_header(
+        flags,
+        sequence,
+        payload_len,
+        v2_frame_checksum(flags, sequence, payload),
+    );
+    let mut out = Vec::with_capacity(V2_FRAME_HEADER_LEN + payload.len());
+    out.extend_from_slice(&header);
     out.extend_from_slice(payload);
     out
 }
@@ -2829,6 +3151,174 @@ mod tests {
         scanner.extend(&frame_bytes(b"12345"));
         scanner.extend(&frame_bytes(b"ok"));
         assert_eq!(scanner.next_frame(), Some(b"ok".to_vec()));
+    }
+
+    #[test]
+    fn v2_crc_and_golden_envelope_match_standard_bytes() {
+        let mut crc = WireCrc32::new();
+        crc.update(b"1234");
+        crc.update(b"56789");
+        assert_eq!(crc.finish(), 0xCBF4_3926);
+
+        assert_eq!(
+            v2_frame_bytes(3, 0x0102_0304, b"hello"),
+            alloc::vec![
+                0xA5, 0x5B, 0x5B, 0xA5, 0x02, 0x03, 0x04, 0x03, 0x02, 0x01, 0x05, 0x00, 0x00, 0x00,
+                0x60, 0xE8, 0x26, 0x2C, 0xE0, 0xE9, 0x18, 0xB9, b'h', b'e', b'l', b'l', b'o',
+            ]
+        );
+    }
+
+    #[test]
+    fn v2_envelope_survives_every_possible_input_split() {
+        let encoded = v2_frame_bytes(7, 42, b"split everywhere");
+        for split in 0..=encoded.len() {
+            let mut scanner = FrameScanner::new();
+            scanner.extend(&encoded[..split]);
+            if split < encoded.len() {
+                assert_eq!(scanner.next_envelope(), None, "split {split}");
+            }
+            scanner.extend(&encoded[split..]);
+            assert_eq!(
+                scanner.next_envelope(),
+                Some(WireEnvelope {
+                    version: WireVersion::V2,
+                    flags: 7,
+                    sequence: Some(42),
+                    payload: b"split everywhere".to_vec(),
+                }),
+                "split {split}",
+            );
+        }
+    }
+
+    #[test]
+    fn dual_scanner_accepts_mixed_legacy_and_v2_frames() {
+        let mut wire = frame_bytes(b"legacy-a");
+        wire.extend_from_slice(&v2_frame_bytes(0, u32::MAX, b"v2"));
+        wire.extend_from_slice(&frame_bytes(b"legacy-b"));
+        let mut scanner = FrameScanner::new();
+        scanner.extend(&wire);
+
+        assert_eq!(
+            scanner.next_envelope().map(|frame| frame.version),
+            Some(WireVersion::Legacy)
+        );
+        assert_eq!(
+            scanner.next_envelope(),
+            Some(WireEnvelope {
+                version: WireVersion::V2,
+                flags: 0,
+                sequence: Some(u32::MAX),
+                payload: b"v2".to_vec(),
+            })
+        );
+        assert_eq!(
+            scanner.next_envelope().map(|frame| frame.payload),
+            Some(b"legacy-b".to_vec())
+        );
+    }
+
+    #[test]
+    fn corrupt_v2_length_filled_by_the_next_frame_is_rejected_and_resynchronized() {
+        let first = v2_frame_bytes(0, 10, b"a payload long enough to span packets");
+        let second = v2_frame_bytes(0, 11, b"recovered");
+        let removed = V2_FRAME_HEADER_LEN + 8;
+        let mut damaged = first;
+        damaged.remove(removed);
+        damaged.extend_from_slice(&second);
+
+        let mut scanner = FrameScanner::new();
+        scanner.extend(&damaged);
+        assert_eq!(
+            scanner.next_envelope().map(|frame| frame.payload),
+            Some(b"recovered".to_vec())
+        );
+        assert!(matches!(
+            scanner.next_event(),
+            Some(FrameScanEvent::ChecksumMismatch { sequence: 10, .. })
+        ));
+    }
+
+    #[test]
+    fn bit_flips_never_emit_a_corrupted_v2_payload() {
+        let original = v2_frame_bytes(0, 1, b"integrity matters");
+        let recovery = v2_frame_bytes(0, 2, b"good");
+        // The sync word itself is not protected, but corrupting it still makes
+        // the candidate invisible rather than accepting bad application data.
+        for index in V2_FRAME_MAGIC.len()..original.len() {
+            let mut wire = original.clone();
+            wire[index] ^= 0x01;
+            wire.extend_from_slice(&recovery);
+            let mut scanner = FrameScanner::new();
+            scanner.extend(&wire);
+            let frames: Vec<_> = core::iter::from_fn(|| scanner.next_envelope()).collect();
+            assert_eq!(
+                frames.last().map(|frame| frame.payload.as_slice()),
+                Some(b"good".as_slice())
+            );
+            assert!(!frames
+                .iter()
+                .any(|frame| frame.payload == b"integrity matters"));
+        }
+    }
+
+    #[test]
+    fn sync_word_inside_a_valid_payload_is_not_mistaken_for_a_header() {
+        let mut payload = b"before".to_vec();
+        payload.extend_from_slice(&V2_FRAME_MAGIC);
+        payload.extend_from_slice(b"after");
+        let mut scanner = FrameScanner::new();
+        scanner.extend(&v2_frame_bytes(0, 1, &payload));
+        assert_eq!(scanner.next_frame(), Some(payload));
+    }
+
+    #[test]
+    fn v2_sequence_events_cover_duplicate_gap_and_wrap() {
+        let mut scanner = FrameScanner::new();
+        for sequence in [u32::MAX - 1, u32::MAX, 0, 0, 3] {
+            scanner.extend(&v2_frame_bytes(0, sequence, b"x"));
+            assert!(scanner.next_frame().is_some());
+        }
+        assert_eq!(
+            scanner.next_event(),
+            Some(FrameScanEvent::DuplicateSequence { sequence: 0 })
+        );
+        assert_eq!(
+            scanner.next_event(),
+            Some(FrameScanEvent::SequenceDiscontinuity {
+                expected: 1,
+                received: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn scanner_reports_oversize_and_bounds_retained_noise() {
+        let mut scanner = FrameScanner::with_max_len(8);
+        let mut oversize = V2_FRAME_MAGIC.to_vec();
+        oversize.extend_from_slice(&[V2_WIRE_VERSION, 0]);
+        oversize.extend_from_slice(&1u32.to_le_bytes());
+        oversize.extend_from_slice(&9u32.to_le_bytes());
+        oversize.extend_from_slice(&0u32.to_le_bytes());
+        oversize.extend_from_slice(&0u32.to_le_bytes());
+        scanner.extend(&oversize);
+        assert_eq!(scanner.next_envelope(), None);
+        assert_eq!(
+            scanner.next_event(),
+            Some(FrameScanEvent::Oversize {
+                version: WireVersion::V2,
+                declared: 9,
+                maximum: 8,
+            })
+        );
+
+        scanner.extend(&alloc::vec![0xCC; 1_000]);
+        assert!(scanner.buffered_len() <= 2 * 8 + 2 * V2_FRAME_HEADER_LEN);
+        assert!(matches!(
+            scanner.next_event(),
+            Some(FrameScanEvent::InputOverflow { discarded }) if discarded > 0
+        ));
     }
 
     #[test]
