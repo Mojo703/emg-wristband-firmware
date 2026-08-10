@@ -21,6 +21,7 @@
 mod adc;
 mod allocation;
 mod calibration;
+mod calibration_outbox;
 mod clock_probe;
 mod config;
 mod cores;
@@ -39,6 +40,7 @@ use adc::acquisition::AcquiredWindow;
 use adc::acquisition::AdcSource;
 use adc::Channel;
 use calibration::{Calibration, CalibrationBuffers, WearerFeatureBuffers, WearerFeatures};
+use calibration_outbox::CalibrationOutbox;
 use config::{Sensitivity, Settings, Store};
 use emg_runtime::band_features::FEATURE_COUNT;
 use emg_runtime::calibration::CalibrationModel;
@@ -395,6 +397,7 @@ struct App {
     links: Links,
     feedback: Feedback,
     calibration: Box<Calibration>,
+    calibration_outbox: CalibrationOutbox,
     calibrated: Option<CalibrationModel>,
     source: Option<AdcSource>,
     #[cfg(feature = "playback")]
@@ -748,6 +751,7 @@ impl App {
             links,
             feedback,
             calibration,
+            calibration_outbox: CalibrationOutbox::new(),
             calibrated,
             source,
             #[cfg(feature = "playback")]
@@ -777,6 +781,7 @@ impl App {
             }
             self.wireless.refresh();
             self.note_wear_state();
+            self.flush_calibration_outbox();
             let config_changed = self.apply_pending_controls();
             self.replay_phone_state();
             self.service_playback();
@@ -943,12 +948,37 @@ impl App {
             });
         }
         let frames = self.calibration.drain_outbound();
-        if !frames.is_empty() {
-            self.links.send_window(None, &frames);
+        let link_generation = self.links.generation();
+        let connected = self.links.active_link().is_connected();
+        for frame in frames {
+            if let Err(full) = self
+                .calibration_outbox
+                .push(link_generation, connected, frame)
+            {
+                // This cannot occur in a valid sequential upload: one host
+                // operation yields at most one acknowledgement, and a failed
+                // write releases the claim before another operation arrives.
+                // Preserve a loud invariant failure rather than silently
+                // repeating the original lost-terminal-frame bug.
+                error!(
+                    "calibration reliable outbox exhausted; refusing to lose {:?}",
+                    full.into_frame()
+                );
+            }
         }
+        self.flush_calibration_outbox();
         if let Some(update) = self.calibration.take_resident_runtime_update() {
             self.apply_resident_runtime_update(update);
         }
+    }
+
+    fn flush_calibration_outbox(&mut self) {
+        let connected = self.links.active_link().is_connected();
+        let generation = self.links.generation();
+        self.calibration_outbox
+            .try_send_one(generation, connected, |frame| {
+                self.links.send_reliable_frame(frame)
+            });
     }
 
     fn apply_resident_runtime_update(&mut self, update: calibration::ResidentRuntimeUpdate) {

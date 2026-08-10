@@ -159,6 +159,23 @@ impl Links {
         ok
     }
 
+    /// Send one retained control-plane frame without coupling its delivery
+    /// acknowledgement to opportunistic telemetry or log draining. If those
+    /// later writes were part of the same aggregate result, a successfully
+    /// written calibration event would be replayed merely because a log write
+    /// stalled, turning an at-least-once transport into needless duplicates.
+    pub fn send_reliable_frame(&mut self, frame: &Frame) -> bool {
+        if !self.claim.is_claimed() {
+            return false;
+        }
+        if self.serial.send(frame).is_ok() {
+            return true;
+        }
+        info!("serial reliable frame write stalled; releasing claim");
+        self.claim.on_stall(Instant::now());
+        false
+    }
+
     pub fn active_link(&self) -> ActiveLink {
         if self.claim.is_claimed() {
             ActiveLink::Serial
