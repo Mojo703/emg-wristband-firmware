@@ -20,7 +20,7 @@
 //! and refuses rather than blocks, and the flow control below is what keeps it
 //! from ever having to.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Instant;
 
@@ -43,6 +43,21 @@ use crate::transport::Control;
 /// of samples: the host is allowed to interleave them, and a refused command
 /// would strand an orchestration sequence.
 const COMMAND_QUEUE_DEPTH: usize = 12;
+
+/// Small, non-payload frames waiting for the serve loop. Payload traffic has a
+/// separate queue, so a stalled USB writer cannot hide an error or status
+/// behind tens of kilobytes of feature batches.
+const OUTBOUND_CONTROL_DEPTH: usize = 8;
+
+/// Heap-heavy feature/decision batches waiting for USB. Two slots bound the
+/// retained payload to roughly two feature batches (about 8 KiB) while still
+/// allowing the worker and serve loop to overlap.
+const OUTBOUND_PAYLOAD_DEPTH: usize = 2;
+
+/// Sliding windows waiting for the calibration flow. The command queue holds
+/// at most twelve sample chunks and each legal chunk closes at most one stride
+/// window, so sixteen slots absorb all work already admitted by ingress.
+const CALIBRATION_WINDOW_DEPTH: usize = 16;
 
 /// Sample bytes the host may have in flight. A byte budget rather than a chunk
 /// count, because the chunk size is the host's to choose and a count that was
@@ -96,7 +111,9 @@ const WORKER_STACK_BYTES: usize = 24 * 1024;
 /// crosses as a message, so there is no lock for a link write to contend with.
 pub struct PlaybackEngine {
     commands: mpsc::SyncSender<Control>,
-    outbound: mpsc::Receiver<Frame>,
+    outbound_control: mpsc::Receiver<SequencedFrame>,
+    outbound_payload: mpsc::Receiver<SequencedFrame>,
+    latest_credit: Arc<Mutex<Option<Frame>>>,
     /// Completed windows, for a calibration running off this stream instead of
     /// off a front end. The same values the features frame carries, handed to
     /// the flow so the scripted wearer is fed by the recording rather than by
@@ -108,6 +125,143 @@ pub struct PlaybackEngine {
     /// Commands the queue refused. Counted here rather than in the worker
     /// because the worker is exactly what was too busy to hear about them.
     refused: Arc<AtomicU32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Delivery {
+    Queued,
+    Superseded,
+    Full,
+    Disconnected,
+}
+
+struct WorkerOutput {
+    control: mpsc::SyncSender<SequencedFrame>,
+    payload: mpsc::SyncSender<SequencedFrame>,
+    latest_credit: Arc<Mutex<Option<Frame>>>,
+    next_ordinal: AtomicU32,
+    dropped_control: AtomicU32,
+    dropped_payload: AtomicU32,
+    superseded_credits: AtomicU32,
+    disconnected_reported: AtomicBool,
+}
+
+struct SequencedFrame {
+    ordinal: u32,
+    frame: Frame,
+}
+
+fn drain_sequenced(
+    control: &mpsc::Receiver<SequencedFrame>,
+    payload: &mpsc::Receiver<SequencedFrame>,
+) -> Vec<Frame> {
+    let mut queued: Vec<_> = control.try_iter().chain(payload.try_iter()).collect();
+    // The queues are separate for admission control, not for wire semantics:
+    // preserve the worker's production order once both bounded queues drain.
+    queued.sort_unstable_by_key(|queued| queued.ordinal);
+    queued.into_iter().map(|queued| queued.frame).collect()
+}
+
+impl WorkerOutput {
+    fn send(&self, frame: Frame) -> Delivery {
+        if matches!(&frame, Frame::PlaybackCredit { .. }) {
+            let Ok(mut pending) = self.latest_credit.lock() else {
+                return Delivery::Disconnected;
+            };
+            let delivery = if pending.replace(frame).is_some() {
+                self.superseded_credits.fetch_add(1, Ordering::Relaxed);
+                Delivery::Superseded
+            } else {
+                Delivery::Queued
+            };
+            return delivery;
+        }
+
+        let (sender, dropped) = if matches!(
+            &frame,
+            Frame::BenchFeatures { .. } | Frame::BenchCommits { .. }
+        ) {
+            (&self.payload, &self.dropped_payload)
+        } else {
+            (&self.control, &self.dropped_control)
+        };
+        let queued = SequencedFrame {
+            ordinal: self.next_ordinal.fetch_add(1, Ordering::Relaxed),
+            frame,
+        };
+        match sender.try_send(queued) {
+            Ok(()) => Delivery::Queued,
+            Err(mpsc::TrySendError::Full(_)) => {
+                let count = dropped.fetch_add(1, Ordering::Relaxed) + 1;
+                if count == 1 || count.is_power_of_two() {
+                    warn!("playback outbound queue saturated; {count} frames dropped");
+                }
+                Delivery::Full
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                if !self.disconnected_reported.swap(true, Ordering::Relaxed) {
+                    warn!("playback outbound consumer disconnected; reports will stop");
+                }
+                Delivery::Disconnected
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WindowDelivery {
+    Queued,
+    Saturated { dropped: u32 },
+    Suppressed { dropped: u32 },
+    Disconnected,
+    SuppressedDisconnected,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WindowStreamState {
+    Active,
+    Saturated { dropped: u32 },
+    Disconnected,
+}
+
+struct WindowOutput {
+    sender: mpsc::SyncSender<crate::calibration::CalibrationWindow>,
+    state: WindowStreamState,
+}
+
+impl WindowOutput {
+    fn new(sender: mpsc::SyncSender<crate::calibration::CalibrationWindow>) -> Self {
+        Self {
+            sender,
+            state: WindowStreamState::Active,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.state = WindowStreamState::Active;
+    }
+
+    fn publish(&mut self, window: crate::calibration::CalibrationWindow) -> WindowDelivery {
+        match &mut self.state {
+            WindowStreamState::Saturated { dropped } => {
+                *dropped = dropped.saturating_add(1);
+                return WindowDelivery::Suppressed { dropped: *dropped };
+            }
+            WindowStreamState::Disconnected => return WindowDelivery::SuppressedDisconnected,
+            WindowStreamState::Active => {}
+        }
+        match self.sender.try_send(window) {
+            Ok(()) => WindowDelivery::Queued,
+            Err(mpsc::TrySendError::Full(_)) => {
+                self.state = WindowStreamState::Saturated { dropped: 1 };
+                WindowDelivery::Saturated { dropped: 1 }
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                self.state = WindowStreamState::Disconnected;
+                WindowDelivery::Disconnected
+            }
+        }
+    }
 }
 
 impl PlaybackEngine {
@@ -130,8 +284,11 @@ impl PlaybackEngine {
             warn!("task watchdog reconfigure failed ({reconfigured}); long fits will reboot");
         }
         let (commands, command_queue) = mpsc::sync_channel(COMMAND_QUEUE_DEPTH);
-        let (produced, outbound) = mpsc::channel();
-        let (produced_windows, windows) = mpsc::channel();
+        let (produced_control, outbound_control) = mpsc::sync_channel(OUTBOUND_CONTROL_DEPTH);
+        let (produced_payload, outbound_payload) = mpsc::sync_channel(OUTBOUND_PAYLOAD_DEPTH);
+        let latest_credit = Arc::new(Mutex::new(None));
+        let worker_credit = Arc::clone(&latest_credit);
+        let (produced_windows, windows) = mpsc::sync_channel(CALIBRATION_WINDOW_DEPTH);
         let gains: Arc<Mutex<Option<[f32; CHANNEL_COUNT]>>> = Arc::new(Mutex::new(None));
         let worker_gains = Arc::clone(&gains);
         let refused = Arc::new(AtomicU32::new(0));
@@ -141,8 +298,18 @@ impl PlaybackEngine {
                 .stack_size(WORKER_STACK_BYTES)
                 .spawn(move || {
                     crate::cores::log_thread_priority("playback worker");
+                    let output = WorkerOutput {
+                        control: produced_control,
+                        payload: produced_payload,
+                        latest_credit: worker_credit,
+                        next_ordinal: AtomicU32::new(0),
+                        dropped_control: AtomicU32::new(0),
+                        dropped_payload: AtomicU32::new(0),
+                        superseded_credits: AtomicU32::new(0),
+                        disconnected_reported: AtomicBool::new(false),
+                    };
                     let mut bench =
-                        Bench::new(produced, worker_refused, produced_windows, worker_gains);
+                        Bench::new(output, worker_refused, produced_windows, worker_gains);
                     while let Ok(control) = command_queue.recv() {
                         bench.handle(control);
                     }
@@ -151,7 +318,9 @@ impl PlaybackEngine {
         info!("playback engine started; streaming sessions over the serial link");
         Ok(Self {
             commands,
-            outbound,
+            outbound_control,
+            outbound_payload,
+            latest_credit,
             windows,
             gains,
             refused,
@@ -177,7 +346,17 @@ impl PlaybackEngine {
 
     /// Everything the worker has produced since the last call, in order.
     pub fn drain_outbound(&self) -> Vec<Frame> {
-        self.outbound.try_iter().collect()
+        let mut frames = Vec::with_capacity(1 + OUTBOUND_CONTROL_DEPTH + OUTBOUND_PAYLOAD_DEPTH);
+        // Credit is overwrite-latest and always goes first: unlike bulk
+        // output, delaying it can stop the host from sending the next chunk.
+        if let Ok(mut credit) = self.latest_credit.lock() {
+            frames.extend(credit.take());
+        }
+        frames.extend(drain_sequenced(
+            &self.outbound_control,
+            &self.outbound_payload,
+        ));
+        frames
     }
 
     /// Completed windows since the last call, oldest first. A calibration
@@ -256,12 +435,11 @@ struct Session {
 
 /// The worker's whole world.
 struct Bench {
-    outbound: mpsc::Sender<Frame>,
+    outbound: WorkerOutput,
     refused: Arc<AtomicU32>,
-    /// Completed windows for a scripted calibration. Send-only and unbounded:
-    /// the serve loop drains every iteration, and a calibration that is not
-    /// running simply drops them.
-    windows: mpsc::Sender<crate::calibration::CalibrationWindow>,
+    /// Completed windows for a scripted calibration. This is independently
+    /// bounded so a stalled calibration consumer cannot grow the firmware heap.
+    windows: WindowOutput,
     gains: Arc<Mutex<Option<[f32; CHANNEL_COUNT]>>>,
     session: Option<Session>,
     model: Option<CalibrationModel>,
@@ -295,15 +473,15 @@ struct Bench {
 
 impl Bench {
     fn new(
-        outbound: mpsc::Sender<Frame>,
+        outbound: WorkerOutput,
         refused: Arc<AtomicU32>,
-        windows: mpsc::Sender<crate::calibration::CalibrationWindow>,
+        windows: mpsc::SyncSender<crate::calibration::CalibrationWindow>,
         gains: Arc<Mutex<Option<[f32; CHANNEL_COUNT]>>>,
     ) -> Self {
         Self {
             outbound,
             refused,
-            windows,
+            windows: WindowOutput::new(windows),
             gains,
             session: None,
             model: None,
@@ -413,6 +591,7 @@ impl Bench {
             windows_at_last_status: 0,
             credit_chunks: credit_chunks(chunk_samples as usize),
         });
+        self.windows.reset();
         self.reject = RejectPipeline::new(COMMAND_CLASSES, REJECT_TAU);
         self.decisions.clear();
         // A new session's windows number from zero again, so the run's own
@@ -585,12 +764,28 @@ impl Bench {
         // contributed, so a spliced run is one monotonic space.
         let end_sample = self.published_base + end_sample;
         self.published_samples = end_sample;
-        let _ = self.windows.send(crate::calibration::CalibrationWindow {
+        let window = crate::calibration::CalibrationWindow {
             end_sample,
             features: *features,
             lead_off: false,
             adc_recovery: false,
-        });
+        };
+        match self.windows.publish(window) {
+            WindowDelivery::Queued
+            | WindowDelivery::Suppressed { .. }
+            | WindowDelivery::SuppressedDisconnected => {}
+            WindowDelivery::Saturated { dropped } => {
+                self.fail(
+                    "calibration_windows",
+                    format!(
+                        "calibration window queue saturated; replay calibration abandoned ({dropped} dropped)"
+                    ),
+                );
+            }
+            WindowDelivery::Disconnected => {
+                warn!("calibration window consumer disconnected; publication stopped");
+            }
+        }
     }
 
     fn score_row(&mut self, window: u32, features: &[f32; FEATURE_COUNT]) {
@@ -871,6 +1066,7 @@ impl Bench {
         self.probabilities = Vec::new();
         self.published_samples = 0;
         self.published_base = 0;
+        self.windows.reset();
         self.reject = RejectPipeline::new(COMMAND_CLASSES, REJECT_TAU);
         self.refused.store(0, Ordering::Relaxed);
         self.mode = BenchMode::Idle;
@@ -893,7 +1089,23 @@ impl Bench {
         };
         session.batch = Vec::with_capacity(FEATURE_BATCH_WINDOWS * FEATURE_COUNT * 4);
         session.batch_windows = 0;
-        self.send(frame);
+        match self.send(frame) {
+            Delivery::Full => {
+                if let Some(session) = self.session.as_mut() {
+                    session.abandoned = true;
+                }
+                self.fail(
+                    "bench_features",
+                    "feature output queue saturated; session abandoned".into(),
+                );
+            }
+            Delivery::Disconnected => {
+                if let Some(session) = self.session.as_mut() {
+                    session.abandoned = true;
+                }
+            }
+            Delivery::Queued | Delivery::Superseded => {}
+        }
     }
 
     fn flush_decisions(&mut self) {
@@ -902,7 +1114,12 @@ impl Bench {
         }
         let decisions = std::mem::take(&mut self.decisions);
         self.decisions = Vec::with_capacity(DECISION_BATCH_WINDOWS);
-        self.send(Frame::BenchCommits { decisions });
+        if self.send(Frame::BenchCommits { decisions }) == Delivery::Full {
+            self.fail(
+                "bench_commits",
+                "decision output queue saturated; comparison is incomplete".into(),
+            );
+        }
     }
 
     fn grant_credit(&self, next_sequence: u32) {
@@ -964,8 +1181,8 @@ impl Bench {
 
     /// A closed outbound channel means the serve loop is gone, which means the
     /// device is on its way down; there is nowhere to report that to.
-    fn send(&self, frame: Frame) {
-        let _ = self.outbound.send(frame);
+    fn send(&self, frame: Frame) -> Delivery {
+        self.outbound.send(frame)
     }
 }
 
@@ -995,6 +1212,174 @@ fn float_at(bits: &[u8], index: usize) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn worker_output(
+        control_depth: usize,
+        payload_depth: usize,
+    ) -> (
+        WorkerOutput,
+        mpsc::Receiver<SequencedFrame>,
+        mpsc::Receiver<SequencedFrame>,
+        Arc<Mutex<Option<Frame>>>,
+    ) {
+        let (control, control_rx) = mpsc::sync_channel(control_depth);
+        let (payload, payload_rx) = mpsc::sync_channel(payload_depth);
+        let latest_credit = Arc::new(Mutex::new(None));
+        (
+            WorkerOutput {
+                control,
+                payload,
+                latest_credit: Arc::clone(&latest_credit),
+                next_ordinal: AtomicU32::new(0),
+                dropped_control: AtomicU32::new(0),
+                dropped_payload: AtomicU32::new(0),
+                superseded_credits: AtomicU32::new(0),
+                disconnected_reported: AtomicBool::new(false),
+            },
+            control_rx,
+            payload_rx,
+            latest_credit,
+        )
+    }
+
+    fn feature_frame(first_window: u32) -> Frame {
+        Frame::BenchFeatures {
+            first_window,
+            window_count: 1,
+            features: vec![0; FEATURE_COUNT * 4],
+        }
+    }
+
+    fn calibration_window(end_sample: u64) -> crate::calibration::CalibrationWindow {
+        crate::calibration::CalibrationWindow {
+            end_sample,
+            features: [0.0; FEATURE_COUNT],
+            lead_off: false,
+            adc_recovery: false,
+        }
+    }
+
+    #[test]
+    fn saturated_payload_cannot_starve_control_output() {
+        let (output, control, payload, _) = worker_output(1, 1);
+        assert_eq!(output.send(feature_frame(0)), Delivery::Queued);
+        assert_eq!(output.send(feature_frame(1)), Delivery::Full);
+        assert_eq!(output.dropped_payload.load(Ordering::Relaxed), 1);
+
+        assert_eq!(
+            output.send(Frame::BenchError {
+                stage: "saturation".into(),
+                detail: "payload full".into(),
+            }),
+            Delivery::Queued
+        );
+        assert!(matches!(
+            control.try_recv(),
+            Ok(SequencedFrame {
+                frame: Frame::BenchError { .. },
+                ..
+            })
+        ));
+        assert!(matches!(
+            payload.try_recv(),
+            Ok(SequencedFrame {
+                frame: Frame::BenchFeatures { .. },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn split_outbound_queues_preserve_worker_production_order() {
+        let (output, control, payload, _) = worker_output(2, 2);
+        assert_eq!(output.send(feature_frame(7)), Delivery::Queued);
+        assert_eq!(
+            output.send(Frame::BenchError {
+                stage: "after_features".into(),
+                detail: "ordered".into(),
+            }),
+            Delivery::Queued
+        );
+        let drained = drain_sequenced(&control, &payload);
+        assert!(matches!(drained[0], Frame::BenchFeatures { .. }));
+        assert!(matches!(drained[1], Frame::BenchError { .. }));
+    }
+
+    #[test]
+    fn credits_are_overwrite_latest_instead_of_filling_a_queue() {
+        let (output, _, _, latest) = worker_output(1, 1);
+        assert_eq!(
+            output.send(Frame::PlaybackCredit {
+                next_sequence: 1,
+                free_chunks: 2,
+            }),
+            Delivery::Queued
+        );
+        assert_eq!(
+            output.send(Frame::PlaybackCredit {
+                next_sequence: 9,
+                free_chunks: 3,
+            }),
+            Delivery::Superseded
+        );
+        assert_eq!(output.superseded_credits.load(Ordering::Relaxed), 1);
+        assert!(matches!(
+            latest.lock().unwrap().take(),
+            Some(Frame::PlaybackCredit {
+                next_sequence: 9,
+                free_chunks: 3
+            })
+        ));
+    }
+
+    #[test]
+    fn stopped_outbound_consumer_is_reported_without_blocking() {
+        let (output, control, payload, _) = worker_output(1, 1);
+        drop(control);
+        drop(payload);
+        assert_eq!(
+            output.send(Frame::BenchError {
+                stage: "worker_stop".into(),
+                detail: "test".into(),
+            }),
+            Delivery::Disconnected
+        );
+        assert_eq!(output.send(feature_frame(0)), Delivery::Disconnected);
+    }
+
+    #[test]
+    fn calibration_window_saturation_abandons_and_counts_suppressed_windows() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let mut output = WindowOutput::new(sender);
+        assert_eq!(
+            output.publish(calibration_window(125)),
+            WindowDelivery::Queued
+        );
+        assert_eq!(
+            output.publish(calibration_window(250)),
+            WindowDelivery::Saturated { dropped: 1 }
+        );
+        assert_eq!(
+            output.publish(calibration_window(375)),
+            WindowDelivery::Suppressed { dropped: 2 }
+        );
+        assert_eq!(receiver.try_iter().count(), 1);
+    }
+
+    #[test]
+    fn calibration_window_consumer_stop_is_sticky_until_reset() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let mut output = WindowOutput::new(sender);
+        drop(receiver);
+        assert_eq!(
+            output.publish(calibration_window(125)),
+            WindowDelivery::Disconnected
+        );
+        assert_eq!(
+            output.publish(calibration_window(250)),
+            WindowDelivery::SuppressedDisconnected
+        );
+    }
 
     /// The credit window must not let the host put more bytes on the wire than
     /// the USB receive ring can hold: the driver drops the overflow instead of
