@@ -1168,9 +1168,7 @@ impl CalibrationModeAdapter {
         }
         *self.selected_track_id.lock().unwrap() = Some(track_id.clone());
         self.coordinator.publish_calibration(
-            request.expected_revision,
-            request.expected_run_revision,
-            request.expected_session_id,
+            request.authority,
             setup_snapshot(&self.tracks, Some(track_id)),
         )?;
         Ok(())
@@ -2005,9 +2003,7 @@ mod tests {
         coordinator
             .handle_intent_for_device(
                 GuidedIntentRequest {
-                    expected_revision: snapshot.revision,
-                    expected_run_revision: snapshot.run_revision,
-                    expected_session_id: None,
+                    authority: snapshot.action_authority,
                     action: GuidedSessionAction::SelectCalibrationTrack {
                         track_id: "calibration-track".into(),
                     },
@@ -2019,9 +2015,7 @@ mod tests {
         coordinator
             .handle_intent_for_device(
                 GuidedIntentRequest {
-                    expected_revision: snapshot.revision,
-                    expected_run_revision: snapshot.run_revision,
-                    expected_session_id: None,
+                    authority: snapshot.action_authority,
                     action: GuidedSessionAction::StartCalibration,
                 },
                 Some(identity),
@@ -2043,9 +2037,7 @@ mod tests {
         assert_eq!(
             coordinator.handle_intent_for_device(
                 GuidedIntentRequest {
-                    expected_revision: preparing.revision,
-                    expected_run_revision: preparing.run_revision,
-                    expected_session_id: preparing.active().map(|active| active.session_id),
+                    authority: preparing.action_authority,
                     action: GuidedSessionAction::ContinueCalibration,
                 },
                 None,
@@ -2146,9 +2138,7 @@ mod tests {
         coordinator
             .handle_intent_for_device(
                 GuidedIntentRequest {
-                    expected_revision: snapshot.revision,
-                    expected_run_revision: snapshot.run_revision,
-                    expected_session_id: snapshot.active().map(|active| active.session_id),
+                    authority: snapshot.action_authority,
                     action: GuidedSessionAction::ContinueCalibration,
                 },
                 None,

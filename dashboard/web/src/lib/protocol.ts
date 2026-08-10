@@ -1113,9 +1113,16 @@ export type GuidedCalibrationSnapshot =
 export interface GuidedSessionSnapshot {
   readonly revision: number;
   readonly run_revision: number;
+  readonly action_authority: GuidedActionAuthority;
   readonly visible_collection_views: number;
   readonly visible_calibration_views: number;
   readonly lifecycle: GuidedSessionState;
+}
+
+export interface GuidedActionAuthority {
+  readonly run_revision: number;
+  readonly session_id: number | null;
+  readonly phase_generation: number;
 }
 
 /** A tagged lifecycle prevents active/failed and collection/calibration fields
@@ -1165,9 +1172,7 @@ export type GuidedSessionAction =
 
 export interface GuidedSessionIntentFrame {
   readonly type: 'guided_session_intent';
-  readonly expected_revision: number;
-  readonly expected_run_revision: number;
-  readonly expected_session_id: number | null;
+  readonly authority: GuidedActionAuthority;
   readonly action: GuidedSessionAction;
 }
 
@@ -1917,12 +1922,29 @@ export function isGuidedSessionSnapshotFrame(
   if (!hasType(value, 'guided_session_snapshot') || !isObject(value)) return false;
   const snapshot = value['snapshot'];
   if (!isObject(snapshot)) return false;
+  const authority = snapshot['action_authority'];
+  const lifecycle = snapshot['lifecycle'];
+  if (!isGuidedActionAuthority(authority) || !isGuidedSessionState(lifecycle)) return false;
+  const activeSessionId =
+    lifecycle.state === 'collection' || lifecycle.state === 'calibration'
+      ? lifecycle.session_id
+      : null;
   return (
     isNonnegativeInteger(snapshot['revision']) &&
     isNonnegativeInteger(snapshot['run_revision']) &&
+    authority.run_revision === snapshot['run_revision'] &&
+    authority.session_id === activeSessionId &&
     isNonnegativeInteger(snapshot['visible_collection_views']) &&
-    isNonnegativeInteger(snapshot['visible_calibration_views']) &&
-    isGuidedSessionState(snapshot['lifecycle'])
+    isNonnegativeInteger(snapshot['visible_calibration_views'])
+  );
+}
+
+function isGuidedActionAuthority(value: unknown): value is GuidedActionAuthority {
+  return (
+    isObject(value) &&
+    isNonnegativeInteger(value['run_revision']) &&
+    (value['session_id'] === null || isPositiveInteger(value['session_id'])) &&
+    isNonnegativeInteger(value['phase_generation'])
   );
 }
 
@@ -2160,10 +2182,7 @@ export function isOutgoingFrame(value: unknown): value is OutgoingFrame {
       return value['mode'] === null || isGuidedMode(value['mode']);
     case 'guided_session_intent':
       return (
-        isNonnegativeInteger(value['expected_revision']) &&
-        isNonnegativeInteger(value['expected_run_revision']) &&
-        (value['expected_session_id'] === null ||
-          isPositiveInteger(value['expected_session_id'])) &&
+        isGuidedActionAuthority(value['authority']) &&
         isGuidedSessionAction(value['action'])
       );
     case 'calibration_timing_intent':

@@ -9,7 +9,7 @@ use crate::timing::TimingService;
 use axum::extract::ws::{Message, WebSocket};
 use dashboard::guided_session::{
     DeviceConnectionIdentity, GuidedBrowserConnection, GuidedIntentRequest,
-    GuidedSessionCoordinator, GuidedSessionId, RunRevision, SnapshotRevision,
+    GuidedSessionCoordinator, GuidedSessionId, RunRevision,
 };
 use dashboard::signal_quality::SignalQualityMonitor;
 use futures_util::{SinkExt, StreamExt};
@@ -782,13 +782,8 @@ fn apply_guided_frame(
         Frame::GuidedViewPresence { mode } => connection
             .set_visible_mode(mode.map(Into::into))
             .map(|_| ()),
-        Frame::GuidedSessionIntent {
-            expected_revision,
-            expected_run_revision,
-            expected_session_id,
-            action,
-        } => {
-            let expected_session_id = match expected_session_id {
+        Frame::GuidedSessionIntent { authority, action } => {
+            let session_id = match authority.session_id {
                 Some(value) => match GuidedSessionId::new(value) {
                     Some(value) => Some(value),
                     None => {
@@ -800,9 +795,14 @@ fn apply_guided_frame(
             };
             coordinator.handle_intent_for_device(
                 GuidedIntentRequest {
-                    expected_revision: SnapshotRevision::from_wire(expected_revision),
-                    expected_run_revision: RunRevision::from_wire(expected_run_revision),
-                    expected_session_id,
+                    authority: dashboard::guided_session::GuidedActionAuthority {
+                        run_revision: RunRevision::from_wire(authority.run_revision),
+                        session_id,
+                        phase_generation:
+                            dashboard::guided_session::ActionPhaseGeneration::from_wire(
+                                authority.phase_generation,
+                            ),
+                    },
                     action,
                 },
                 device,

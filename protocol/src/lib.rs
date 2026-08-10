@@ -224,12 +224,10 @@ pub enum Frame {
     GuidedSessionSnapshot { snapshot: GuidedSessionSnapshot },
 
     /// Browser → backend: one action rendered from an authoritative guided
-    /// snapshot. All three identities must still match before the mode adapter
-    /// may act, so a delayed browser cannot control a replacement run.
+    /// snapshot. The authority remains stable across projection-only telemetry
+    /// updates, but changes when the session or actionable phase changes.
     GuidedSessionIntent {
-        expected_revision: u64,
-        expected_run_revision: u64,
-        expected_session_id: Option<u64>,
+        authority: GuidedActionAuthority,
         action: GuidedSessionAction,
     },
 
@@ -841,9 +839,22 @@ pub enum GuidedFailureKind {
 pub struct GuidedSessionSnapshot {
     pub revision: u64,
     pub run_revision: u64,
+    pub action_authority: GuidedActionAuthority,
     pub visible_collection_views: u64,
     pub visible_calibration_views: u64,
     pub lifecycle: GuidedSessionState,
+}
+
+/// Stable authority for one actionable guided lifecycle phase.
+///
+/// Unlike `GuidedSessionSnapshot::revision`, this token does not change for
+/// progress/telemetry projections within a phase. Its complete identity still
+/// prevents an old browser callback from controlling a replacement run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuidedActionAuthority {
+    pub run_revision: u64,
+    pub session_id: Option<u64>,
+    pub phase_generation: u64,
 }
 
 /// Complete guided-mode ownership and projection.
@@ -5104,6 +5115,11 @@ mod tests {
                 snapshot: GuidedSessionSnapshot {
                     revision: 12,
                     run_revision: 4,
+                    action_authority: GuidedActionAuthority {
+                        run_revision: 4,
+                        session_id: Some(9),
+                        phase_generation: 7,
+                    },
                     visible_collection_views: 2,
                     visible_calibration_views: 1,
                     lifecycle: GuidedSessionState::CalibrationFailed {
@@ -5114,9 +5130,11 @@ mod tests {
                 },
             },
             Frame::GuidedSessionIntent {
-                expected_revision: 12,
-                expected_run_revision: 4,
-                expected_session_id: Some(9),
+                authority: GuidedActionAuthority {
+                    run_revision: 4,
+                    session_id: Some(9),
+                    phase_generation: 7,
+                },
                 action: GuidedSessionAction::StartCalibration,
             },
         ];

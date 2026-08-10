@@ -8,6 +8,7 @@ function snapshot(revision: number, runRevision = 4): GuidedSessionSnapshot {
   return {
     revision,
     run_revision: runRevision,
+    action_authority: { run_revision: runRevision, session_id: 9, phase_generation: 6 },
     visible_collection_views: 0,
     visible_calibration_views: 2,
     lifecycle: {
@@ -27,14 +28,16 @@ test('guided snapshot reducer rejects duplicate and stale frames', () => {
   assert.equal(acceptGuidedSnapshot(current, snapshot(13)).revision, 13);
 });
 
-test('guided callbacks carry the exact snapshot run identity', () => {
+test('guided callbacks carry stable action authority rather than telemetry revision', () => {
   assert.deepEqual(guidedIntent(snapshot(12), { name: 'pause_calibration' }), {
     type: 'guided_session_intent',
-    expected_revision: 12,
-    expected_run_revision: 4,
-    expected_session_id: 9,
+    authority: { run_revision: 4, session_id: 9, phase_generation: 6 },
     action: { name: 'pause_calibration' },
   });
+  assert.deepEqual(
+    guidedIntent(snapshot(99), { name: 'pause_calibration' }).authority,
+    guidedIntent(snapshot(12), { name: 'pause_calibration' }).authority,
+  );
 });
 
 test('guided wire guard requires one complete tagged lifecycle', () => {
@@ -69,6 +72,16 @@ test('guided wire guard requires one complete tagged lifecycle', () => {
     asIncomingFrame({
       ...valid,
       snapshot: { ...valid.snapshot, revision: 12.5 },
+    }),
+    null,
+  );
+  assert.equal(
+    asIncomingFrame({
+      ...valid,
+      snapshot: {
+        ...valid.snapshot,
+        action_authority: { ...valid.snapshot.action_authority, session_id: 10 },
+      },
     }),
     null,
   );

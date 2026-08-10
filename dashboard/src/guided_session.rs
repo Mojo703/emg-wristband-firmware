@@ -24,6 +24,7 @@ macro_rules! revision_type {
 
 revision_type!(SnapshotRevision);
 revision_type!(RunRevision);
+revision_type!(ActionPhaseGeneration);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct GuidedSessionId(u64);
@@ -71,6 +72,13 @@ pub struct GuidedSessionBinding {
     pub device: Option<DeviceConnectionIdentity>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GuidedActionAuthority {
+    pub run_revision: RunRevision,
+    pub session_id: Option<GuidedSessionId>,
+    pub phase_generation: ActionPhaseGeneration,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuidedFailureKind {
     DependencyFailed,
@@ -89,6 +97,7 @@ pub struct GuidedFailure {
 pub struct GuidedSessionSnapshot {
     pub revision: SnapshotRevision,
     pub run_revision: RunRevision,
+    pub action_authority: GuidedActionAuthority,
     pub visible_collection_views: usize,
     pub visible_calibration_views: usize,
     pub lifecycle: GuidedSessionLifecycle,
@@ -196,6 +205,11 @@ impl GuidedSessionSnapshot {
         protocol::GuidedSessionSnapshot {
             revision: self.revision.get(),
             run_revision: self.run_revision.get(),
+            action_authority: protocol::GuidedActionAuthority {
+                run_revision: self.action_authority.run_revision.get(),
+                session_id: self.action_authority.session_id.map(GuidedSessionId::get),
+                phase_generation: self.action_authority.phase_generation.get(),
+            },
             visible_collection_views: self.visible_collection_views as u64,
             visible_calibration_views: self.visible_calibration_views as u64,
             lifecycle,
@@ -262,9 +276,7 @@ pub struct SessionRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuidedIntentRequest {
-    pub expected_revision: SnapshotRevision,
-    pub expected_run_revision: RunRevision,
-    pub expected_session_id: Option<GuidedSessionId>,
+    pub authority: GuidedActionAuthority,
     pub action: protocol::GuidedSessionAction,
 }
 
@@ -285,6 +297,10 @@ pub enum CoordinatorError {
     StaleSession {
         expected: Option<GuidedSessionId>,
         received: Option<GuidedSessionId>,
+    },
+    StaleActionPhase {
+        expected: ActionPhaseGeneration,
+        received: ActionPhaseGeneration,
     },
     RevisionExhausted,
     LeaseMismatch,
@@ -340,6 +356,11 @@ impl GuidedSessionCoordinator {
         let snapshot = GuidedSessionSnapshot {
             revision: SnapshotRevision(0),
             run_revision: RunRevision(0),
+            action_authority: GuidedActionAuthority {
+                run_revision: RunRevision(0),
+                session_id: None,
+                phase_generation: ActionPhaseGeneration(0),
+            },
             visible_collection_views: 0,
             visible_calibration_views: 0,
             lifecycle: GuidedSessionLifecycle::Idle { calibration: None },
@@ -403,6 +424,7 @@ impl GuidedSessionCoordinator {
             return Err(CoordinatorError::ModeUnavailable(mode));
         }
         let next_snapshot_revision = next_snapshot_revision(&state.snapshot)?;
+        let next_action_generation = next_action_phase_generation(&state.snapshot)?;
         let run = state
             .snapshot
             .run_revision
@@ -425,6 +447,7 @@ impl GuidedSessionCoordinator {
                 calibration: None,
             },
         };
+        refresh_action_authority(&mut state.snapshot, next_action_generation);
         publish_locked(&self.inner, state, next_snapshot_revision);
         Ok(SessionLease {
             coordinator: Arc::downgrade(&self.inner),
@@ -449,12 +472,20 @@ impl GuidedSessionCoordinator {
     ) -> Result<GuidedSessionSnapshot, CoordinatorError> {
         let mut state = self.inner.state.lock().unwrap();
         let next_revision = next_snapshot_revision(&state.snapshot)?;
+        let previous_phase = state.snapshot.calibration().map(calibration_action_phase);
+        let next_phase = calibration_action_phase(&calibration);
+        let next_action_generation = (previous_phase != Some(next_phase))
+            .then(|| next_action_phase_generation(&state.snapshot))
+            .transpose()?;
         match &mut state.snapshot.lifecycle {
             GuidedSessionLifecycle::Calibration {
                 binding: active,
                 calibration: current,
             } if active == binding => *current = Some(calibration),
             _ => return Err(CoordinatorError::LeaseMismatch),
+        }
+        if let Some(generation) = next_action_generation {
+            refresh_action_authority(&mut state.snapshot, generation);
         }
         publish_locked(&self.inner, &mut state, next_revision);
         Ok(state.snapshot.clone())
@@ -466,6 +497,15 @@ impl GuidedSessionCoordinator {
     ) -> Result<GuidedSessionSnapshot, CoordinatorError> {
         let mut state = self.inner.state.lock().unwrap();
         let next_revision = next_snapshot_revision(&state.snapshot)?;
+        let previous_phase = state.snapshot.calibration().map(calibration_action_phase);
+        let was_idle = matches!(
+            state.snapshot.lifecycle,
+            GuidedSessionLifecycle::Idle { .. }
+        );
+        let next_phase = calibration_action_phase(&calibration);
+        let next_action_generation = (!was_idle || previous_phase != Some(next_phase))
+            .then(|| next_action_phase_generation(&state.snapshot))
+            .transpose()?;
         match state.snapshot.lifecycle {
             GuidedSessionLifecycle::Idle { .. }
             | GuidedSessionLifecycle::CollectionFailed { .. }
@@ -478,6 +518,9 @@ impl GuidedSessionCoordinator {
             | GuidedSessionLifecycle::Calibration { .. } => {
                 return Err(CoordinatorError::LeaseMismatch);
             }
+        }
+        if let Some(generation) = next_action_generation {
+            refresh_action_authority(&mut state.snapshot, generation);
         }
         publish_locked(&self.inner, &mut state, next_revision);
         Ok(state.snapshot.clone())
@@ -493,7 +536,7 @@ impl GuidedSessionCoordinator {
         device: Option<DeviceConnectionIdentity>,
     ) -> Result<(), CoordinatorError> {
         let (adapter, active) = {
-            let state = self.inner.state.lock().unwrap();
+            let mut state = self.inner.state.lock().unwrap();
             check_intent_identity(&state.snapshot, &request)?;
             let adapter = state
                 .adapters
@@ -501,7 +544,13 @@ impl GuidedSessionCoordinator {
                 .and_then(Weak::upgrade)
                 .filter(|adapter| adapter.available())
                 .ok_or(CoordinatorError::ModeUnavailable(GuidedMode::Calibration))?;
-            (adapter, state.snapshot.active().cloned())
+            let active = state.snapshot.active().cloned();
+            if is_terminal_action(&request.action) {
+                let next_revision = next_snapshot_revision(&state.snapshot)?;
+                advance_action_authority(&mut state.snapshot)?;
+                publish_locked(&self.inner, &mut state, next_revision);
+            }
+            (adapter, active)
         };
         adapter.handle_intent(active.as_ref(), device, request)
     }
@@ -519,19 +568,13 @@ impl GuidedSessionCoordinator {
 
     pub fn publish_calibration(
         &self,
-        expected_revision: SnapshotRevision,
-        expected_run_revision: RunRevision,
-        expected_session_id: Option<GuidedSessionId>,
+        authority: GuidedActionAuthority,
         calibration: protocol::GuidedCalibrationSnapshot,
     ) -> Result<GuidedSessionSnapshot, CoordinatorError> {
         let mut state = self.inner.state.lock().unwrap();
-        check_identity(
-            &state.snapshot,
-            expected_revision,
-            expected_run_revision,
-            expected_session_id,
-        )?;
+        check_authority(&state.snapshot, authority)?;
         let next_revision = next_snapshot_revision(&state.snapshot)?;
+        let next_action_generation = next_action_phase_generation(&state.snapshot)?;
         match &mut state.snapshot.lifecycle {
             GuidedSessionLifecycle::Idle {
                 calibration: current,
@@ -549,6 +592,7 @@ impl GuidedSessionCoordinator {
                 return Err(CoordinatorError::LeaseMismatch);
             }
         }
+        refresh_action_authority(&mut state.snapshot, next_action_generation);
         publish_locked(&self.inner, &mut state, next_revision);
         Ok(state.snapshot.clone())
     }
@@ -595,35 +639,105 @@ fn check_intent_identity(
     snapshot: &GuidedSessionSnapshot,
     request: &GuidedIntentRequest,
 ) -> Result<(), CoordinatorError> {
-    check_identity(
-        snapshot,
-        request.expected_revision,
-        request.expected_run_revision,
-        request.expected_session_id,
-    )
+    check_authority(snapshot, request.authority)
 }
 
-fn check_identity(
+fn check_authority(
     snapshot: &GuidedSessionSnapshot,
-    expected_revision: SnapshotRevision,
-    expected_run_revision: RunRevision,
-    expected_session_id: Option<GuidedSessionId>,
+    received: GuidedActionAuthority,
 ) -> Result<(), CoordinatorError> {
-    check_revision(snapshot, expected_revision)?;
-    if snapshot.run_revision != expected_run_revision {
+    let expected = snapshot.action_authority;
+    if expected.run_revision != received.run_revision {
         return Err(CoordinatorError::StaleRun {
-            expected: snapshot.run_revision,
-            received: expected_run_revision,
+            expected: expected.run_revision,
+            received: received.run_revision,
         });
     }
-    let expected_session = snapshot.active().map(|active| active.session_id);
-    if expected_session != expected_session_id {
+    if expected.session_id != received.session_id {
         return Err(CoordinatorError::StaleSession {
-            expected: expected_session,
-            received: expected_session_id,
+            expected: expected.session_id,
+            received: received.session_id,
+        });
+    }
+    if expected.phase_generation != received.phase_generation {
+        return Err(CoordinatorError::StaleActionPhase {
+            expected: expected.phase_generation,
+            received: received.phase_generation,
         });
     }
     Ok(())
+}
+
+fn advance_action_authority(snapshot: &mut GuidedSessionSnapshot) -> Result<(), CoordinatorError> {
+    let generation = next_action_phase_generation(snapshot)?;
+    refresh_action_authority(snapshot, generation);
+    Ok(())
+}
+
+fn next_action_phase_generation(
+    snapshot: &GuidedSessionSnapshot,
+) -> Result<ActionPhaseGeneration, CoordinatorError> {
+    snapshot
+        .action_authority
+        .phase_generation
+        .0
+        .checked_add(1)
+        .map(ActionPhaseGeneration)
+        .ok_or(CoordinatorError::RevisionExhausted)
+}
+
+fn refresh_action_authority(
+    snapshot: &mut GuidedSessionSnapshot,
+    generation: ActionPhaseGeneration,
+) {
+    snapshot.action_authority = GuidedActionAuthority {
+        run_revision: snapshot.run_revision,
+        session_id: snapshot.active().map(|active| active.session_id),
+        phase_generation: generation,
+    };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CalibrationActionPhase {
+    Setup,
+    Preparing(protocol::GuidedCalibrationPreparationStage),
+    PlayingRunning,
+    PlayingPaused,
+    BetweenSongs,
+    TechnicalFailure,
+}
+
+fn calibration_action_phase(
+    calibration: &protocol::GuidedCalibrationSnapshot,
+) -> CalibrationActionPhase {
+    match calibration {
+        protocol::GuidedCalibrationSnapshot::Setup { .. } => CalibrationActionPhase::Setup,
+        protocol::GuidedCalibrationSnapshot::Preparing { stage, .. } => {
+            CalibrationActionPhase::Preparing(*stage)
+        }
+        protocol::GuidedCalibrationSnapshot::Playing { paused_reason, .. } => {
+            if paused_reason.is_some() {
+                CalibrationActionPhase::PlayingPaused
+            } else {
+                CalibrationActionPhase::PlayingRunning
+            }
+        }
+        protocol::GuidedCalibrationSnapshot::BetweenSongs { .. } => {
+            CalibrationActionPhase::BetweenSongs
+        }
+        protocol::GuidedCalibrationSnapshot::TechnicalFailure { .. } => {
+            CalibrationActionPhase::TechnicalFailure
+        }
+    }
+}
+
+fn is_terminal_action(action: &protocol::GuidedSessionAction) -> bool {
+    matches!(
+        action,
+        protocol::GuidedSessionAction::SaveCalibration
+            | protocol::GuidedSessionAction::ContinueCalibration
+            | protocol::GuidedSessionAction::DiscardCalibration
+    )
 }
 
 fn next_snapshot_revision(
@@ -706,6 +820,9 @@ fn release(
     let Ok(next_revision) = next_snapshot_revision(&state.snapshot) else {
         return;
     };
+    let Ok(next_action_generation) = next_action_phase_generation(&state.snapshot) else {
+        return;
+    };
     let calibration = match &mut state.snapshot.lifecycle {
         GuidedSessionLifecycle::Calibration { calibration, .. } => calibration.take(),
         _ => None,
@@ -724,6 +841,7 @@ fn release(
             failed_lifecycle(binding, GuidedFailureKind::TaskFailed, detail, calibration)
         }
     };
+    refresh_action_authority(&mut state.snapshot, next_action_generation);
     publish_locked(&inner, &mut state, next_revision);
 }
 
@@ -930,6 +1048,26 @@ mod tests {
         (coordinator, adapter)
     }
 
+    fn preparing(
+        stage: protocol::GuidedCalibrationPreparationStage,
+        elapsed_milliseconds: u32,
+    ) -> protocol::GuidedCalibrationSnapshot {
+        protocol::GuidedCalibrationSnapshot::Preparing {
+            track: protocol::GuidedCalibrationTrack {
+                id: "track-1".into(),
+                title: "Track".into(),
+                beats_per_minute: 120,
+                duration_ms: 60_000,
+                cue_count: 10,
+                content_identity: "identity".into(),
+                cue_shortfall: 0,
+            },
+            stage,
+            elapsed_milliseconds,
+            remaining_milliseconds: 30_000_u32.saturating_sub(elapsed_milliseconds),
+        }
+    }
+
     #[test]
     fn collection_and_calibration_are_mutually_exclusive() {
         let (coordinator, _adapter) = coordinator();
@@ -1000,9 +1138,7 @@ mod tests {
             .unwrap();
         let snapshot = coordinator.snapshot();
         let request = GuidedIntentRequest {
-            expected_revision: snapshot.revision,
-            expected_run_revision: snapshot.run_revision,
-            expected_session_id: snapshot.active().map(|active| active.session_id),
+            authority: snapshot.action_authority,
             action: protocol::GuidedSessionAction::PauseCalibration,
         };
 
@@ -1013,14 +1149,14 @@ mod tests {
         );
 
         let mut stale_run = request.clone();
-        stale_run.expected_run_revision = RunRevision::from_wire(0);
+        stale_run.authority.run_revision = RunRevision::from_wire(0);
         assert!(matches!(
             coordinator.handle_intent(stale_run),
             Err(CoordinatorError::StaleRun { .. })
         ));
 
         let mut stale_session = request;
-        stale_session.expected_session_id = None;
+        stale_session.authority.session_id = None;
         assert!(matches!(
             coordinator.handle_intent(stale_session),
             Err(CoordinatorError::StaleSession { .. })
@@ -1030,13 +1166,83 @@ mod tests {
     }
 
     #[test]
+    fn telemetry_revisions_do_not_expire_action_authority_but_phase_changes_do() {
+        let (coordinator, adapter) = coordinator();
+        let lease = coordinator
+            .acquire_current(GuidedMode::Calibration, Some(device()))
+            .unwrap();
+        coordinator
+            .update_calibration(
+                lease.binding(),
+                preparing(protocol::GuidedCalibrationPreparationStage::Stillness, 0),
+            )
+            .unwrap();
+        let authority = coordinator.snapshot().action_authority;
+
+        for elapsed in 1..=40 {
+            coordinator
+                .update_calibration(
+                    lease.binding(),
+                    preparing(
+                        protocol::GuidedCalibrationPreparationStage::Stillness,
+                        elapsed * 100,
+                    ),
+                )
+                .unwrap();
+        }
+        assert_eq!(coordinator.snapshot().action_authority, authority);
+        let request = GuidedIntentRequest {
+            authority,
+            action: protocol::GuidedSessionAction::PauseCalibration,
+        };
+        coordinator.handle_intent(request.clone()).unwrap();
+
+        coordinator
+            .update_calibration(
+                lease.binding(),
+                preparing(
+                    protocol::GuidedCalibrationPreparationStage::GainEstimation,
+                    10_100,
+                ),
+            )
+            .unwrap();
+        assert!(matches!(
+            coordinator.handle_intent(request),
+            Err(CoordinatorError::StaleActionPhase { .. })
+        ));
+        assert_eq!(adapter.actions.lock().unwrap().len(), 1);
+        lease.finish(SessionExit::Completed);
+    }
+
+    #[test]
+    fn terminal_action_authority_is_single_use_under_duplicate_delivery() {
+        let (coordinator, adapter) = coordinator();
+        let lease = coordinator
+            .acquire_current(GuidedMode::Calibration, Some(device()))
+            .unwrap();
+        let request = GuidedIntentRequest {
+            authority: coordinator.snapshot().action_authority,
+            action: protocol::GuidedSessionAction::DiscardCalibration,
+        };
+
+        coordinator.handle_intent(request.clone()).unwrap();
+        assert!(matches!(
+            coordinator.handle_intent(request),
+            Err(CoordinatorError::StaleActionPhase { .. })
+        ));
+        assert_eq!(
+            adapter.actions.lock().unwrap().as_slice(),
+            &[protocol::GuidedSessionAction::DiscardCalibration]
+        );
+        lease.finish(SessionExit::OperatorStopped);
+    }
+
+    #[test]
     fn adapter_mutation_rechecks_identity_after_dispatch_validation() {
         let (coordinator, _adapter) = coordinator();
         let before = coordinator.snapshot();
         let request = GuidedIntentRequest {
-            expected_revision: before.revision,
-            expected_run_revision: before.run_revision,
-            expected_session_id: None,
+            authority: before.action_authority,
             action: protocol::GuidedSessionAction::StartCalibration,
         };
         let connection = coordinator.connect_browser();
@@ -1044,11 +1250,11 @@ mod tests {
             .set_visible_mode(Some(GuidedMode::Calibration))
             .unwrap();
 
-        assert!(matches!(
-            coordinator.acquire_for_intent(&request, GuidedMode::Calibration, Some(device())),
-            Err(CoordinatorError::StaleRevision { .. })
-        ));
-        assert!(coordinator.snapshot().active().is_none());
+        let lease = coordinator
+            .acquire_for_intent(&request, GuidedMode::Calibration, Some(device()))
+            .unwrap();
+        assert!(coordinator.snapshot().active().is_some());
+        lease.finish(SessionExit::OperatorStopped);
     }
 
     #[test]

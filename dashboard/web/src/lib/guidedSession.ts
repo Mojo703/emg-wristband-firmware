@@ -49,9 +49,7 @@ export function guidedIntent(
 ): GuidedSessionIntentFrame {
   return {
     type: 'guided_session_intent',
-    expected_revision: snapshot.revision,
-    expected_run_revision: snapshot.run_revision,
-    expected_session_id: activeGuidedSession(snapshot)?.session_id ?? null,
+    authority: snapshot.action_authority,
     action,
   };
 }
