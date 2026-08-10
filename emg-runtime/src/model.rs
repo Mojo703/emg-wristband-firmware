@@ -350,11 +350,13 @@ impl<'a> Model<'a> {
             let xin: &I8Activation = if index == 0 { input } else { pointwise_out };
             layers::depthwise(
                 xin,
-                blk.dw,
-                blk.dw_bias,
-                *kernel,
-                STRIDE,
-                blk.dw_rq,
+                layers::DepthwiseLayer {
+                    weights: blk.dw,
+                    bias: blk.dw_bias,
+                    kernel: *kernel,
+                    stride: STRIDE,
+                    requantize: blk.dw_rq,
+                },
                 padded,
                 depthwise_out,
             );
@@ -376,38 +378,6 @@ impl<'a> Model<'a> {
 
 pub enum ForwardResult {
     Logits([i32; NUM_CLASSES]),
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[repr(align(16))]
-    struct Aligned<const N: usize>([u8; N]);
-
-    static MODEL: Aligned<{ include_bytes!("../data/model_int8.bin").len() }> =
-        Aligned(*include_bytes!("../data/model_int8.bin"));
-
-    #[test]
-    #[should_panic]
-    fn truncated_i8_slice_panics_before_forming_slice() {
-        let mut cursor = ModelFileCursor::new(&[0]);
-
-        let _ = cursor.i8_slice(2);
-    }
-
-    #[test]
-    fn repeated_forward_calls_do_not_allocate() {
-        let buffers = ModelBuffers::reserve(&MODEL.0);
-        let (mut model, input) = Model::load(&MODEL.0, buffers);
-        let allocations = crate::test_alloc::count(|| {
-            for _ in 0..1_000 {
-                let ForwardResult::Logits(logits) = model.forward(&input);
-                core::hint::black_box(logits);
-            }
-        });
-        assert_eq!(allocations, 0);
-    }
 }
 
 impl<'a> VerifyBatch<'a> {
@@ -472,5 +442,37 @@ impl<'a> VerifyBatch<'a> {
             label,
             float_logits,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[repr(align(16))]
+    struct Aligned<const N: usize>([u8; N]);
+
+    static MODEL: Aligned<{ include_bytes!("../data/model_int8.bin").len() }> =
+        Aligned(*include_bytes!("../data/model_int8.bin"));
+
+    #[test]
+    #[should_panic]
+    fn truncated_i8_slice_panics_before_forming_slice() {
+        let mut cursor = ModelFileCursor::new(&[0]);
+
+        let _ = cursor.i8_slice(2);
+    }
+
+    #[test]
+    fn repeated_forward_calls_do_not_allocate() {
+        let buffers = ModelBuffers::reserve(&MODEL.0);
+        let (mut model, input) = Model::load(&MODEL.0, buffers);
+        let allocations = crate::test_alloc::count(|| {
+            for _ in 0..1_000 {
+                let ForwardResult::Logits(logits) = model.forward(&input);
+                core::hint::black_box(logits);
+            }
+        });
+        assert_eq!(allocations, 0);
     }
 }

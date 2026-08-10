@@ -25,6 +25,18 @@ impl Requantize {
     }
 }
 
+/// Immutable parameters of one depthwise convolution.  Grouping the tensor
+/// metadata and quantizer makes scalar/SIMD entry points take one layer value
+/// rather than a fragile list of parallel arguments.
+#[derive(Clone, Copy)]
+pub struct DepthwiseLayer<'a> {
+    pub weights: &'a [i8],
+    pub bias: &'a [i32],
+    pub kernel: usize,
+    pub stride: usize,
+    pub requantize: Requantize,
+}
+
 /// Copies `x` into `padded` with `pad` zeroed time steps either side, reusing
 /// `padded`'s allocation. Every layer output here is written into a caller-owned
 /// buffer for the same reason: per-inference allocations in the multi-kilobyte size
@@ -43,14 +55,17 @@ fn pad_input_into(x: &I8Activation, pad: usize, padded: &mut I8Activation) {
 /// oracle for the SIMD self-test.
 pub fn depthwise_scalar(
     x: &I8Activation,
-    w: &[i8],
-    bias: &[i32],
-    k: usize,
-    stride: usize,
-    rq: Requantize,
+    layer: DepthwiseLayer<'_>,
     padded: &mut I8Activation,
     out: &mut I8Activation,
 ) {
+    let DepthwiseLayer {
+        weights: w,
+        bias,
+        kernel: k,
+        stride,
+        requantize: rq,
+    } = layer;
     let c = x.c;
     let t_out = x.t.div_ceil(stride);
     let pad = k / 2;
@@ -100,14 +115,17 @@ fn extract_qacc_half(data: &[u8], out: &mut [i32]) {
 #[cfg(target_arch = "xtensa")]
 pub fn depthwise_simd(
     x: &I8Activation,
-    w: &[i8],
-    bias: &[i32],
-    k: usize,
-    stride: usize,
-    rq: Requantize,
+    layer: DepthwiseLayer<'_>,
     padded: &mut I8Activation,
     out: &mut I8Activation,
 ) {
+    let DepthwiseLayer {
+        weights: w,
+        bias,
+        kernel: k,
+        stride,
+        requantize: rq,
+    } = layer;
     let c = x.c;
     let t_out = x.t.div_ceil(stride);
     let pad = k / 2;
@@ -178,30 +196,22 @@ pub fn depthwise_simd(
 #[cfg(not(target_arch = "xtensa"))]
 pub fn depthwise_simd(
     x: &I8Activation,
-    w: &[i8],
-    bias: &[i32],
-    k: usize,
-    stride: usize,
-    rq: Requantize,
+    layer: DepthwiseLayer<'_>,
     padded: &mut I8Activation,
     out: &mut I8Activation,
 ) {
-    depthwise_scalar(x, w, bias, k, stride, rq, padded, out)
+    depthwise_scalar(x, layer, padded, out)
 }
 
 /// Depthwise 1D conv into `out` via `padded`: SIMD on ESP32-S3, scalar fallback
 /// off-target. Weight layout `[K, C]`: `w[j * c + ch]`.
 pub fn depthwise(
     x: &I8Activation,
-    w: &[i8],
-    bias: &[i32],
-    k: usize,
-    stride: usize,
-    rq: Requantize,
+    layer: DepthwiseLayer<'_>,
     padded: &mut I8Activation,
     out: &mut I8Activation,
 ) {
-    depthwise_simd(x, w, bias, k, stride, rq, padded, out)
+    depthwise_simd(x, layer, padded, out)
 }
 
 /// Pointwise (1x1) conv into `out`: independent `cin -> out_ch` matmul at each time
