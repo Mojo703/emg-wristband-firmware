@@ -85,6 +85,7 @@ test('strict authoritative wire snapshot reaches the real guided component', asy
     snapshot: {
       revision: 7,
       run_revision: 0,
+      action_authority: { run_revision: 0, session_id: null, phase_generation: 0 },
       visible_collection_views: 0,
       visible_calibration_views: 1,
       lifecycle: { state: 'idle', calibration: setup },
