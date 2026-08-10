@@ -176,7 +176,16 @@ async function main() {
   const interruption = await waitFor('heartbeat-timeout interruption', value => value.type === 'calibration_song_interrupted', 8_000);
   if (interruption.interruption.reason !== 'heartbeat_timeout') fail(`unexpected interruption ${interruption.interruption.reason}`);
   await waitFor('between-songs snapshot', value => value.type === 'guided_session_snapshot' && calibration(value.snapshot)?.phase === 'between_songs', 8_000);
+  // Initial Idle snapshots remain in the asynchronous inbox for the whole run;
+  // do not let one make Discard appear complete before the device's exact ACK.
+  inbox.length = 0;
   guided({ name: 'discard_calibration' });
+  await waitFor('Discard candidate-absent acknowledgement', value =>
+    value.type === 'calibration_candidate_status' &&
+    value.candidate.run.session_id === schedule.run.session_id &&
+    value.candidate.run.run_id === schedule.run.run_id &&
+    value.candidate.schedule_revision === schedule.schedule_revision &&
+    value.candidate.presence.state === 'absent', 8_000);
   await waitFor('Discard completion', value =>
     value.type === 'guided_session_snapshot' &&
     value.snapshot.lifecycle.state === 'idle' &&
