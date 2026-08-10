@@ -66,6 +66,16 @@ test('setup renders tracks and disables Start without an authoritative selection
   assert.match(button(body, 'Start calibration'), DISABLED_ATTRIBUTE);
 });
 
+test('a selected short authored song keeps Start enabled', async () => {
+  const { fixtures } = await modules();
+  const setup = fixtures['calibrationSetupFixture'];
+  assert.ok(setup?.phase === 'setup');
+  const body = await render({ ...setup, selected_track_id: 'short-track' });
+
+  assert.doesNotMatch(button(body, 'Start calibration'), DISABLED_ATTRIBUTE);
+  assert.match(body, /56 short/);
+});
+
 test('strict authoritative wire snapshot reaches the real guided component', async () => {
   const { fixtures } = await modules();
   const setup = fixtures['calibrationSetupFixture'];

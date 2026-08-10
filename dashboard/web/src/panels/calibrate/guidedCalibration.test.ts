@@ -20,6 +20,8 @@ function songEnd(
   return {
     phase: 'between_songs',
     track_title: 'Calibration Song',
+    tracks: calibrationSetupFixture.tracks,
+    selected_track_id: 'fixture-track',
     candidate_available: candidateAvailable,
     continue_available: continueAvailable,
     valid_reps: 94,

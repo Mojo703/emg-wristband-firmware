@@ -2,6 +2,7 @@
   import { Button } from '$lib/components/ui/button/index.js';
   import { api, live } from '../lib/socket.svelte';
   import { asOffsetMilliseconds } from '../lib/protocol';
+  import { timingAvailable, timingDisplayProjection, timingQualityWarning } from './timing';
 
   const selection = $derived(live.hello?.selection ?? null);
   const selectedDevice = $derived(
@@ -9,8 +10,14 @@
   );
   const status = $derived(live.timingStatus?.status ?? null);
   const activeGuidedMode = $derived(live.guidedSession?.active?.mode ?? null);
-  const busy = $derived(activeGuidedMode !== null);
-  const running = $derived(status?.state === 'running');
+  const available = $derived(
+    timingAvailable({ selectedDeviceConnected: selectedDevice?.connected === true, guidedMode: activeGuidedMode }),
+  );
+  const busy = $derived(!available);
+  const display = $derived(timingDisplayProjection(status));
+  const running = $derived(display.running);
+  const timingState = $derived(display.state);
+  const qualityWarning = $derived(timingQualityWarning(status));
 
   function adjust(delta: 5 | -5 | 50 | -50): void {
     api.timing({ name: 'adjust_host_timeline', delta_milliseconds: asOffsetMilliseconds(delta) });
@@ -44,13 +51,13 @@
         <strong>Device reference sequence</strong>
         <p class="muted">{selectedDevice?.label ?? selection.device_id}</p>
       </div>
-      <span class:running class="state" role="status">{running ? 'Running' : 'Stopped'}</span>
+      <span class:running class="state" role="status">{timingState === 'unknown' ? 'Waiting for device' : timingState}</span>
     </div>
 
     <div class="rgb" aria-label="Fixed red green blue reference sequence">
-      <span class:active={status?.color === 'red'} class="red">Red</span>
-      <span class:active={status?.color === 'green'} class="green">Green</span>
-      <span class:active={status?.color === 'blue'} class="blue">Blue</span>
+      <span class:active={display.color === 'red'} class="red">Red</span>
+      <span class:active={display.color === 'green'} class="green">Green</span>
+      <span class:active={display.color === 'blue'} class="blue">Blue</span>
     </div>
     <p class="muted note">
       The wristband owns the 500 ms red → green → blue loop. This page renders the same sequence;
@@ -64,15 +71,17 @@
       <button class="adjust large" aria-label="Shift host timeline later by 50 milliseconds" disabled={!running || busy} onclick={() => adjust(50)}>&gt;&gt;</button>
     </div>
     <div class="actions">
-      {#if running}
+      {#if timingState === 'running'}
         <Button variant="secondary" disabled={busy} onclick={stop}>Stop timing</Button>
       {:else}
-        <Button disabled={busy} onclick={start}>Start timing</Button>
+        <Button disabled={!available || (timingState !== 'stopped' && timingState !== 'error')} onclick={start}>Start timing</Button>
       {/if}
       <Button variant="secondary" disabled={!running || busy} onclick={reset}>Reset</Button>
     </div>
 
-    {#if busy}
+    {#if selectedDevice?.connected !== true}
+      <p class="warn" role="status">Timing requires the selected wristband to remain connected.</p>
+    {:else if activeGuidedMode !== null}
       <p class="warn" role="status">Timing is unavailable while {activeGuidedMode} is active.</p>
     {/if}
   </section>
@@ -85,6 +94,12 @@
     <div><span>Total correction</span><strong>{milliseconds(status?.total_correction_milliseconds)}</strong></div>
     <div><span>Probe window</span><strong>{status === null ? '—' : `${status.probe_window.sample_count}/${status.probe_window.capacity}`}</strong></div>
   </section>
+  {#if qualityWarning !== null}
+    <p class="warn" role="status">{qualityWarning}</p>
+  {/if}
+  {#if status?.state === 'error' && status.error_detail !== null}
+    <p class="warn" role="alert">{status.error_detail}</p>
+  {/if}
   <p class="muted footnote">Timing state is volatile and retained per device only while this dashboard process runs. Persistence is intentionally deferred.</p>
 {/if}
 

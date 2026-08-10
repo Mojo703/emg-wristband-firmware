@@ -56,6 +56,7 @@ test('replacement browser mirrors expose bounded integer timing state', () => {
       manual_trim_milliseconds: asOffsetMilliseconds(-1000),
       total_correction_milliseconds: asOffsetMilliseconds(-2147484648),
       probe_window: { sample_count: 11, capacity: 11 },
+      error_detail: null,
     },
   });
   assert.equal(status?.type, 'calibration_timing_status');
@@ -73,6 +74,7 @@ test('replacement browser mirrors expose bounded integer timing state', () => {
         manual_trim_milliseconds: 1001,
         total_correction_milliseconds: null,
         probe_window: { sample_count: 12, capacity: 11 },
+        error_detail: null,
       },
     }),
     null,
@@ -121,5 +123,32 @@ test('schedule acceptance echoes whole-song identity and candidate state', () =>
       },
     })?.type,
     'calibration_song_result',
+  );
+});
+
+test('device preparation status is a closed acquisition-authoritative phase union', () => {
+  const settling = asIncomingFrame({
+    type: 'calibration_preparation_status',
+    status: {
+      run,
+      schedule_revision: 3,
+      phase: {
+        phase: 'settling',
+        elapsed_milliseconds: 2500,
+        remaining_milliseconds: 7500,
+      },
+    },
+  });
+  assert.equal(settling?.type, 'calibration_preparation_status');
+  assert.equal(
+    asIncomingFrame({
+      type: 'calibration_preparation_status',
+      status: {
+        run,
+        schedule_revision: 3,
+        phase: { phase: 'settling', elapsed_milliseconds: -1, remaining_milliseconds: 1 },
+      },
+    }),
+    null,
   );
 });

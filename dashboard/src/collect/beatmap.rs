@@ -401,15 +401,14 @@ impl TrackCatalog {
         self.find(track_id).and_then(|track| track.rest.clone())
     }
 
-    pub fn calibration_availability(&self, track_id: &TrackId) -> Option<&CalibrationAvailability> {
-        self.find(track_id)?.calibration.as_ref()
-    }
-
     pub fn calibration_tracks(&self) -> Vec<CalibrationTrack> {
         self.tracks
             .iter()
             .filter_map(|track| {
                 let calibration = track.calibration.as_ref()?;
+                if calibration.entries.is_empty() {
+                    return None;
+                }
                 Some(CalibrationTrack {
                     id: track.info.id.clone(),
                     title: track.info.title.clone(),
@@ -851,7 +850,6 @@ mod tests {
         let catalog = catalog_of(vec![legacy]).unwrap();
         let track_id = TrackId("legacy".into());
 
-        assert_eq!(catalog.calibration_availability(&track_id), None);
         assert!(catalog
             .generate(&track_id, &catalog.class_ids(), DifficultyLevel::Medium, 7,)
             .is_ok());
@@ -915,27 +913,6 @@ mod tests {
                 .is_ok());
             let _ = std::fs::remove_dir_all(directory);
         }
-    }
-
-    #[test]
-    fn catalog_exposes_calibration_availability_without_changing_tracks() {
-        let mut entry = track_entry("calibrated", one_note_per_cell(), 60_000);
-        entry.calibration = Some(
-            crate::collect::calibration_level::CalibrationLevelProduct::generate(
-                &entry.levels["hard"].map_notes,
-                entry.duration_ms,
-            ),
-        );
-        let expected_count = entry.calibration.as_ref().unwrap().cue_count();
-        let expected_identity = entry.calibration.as_ref().unwrap().content_identity.clone();
-        let catalog = catalog_of(vec![entry]).unwrap();
-        let availability = catalog
-            .calibration_availability(&TrackId("calibrated".into()))
-            .unwrap();
-
-        assert_eq!(availability.cue_count, expected_count);
-        assert_eq!(availability.content_identity, expected_identity);
-        assert_eq!(catalog.tracks().len(), 1);
     }
 
     #[test]

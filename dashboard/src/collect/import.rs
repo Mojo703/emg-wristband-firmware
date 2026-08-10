@@ -16,9 +16,8 @@
 //! place, so an import that fails partway leaves nothing for
 //! [`TrackCatalog::load`](super::beatmap::TrackCatalog::load) to trip over.
 
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, Read};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{anyhow, Context};
 use serde::Serialize;
@@ -304,74 +303,6 @@ fn write_track_directory(
         .with_context(|| format!("moving the imported track into {}", destination.display()))
 }
 
-/// Atomically replace only a track's derived manifest. The retained source and
-/// personal audio are outside the destination path and are never opened here.
-/// HTTP regeneration wiring can call this after rebuilding a [`TrackEntry`]
-/// from the retained source directory.
-pub fn replace_derived_metadata(track_directory: &Path, entry: &TrackEntry) -> anyhow::Result<()> {
-    if let Some(calibration) = &entry.calibration {
-        let source = entry
-            .levels
-            .get(CALIBRATION_SOURCE_LEVEL)
-            .ok_or_else(|| anyhow!("regenerated metadata has no hard source level"))?;
-        calibration
-            .validate_against_source(&source.map_notes, entry.duration_ms)
-            .context("validating regenerated calibration metadata")?;
-    }
-    let bytes =
-        serde_json::to_vec_pretty(entry).context("serializing regenerated track metadata")?;
-    let destination = track_directory.join(TRACK_FILE_NAME);
-    replace_file_atomically(&destination, |file| {
-        file.write_all(&bytes)?;
-        file.write_all(b"\n")
-    })
-    .with_context(|| format!("replacing {}", destination.display()))
-}
-
-static ATOMIC_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-fn replace_file_atomically(
-    destination: &Path,
-    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
-) -> std::io::Result<()> {
-    let parent = destination.parent().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "atomic destination has no parent directory",
-        )
-    })?;
-    let file_name = destination
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "atomic destination has no UTF-8 file name",
-            )
-        })?;
-    let sequence = ATOMIC_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let temporary = parent.join(format!(
-        ".{file_name}.{}.{}.tmp",
-        std::process::id(),
-        sequence
-    ));
-
-    let result = (|| {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)?;
-        write(&mut file)?;
-        file.sync_all()?;
-        std::fs::rename(&temporary, destination)?;
-        std::fs::File::open(parent)?.sync_all()
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    result
-}
-
 /// Read one archive entry by file name, ignoring whatever directory path the
 /// entry claims to sit in — a map's files sit either at the archive root or
 /// inside one directory, and neither placement changes what is taken.
@@ -569,14 +500,6 @@ mod tests {
     use super::*;
     use crate::collect::beatmap::{assign_columns, LevelEntry, MapNote, MAXIMUM_COLUMNS};
 
-    fn unique_test_directory(name: &str) -> std::path::PathBuf {
-        let sequence = ATOMIC_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!(
-            "dashboard-import-{name}-{}-{sequence}",
-            std::process::id()
-        ))
-    }
-
     fn test_track_entry(id: &str) -> TrackEntry {
         let map_notes = (0..12)
             .map(|index| MapNote {
@@ -728,26 +651,6 @@ mod tests {
     }
 
     #[test]
-    fn atomic_metadata_replacement_never_touches_audio() {
-        let directory = unique_test_directory("atomic-metadata");
-        std::fs::create_dir_all(&directory).unwrap();
-        let audio_path = directory.join(TRACK_AUDIO_NAME);
-        std::fs::write(&audio_path, b"personal audio").unwrap();
-        std::fs::write(directory.join(TRACK_FILE_NAME), b"old metadata").unwrap();
-        let entry = test_track_entry("replacement");
-
-        replace_derived_metadata(&directory, &entry).unwrap();
-
-        assert_eq!(std::fs::read(&audio_path).unwrap(), b"personal audio");
-        let loaded: TrackEntry =
-            serde_json::from_slice(&std::fs::read(directory.join(TRACK_FILE_NAME)).unwrap())
-                .unwrap();
-        assert_eq!(loaded.id.0, "replacement");
-        assert!(loaded.calibration.is_some());
-        let _ = std::fs::remove_dir_all(directory);
-    }
-
-    #[test]
     fn imported_entry_adds_calibration_from_hard_without_changing_ordinary_levels() {
         let original = test_track_entry("source");
         let levels = original.levels.clone();
@@ -791,25 +694,5 @@ mod tests {
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(json["availability"], "available");
         assert!(json.get("available").is_none());
-    }
-
-    #[test]
-    fn failed_atomic_write_keeps_previous_metadata_and_audio() {
-        let directory = unique_test_directory("failed-atomic-metadata");
-        std::fs::create_dir_all(&directory).unwrap();
-        let metadata_path = directory.join(TRACK_FILE_NAME);
-        let audio_path = directory.join(TRACK_AUDIO_NAME);
-        std::fs::write(&metadata_path, b"old metadata").unwrap();
-        std::fs::write(&audio_path, b"personal audio").unwrap();
-
-        let result = replace_file_atomically(&metadata_path, |file| {
-            file.write_all(b"partial replacement")?;
-            Err(std::io::Error::other("injected failure"))
-        });
-
-        assert!(result.is_err());
-        assert_eq!(std::fs::read(&metadata_path).unwrap(), b"old metadata");
-        assert_eq!(std::fs::read(&audio_path).unwrap(), b"personal audio");
-        let _ = std::fs::remove_dir_all(directory);
     }
 }

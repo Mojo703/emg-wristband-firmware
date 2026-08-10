@@ -99,6 +99,8 @@ export const calibrationPlayingFixture: CalibrationPlayingSnapshot = {
 export const calibrationSongEndFixture: CalibrationSongEndSnapshot = {
   phase: 'between_songs',
   track_title: track.title,
+  tracks: calibrationSetupFixture.tracks,
+  selected_track_id: track.id,
   candidate_available: true,
   continue_available: true,
   valid_reps: 124,

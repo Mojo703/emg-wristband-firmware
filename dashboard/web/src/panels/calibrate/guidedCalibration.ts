@@ -47,9 +47,19 @@ export interface CalibrationPlayingSnapshot {
   readonly counts: readonly CalibrationCount[];
 }
 
+export interface CalibrationPreparingSnapshot {
+  readonly phase: 'preparing';
+  readonly track: CalibrationTrack;
+  readonly stage: 'stillness' | 'gain_estimation' | 'ready_for_schedule';
+  readonly elapsed_milliseconds: number;
+  readonly remaining_milliseconds: number;
+}
+
 export interface CalibrationSongEndSnapshot {
   readonly phase: 'between_songs';
   readonly track_title: string;
+  readonly tracks: readonly CalibrationTrack[];
+  readonly selected_track_id: string | null;
   readonly candidate_available: boolean;
   readonly continue_available: boolean;
   readonly valid_reps: number;
@@ -64,6 +74,7 @@ export interface CalibrationTechnicalFailureSnapshot {
 
 export type GuidedCalibrationSnapshot =
   | CalibrationSetupSnapshot
+  | CalibrationPreparingSnapshot
   | CalibrationPlayingSnapshot
   | CalibrationSongEndSnapshot
   | CalibrationTechnicalFailureSnapshot;

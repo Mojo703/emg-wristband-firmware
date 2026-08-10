@@ -109,7 +109,8 @@ fn delivery_for(frame: &Frame) -> Delivery {
         Frame::Event { .. } | Frame::Log { .. } | Frame::PhoneState { .. } => Delivery::Reliable,
         // A calibration run narrates itself in edges. Coalescing can erase the
         // transition that explains the state currently on screen.
-        Frame::CalibrationScheduleAccepted { .. }
+        Frame::CalibrationPreparationStatus { .. }
+        | Frame::CalibrationScheduleAccepted { .. }
         | Frame::CalibrationSongInterrupted { .. }
         | Frame::CalibrationSongResult { .. }
         | Frame::CalibrationCandidateStatus { .. }
@@ -520,16 +521,29 @@ pub async fn handle_browser(
                                 if send_reliable(&browser_tx, Message::Binary(frame::encode(&refusal))).await.is_err() { break; }
                                 continue;
                             }
-                            let (status, control) = timing.intent(device_id, intent);
+                            let (mut status, control) = match timing.intent(device_id, intent) {
+                                Ok(result) => result,
+                                Err(error) => {
+                                    let refusal = Frame::BenchError {
+                                        stage: "timing".into(),
+                                        detail: error.to_string(),
+                                    };
+                                    if send_reliable(&browser_tx, Message::Binary(frame::encode(&refusal))).await.is_err() { break; }
+                                    continue;
+                                }
+                            };
                             if let Some(control) = control {
                                 if let Err(error) = registry.send_control(device_id, control) {
+                                    let status = timing.control_failed(device_id, error.calibration_message().into());
                                     let refusal = Frame::BenchError {
                                         stage: "timing".into(),
                                         detail: error.calibration_message().into(),
                                     };
                                     if send_reliable(&browser_tx, Message::Binary(frame::encode(&refusal))).await.is_err() { break; }
+                                    if send_reliable(&browser_tx, Message::Binary(frame::encode(&status))).await.is_err() { break; }
                                     continue;
                                 }
+                                status = timing.control_delivered(device_id, intent);
                             }
                             if send_reliable(&browser_tx, Message::Binary(frame::encode(&status))).await.is_err() { break; }
                         }
@@ -541,6 +555,12 @@ pub async fn handle_browser(
                             let hello = Message::Binary(frame::encode(&view(&registry, &collection, selection.device_id(), device_port)));
                             if send_reliable(&browser_tx, hello).await.is_err() {
                                 break;
+                            }
+                            if let Some(device_id) = selection.device_id() {
+                                if send_reliable(
+                                    &browser_tx,
+                                    Message::Binary(frame::encode(&timing.status(device_id))),
+                                ).await.is_err() { break; }
                             }
                         }
                         // Forward ordinary device controls. Calibration lifecycle
@@ -623,6 +643,12 @@ pub async fn handle_browser(
                 if matches!(frame, Frame::Emg { .. }) && !emg_stream {
                     continue;
                 }
+                // Raw device loop observations are consumed above and reduced
+                // to the backend-authoritative CalibrationTimingStatus. Do
+                // not expose a second browser state source.
+                if matches!(frame, Frame::CalibrationTimingLoopStatus { .. }) {
+                    continue;
+                }
                 let msg = Message::Binary(frame::encode(&frame));
                 let result = match delivery_for(&frame) {
                     Delivery::Reliable => send_reliable(&browser_tx, msg).await,
@@ -671,6 +697,12 @@ pub async fn handle_browser(
                 // The browser clears its log panel on every hello; refill it.
                 if replay_retained(&registry, selection.device_id(), &browser_tx).await.is_err() {
                     break;
+                }
+                if let Some(device_id) = selection.device_id() {
+                    if send_reliable(
+                        &browser_tx,
+                        Message::Binary(frame::encode(&timing.status(device_id))),
+                    ).await.is_err() { break; }
                 }
             }
         }

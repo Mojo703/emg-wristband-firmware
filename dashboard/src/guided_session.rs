@@ -346,7 +346,7 @@ impl GuidedSessionCoordinator {
         Ok(SessionLease {
             coordinator: Arc::downgrade(&self.inner),
             binding,
-            finished: false,
+            lifecycle: LeaseLifecycle::Active,
         })
     }
 
@@ -453,7 +453,7 @@ impl GuidedSessionCoordinator {
         GuidedBrowserConnection {
             coordinator: Arc::downgrade(&self.inner),
             id,
-            connected: true,
+            lifecycle: BrowserConnectionLifecycle::Attached,
         }
     }
 
@@ -538,7 +538,13 @@ fn publish_locked(
 pub struct SessionLease {
     coordinator: Weak<CoordinatorInner>,
     binding: GuidedSessionBinding,
-    finished: bool,
+    lifecycle: LeaseLifecycle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeaseLifecycle {
+    Active,
+    Finished,
 }
 
 impl fmt::Debug for SessionLease {
@@ -546,7 +552,7 @@ impl fmt::Debug for SessionLease {
         formatter
             .debug_struct("SessionLease")
             .field("binding", &self.binding)
-            .field("finished", &self.finished)
+            .field("lifecycle", &self.lifecycle)
             .finish()
     }
 }
@@ -557,14 +563,14 @@ impl SessionLease {
     }
 
     pub fn finish(mut self, outcome: SessionExit) {
-        self.finished = true;
+        self.lifecycle = LeaseLifecycle::Finished;
         release(&self.coordinator, &self.binding, outcome);
     }
 }
 
 impl Drop for SessionLease {
     fn drop(&mut self) {
-        if !self.finished {
+        if matches!(self.lifecycle, LeaseLifecycle::Active) {
             release(
                 &self.coordinator,
                 &self.binding,
@@ -611,7 +617,13 @@ fn release(
 pub struct GuidedBrowserConnection {
     coordinator: Weak<CoordinatorInner>,
     id: u64,
-    connected: bool,
+    lifecycle: BrowserConnectionLifecycle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowserConnectionLifecycle {
+    Attached,
+    Removed,
 }
 
 impl GuidedBrowserConnection {
@@ -651,10 +663,10 @@ impl GuidedBrowserConnection {
     }
 
     fn remove(&mut self) {
-        if !self.connected {
+        if matches!(self.lifecycle, BrowserConnectionLifecycle::Removed) {
             return;
         }
-        self.connected = false;
+        self.lifecycle = BrowserConnectionLifecycle::Removed;
         let Some(inner) = self.coordinator.upgrade() else {
             return;
         };

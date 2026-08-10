@@ -20,7 +20,6 @@ import {
   type Binding,
   type BoardRevision,
   type CalibrationTimingStatusFrame,
-  type CalibrationTimingLoopStatusFrame,
   type CalibrationTimingIntent,
   type CalibrationSongResultFrame,
   type CalibrationSongInterruptedFrame,
@@ -112,7 +111,6 @@ class LiveStateManager {
   #phoneState = $state<PhoneStateFrame | null>(null);
   #guidedSession = $state<GuidedSessionSnapshot | null>(null);
   #timingStatus = $state<CalibrationTimingStatusFrame | null>(null);
-  #timingLoopStatus = $state<CalibrationTimingLoopStatusFrame | null>(null);
   #calibrationSongResult = $state<CalibrationSongResultFrame | null>(null);
   #calibrationSongInterrupted = $state<CalibrationSongInterruptedFrame | null>(null);
   #calibrationCandidate = $state<CalibrationCandidateStatusFrame | null>(null);
@@ -158,10 +156,6 @@ class LiveStateManager {
     return this.status === 'online' ? this.#timingStatus : null;
   }
 
-  get timingLoopStatus(): CalibrationTimingLoopStatusFrame | null {
-    return this.status === 'online' ? this.#timingLoopStatus : null;
-  }
-
   get calibrationSongResult(): CalibrationSongResultFrame | null {
     return this.status === 'online' ? this.#calibrationSongResult : null;
   }
@@ -193,14 +187,16 @@ class LiveStateManager {
   setHello(value: HelloFrame): void {
     this.#hello = value;
     this.logs = [];
+    // A Hello can describe a reconnect under the same device id. Until the
+    // backend sends the fresh authoritative projection, never retain the old
+    // device's Running/colour state in the Timing page.
+    this.#timingStatus = null;
     const device = value.selection?.device_id ?? null;
     if (device !== this.#telemetryDevice) {
       this.#telemetryDevice = device;
       this.telemetry = {};
       this.#signalQuality = null;
       this.#phoneState = null;
-      this.#timingStatus = null;
-      this.#timingLoopStatus = null;
       this.#calibrationSongResult = null;
       this.#calibrationSongInterrupted = null;
       this.#calibrationCandidate = null;
@@ -275,10 +271,6 @@ class LiveStateManager {
     this.#timingStatus = value;
   }
 
-  setTimingLoopStatus(value: CalibrationTimingLoopStatusFrame): void {
-    this.#timingLoopStatus = value;
-  }
-
   setCalibrationSongResult(value: CalibrationSongResultFrame): void {
     this.#calibrationSongResult = value;
   }
@@ -337,7 +329,6 @@ class LiveStateManager {
     this.#phoneState = null;
     this.#guidedSession = null;
     this.#timingStatus = null;
-    this.#timingLoopStatus = null;
     this.#calibrationSongResult = null;
     this.#calibrationSongInterrupted = null;
     this.#calibrationCandidate = null;
@@ -361,7 +352,6 @@ class LiveStateManager {
     this.#phoneState = null;
     this.#guidedSession = null;
     this.#timingStatus = null;
-    this.#timingLoopStatus = null;
     this.#calibrationSongResult = null;
     this.#calibrationSongInterrupted = null;
     this.#calibrationCandidate = null;
@@ -521,8 +511,6 @@ export function connect(): void {
       live.setPhoneState(frame);
     } else if (frame.type === 'calibration_timing_status') {
       live.setTimingStatus(frame);
-    } else if (frame.type === 'calibration_timing_loop_status') {
-      live.setTimingLoopStatus(frame);
     } else if (frame.type === 'guided_session_snapshot') {
       live.setGuidedSession(frame.snapshot);
     } else if (frame.type === 'collection_catalog') {
@@ -637,7 +625,6 @@ export type {
   BenchErrorFrame,
   BoardRevision,
   CalibrationTimingStatusFrame,
-  CalibrationTimingLoopStatusFrame,
   CalibrationSongResultFrame,
   CalibrationSongInterruptedFrame,
   CalibrationCandidateStatusFrame,

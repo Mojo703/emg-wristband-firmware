@@ -2,7 +2,6 @@
 //! source-derived collection schedule.
 
 use super::beatmap::MapNote;
-use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -14,7 +13,6 @@ pub const ANTI_CUES_PER_CLASS: usize = 16;
 pub const MAXIMUM_CUES: usize =
     COMMAND_SEMANTIC_COUNT * (COMMAND_CUES_PER_CLASS + ANTI_CUES_PER_CLASS);
 pub const SEMANTIC_COLUMN_COUNT: usize = 10;
-pub const VISUAL_LANE_COUNT: usize = 5;
 pub const CALIBRATION_LEVEL_SCHEMA_VERSION: u32 = 2;
 pub const CALIBRATION_LEVEL_GENERATOR_VERSION: u32 = 2;
 pub const CALIBRATION_SOURCE_LEVEL: &str = "hard";
@@ -22,133 +20,6 @@ pub const CALIBRATION_SOURCE_LEVEL: &str = "hard";
 /// Fixed measured order, beginning at command zero. No implicit song/session
 /// rotation participates in the imported product.
 const PAIRED_SEMANTIC_CYCLE: [u8; SEMANTIC_COLUMN_COUNT] = [0, 5, 1, 6, 2, 7, 3, 8, 4, 9];
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ThumbVariant {
-    Up,
-    Down,
-}
-
-impl ThumbVariant {
-    const fn index(self) -> usize {
-        match self {
-            Self::Up => 0,
-            Self::Down => 1,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct VisualLane(u8);
-
-impl VisualLane {
-    pub const fn index(self) -> u8 {
-        self.0
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SemanticColumn(u8);
-
-impl SemanticColumn {
-    pub const fn from_index(index: u8) -> Option<Self> {
-        if index < SEMANTIC_COLUMN_COUNT as u8 {
-            Some(Self(index))
-        } else {
-            None
-        }
-    }
-
-    pub const fn index(self) -> u8 {
-        self.0
-    }
-
-    pub const fn visual_lane(self) -> VisualLane {
-        VisualLane(self.0 % COMMAND_SEMANTIC_COUNT as u8)
-    }
-
-    pub const fn thumb_variant(self) -> ThumbVariant {
-        if self.0 < COMMAND_SEMANTIC_COUNT as u8 {
-            ThumbVariant::Up
-        } else {
-            ThumbVariant::Down
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CalibrationNote {
-    /// Position in the source-derived schedule. Retaining it makes the
-    /// no-synthesis guarantee inspectable even when source cues share a cell.
-    pub source_index: usize,
-    pub map_note: MapNote,
-    pub semantic_column: SemanticColumn,
-}
-
-impl CalibrationNote {
-    pub const fn visual_lane(&self) -> VisualLane {
-        self.semantic_column.visual_lane()
-    }
-
-    pub const fn thumb_variant(&self) -> ThumbVariant {
-        self.semantic_column.thumb_variant()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CalibrationLevel {
-    notes: Vec<CalibrationNote>,
-    duration_ms: u32,
-}
-
-impl CalibrationLevel {
-    pub fn notes(&self) -> &[CalibrationNote] {
-        &self.notes
-    }
-
-    /// The generated product ends when its final selected cue releases.
-    pub const fn duration_ms(&self) -> u32 {
-        self.duration_ms
-    }
-
-    /// Audio fading begins at the generated product's final release.
-    pub fn fade_at_ms(&self) -> Option<u32> {
-        self.notes.last().map(|_| self.duration_ms)
-    }
-
-    pub fn summary(&self) -> CalibrationLevelSummary {
-        let mut semantic_column_counts = [0; SEMANTIC_COLUMN_COUNT];
-        let mut visual_lane_counts = [0; VISUAL_LANE_COUNT];
-        let mut thumb_variant_counts = [0; 2];
-        for note in &self.notes {
-            semantic_column_counts[usize::from(note.semantic_column.index())] += 1;
-            visual_lane_counts[usize::from(note.visual_lane().index())] += 1;
-            thumb_variant_counts[note.thumb_variant().index()] += 1;
-        }
-        CalibrationLevelSummary {
-            cue_count: self.notes.len(),
-            maximum_cue_count: MAXIMUM_CUES,
-            shorter_than_maximum: self.notes.len() < MAXIMUM_CUES,
-            semantic_column_counts,
-            visual_lane_counts,
-            thumb_variant_counts,
-            duration_ms: self.duration_ms,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CalibrationLevelSummary {
-    pub cue_count: usize,
-    pub maximum_cue_count: usize,
-    pub shorter_than_maximum: bool,
-    pub semantic_column_counts: [usize; SEMANTIC_COLUMN_COUNT],
-    /// Counts after command `n` and anti `n + 5` fold into one visual lane.
-    pub visual_lane_counts: [usize; VISUAL_LANE_COUNT],
-    /// Thumb-up then thumb-down counts.
-    pub thumb_variant_counts: [usize; 2],
-    pub duration_ms: u32,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CalibrationLevelProduct {
@@ -169,22 +40,29 @@ pub struct CalibrationLevelProductNote {
 
 impl CalibrationLevelProduct {
     pub fn generate(source_notes: &[MapNote], source_duration_ms: u32) -> Self {
-        let level = generate(source_notes, source_duration_ms);
+        let selected = select_notes(source_notes, source_duration_ms);
+        let columns = sequential_columns(selected.len());
+        let notes: Vec<_> = selected
+            .into_iter()
+            .zip(columns)
+            .map(
+                |((source_index, map_note), semantic_column)| CalibrationLevelProductNote {
+                    source_index,
+                    map_note,
+                    semantic_column,
+                },
+            )
+            .collect();
+        let duration_ms = notes
+            .last()
+            .map_or(0, |note| note.map_note.time_ms + note.map_note.hold_ms);
         let mut product = Self {
             schema_version: CALIBRATION_LEVEL_SCHEMA_VERSION,
             generator_version: CALIBRATION_LEVEL_GENERATOR_VERSION,
             source_level: CALIBRATION_SOURCE_LEVEL.to_string(),
             content_identity: String::new(),
-            duration_ms: level.duration_ms(),
-            notes: level
-                .notes()
-                .iter()
-                .map(|note| CalibrationLevelProductNote {
-                    source_index: note.source_index,
-                    map_note: note.map_note,
-                    semantic_column: note.semantic_column.index(),
-                })
-                .collect(),
+            duration_ms,
+            notes,
         };
         product.content_identity = product.calculate_content_identity();
         product
@@ -218,12 +96,11 @@ impl CalibrationLevelProduct {
         for (position, (note, expected_column)) in
             self.notes.iter().zip(expected_columns).enumerate()
         {
-            SemanticColumn::from_index(note.semantic_column).with_context(|| {
-                format!(
-                    "calibration cue {position} has semantic column {}",
-                    note.semantic_column
-                )
-            })?;
+            anyhow::ensure!(
+                usize::from(note.semantic_column) < SEMANTIC_COLUMN_COUNT,
+                "calibration cue {position} has semantic column {}",
+                note.semantic_column
+            );
             if note.semantic_column != expected_column {
                 anyhow::bail!("calibration cue {position} has a noncanonical semantic column");
             }
@@ -292,10 +169,10 @@ impl CalibrationLevelProduct {
     }
 }
 
-/// Build a calibration product by selecting only cues already present in a
-/// source-derived schedule. The first eligible cue wins, then each later cue
-/// must leave the fixed recovery interval after the preceding fixed hold.
-pub fn generate(source_notes: &[MapNote], source_duration_ms: u32) -> CalibrationLevel {
+/// Select cues already present in a source-derived schedule. The first eligible
+/// cue wins, then each later cue must leave the fixed recovery interval after
+/// the preceding fixed hold.
+fn select_notes(source_notes: &[MapNote], source_duration_ms: u32) -> Vec<(usize, MapNote)> {
     let mut selected = Vec::with_capacity(MAXIMUM_CUES.min(source_notes.len()));
     let mut next_eligible_onset = 0;
 
@@ -319,21 +196,7 @@ pub fn generate(source_notes: &[MapNote], source_duration_ms: u32) -> Calibratio
         next_eligible_onset = release.saturating_add(MINIMUM_RECOVERY_MILLISECONDS);
     }
 
-    let columns = sequential_columns(selected.len());
-    let notes = selected
-        .into_iter()
-        .zip(columns)
-        .map(|((source_index, map_note), column)| CalibrationNote {
-            source_index,
-            map_note,
-            semantic_column: SemanticColumn::from_index(column)
-                .expect("the measured cycle contains semantic columns 0 through 9"),
-        })
-        .collect::<Vec<_>>();
-    let duration_ms = notes
-        .last()
-        .map_or(0, |note| note.map_note.time_ms + note.map_note.hold_ms);
-    CalibrationLevel { notes, duration_ms }
+    selected
 }
 
 /// Deal authored cue slots through the measured class queues. Commands stop
@@ -380,6 +243,147 @@ mod tests {
 
     fn source_duration(notes: &[MapNote]) -> u32 {
         notes.last().map_or(10_000, |note| note.time_ms + 10_000)
+    }
+
+    const VISUAL_LANE_COUNT: usize = 5;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ThumbVariant {
+        Up,
+        Down,
+    }
+
+    impl ThumbVariant {
+        const fn index(self) -> usize {
+            match self {
+                Self::Up => 0,
+                Self::Down => 1,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct VisualLane(u8);
+
+    impl VisualLane {
+        const fn index(self) -> u8 {
+            self.0
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct SemanticColumn(u8);
+
+    impl SemanticColumn {
+        const fn from_index(index: u8) -> Option<Self> {
+            if index < SEMANTIC_COLUMN_COUNT as u8 {
+                Some(Self(index))
+            } else {
+                None
+            }
+        }
+
+        const fn index(self) -> u8 {
+            self.0
+        }
+
+        const fn visual_lane(self) -> VisualLane {
+            VisualLane(self.0 % COMMAND_SEMANTIC_COUNT as u8)
+        }
+
+        const fn thumb_variant(self) -> ThumbVariant {
+            if self.0 < COMMAND_SEMANTIC_COUNT as u8 {
+                ThumbVariant::Up
+            } else {
+                ThumbVariant::Down
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct CalibrationNote {
+        source_index: usize,
+        map_note: MapNote,
+        semantic_column: SemanticColumn,
+    }
+
+    impl CalibrationNote {
+        const fn visual_lane(&self) -> VisualLane {
+            self.semantic_column.visual_lane()
+        }
+
+        const fn thumb_variant(&self) -> ThumbVariant {
+            self.semantic_column.thumb_variant()
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct CalibrationLevel {
+        notes: Vec<CalibrationNote>,
+        duration_ms: u32,
+    }
+
+    impl CalibrationLevel {
+        fn notes(&self) -> &[CalibrationNote] {
+            &self.notes
+        }
+
+        const fn duration_ms(&self) -> u32 {
+            self.duration_ms
+        }
+
+        fn fade_at_ms(&self) -> Option<u32> {
+            self.notes.last().map(|_| self.duration_ms)
+        }
+
+        fn summary(&self) -> CalibrationLevelSummary {
+            let mut semantic_column_counts = [0; SEMANTIC_COLUMN_COUNT];
+            let mut visual_lane_counts = [0; VISUAL_LANE_COUNT];
+            let mut thumb_variant_counts = [0; 2];
+            for note in &self.notes {
+                semantic_column_counts[usize::from(note.semantic_column.index())] += 1;
+                visual_lane_counts[usize::from(note.visual_lane().index())] += 1;
+                thumb_variant_counts[note.thumb_variant().index()] += 1;
+            }
+            CalibrationLevelSummary {
+                cue_count: self.notes.len(),
+                maximum_cue_count: MAXIMUM_CUES,
+                shorter_than_maximum: self.notes.len() < MAXIMUM_CUES,
+                semantic_column_counts,
+                visual_lane_counts,
+                thumb_variant_counts,
+                duration_ms: self.duration_ms,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct CalibrationLevelSummary {
+        cue_count: usize,
+        maximum_cue_count: usize,
+        shorter_than_maximum: bool,
+        semantic_column_counts: [usize; SEMANTIC_COLUMN_COUNT],
+        visual_lane_counts: [usize; VISUAL_LANE_COUNT],
+        thumb_variant_counts: [usize; 2],
+        duration_ms: u32,
+    }
+
+    fn generate(source_notes: &[MapNote], source_duration_ms: u32) -> CalibrationLevel {
+        let selected = select_notes(source_notes, source_duration_ms);
+        let selected_count = selected.len();
+        let notes = selected
+            .into_iter()
+            .zip(sequential_columns(selected_count))
+            .map(|((source_index, map_note), column)| CalibrationNote {
+                source_index,
+                map_note,
+                semantic_column: SemanticColumn::from_index(column).unwrap(),
+            })
+            .collect::<Vec<_>>();
+        let duration_ms = notes
+            .last()
+            .map_or(0, |note| note.map_note.time_ms + note.map_note.hold_ms);
+        CalibrationLevel { notes, duration_ms }
     }
 
     #[test]
