@@ -913,6 +913,13 @@ async fn serial_session(
     std::thread::spawn(move || {
         let mut port = writer_port;
         let mut out_rx = out_rx;
+        // Explicitly opt-in live fault injection for transport recovery
+        // validation.  Corrupting the first schedule chunk's V2 payload CRC
+        // proves that the device rejects the operation and that the existing
+        // bounded ACK retry applies it exactly once.  Normal runs never enter
+        // this path.
+        let mut corrupt_first_schedule_chunk =
+            std::env::var_os("EMG_SERIAL_CORRUPT_FIRST_SCHEDULE_CHUNK").is_some();
         'session: while let Some(outbound) = out_rx.blocking_recv() {
             let frame = outbound.frame;
             if matches!(frame, Frame::Probe {}) {
@@ -955,7 +962,22 @@ async fn serial_session(
                 }
                 _ => {}
             }
-            let bytes = writer_wire.encode(&frame, outbound.forced_wire);
+            let mut bytes = writer_wire.encode(&frame, outbound.forced_wire);
+            if corrupt_first_schedule_chunk
+                && matches!(frame, Frame::CalibrationScheduleChunk { .. })
+                && bytes.starts_with(&protocol::V2_FRAME_MAGIC)
+            {
+                // The payload CRC is the final u32 in a V2 envelope.  Damage
+                // one CRC byte instead of the CBOR so the intended frame can
+                // never decode or mutate device state.
+                if let Some(last) = bytes.last_mut() {
+                    *last ^= 0x01;
+                    corrupt_first_schedule_chunk = false;
+                    tracing::warn!(
+                        "serial {writer_path} fault injection corrupted first calibration Chunk V2 payload CRC"
+                    );
+                }
+            }
             if let Err(e) = write_serial_bytes(&mut port, &bytes) {
                 tracing::warn!("serial write failed ({e}); ending session");
                 break 'session;
