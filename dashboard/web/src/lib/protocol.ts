@@ -932,6 +932,7 @@ export interface CalibrationSongInterruptedFrame {
       | 'device_link_lost'
       | 'schedule_replaced';
     readonly open_cue: number | null;
+    readonly counts: readonly CalibrationClassCounts[];
   };
 }
 
@@ -2517,7 +2518,9 @@ export function isCalibrationSongInterruptedFrame(
       value['interruption']['reason'] as string,
     ) &&
     (value['interruption']['open_cue'] === null ||
-      isPositiveInteger(value['interruption']['open_cue']))
+      isPositiveInteger(value['interruption']['open_cue'])) &&
+    Array.isArray(value['interruption']['counts']) &&
+    value['interruption']['counts'].every(isCalibrationClassCounts)
   );
 }
 

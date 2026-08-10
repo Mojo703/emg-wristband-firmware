@@ -1392,7 +1392,9 @@ pub enum CalibrationSongInterruptionReason {
 }
 
 /// A device interruption rejects the open cue, if any, and never rolls back
-/// completed evidence or fitting checkpoints.
+/// completed evidence or fitting checkpoints. `counts` is the authoritative
+/// retained-evidence snapshot after that rejection, so an interrupted short
+/// song can offer Continue without guessing from a stale normal result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CalibrationSongInterruption {
     pub run: CalibrationRunKey,
@@ -1400,6 +1402,7 @@ pub struct CalibrationSongInterruption {
     pub content_identity: String,
     pub reason: CalibrationSongInterruptionReason,
     pub open_cue: Option<CalibrationCueId>,
+    pub counts: Vec<CalibrationClassCounts>,
 }
 
 /// Counts for one command or paired anti-gesture class. `deficit_count` is
@@ -4563,6 +4566,14 @@ mod tests {
                     content_identity: "sha256:test".into(),
                     reason: CalibrationSongInterruptionReason::HeartbeatTimeout,
                     open_cue: Some(CalibrationCueId::new(11).unwrap()),
+                    counts: vec![CalibrationClassCounts {
+                        gesture: CalibrationGesture::ThumbExtension,
+                        modifier: CalibrationModifier::ThumbDown,
+                        accepted_count: u32::MAX,
+                        rejected_count: u32::MAX,
+                        target_count: u32::MAX,
+                        deficit_count: u32::MAX,
+                    }],
                 },
             },
             Frame::CalibrationSongResult {

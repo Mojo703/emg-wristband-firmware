@@ -58,6 +58,22 @@ impl AnchoredRecipeProgress {
         count.rejected = count.rejected.saturating_add(1);
     }
 
+    /// Every command and paired anti-gesture class has its retained target.
+    ///
+    /// This is deliberately derived from the same capped counts which own
+    /// flash-row retention. A host may show a short song's counts, but only a
+    /// complete recipe may enter final fitting and resident promotion.
+    pub fn is_complete(&self) -> bool {
+        CalibrationGesture::ALL.into_iter().all(|gesture| {
+            [CalibrationModifier::ThumbUp, CalibrationModifier::ThumbDown]
+                .into_iter()
+                .all(|modifier| {
+                    self.counts[anchored_class_index_parts(gesture, modifier)].accepted
+                        >= anchored_target_count(modifier)
+                })
+        })
+    }
+
     pub fn retained_rep_count(&self) -> u32 {
         CalibrationGesture::ALL
             .into_iter()
@@ -137,6 +153,7 @@ mod tests {
     fn surplus_continue_cues_count_but_never_consume_recipe_rows() {
         let constants = Constants::DEFAULT;
         let mut progress = AnchoredRecipeProgress::default();
+        assert!(!progress.is_complete());
         let mut retained_rows = 0;
         for gesture in CalibrationGesture::ALL {
             for modifier in [CalibrationModifier::ThumbUp, CalibrationModifier::ThumbDown] {
@@ -150,6 +167,7 @@ mod tests {
         }
         assert_eq!(progress.retained_rep_count(), 130);
         assert_eq!(retained_rows, 1_170);
+        assert!(progress.is_complete());
     }
 
     #[test]

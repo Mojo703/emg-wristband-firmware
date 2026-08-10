@@ -419,9 +419,9 @@ impl EvidenceState {
 #[derive(Clone, Copy)]
 enum CandidateState {
     Absent,
-    /// A matching SongResult is sufficient authority to ask the wristband to
-    /// build and atomically promote its candidate. The device deliberately
-    /// does that work only after an explicit Save.
+    /// A complete, matching SongResult is sufficient authority to ask the
+    /// wristband to build and atomically promote its candidate. The device
+    /// deliberately does that work only after an explicit Save.
     Buildable,
     Present(protocol::CalibrationCandidateValidity),
 }
@@ -533,6 +533,46 @@ impl CandidateState {
 
 fn counts_have_deficits(counts: &[protocol::CalibrationClassCounts]) -> bool {
     counts.iter().any(|count| count.deficit_count > 0)
+}
+
+/// A terminal count projection authorizes Save only when it names every
+/// guided recipe class exactly once and the device reports that every target
+/// is met. This keeps an arbitrary short song on the Continue path and makes
+/// an empty or malformed terminal projection fail closed.
+fn counts_complete_recipe(counts: &[protocol::CalibrationClassCounts]) -> bool {
+    let modifiers = [
+        protocol::CalibrationModifier::ThumbUp,
+        protocol::CalibrationModifier::ThumbDown,
+    ];
+    if counts.len() != protocol::CalibrationGesture::ALL.len() * modifiers.len() {
+        return false;
+    }
+    protocol::CalibrationGesture::ALL
+        .into_iter()
+        .flat_map(|gesture| {
+            modifiers
+                .into_iter()
+                .map(move |modifier| (gesture, modifier))
+        })
+        .all(|(gesture, modifier)| {
+            let mut matching = counts
+                .iter()
+                .filter(|count| count.gesture == gesture && count.modifier == modifier);
+            matching.next().is_some_and(|count| {
+                matching.next().is_none()
+                    && count.target_count > 0
+                    && count.deficit_count == 0
+                    && count.accepted_count >= count.target_count
+            })
+        })
+}
+
+fn buildability_from_counts(counts: &[protocol::CalibrationClassCounts]) -> CandidateState {
+    if counts_complete_recipe(counts) {
+        CandidateState::Buildable
+    } else {
+        CandidateState::Absent
+    }
 }
 
 impl CalibrationModeAdapter {
@@ -1011,6 +1051,11 @@ impl CalibrationModeAdapter {
                             };
                             continue;
                         }
+                        if !matches!(terminal, TerminalDecision::Open) {
+                            continue;
+                        }
+                        song_counts = interruption.counts;
+                        candidate = buildability_from_counts(&song_counts);
                         enter_between_songs(&mut evidence, &track.title, &mut heartbeat_mode, &mut playback);
                         let _ = self.coordinator.update_calibration(
                             &binding,
@@ -1028,12 +1073,6 @@ impl CalibrationModeAdapter {
                         if result.run == run
                             && result.schedule_revision == schedule_revision
                             && result.content_identity == track.content_identity => {
-                        song_counts = result.counts;
-                        // A completed, identity-matching song is the explicit
-                        // boundary at which Save becomes available. Firmware
-                        // defers fitting/polishing and resident promotion until
-                        // it receives that Save request.
-                        candidate = CandidateState::Buildable;
                         if matches!(terminal, TerminalDecision::AwaitingInterruption { .. }) {
                             heartbeat_mode = HeartbeatMode::Withheld;
                             playback = PlaybackState::Dormant;
@@ -1048,6 +1087,14 @@ impl CalibrationModeAdapter {
                             };
                             continue;
                         }
+                        if !matches!(terminal, TerminalDecision::Open) {
+                            continue;
+                        }
+                        song_counts = result.counts;
+                        // Only a complete, identity-matching recipe is the
+                        // boundary at which Save becomes available. A short
+                        // song remains explicitly continuable instead.
+                        candidate = buildability_from_counts(&song_counts);
                         // A normal song result is the same transport/output
                         // boundary as an explicit interruption.  Previously
                         // the UI entered BetweenSongs while the actor kept
@@ -1504,6 +1551,19 @@ impl CalibrationModeAdapter {
         self.send_action(binding, action)
     }
 
+    fn continue_between_songs(
+        &self,
+        binding: &GuidedSessionBinding,
+    ) -> Result<(), CoordinatorError> {
+        self.require_between_songs(binding)?;
+        // Stop song is a terminal interruption of that exact anchored
+        // schedule, not a resumable pause. Clicking Continue is the explicit
+        // operator edge that opens a fresh revision, so clear the sticky gate
+        // before the actor reads it while establishing that revision.
+        self.set_gate(binding, RunGate::Running)?;
+        self.send_action(binding, RunAction::Continue)
+    }
+
     fn exit_inactive(&self) -> Result<(), CoordinatorError> {
         let selected_track_id = self.selected_track_id.lock().unwrap().clone();
         self.coordinator
@@ -1568,10 +1628,9 @@ impl GuidedModeAdapter for CalibrationModeAdapter {
                 session.ok_or(CoordinatorError::LeaseMismatch)?,
                 RunAction::Save,
             ),
-            GuidedSessionAction::ContinueCalibration => self.send_between_songs_action(
-                session.ok_or(CoordinatorError::LeaseMismatch)?,
-                RunAction::Continue,
-            ),
+            GuidedSessionAction::ContinueCalibration => {
+                self.continue_between_songs(session.ok_or(CoordinatorError::LeaseMismatch)?)
+            }
             GuidedSessionAction::SelectCalibrationTrack { .. }
             | GuidedSessionAction::StartCalibration => Ok(()),
         }
@@ -2219,6 +2278,31 @@ mod tests {
     }
 
     #[test]
+    fn only_one_complete_projection_of_every_recipe_class_is_buildable() {
+        let complete = complete_recipe_counts();
+        assert!(counts_complete_recipe(&complete));
+        assert!(buildability_from_counts(&complete).permits_save());
+
+        let mut short = complete.clone();
+        short[0].accepted_count -= 1;
+        short[0].deficit_count = 1;
+        assert!(!counts_complete_recipe(&short));
+        assert!(!buildability_from_counts(&short).permits_save());
+
+        let mut missing = complete.clone();
+        missing.pop();
+        assert!(!counts_complete_recipe(&missing));
+
+        let mut duplicate = complete.clone();
+        duplicate[1] = duplicate[0];
+        assert!(!counts_complete_recipe(&duplicate));
+
+        let mut zero_target = complete;
+        zero_target[0].target_count = 0;
+        assert!(!counts_complete_recipe(&zero_target));
+    }
+
+    #[test]
     fn interrupt_supersedes_a_stale_resume_even_when_actions_are_saturated() {
         let (actions, receiver) = mpsc::channel(1);
         enqueue_run_action(&actions, RunAction::Continue).unwrap();
@@ -2381,6 +2465,34 @@ mod tests {
                 hold: protocol::DurationMilliseconds::new(1_500),
             }],
         }
+    }
+
+    fn complete_recipe_counts() -> Vec<protocol::CalibrationClassCounts> {
+        protocol::CalibrationGesture::ALL
+            .into_iter()
+            .flat_map(|gesture| {
+                [
+                    protocol::CalibrationModifier::ThumbUp,
+                    protocol::CalibrationModifier::ThumbDown,
+                ]
+                .into_iter()
+                .map(move |modifier| (gesture, modifier))
+            })
+            .map(|(gesture, modifier)| {
+                let target_count = match modifier {
+                    protocol::CalibrationModifier::ThumbUp => 10,
+                    protocol::CalibrationModifier::ThumbDown => 16,
+                };
+                protocol::CalibrationClassCounts {
+                    gesture,
+                    modifier,
+                    accepted_count: target_count,
+                    rejected_count: 0,
+                    target_count,
+                    deficit_count: 0,
+                }
+            })
+            .collect()
     }
 
     fn attach_test_collection(
@@ -2760,16 +2872,10 @@ mod tests {
                     run,
                     schedule_revision,
                     content_identity: "test-content".into(),
-                    // Save remains available even with no deficits; the
-                    // wristband owns the final queued checkpoint/fit work.
-                    counts: vec![protocol::CalibrationClassCounts {
-                        gesture: protocol::CalibrationGesture::WristPronation,
-                        modifier: protocol::CalibrationModifier::ThumbUp,
-                        accepted_count: 10,
-                        rejected_count: 0,
-                        target_count: 10,
-                        deficit_count: 0,
-                    }],
+                    // Save becomes available only once every exact recipe
+                    // class is complete; the wristband then owns the final
+                    // queued checkpoint/fit work.
+                    counts: complete_recipe_counts(),
                     validity: protocol::CalibrationCandidateValidity {
                         model_numerically_valid: false,
                         record_crc_valid: false,
@@ -2931,18 +3037,37 @@ mod tests {
             target_count: 10,
             deficit_count: 1,
         }];
+        let playing = coordinator.snapshot();
+        coordinator
+            .handle_intent_for_device(
+                GuidedIntentRequest {
+                    authority: playing.action_authority,
+                    action: GuidedSessionAction::PauseCalibration,
+                },
+                None,
+            )
+            .unwrap();
+        loop {
+            if matches!(
+                receive_control(&mut device).await,
+                Frame::CalibrationInterrupt {
+                    run: interrupted_run,
+                    schedule_revision,
+                } if interrupted_run == run && schedule_revision == first_revision
+            ) {
+                break;
+            }
+        }
         device
             .frames
-            .send(Frame::CalibrationSongResult {
-                result: protocol::CalibrationSongResult {
+            .send(Frame::CalibrationSongInterrupted {
+                interruption: protocol::CalibrationSongInterruption {
                     run,
                     schedule_revision: first_revision,
                     content_identity: first_track.content_identity.clone(),
                     counts: first_counts,
-                    validity: protocol::CalibrationCandidateValidity {
-                        model_numerically_valid: false,
-                        record_crc_valid: false,
-                    },
+                    reason: protocol::CalibrationSongInterruptionReason::Operator,
+                    open_cue: None,
                 },
             })
             .unwrap();
@@ -2961,7 +3086,7 @@ mod tests {
             coordinator.snapshot().calibration(),
             Some(GuidedCalibrationSnapshot::BetweenSongs {
                 track_title,
-                candidate_available: true,
+                candidate_available: false,
                 continue_available: true,
                 valid_reps: 9,
                 invalid_reps: 1,
@@ -2971,7 +3096,7 @@ mod tests {
 
         // Select the replacement track through the same public intent path a
         // browser uses. A delayed status for song one must neither relabel its
-        // evidence nor withdraw Save before Continue consumes the selection.
+        // evidence nor change its exact short-song Continue authority.
         let between_songs = coordinator.snapshot();
         coordinator
             .handle_intent_for_device(
@@ -3008,7 +3133,7 @@ mod tests {
             Some(GuidedCalibrationSnapshot::BetweenSongs {
                 track_title,
                 selected_track_id: Some(selected),
-                candidate_available: true,
+                candidate_available: false,
                 continue_available: true,
                 ..
             }) if track_title == &first_track.title && selected == &second_track.id.0
@@ -3468,7 +3593,7 @@ mod tests {
         assert!(matches!(
             coordinator.snapshot().calibration(),
             Some(GuidedCalibrationSnapshot::BetweenSongs {
-                candidate_available: true,
+                candidate_available: false,
                 continue_available: true,
                 valid_reps: 3,
                 invalid_reps: 1,

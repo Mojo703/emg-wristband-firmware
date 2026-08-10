@@ -2136,6 +2136,12 @@ impl Calibration {
         else {
             return;
         };
+        if !self.anchored_recipe_is_complete() {
+            self.fail_anchored_execution(
+                "anchored final polish requires every calibration class to reach its target",
+            );
+            return;
+        }
         let (Some(checkpoint), Some(partition)) =
             (self.checkpoint.as_ref(), self.partition.as_ref())
         else {
@@ -2212,6 +2218,12 @@ impl Calibration {
             .retains_next(entry)
     }
 
+    fn anchored_recipe_is_complete(&self) -> bool {
+        self.anchored
+            .recipe()
+            .is_some_and(AnchoredRecipeProgress::is_complete)
+    }
+
     fn emit_anchored_interruption(
         &mut self,
         reason: SongInterruption,
@@ -2223,6 +2235,9 @@ impl Calibration {
             .and_then(|song| song.identity())
             .cloned()
         else {
+            return;
+        };
+        let Some(counts) = self.anchored_count_projection() else {
             return;
         };
         let reason = match reason {
@@ -2239,6 +2254,7 @@ impl Calibration {
                 content_identity: identity.content_identity,
                 reason,
                 open_cue: rejected_open_cue.map(|entry| entry.cue_id),
+                counts,
             },
         });
         // The candidate gains were adopted for collection. An interrupted run
@@ -2306,6 +2322,31 @@ impl Calibration {
         else {
             return;
         };
+        let Some(counts) = self.anchored_count_projection() else {
+            return;
+        };
+        self.outbound.push(Frame::CalibrationSongResult {
+            result: CalibrationSongResult {
+                run: identity.run,
+                schedule_revision: identity.revision,
+                content_identity: identity.content_identity,
+                counts,
+                // Rows are retained immediately. Candidate validity becomes
+                // true only after the existing fitter/storage lifecycle has
+                // produced and CRC-validated a candidate record.
+                validity: CalibrationCandidateValidity {
+                    model_numerically_valid: false,
+                    record_crc_valid: false,
+                },
+            },
+        });
+        self.emit_anchored_candidate_status(identity.run, identity.revision);
+    }
+
+    /// Project retained recipe progress for either normal completion or an
+    /// interruption. Keeping this one calculation shared makes the terminal
+    /// interruption snapshot exact after its open cue has been rejected.
+    fn anchored_count_projection(&self) -> Option<Vec<CalibrationClassCounts>> {
         let mut counts = Vec::with_capacity(CalibrationGesture::ALL.len() * 2);
         for gesture in CalibrationGesture::ALL {
             for modifier in [CalibrationModifier::ThumbUp, CalibrationModifier::ThumbDown] {
@@ -2329,22 +2370,7 @@ impl Calibration {
                 });
             }
         }
-        self.outbound.push(Frame::CalibrationSongResult {
-            result: CalibrationSongResult {
-                run: identity.run,
-                schedule_revision: identity.revision,
-                content_identity: identity.content_identity,
-                counts,
-                // Rows are retained immediately. Candidate validity becomes
-                // true only after the existing fitter/storage lifecycle has
-                // produced and CRC-validated a candidate record.
-                validity: CalibrationCandidateValidity {
-                    model_numerically_valid: false,
-                    record_crc_valid: false,
-                },
-            },
-        });
-        self.emit_anchored_candidate_status(identity.run, identity.revision);
+        Some(counts)
     }
 
     fn owned_candidate(&self, schedule: &AnchoredSongIdentity) -> Option<StoredIdentity> {
@@ -2420,6 +2446,15 @@ impl Calibration {
             self.refuse("Save did not identify the retained calibration run");
             return;
         };
+        if !self.anchored_recipe_is_complete() {
+            // Preserve partial rows and the interrupted song for Continue.
+            // A host asking to Save early has not invalidated that evidence.
+            self.emit_anchored_candidate_status(identity.run, identity.revision);
+            self.refuse(
+                "Save requires all calibration classes; Continue the retained evidence first",
+            );
+            return;
+        }
         let presence = self.anchored_candidate_presence(&identity);
         let CalibrationCandidatePresence::Present { validity, .. } = presence else {
             if matches!(

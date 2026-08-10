@@ -10,6 +10,7 @@ import {
   isCalibrationCandidateStatusFrame,
   isCalibrationScheduleCommitDeferredFrame,
   isCalibrationScheduleChunkFrame,
+  isCalibrationSongInterruptedFrame,
   isCalibrationScheduleUploadAcknowledgedFrame,
   isOutgoingFrame,
   type CalibrationScheduleChunkFrame,
@@ -80,6 +81,33 @@ test('only typed device prerequisites authorize a schedule commit retry', () => 
       ...deferred,
       deferred: { ...deferred.deferred, reason: 'electrodes not making contact' },
     }),
+    false,
+  );
+});
+
+test('song interruption carries authoritative retained counts for Continue', () => {
+  const interruption = {
+    type: 'calibration_song_interrupted',
+    interruption: {
+      run,
+      schedule_revision: 1,
+      content_identity: 'a'.repeat(64),
+      reason: 'operator',
+      open_cue: null,
+      counts: [{
+        gesture: 'wrist_pronation',
+        modifier: 'thumb_up',
+        accepted_count: 9,
+        rejected_count: 1,
+        target_count: 10,
+        deficit_count: 1,
+      }],
+    },
+  };
+  assert.equal(isCalibrationSongInterruptedFrame(interruption), true);
+  const { counts: _counts, ...withoutCounts } = interruption.interruption;
+  assert.equal(
+    isCalibrationSongInterruptedFrame({ ...interruption, interruption: withoutCounts }),
     false,
   );
 });

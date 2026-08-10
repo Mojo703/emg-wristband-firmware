@@ -1629,9 +1629,9 @@ mod tests {
     };
     use crate::capture::Capture;
     use protocol::{
-        CalibrationCueId, CalibrationGesture, CalibrationModifier, CalibrationScheduleAccepted,
-        CalibrationScheduleEntry, CalibrationSongInterruption, CalibrationSongInterruptionReason,
-        DurationMilliseconds, Frame, TrackMilliseconds,
+        CalibrationClassCounts, CalibrationCueId, CalibrationGesture, CalibrationModifier,
+        CalibrationScheduleAccepted, CalibrationScheduleEntry, CalibrationSongInterruption,
+        CalibrationSongInterruptionReason, DurationMilliseconds, Frame, TrackMilliseconds,
     };
     use std::path::PathBuf;
 
@@ -1822,6 +1822,14 @@ mod tests {
                 content_identity: "sha256:interrupted-song".into(),
                 reason: CalibrationSongInterruptionReason::HeartbeatTimeout,
                 open_cue: Some(CalibrationCueId::new(1).unwrap()),
+                counts: vec![CalibrationClassCounts {
+                    gesture: CalibrationGesture::ThumbExtension,
+                    modifier: CalibrationModifier::ThumbUp,
+                    accepted_count: 1,
+                    rejected_count: 0,
+                    target_count: 10,
+                    deficit_count: 9,
+                }],
             },
         });
         assert!(capture.has_calibration_song_terminal_event());
