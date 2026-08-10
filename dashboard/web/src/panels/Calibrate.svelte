@@ -64,6 +64,8 @@
     snapshot={guidedCalibration}
     onSelectTrack={(trackId) => sendGuided({ name: 'select_calibration_track', track_id: trackId })}
     onStart={() => sendGuided({ name: 'start_calibration' })}
+    onPause={() => sendGuided({ name: 'pause_calibration' })}
+    onResume={() => sendGuided({ name: 'resume_calibration' })}
     onSongEndAction={guidedSongEnd}
   />
 {:else if guidedSnapshot !== null && activeGuidedSession(guidedSnapshot)?.mode === 'calibration'}

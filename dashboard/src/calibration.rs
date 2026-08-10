@@ -144,6 +144,19 @@ fn enqueue_run_action(
     })
 }
 
+/// Keep one physical queue slot reserved for the single-use Exit decision.
+/// Ordinary actions may be bursty at a song boundary; they must never make it
+/// impossible for the operator to stop the device-owned schedule.
+fn enqueue_nonterminal_run_action(
+    actions: &mpsc::Sender<RunAction>,
+    action: RunAction,
+) -> Result<(), CoordinatorError> {
+    if actions.capacity() <= 1 {
+        return Err(CoordinatorError::AdapterTaskBusy);
+    }
+    enqueue_run_action(actions, action)
+}
+
 /// The host actor's phase-local state.  These are deliberately not booleans:
 /// a heartbeat cannot be active without the accepted revision it names, and
 /// output cannot be both armed and playing.
@@ -219,6 +232,33 @@ enum HeartbeatMode {
         schedule_revision: CalibrationScheduleRevision,
         next_sequence: u32,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeviceInterruption {
+    Available,
+    Requested,
+}
+
+fn request_device_interruption(
+    registry: &Registry,
+    device: &DeviceConnectionIdentity,
+    run: CalibrationRunKey,
+    schedule_revision: CalibrationScheduleRevision,
+    state: &mut DeviceInterruption,
+) -> Result<(), ControlDeliveryError> {
+    if !matches!(state, DeviceInterruption::Available) {
+        return Ok(());
+    }
+    registry.send_bound_control(
+        device,
+        Frame::CalibrationInterrupt {
+            run,
+            schedule_revision,
+        },
+    )?;
+    *state = DeviceInterruption::Requested;
+    Ok(())
 }
 
 enum PlaybackState {
@@ -632,6 +672,7 @@ impl CalibrationModeAdapter {
             schedule_revision,
             next_sequence: 0,
         };
+        let mut device_interruption = DeviceInterruption::Available;
         let mut gate_state = *gate.borrow_and_update();
         let mut song_counts = Vec::new();
         let mut evidence = EvidenceState::Fresh;
@@ -687,8 +728,10 @@ impl CalibrationModeAdapter {
             let terminal_deadline = terminal.deadline().unwrap_or_else(|| {
                 tokio::time::Instant::now() + std::time::Duration::from_secs(365 * 24 * 60 * 60)
             });
+            // Device EMG/log traffic can be continuously ready. An unbiased
+            // select is required so that operator actions, deadlines, and the
+            // playback alarm cannot starve behind the device broadcast.
             tokio::select! {
-                biased;
                 changed = gate.changed() => match changed {
                     Ok(()) => match *gate.borrow_and_update() {
                         RunGate::Interrupted => {
@@ -704,6 +747,15 @@ impl CalibrationModeAdapter {
                                 heartbeat_mode = HeartbeatMode::Withheld;
                                 if let PlaybackState::Playing(opened) = &playback {
                                     opened.pause();
+                                }
+                                if let Err(error) = request_device_interruption(
+                                    &self.registry,
+                                    &device,
+                                    run,
+                                    schedule_revision,
+                                    &mut device_interruption,
+                                ) {
+                                    break delivery_failure(error);
                                 }
                             }
                         }
@@ -1150,6 +1202,15 @@ impl CalibrationModeAdapter {
                                 deadline: tokio::time::Instant::now() + TERMINAL_DECISION_TIMEOUT,
                             };
                         } else {
+                            if let Err(error) = request_device_interruption(
+                                &self.registry,
+                                &device,
+                                run,
+                                schedule_revision,
+                                &mut device_interruption,
+                            ) {
+                                break delivery_failure(error);
+                            }
                             terminal = TerminalDecision::AwaitingInterruption {
                                 deadline: tokio::time::Instant::now() + TERMINAL_DECISION_TIMEOUT,
                             };
@@ -1193,6 +1254,7 @@ impl CalibrationModeAdapter {
                                 schedule_revision,
                                 next_sequence: 0,
                             };
+                            device_interruption = DeviceInterruption::Available;
                             playback = PlaybackState::Dormant;
                             continue;
                         }
@@ -1301,7 +1363,7 @@ impl CalibrationModeAdapter {
             .filter(|active| &active.binding == binding)
             .ok_or(CoordinatorError::LeaseMismatch)?
             .actions;
-        enqueue_run_action(actions, action)
+        enqueue_nonterminal_run_action(actions, action)
     }
 
     fn set_gate(
@@ -1316,6 +1378,19 @@ impl CalibrationModeAdapter {
             .ok_or(CoordinatorError::LeaseMismatch)?
             .gate;
         gate.send(requested)
+            .map_err(|_| CoordinatorError::AdapterTaskUnavailable)
+    }
+
+    fn request_exit(&self, binding: &GuidedSessionBinding) -> Result<(), CoordinatorError> {
+        let active = self.active.lock().unwrap();
+        let active = active
+            .as_ref()
+            .filter(|active| &active.binding == binding)
+            .ok_or(CoordinatorError::LeaseMismatch)?;
+        enqueue_run_action(&active.actions, RunAction::Exit)?;
+        active
+            .gate
+            .send(RunGate::Interrupted)
             .map_err(|_| CoordinatorError::AdapterTaskUnavailable)
     }
 
@@ -1431,7 +1506,7 @@ impl GuidedModeAdapter for CalibrationModeAdapter {
             ),
             GuidedSessionAction::ExitCalibration => match session {
                 Some(binding) if binding.mode == GuidedMode::Calibration => {
-                    self.send_action(binding, RunAction::Exit)
+                    self.request_exit(binding)
                 }
                 Some(_) => Err(CoordinatorError::LeaseMismatch),
                 None => self.exit_inactive(),
@@ -2223,6 +2298,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn operator_interruption_is_an_explicit_exact_once_device_control() {
+        let registry = Registry::new();
+        let mut device = register_device(&registry);
+        let identity = registry.connection_identity("opal-test").unwrap();
+        let run = CalibrationRunKey {
+            session_id: CalibrationSessionId::new(8).unwrap(),
+            run_id: CalibrationRunId::new(3).unwrap(),
+        };
+        let revision = CalibrationScheduleRevision::new(2).unwrap();
+        let mut state = DeviceInterruption::Available;
+
+        request_device_interruption(&registry, &identity, run, revision, &mut state).unwrap();
+        request_device_interruption(&registry, &identity, run, revision, &mut state).unwrap();
+
+        assert_eq!(state, DeviceInterruption::Requested);
+        assert!(matches!(
+            device.control_rx.try_recv(),
+            Ok(Frame::CalibrationInterrupt {
+                run: received_run,
+                schedule_revision: received_revision,
+            }) if received_run == run && received_revision == revision
+        ));
+        assert!(device.control_rx.try_recv().is_err());
+    }
+
     #[tokio::test]
     async fn exit_during_preparation_waits_for_exact_absent_ack_and_is_single_use() {
         let registry = Arc::new(Registry::new());
@@ -2851,7 +2952,7 @@ mod tests {
             ("wrist_supination", "Tilt In", "amber"),
             ("wrist_radial_deviation", "Tilt Forward", "green"),
             ("wrist_ulnar_deviation", "Tilt Back", "purple"),
-            ("thumb_extension", "Lift Thumb", "pink"),
+            ("thumb_extension", "Tip center", "pink"),
         ]
         .map(|(id, label, color)| protocol::CollectionClass {
             id: protocol::ClassId(id.into()),

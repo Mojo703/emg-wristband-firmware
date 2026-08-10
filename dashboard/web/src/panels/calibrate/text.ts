@@ -5,7 +5,7 @@ const GESTURE_LABELS: Record<CalibrationGesture, string> = {
   [CalibrationGesture.WristSupination]: 'Supination',
   [CalibrationGesture.WristRadialDeviation]: 'Radial deviation',
   [CalibrationGesture.WristUlnarDeviation]: 'Ulnar deviation',
-  [CalibrationGesture.ThumbExtension]: 'Thumb extension',
+  [CalibrationGesture.ThumbExtension]: 'Tip center',
 };
 
 /** Human-readable labels shared by the device configuration and guided views. */

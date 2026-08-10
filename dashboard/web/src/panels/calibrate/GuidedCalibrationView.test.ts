@@ -116,9 +116,10 @@ test('playing renders a persistent thumb legend and accessible cue narration', a
   assert.match(body, /<canvas[^>]*aria-hidden="true"/);
   assert.match(body, /Tip out/);
   assert.match(body, /Tip in/);
+  assert.match(body, /Tip center/);
   assert.match(body, /color: #70b8ff/);
   assert.match(body, /color: #ffca16/);
-  assert.doesNotMatch(body, /WristPronation|WristSupination/);
+  assert.doesNotMatch(body, /WristPronation|WristSupination|Lift thumb/);
 });
 
 test('song end keeps unavailable actions visible and disabled', async () => {

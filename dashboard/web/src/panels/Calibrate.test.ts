@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import test, { after, before } from 'node:test';
 import { createServer, type ViteDevServer } from 'vite';
 
@@ -60,4 +61,10 @@ test('authoritative exit projection disables the persistent exit action until de
   assert.ok(exitButton, 'the persistent exit control remains visible');
   assert.match(exitButton, /\sdisabled(?:=|(?=\s|>))/);
   assert.match(body, /Waiting for the wristband to confirm that no candidate remains/);
+});
+
+test('calibration shell wires both required playback controls to typed intents', async () => {
+  const source = await readFile(new URL('./Calibrate.svelte', import.meta.url), 'utf8');
+  assert.match(source, /onPause=\{\(\) => sendGuided\(\{ name: 'pause_calibration' \}\)\}/);
+  assert.match(source, /onResume=\{\(\) => sendGuided\(\{ name: 'resume_calibration' \}\)\}/);
 });

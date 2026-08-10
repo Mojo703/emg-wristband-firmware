@@ -92,7 +92,7 @@ test('calibration lanes carry the same user-facing Collect presentation', () => 
       { id: 'wrist_supination', label: 'Tip in', colorName: 'amber', arrow: 'left' },
       { id: 'wrist_radial_deviation', label: 'Tip forward', colorName: 'green', arrow: 'up' },
       { id: 'wrist_ulnar_deviation', label: 'Tip back', colorName: 'purple', arrow: 'down' },
-      { id: 'thumb_extension', label: 'Lift thumb', colorName: 'pink', arrow: null },
+      { id: 'thumb_extension', label: 'Tip center', colorName: 'pink', arrow: null },
     ],
   );
 });

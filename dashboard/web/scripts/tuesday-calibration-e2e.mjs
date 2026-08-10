@@ -18,10 +18,14 @@ const encoder = new Encoder({ useRecords: false, mapsAsObjects: true, tagUint8Ar
 const decoder = new Decoder({ mapsAsObjects: true });
 const trace = [];
 const now = () => new Date().toISOString();
+const json = value => JSON.stringify(
+  value,
+  (_key, nested) => typeof nested === 'bigint' ? nested.toString() : nested,
+);
 const record = (event, value = {}) => {
   const entry = { at: now(), event, ...value };
   trace.push(entry);
-  console.log(JSON.stringify(entry));
+  console.log(json(entry));
 };
 const fail = (message) => { throw new Error(message); };
 
@@ -237,13 +241,13 @@ try {
   await main();
   await mkdir(traceDirectory, { recursive: true });
   const path = `${traceDirectory}/tuesday-calibration-e2e-${now().replaceAll(':', '-').replaceAll('.', '-')}.jsonl`;
-  await writeFile(path, `${trace.map(entry => JSON.stringify(entry)).join('\n')}\n`);
+  await writeFile(path, `${trace.map(json).join('\n')}\n`);
   record('trace_written', { path });
   socket.close();
 } catch (error) {
   record('failure', { message: String(error?.stack ?? error) });
   await mkdir(traceDirectory, { recursive: true });
-  await writeFile(`${traceDirectory}/tuesday-calibration-e2e-failure.jsonl`, `${trace.map(entry => JSON.stringify(entry)).join('\n')}\n`);
+  await writeFile(`${traceDirectory}/tuesday-calibration-e2e-failure.jsonl`, `${trace.map(json).join('\n')}\n`);
   socket.close();
   process.exitCode = 1;
 }

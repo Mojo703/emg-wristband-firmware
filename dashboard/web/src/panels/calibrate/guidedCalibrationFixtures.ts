@@ -59,7 +59,7 @@ const lanes: FiveCalibrationLanes = [
   {
     visualLane: VisualLane.Gesture4,
     id: 'thumb_extension',
-    label: 'Lift thumb',
+    label: 'Tip center',
     colorName: 'pink',
     motion: null,
   },

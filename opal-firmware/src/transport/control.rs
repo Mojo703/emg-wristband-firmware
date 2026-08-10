@@ -57,6 +57,10 @@ pub enum Control {
     CalibrationHeartbeat {
         heartbeat: CalibrationHeartbeat,
     },
+    CalibrationInterrupt {
+        run: CalibrationRunKey,
+        schedule_revision: CalibrationScheduleRevision,
+    },
     CalibrationContinue {
         run: CalibrationRunKey,
     },
@@ -129,6 +133,7 @@ impl Control {
                 | Control::CalibrationScheduleChunk { .. }
                 | Control::CalibrationScheduleCommit { .. }
                 | Control::CalibrationHeartbeat { .. }
+                | Control::CalibrationInterrupt { .. }
                 | Control::CalibrationContinue { .. }
                 | Control::CalibrationSave { .. }
                 | Control::CalibrationDiscard { .. }

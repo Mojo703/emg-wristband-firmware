@@ -1445,6 +1445,10 @@ impl Calibration {
                     self.refuse(&format!("calibration heartbeat rejected: {error}"));
                 }
             }
+            Control::CalibrationInterrupt {
+                run,
+                schedule_revision,
+            } => self.interrupt_anchored_song(run, schedule_revision),
             Control::CalibrationContinue { run }
                 if !matches!(
                     self.anchored.song().and_then(AnchoredSong::identity),
@@ -2082,6 +2086,44 @@ impl Calibration {
         // resumes the previous resident immediately, so restore the resident's
         // reference before its command model sees another feature window.
         self.queue_resident_gain_restore();
+    }
+
+    fn interrupt_anchored_song(
+        &mut self,
+        run: protocol::CalibrationRunKey,
+        schedule_revision: protocol::CalibrationScheduleRevision,
+    ) {
+        let identity_matches = self
+            .anchored
+            .song()
+            .and_then(AnchoredSong::identity)
+            .is_some_and(|identity| identity.run == run && identity.revision == schedule_revision);
+        if !identity_matches {
+            self.refuse("Interrupt did not identify the committed calibration song");
+            return;
+        }
+        let action = self
+            .anchored
+            .song_mut()
+            .expect("matched identity belongs to an anchored song")
+            .interrupt(SongInterruption::OperatorStopped);
+        let Ok(AnchoredSongAction::Interrupted {
+            reason,
+            rejected_open_cue,
+        }) = action
+        else {
+            self.refuse("Interrupt requires a running committed calibration song");
+            return;
+        };
+        self.anchored
+            .cue_mut()
+            .expect("a committed song owns a cue lifecycle")
+            .clear();
+        self.rep_rows.clear();
+        if let Some(entry) = rejected_open_cue {
+            self.anchored_count_mut(entry).rejected += 1;
+        }
+        self.emit_anchored_interruption(reason, rejected_open_cue);
     }
 
     fn queue_resident_gain_restore(&mut self) {

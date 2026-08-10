@@ -1331,6 +1331,7 @@ fn apply_control(
         | Control::CalibrationScheduleChunk { .. }
         | Control::CalibrationScheduleCommit { .. }
         | Control::CalibrationHeartbeat { .. }
+        | Control::CalibrationInterrupt { .. }
         | Control::CalibrationContinue { .. }
         | Control::CalibrationSave { .. }
         | Control::CalibrationDiscard { .. } => false,

@@ -204,6 +204,7 @@ fn control_kind(control: &Control) -> &'static str {
         Control::CalibrationScheduleChunk { .. } => "schedule_chunk",
         Control::CalibrationScheduleCommit { .. } => "schedule_commit",
         Control::CalibrationHeartbeat { .. } => "calibration_heartbeat",
+        Control::CalibrationInterrupt { .. } => "calibration_interrupt",
         Control::CalibrationContinue { .. } => "calibration_continue",
         Control::CalibrationSave { .. } => "calibration_save",
         Control::CalibrationDiscard { .. } => "calibration_discard",

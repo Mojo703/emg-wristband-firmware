@@ -597,6 +597,14 @@ pub enum Frame {
     /// after two seconds without one.
     CalibrationHeartbeat { heartbeat: CalibrationHeartbeat },
 
+    /// Host → device: explicitly stop one exact committed calibration song.
+    /// Heartbeat expiry remains crash recovery; operator control must not rely
+    /// on deliberately waiting for a lease timeout.
+    CalibrationInterrupt {
+        run: CalibrationRunKey,
+        schedule_revision: CalibrationScheduleRevision,
+    },
+
     /// Device → host: a song was interrupted before its ordinary result. Any
     /// completed rows and fitting checkpoints remain available to Continue.
     CalibrationSongInterrupted {
@@ -4403,6 +4411,10 @@ mod tests {
                     schedule_revision: schedule_revision(),
                     sequence: u32::MAX,
                 },
+            },
+            Frame::CalibrationInterrupt {
+                run: run_key(),
+                schedule_revision: schedule_revision(),
             },
             Frame::CalibrationContinue { run: run_key() },
             Frame::CalibrationSave { run: run_key() },

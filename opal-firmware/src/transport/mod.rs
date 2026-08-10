@@ -231,10 +231,14 @@ mod tests {
                 sequence: 1,
             },
         });
+        frames.push(Frame::CalibrationInterrupt {
+            run,
+            schedule_revision,
+        });
         assert_eq!(
             frames.len(),
-            8,
-            "begin + 32/32/32/32/2 + commit + heartbeat"
+            9,
+            "begin + 32/32/32/32/2 + commit + heartbeat + explicit interrupt"
         );
         let mut wire = Vec::new();
         let mut chunk_zero_payload_len = None;
@@ -284,6 +288,13 @@ mod tests {
                 ref entries,
                 ..
             } if entries.len() == protocol::CALIBRATION_SCHEDULE_CHUNK_MAX_ENTRIES
+        ));
+        assert!(matches!(
+            controls.last(),
+            Some(Control::CalibrationInterrupt {
+                run: received_run,
+                schedule_revision: received_revision,
+            }) if *received_run == run && *received_revision == schedule_revision
         ));
     }
 

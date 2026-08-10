@@ -23,8 +23,8 @@
     snapshot: GuidedCalibrationSnapshot;
     onSelectTrack?: (trackId: string) => void;
     onStart?: () => void;
-    onPause?: () => void;
-    onResume?: () => void;
+    onPause: () => void;
+    onResume: () => void;
     onSongEndAction?: (action: CalibrationSongEndAction) => void;
   }
 
@@ -147,7 +147,7 @@
       <Button
         variant="secondary"
         size="sm"
-        onclick={() => snapshot.paused_reason === null ? onPause?.() : onResume?.()}
+        onclick={() => snapshot.paused_reason === null ? onPause() : onResume()}
       >
         {snapshot.paused_reason === null ? 'Pause' : 'Resume'}
       </Button>
@@ -176,7 +176,7 @@
         <div class="gate">
           <strong>Paused</strong>
           <p>{snapshot.paused_reason}</p>
-          <Button onclick={() => onResume?.()}>Resume</Button>
+          <Button onclick={() => onResume()}>Resume</Button>
         </div>
       {/if}
     </div>
