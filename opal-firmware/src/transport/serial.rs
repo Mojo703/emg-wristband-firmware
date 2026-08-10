@@ -1,11 +1,11 @@
 //! The serial link: framed CBOR over the USB-Serial-JTAG CDC channel.
 
-use super::{decode, encode_to, frame_header, Control, Transport};
+use super::{decode, encode_to, frame_header, v2_frame_header, Control, Transport};
 use anyhow::Result;
 use esp_idf_svc::hal::delay;
 use esp_idf_svc::hal::usb_serial::UsbSerialDriver;
 use log::{info, warn};
-use protocol::{Frame, FrameScanner};
+use protocol::{Frame, FrameScanEvent, FrameScanner, WireVersion};
 use std::io::Write;
 use std::time::Duration;
 
@@ -76,6 +76,8 @@ pub struct SerialTransport {
     /// The one large candidate frame announced on CDC. Suppress per-packet
     /// narration while retaining one high-signal start/complete trace.
     reported_pending_payload: Option<usize>,
+    outbound_wire: WireVersion,
+    next_outbound_sequence: u32,
 }
 
 impl SerialTransport {
@@ -84,6 +86,8 @@ impl SerialTransport {
             driver,
             scanner: FrameScanner::with_max_len(SERIAL_CONTROL_MAX_LEN),
             reported_pending_payload: None,
+            outbound_wire: WireVersion::Legacy,
+            next_outbound_sequence: 0,
         }
     }
 
@@ -95,9 +99,16 @@ impl SerialTransport {
 
 impl Transport for SerialTransport {
     fn send(&mut self, frame: &Frame) -> Result<()> {
-        let header = frame_header(frame)?;
+        let header = match self.outbound_wire {
+            WireVersion::Legacy => WireHeader::Legacy(frame_header(frame)?),
+            WireVersion::V2 => {
+                let sequence = self.next_outbound_sequence;
+                self.next_outbound_sequence = self.next_outbound_sequence.wrapping_add(1);
+                WireHeader::V2(v2_frame_header(frame, sequence)?)
+            }
+        };
         let mut writer = SerialWriter(&mut self.driver);
-        writer.write_all(&header)?;
+        writer.write_all(header.as_bytes())?;
         encode_to(frame, &mut writer)
     }
 
@@ -117,25 +128,30 @@ impl Transport for SerialTransport {
                     self.reported_pending_payload = Some(length);
                 }
             }
-            while let Some(payload) = self.scanner.next_frame() {
+            while let Some(envelope) = self.scanner.next_envelope() {
                 self.reported_pending_payload = None;
-                match decode(&payload) {
+                match decode(&envelope.payload) {
                     Some(control) => {
+                        if matches!(envelope.version, WireVersion::V2) {
+                            self.outbound_wire = WireVersion::V2;
+                        }
                         info!(
-                            "serial control decoded {} bytes fingerprint {:08x} as {}",
-                            payload.len(),
-                            wire_fingerprint(&payload),
+                            "serial {:?} control decoded {} bytes fingerprint {:08x} as {}",
+                            envelope.version,
+                            envelope.payload.len(),
+                            wire_fingerprint(&envelope.payload),
                             control_kind(&control)
                         );
                         return Some(control);
                     }
                     None => warn!(
                         "serial control rejected CBOR payload of {} bytes fingerprint {:08x} after complete framing",
-                        payload.len(),
-                        wire_fingerprint(&payload),
+                        envelope.payload.len(),
+                        wire_fingerprint(&envelope.payload),
                     ),
                 }
             }
+            report_scan_events(&mut self.scanner);
             match self.driver.read(
                 &mut chunk,
                 delay::TickType::new_millis(SERIAL_READ_TIMEOUT_MS as u64).ticks(),
@@ -143,6 +159,31 @@ impl Transport for SerialTransport {
                 Ok(0) | Err(_) => return None,
                 Ok(n) => self.scanner.extend(&chunk[..n]),
             }
+        }
+    }
+}
+
+enum WireHeader {
+    Legacy([u8; 6]),
+    V2([u8; protocol::V2_FRAME_HEADER_LEN]),
+}
+
+impl WireHeader {
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Legacy(header) => header,
+            Self::V2(header) => header,
+        }
+    }
+}
+
+fn report_scan_events(scanner: &mut FrameScanner) {
+    while let Some(event) = scanner.next_event() {
+        match event {
+            FrameScanEvent::DuplicateSequence { sequence } => {
+                info!("duplicate serial V2 sequence {sequence}");
+            }
+            other => warn!("serial framing event: {other:?}"),
         }
     }
 }

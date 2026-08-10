@@ -1,5 +1,5 @@
 //! The USB-Serial-JTAG link to the dashboard. The device emits frames and polls
-//! for controls over `protocol`'s magic + length + CBOR framing.
+//! for controls over the protocol's dual legacy/integrity-protected framing.
 
 mod control;
 mod serial;
@@ -10,7 +10,7 @@ pub use serial::{
 };
 
 use anyhow::Result;
-use protocol::Frame;
+use protocol::{Frame, WireCrc32};
 
 /// One end of a dashboard link.
 pub trait Transport {
@@ -46,6 +46,58 @@ fn frame_header(frame: &Frame) -> Result<[u8; 6]> {
     header[..protocol::FRAME_MAGIC.len()].copy_from_slice(&protocol::FRAME_MAGIC);
     header[protocol::FRAME_MAGIC.len()..].copy_from_slice(&length.to_le_bytes());
     Ok(header)
+}
+
+fn payload_len(frame: &Frame) -> Result<u32> {
+    let mut counter = CountingWriter(0);
+    ciborium::into_writer(frame, &mut counter)
+        .map_err(|error| anyhow::anyhow!("CBOR size pass: {error}"))?;
+    u32::try_from(counter.0)
+        .map_err(|_| anyhow::anyhow!("encoded frame is too large: {} bytes", counter.0))
+}
+
+struct CrcWriter {
+    crc: WireCrc32,
+    written: usize,
+}
+
+impl std::io::Write for CrcWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.crc.update(bytes);
+        self.written = self
+            .written
+            .checked_add(bytes.len())
+            .ok_or_else(|| std::io::Error::other("encoded frame length overflow"))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn v2_frame_header(frame: &Frame, sequence: u32) -> Result<[u8; protocol::V2_FRAME_HEADER_LEN]> {
+    const FLAGS: u8 = 0;
+    let length = payload_len(frame)?;
+    let mut crc = WireCrc32::new();
+    crc.update(&[protocol::V2_WIRE_VERSION, FLAGS]);
+    crc.update(&sequence.to_le_bytes());
+    crc.update(&length.to_le_bytes());
+    let mut writer = CrcWriter { crc, written: 0 };
+    ciborium::into_writer(frame, &mut writer)
+        .map_err(|error| anyhow::anyhow!("CBOR checksum pass: {error}"))?;
+    if writer.written != length as usize {
+        return Err(anyhow::anyhow!(
+            "CBOR size/checksum passes disagreed: {} != {length}",
+            writer.written
+        ));
+    }
+    Ok(protocol::v2_frame_header(
+        FLAGS,
+        sequence,
+        length,
+        writer.crc.finish(),
+    ))
 }
 
 fn encode_to(frame: &Frame, writer: impl std::io::Write) -> Result<()> {
@@ -254,5 +306,29 @@ mod tests {
             u32::from_le_bytes(header[protocol::FRAME_MAGIC.len()..].try_into().unwrap()) as usize,
             encoded.len()
         );
+    }
+
+    #[test]
+    fn streaming_v2_header_matches_the_shared_buffered_encoder() {
+        let frame = Frame::ClockProbeRequest {
+            sequence: 17,
+            host_send_nanoseconds: 9_876_543_210,
+        };
+        let sequence = 0x0102_0304;
+        let mut payload = Vec::new();
+        encode_to(&frame, &mut payload).unwrap();
+        let mut streamed = v2_frame_header(&frame, sequence).unwrap().to_vec();
+        streamed.extend_from_slice(&payload);
+        assert_eq!(streamed, protocol::v2_frame_bytes(0, sequence, &payload));
+
+        let mut scanner = protocol::FrameScanner::new();
+        scanner.extend(&streamed);
+        let envelope = scanner.next_envelope().unwrap();
+        assert_eq!(envelope.version, protocol::WireVersion::V2);
+        assert_eq!(envelope.sequence, Some(sequence));
+        assert!(matches!(
+            decode(&envelope.payload),
+            Some(Control::ClockProbeRequest { sequence: 17, .. })
+        ));
     }
 }
