@@ -85,6 +85,8 @@ export const FrameType = {
   CalibrationScheduleBegin: 'calibration_schedule_begin',
   CalibrationScheduleChunk: 'calibration_schedule_chunk',
   CalibrationScheduleCommit: 'calibration_schedule_commit',
+  CalibrationScheduleUploadAcknowledged: 'calibration_schedule_upload_acknowledged',
+  CalibrationPreparationStatus: 'calibration_preparation_status',
   CalibrationScheduleAccepted: 'calibration_schedule_accepted',
   CalibrationHeartbeat: 'calibration_heartbeat',
   CalibrationSongInterrupted: 'calibration_song_interrupted',
@@ -747,7 +749,7 @@ export interface NoteResultFrame {
 // ---------------------------------------------------------------------------
 
 export type CalibrationTimingColor = 'red' | 'green' | 'blue';
-export type CalibrationTimingState = 'stopped' | 'running';
+export type CalibrationTimingState = 'stopped' | 'starting' | 'running' | 'stopping' | 'error';
 
 /** Device → backend: fixed RGB loop state on the device monotonic clock. */
 export interface CalibrationTimingLoopStatusFrame {
@@ -778,6 +780,7 @@ export interface CalibrationTimingStatusFrame {
       readonly sample_count: number;
       readonly capacity: number;
     };
+    readonly error_detail: string | null;
   };
 }
 
@@ -832,6 +835,40 @@ export interface CalibrationScheduleCommitFrame {
   readonly schedule_revision: number;
   readonly content_identity: string;
   readonly total_count: number;
+}
+
+/** Device → backend: one exact Begin/Chunk transaction step applied. */
+export interface CalibrationScheduleUploadAcknowledgedFrame {
+  readonly type: 'calibration_schedule_upload_acknowledged';
+  readonly acknowledgement: {
+    readonly run: CalibrationRunKey;
+    readonly schedule_revision: number;
+    readonly content_identity: string;
+    readonly total_count: number;
+    readonly first_entry: number | null;
+  };
+}
+
+/** Device → backend: acquisition-authoritative calibration preparation. */
+export interface CalibrationPreparationStatusFrame {
+  readonly type: 'calibration_preparation_status';
+  readonly status: {
+    readonly run: CalibrationRunKey;
+    readonly schedule_revision: number;
+    readonly phase:
+      | {
+          readonly phase: 'settling';
+          readonly elapsed_milliseconds: number;
+          readonly remaining_milliseconds: number;
+        }
+      | {
+          readonly phase: 'estimating_gains';
+          readonly elapsed_milliseconds: number;
+          readonly remaining_milliseconds: number;
+        }
+      | { readonly phase: 'ready_for_schedule' }
+      | { readonly phase: 'failed'; readonly detail: string };
+  };
 }
 
 export interface CalibrationScheduleAcceptedFrame {
@@ -1013,6 +1050,13 @@ export type GuidedCalibrationSnapshot =
       readonly selected_track_id: string | null;
     }
   | {
+      readonly phase: 'preparing';
+      readonly track: GuidedCalibrationTrack;
+      readonly stage: 'stillness' | 'gain_estimation' | 'ready_for_schedule';
+      readonly elapsed_milliseconds: number;
+      readonly remaining_milliseconds: number;
+    }
+  | {
       readonly phase: 'playing';
       readonly track: GuidedCalibrationTrack;
       readonly lanes: readonly [
@@ -1032,6 +1076,8 @@ export type GuidedCalibrationSnapshot =
   | {
       readonly phase: 'between_songs';
       readonly track_title: string;
+      readonly tracks: readonly GuidedCalibrationTrack[];
+      readonly selected_track_id: string | null;
       readonly candidate_available: boolean;
       readonly continue_available: boolean;
       readonly valid_reps: number;
@@ -1222,6 +1268,8 @@ export type IncomingFrame =
   | NoteResultFrame
   | CalibrationTimingStatusFrame
   | CalibrationTimingLoopStatusFrame
+  | CalibrationPreparationStatusFrame
+  | CalibrationScheduleUploadAcknowledgedFrame
   | CalibrationScheduleAcceptedFrame
   | CalibrationSongInterruptedFrame
   | CalibrationSongResultFrame
@@ -1699,9 +1747,21 @@ export function isGuidedCalibrationSnapshot(
         value['counts'].every(isGuidedCalibrationCount)
       );
     }
+    case 'preparing':
+      return (
+        isGuidedCalibrationTrack(value['track']) &&
+        (value['stage'] === 'stillness' ||
+          value['stage'] === 'gain_estimation' ||
+          value['stage'] === 'ready_for_schedule') &&
+        isNonnegativeInteger(value['elapsed_milliseconds']) &&
+        isNonnegativeInteger(value['remaining_milliseconds'])
+      );
     case 'between_songs':
       return (
         isString(value['track_title']) &&
+        Array.isArray(value['tracks']) &&
+        value['tracks'].every(isGuidedCalibrationTrack) &&
+        (value['selected_track_id'] === null || isString(value['selected_track_id'])) &&
         isBoolean(value['candidate_available']) &&
         isBoolean(value['continue_available']) &&
         isNonnegativeInteger(value['valid_reps']) &&
@@ -2088,7 +2148,9 @@ export function isCalibrationTimingStatusFrame(
     hasType(value, 'calibration_timing_status') &&
     isObject(value) &&
     isObject(value['status']) &&
-    (value['status']['state'] === 'stopped' || value['status']['state'] === 'running') &&
+    ['stopped', 'starting', 'running', 'stopping', 'error'].includes(
+      value['status']['state'] as string,
+    ) &&
     ['red', 'green', 'blue'].includes(value['status']['color'] as string) &&
     isNonnegativeInteger(value['status']['color_elapsed_milliseconds']) &&
     value['status']['color_elapsed_milliseconds'] < 500 &&
@@ -2109,7 +2171,8 @@ export function isCalibrationTimingStatusFrame(
     isPositiveInteger(value['status']['probe_window']['capacity']) &&
     value['status']['probe_window']['capacity'] === 11 &&
     value['status']['probe_window']['sample_count'] <=
-      value['status']['probe_window']['capacity']
+      value['status']['probe_window']['capacity'] &&
+    (value['status']['error_detail'] === null || isString(value['status']['error_detail']))
   );
 }
 
@@ -2154,6 +2217,36 @@ function isReplacementCalibrationIdentity(value: unknown): boolean {
   );
 }
 
+function isCalibrationPreparationPhase(value: unknown): boolean {
+  if (!isObject(value) || !isString(value['phase'])) return false;
+  switch (value['phase']) {
+    case 'settling':
+    case 'estimating_gains':
+      return (
+        isNonnegativeInteger(value['elapsed_milliseconds']) &&
+        isNonnegativeInteger(value['remaining_milliseconds'])
+      );
+    case 'ready_for_schedule':
+      return true;
+    case 'failed':
+      return isString(value['detail']);
+    default:
+      return false;
+  }
+}
+
+export function isCalibrationPreparationStatusFrame(
+  value: unknown,
+): value is CalibrationPreparationStatusFrame {
+  return (
+    hasType(value, 'calibration_preparation_status') &&
+    isObject(value) &&
+    isObject(value['status']) &&
+    isReplacementCalibrationIdentity(value['status']) &&
+    isCalibrationPreparationPhase(value['status']['phase'])
+  );
+}
+
 export function isCalibrationScheduleAcceptedFrame(
   value: unknown,
 ): value is CalibrationScheduleAcceptedFrame {
@@ -2165,6 +2258,20 @@ export function isCalibrationScheduleAcceptedFrame(
     isNonnegativeInteger(value['accepted']['acknowledged_device_monotonic_microseconds']) &&
     isNonnegativeInteger(value['accepted']['anchor_device_monotonic_microseconds']) &&
     isNonnegativeInteger(value['accepted']['acquisition_sample'])
+  );
+}
+
+export function isCalibrationScheduleUploadAcknowledgedFrame(
+  value: unknown,
+): value is CalibrationScheduleUploadAcknowledgedFrame {
+  return (
+    hasType(value, 'calibration_schedule_upload_acknowledged') && isObject(value) &&
+    isObject(value['acknowledgement']) &&
+    isReplacementCalibrationIdentity(value['acknowledgement']) &&
+    isContentIdentity(value['acknowledgement']['content_identity']) &&
+    isNonnegativeInteger(value['acknowledgement']['total_count']) &&
+    (value['acknowledgement']['first_entry'] === null ||
+      isNonnegativeInteger(value['acknowledgement']['first_entry']))
   );
 }
 
@@ -2350,6 +2457,8 @@ export function asIncomingFrame(value: unknown): IncomingFrame | null {
   if (isNoteResultFrame(value)) return value;
   if (isCalibrationTimingStatusFrame(value)) return value;
   if (isCalibrationTimingLoopStatusFrame(value)) return value;
+  if (isCalibrationPreparationStatusFrame(value)) return value;
+  if (isCalibrationScheduleUploadAcknowledgedFrame(value)) return value;
   if (isCalibrationScheduleAcceptedFrame(value)) return value;
   if (isCalibrationSongInterruptedFrame(value)) return value;
   if (isCalibrationSongResultFrame(value)) return value;

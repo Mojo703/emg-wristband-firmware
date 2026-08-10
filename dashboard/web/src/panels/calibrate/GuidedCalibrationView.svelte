@@ -77,8 +77,8 @@
     <div>
       <strong>Choose a Calibration track</strong>
       <p class="muted">
-        Only validated Calibration v2 levels appear: 10 command and 16 anti prompts per gesture,
-        130 cues when the authored song has enough slots.
+        Validated Calibration v2 levels appear with their authored cue count. Shortfall is shown as
+        a quality warning; any nonempty authored song can be run and continued with a new revision.
       </p>
     </div>
     {#if snapshot.tracks.length === 0}
@@ -155,6 +155,23 @@
       {/each}
     </div>
   </section>
+{:else if snapshot.phase === 'preparing'}
+  <section class="song-end card" aria-live="polite">
+    <div>
+      <span class="eyebrow">Preparing calibration</span>
+      <h3>{snapshot.track.title}</h3>
+      <p>
+        {snapshot.stage === 'stillness'
+          ? 'Hold still'
+          : snapshot.stage === 'gain_estimation'
+            ? 'Estimating reference gains'
+            : 'Uploading schedule; waiting for device acceptance'}
+        {#if snapshot.stage !== 'ready_for_schedule'}
+          · {Math.ceil(snapshot.remaining_milliseconds / 1000)} s remaining
+        {/if}
+      </p>
+    </div>
+  </section>
 {:else if snapshot.phase === 'between_songs'}
   <section class="song-end card">
     <div>
@@ -170,6 +187,19 @@
         {/each}
       </div>
     {/if}
+    <div class="track-grid" aria-label="Choose the next calibration track">
+      {#each snapshot.tracks as track (track.id)}
+        <button
+          class="track-card"
+          class:selected={snapshot.selected_track_id === track.id}
+          aria-pressed={snapshot.selected_track_id === track.id}
+          onclick={() => onSelectTrack?.(track.id)}
+        >
+          <strong>{track.title}</strong>
+          <span>{track.cue_count} cues{track.cue_shortfall > 0 ? ` · ${track.cue_shortfall} short` : ''}</span>
+        </button>
+      {/each}
+    </div>
     <div class="actions">
       {#each songEndActions(snapshot) as state (state.action)}
         <Button
