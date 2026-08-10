@@ -125,14 +125,21 @@ enum SessionControl {
     StartTrack,
     /// Freeze both where they stand.
     PauseTrack,
-    /// The last browser disconnected: freeze for a reason the operator did not
-    /// choose, and say so when they come back.
-    BrowserGone,
     /// Unfreeze both from where they froze.
     ResumeTrack,
     /// End the session now and move to review, mid-track or not.
     Finish,
 }
+
+/// A latest-wins safety interrupt, kept separate from operator commands.
+///
+/// Disconnect is idempotent, so multiple departures may coalesce. The
+/// generation makes every departure observable even when the receiver has
+/// already handled an earlier one. A watch channel cannot become full, which
+/// means a saturated operator queue can never prevent an unattended recording
+/// from being frozen.
+#[derive(Clone, Copy, Default)]
+struct BrowserDeparture(u64);
 
 /// Latest-wins audio settings are state, not an event stream. A watch channel
 /// prevents a dragged volume slider from starving lifecycle commands.
@@ -151,6 +158,7 @@ enum Phase {
     Running {
         session_id: dashboard::guided_session::GuidedSessionId,
         control: mpsc::Sender<SessionControl>,
+        browser_departure: watch::Sender<BrowserDeparture>,
         audio: watch::Sender<LiveAudioSettings>,
     },
     /// The wire-facing session/summary data lives in the cached `latest_state`
@@ -739,6 +747,8 @@ impl CollectionManager {
         }
 
         let (control, control_receiver) = mpsc::channel(CONTROL_CAPACITY);
+        let (browser_departure, browser_departure_receiver) =
+            watch::channel(BrowserDeparture::default());
         let current_audio = {
             let settings = self.audio_settings.lock().unwrap();
             LiveAudioSettings {
@@ -757,6 +767,7 @@ impl CollectionManager {
             state.phase = Phase::Running {
                 session_id: guided_session_id,
                 control,
+                browser_departure,
                 audio,
             };
             // The photo now belongs to this session; a practice session leaves
@@ -778,6 +789,7 @@ impl CollectionManager {
             session_id,
             capture,
             control_receiver,
+            browser_departure_receiver,
             audio_receiver,
             playback_audio,
             beatmap,
@@ -1017,14 +1029,14 @@ impl GuidedModeAdapter for CollectionManager {
         let state = self.state.lock().unwrap();
         if let Phase::Running {
             session_id,
-            control,
+            browser_departure,
             ..
         } = &state.phase
         {
             if *session_id == session.session_id {
-                if let Err(error) = control.try_send(SessionControl::BrowserGone) {
-                    tracing::error!(?error, "failed to pause collection after browser departure");
-                }
+                browser_departure.send_modify(|departure| {
+                    departure.0 = departure.0.wrapping_add(1);
+                });
             }
         }
     }
@@ -1198,6 +1210,7 @@ struct RunningSession {
     session_id: SessionId,
     capture: CaptureResources,
     control: mpsc::Receiver<SessionControl>,
+    browser_departure: watch::Receiver<BrowserDeparture>,
     audio: watch::Receiver<LiveAudioSettings>,
     applied_audio: LiveAudioSettings,
     cues: Vec<CueState>,
@@ -1228,6 +1241,7 @@ impl RunningSession {
         session_id: SessionId,
         capture: CaptureResources,
         control: mpsc::Receiver<SessionControl>,
+        browser_departure: watch::Receiver<BrowserDeparture>,
         audio: watch::Receiver<LiveAudioSettings>,
         applied_audio: LiveAudioSettings,
         beatmap: Beatmap,
@@ -1255,6 +1269,7 @@ impl RunningSession {
             session_id,
             capture,
             control,
+            browser_departure,
             audio,
             applied_audio,
             cues,
@@ -1289,10 +1304,19 @@ impl RunningSession {
         let mut publish_health = false;
         let outcome = loop {
             tokio::select! {
+                biased;
+                departed = self.browser_departure.changed() => match departed {
+                    Ok(()) => {
+                        self.browser_departure.borrow_and_update();
+                        self.browser_gone().await;
+                    }
+                    Err(_) => break SessionExit::TaskFailed(
+                        "collection browser-safety channel closed".into(),
+                    ),
+                },
                 message = self.control.recv() => match message {
                     Some(SessionControl::StartTrack) => self.start_track().await,
                     Some(SessionControl::PauseTrack) => self.pause_track().await,
-                    Some(SessionControl::BrowserGone) => self.browser_gone().await,
                     Some(SessionControl::ResumeTrack) => self.resume_track().await,
                     Some(SessionControl::Finish) => break SessionExit::OperatorStopped,
                     None => break SessionExit::TaskFailed("collection control channel closed".into()),
@@ -2008,9 +2032,12 @@ mod tests {
         session_id: dashboard::guided_session::GuidedSessionId,
     ) -> (
         mpsc::Receiver<SessionControl>,
+        watch::Receiver<BrowserDeparture>,
         watch::Receiver<LiveAudioSettings>,
     ) {
         let (control, receiver) = mpsc::channel(CONTROL_CAPACITY);
+        let (browser_departure, browser_departure_receiver) =
+            watch::channel(BrowserDeparture::default());
         let settings = LiveAudioSettings {
             output: AudioOutput::Silent,
             gain: 0.0,
@@ -2019,9 +2046,10 @@ mod tests {
         manager.state.lock().unwrap().phase = Phase::Running {
             session_id,
             control,
+            browser_departure,
             audio,
         };
-        (receiver, audio_receiver)
+        (receiver, browser_departure_receiver, audio_receiver)
     }
 
     #[test]
@@ -2030,7 +2058,8 @@ mod tests {
         let lease = guided_sessions
             .acquire_current(GuidedMode::Collection, None)
             .unwrap();
-        let (mut control, _audio) = pretend_running(&manager, lease.binding().session_id);
+        let (mut control, mut browser_departure, _audio) =
+            pretend_running(&manager, lease.binding().session_id);
         let generic = guided_sessions.connect_browser();
         let first = guided_sessions.connect_browser();
         let second = guided_sessions.connect_browser();
@@ -2049,10 +2078,8 @@ mod tests {
         );
 
         drop(second);
-        assert!(
-            matches!(control.try_recv(), Ok(SessionControl::BrowserGone)),
-            "the last visible guided view leaving did not freeze the session"
-        );
+        assert!(browser_departure.has_changed().unwrap());
+        assert_eq!(browser_departure.borrow_and_update().0, 1);
         lease.finish(SessionExit::Completed);
     }
 
@@ -2062,7 +2089,8 @@ mod tests {
         let lease = guided_sessions
             .acquire_current(GuidedMode::Collection, None)
             .unwrap();
-        let (mut control, _audio) = pretend_running(&manager, lease.binding().session_id);
+        let (_control, mut browser_departure, _audio) =
+            pretend_running(&manager, lease.binding().session_id);
 
         for _ in 0..2 {
             let connection = guided_sessions.connect_browser();
@@ -2070,11 +2098,35 @@ mod tests {
                 .set_visible_mode(Some(GuidedMode::Collection))
                 .unwrap();
             drop(connection);
-            assert!(matches!(
-                control.try_recv(),
-                Ok(SessionControl::BrowserGone)
-            ));
+            assert!(browser_departure.has_changed().unwrap());
+            browser_departure.borrow_and_update();
         }
+        lease.finish(SessionExit::Completed);
+    }
+
+    #[test]
+    fn browser_departure_bypasses_a_saturated_operator_queue() {
+        let (manager, guided_sessions) = bare_manager("departure-priority");
+        let lease = guided_sessions
+            .acquire_current(GuidedMode::Collection, None)
+            .unwrap();
+        let (mut control, mut browser_departure, _audio) =
+            pretend_running(&manager, lease.binding().session_id);
+        let browser = guided_sessions.connect_browser();
+        browser
+            .set_visible_mode(Some(GuidedMode::Collection))
+            .unwrap();
+
+        for _ in 0..CONTROL_CAPACITY {
+            manager.start_track();
+        }
+        assert_eq!(control.len(), CONTROL_CAPACITY);
+
+        drop(browser);
+
+        assert!(browser_departure.has_changed().unwrap());
+        assert_eq!(browser_departure.borrow_and_update().0, 1);
+        assert!(matches!(control.try_recv(), Ok(SessionControl::StartTrack)));
         lease.finish(SessionExit::Completed);
     }
 
@@ -2089,15 +2141,13 @@ mod tests {
         let replacement = guided_sessions
             .acquire_current(GuidedMode::Collection, None)
             .unwrap();
-        let (mut control, _audio) = pretend_running(&manager, replacement.binding().session_id);
+        let (_control, browser_departure, _audio) =
+            pretend_running(&manager, replacement.binding().session_id);
 
         manager.pause_for_no_visible_views(&old_binding);
-        assert!(control.try_recv().is_err());
+        assert!(!browser_departure.has_changed().unwrap());
         manager.pause_for_no_visible_views(replacement.binding());
-        assert!(matches!(
-            control.try_recv(),
-            Ok(SessionControl::BrowserGone)
-        ));
+        assert!(browser_departure.has_changed().unwrap());
         replacement.finish(SessionExit::Completed);
     }
 
@@ -2107,7 +2157,8 @@ mod tests {
         let lease = guided_sessions
             .acquire_current(GuidedMode::Collection, None)
             .unwrap();
-        let (mut control, audio) = pretend_running(&manager, lease.binding().session_id);
+        let (mut control, _browser_departure, audio) =
+            pretend_running(&manager, lease.binding().session_id);
 
         for volume in 0..=1000 {
             manager.audio_settings.lock().unwrap().volume_permille = volume;
@@ -2144,8 +2195,10 @@ mod tests {
         let lease = guided_sessions
             .acquire_current(GuidedMode::Collection, None)
             .unwrap();
-        let (control, audio) = pretend_running(&manager, lease.binding().session_id);
+        let (control, browser_departure, audio) =
+            pretend_running(&manager, lease.binding().session_id);
         drop(control);
+        drop(browser_departure);
         drop(audio);
         let mut outbound = manager.subscribe();
 
@@ -2172,7 +2225,7 @@ mod tests {
                 .unwrap();
             let session_id = lease.binding().session_id;
             if running {
-                let (_control, _audio) = pretend_running(&manager, session_id);
+                let (_control, _browser_departure, _audio) = pretend_running(&manager, session_id);
             } else {
                 manager.state.lock().unwrap().phase = Phase::Starting { session_id };
             }
