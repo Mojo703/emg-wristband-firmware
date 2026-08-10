@@ -1056,6 +1056,47 @@ pub struct CalibrationScheduleUploadAcknowledgement {
     pub first_entry: Option<u32>,
 }
 
+/// A canonical integrity token for one logical Begin or Chunk operation. This
+/// is deliberately independent of CBOR map ordering and transport framing: a
+/// device ACK proves it decoded and applied the exact semantic payload the host
+/// intended, including every cue label and timestamp.
+pub fn calibration_schedule_operation_fingerprint(
+    run: CalibrationRunKey,
+    schedule_revision: CalibrationScheduleRevision,
+    content_identity: &str,
+    total_count: u32,
+    first_entry: Option<u32>,
+    entries: &[CalibrationScheduleEntry],
+) -> u32 {
+    let mut crc = WireCrc32::new();
+    crc.update(b"opal-calibration-upload-v1");
+    crc.update(&run.session_id.get().to_le_bytes());
+    crc.update(&run.run_id.get().to_le_bytes());
+    crc.update(&schedule_revision.get().to_le_bytes());
+    crc.update(&(content_identity.len() as u64).to_le_bytes());
+    crc.update(content_identity.as_bytes());
+    crc.update(&total_count.to_le_bytes());
+    match first_entry {
+        None => crc.update(&[0]),
+        Some(first_entry) => {
+            crc.update(&[1]);
+            crc.update(&first_entry.to_le_bytes());
+        }
+    }
+    crc.update(&(entries.len() as u32).to_le_bytes());
+    for entry in entries {
+        crc.update(&entry.cue_id.get().to_le_bytes());
+        crc.update(&[entry.gesture.index()]);
+        crc.update(&[match entry.modifier {
+            CalibrationModifier::ThumbUp => 0,
+            CalibrationModifier::ThumbDown => 1,
+        }]);
+        crc.update(&entry.track_offset.get().to_le_bytes());
+        crc.update(&entry.hold.get().to_le_bytes());
+    }
+    crc.finish()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "phase", rename_all = "snake_case")]
 pub enum CalibrationPreparationPhase {
@@ -4327,6 +4368,56 @@ mod tests {
                 assert_eq!(entries[31].cue_id.get(), 32);
             }
             other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn schedule_operation_fingerprint_covers_identity_position_and_every_cue_field() {
+        let entry = CalibrationScheduleEntry {
+            cue_id: CalibrationCueId::new(7).unwrap(),
+            gesture: CalibrationGesture::WristPronation,
+            modifier: CalibrationModifier::ThumbUp,
+            track_offset: TrackMilliseconds::new(2_000),
+            hold: DurationMilliseconds::new(1_500),
+        };
+        let fingerprint = |identity: &str, first, entry: CalibrationScheduleEntry| {
+            calibration_schedule_operation_fingerprint(
+                run_key(),
+                schedule_revision(),
+                identity,
+                90,
+                first,
+                &[entry],
+            )
+        };
+        let baseline = fingerprint("sha256:test", Some(8), entry);
+        assert_ne!(baseline, fingerprint("sha256:other", Some(8), entry));
+        assert_ne!(baseline, fingerprint("sha256:test", Some(16), entry));
+        assert_ne!(baseline, fingerprint("sha256:test", None, entry));
+
+        for changed in [
+            CalibrationScheduleEntry {
+                cue_id: CalibrationCueId::new(8).unwrap(),
+                ..entry
+            },
+            CalibrationScheduleEntry {
+                gesture: CalibrationGesture::WristSupination,
+                ..entry
+            },
+            CalibrationScheduleEntry {
+                modifier: CalibrationModifier::ThumbDown,
+                ..entry
+            },
+            CalibrationScheduleEntry {
+                track_offset: TrackMilliseconds::new(2_001),
+                ..entry
+            },
+            CalibrationScheduleEntry {
+                hold: DurationMilliseconds::new(1_501),
+                ..entry
+            },
+        ] {
+            assert_ne!(baseline, fingerprint("sha256:test", Some(8), changed));
         }
     }
 
