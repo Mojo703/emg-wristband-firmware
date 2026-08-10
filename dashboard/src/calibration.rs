@@ -18,8 +18,9 @@ use tokio::sync::{broadcast, mpsc};
 /// units. This transport choice is not a protocol limit: firmware still
 /// validates/reassembles chunks up to the public 32-entry maximum.
 const OPERATIONAL_SCHEDULE_UPLOAD_ENTRIES: usize = 8;
-const CHUNK_ACK_RETRY_AFTER: Duration = Duration::from_secs(2);
+const UPLOAD_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_CHUNK_ACK_RETRIES: u8 = 3;
+const SCHEDULE_ACCEPTANCE_TIMEOUT: Duration = Duration::from_secs(2);
 const RUN_ACTION_CAPACITY: usize = 8;
 
 pub struct CalibrationModeAdapter {
@@ -88,7 +89,9 @@ fn enqueue_run_action(
 /// output cannot be both armed and playing.
 enum ScheduleCommitPhase {
     AwaitingDeviceReadiness,
-    Sent,
+    Sent {
+        acceptance_deadline: tokio::time::Instant,
+    },
     /// The exact run/revision/identity was accepted. Late preparation
     /// narration can no longer project the UI back before this boundary.
     Accepted,
@@ -96,7 +99,27 @@ enum ScheduleCommitPhase {
 
 impl ScheduleCommitPhase {
     fn projects_preparation(&self) -> bool {
-        matches!(self, Self::AwaitingDeviceReadiness | Self::Sent)
+        matches!(self, Self::AwaitingDeviceReadiness | Self::Sent { .. })
+    }
+
+    fn sent_at(now: tokio::time::Instant) -> Self {
+        Self::Sent {
+            acceptance_deadline: now + SCHEDULE_ACCEPTANCE_TIMEOUT,
+        }
+    }
+
+    fn acceptance_deadline(&self) -> Option<tokio::time::Instant> {
+        match self {
+            Self::Sent {
+                acceptance_deadline,
+            } => Some(*acceptance_deadline),
+            Self::AwaitingDeviceReadiness | Self::Accepted => None,
+        }
+    }
+
+    fn acceptance_timed_out(&self, now: tokio::time::Instant) -> bool {
+        self.acceptance_deadline()
+            .is_some_and(|deadline| now >= deadline)
     }
 }
 
@@ -107,6 +130,27 @@ enum UploadPhase {
     AwaitingBeginAcknowledgement,
     AwaitingChunkAcknowledgement { first_entry: u32 },
     Complete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UploadTimeoutAction {
+    FailBegin,
+    RetryChunk,
+    FailChunk,
+    None,
+}
+
+fn upload_timeout_action(upload: &UploadPhase, chunk_retries: u8) -> UploadTimeoutAction {
+    match upload {
+        UploadPhase::AwaitingBeginAcknowledgement => UploadTimeoutAction::FailBegin,
+        UploadPhase::AwaitingChunkAcknowledgement { .. }
+            if chunk_retries >= MAX_CHUNK_ACK_RETRIES =>
+        {
+            UploadTimeoutAction::FailChunk
+        }
+        UploadPhase::AwaitingChunkAcknowledgement { .. } => UploadTimeoutAction::RetryChunk,
+        UploadPhase::Complete => UploadTimeoutAction::None,
+    }
 }
 
 enum HeartbeatMode {
@@ -123,6 +167,59 @@ enum PlaybackState {
         playback: crate::collect::audio::Playback,
     },
     Playing(crate::collect::audio::Playback),
+}
+
+/// An opened song is affine authority for one accepted schedule identity.  A
+/// `JoinHandle` is a future and may not be polled after it has completed; keeping
+/// it loose beside the mutable track previously let Continue poll the first
+/// song's completed handle a second time (and let a replacement track consume
+/// the old song).  Consuming this enum before awaiting makes both states
+/// unrepresentable.
+enum PlaybackPreparation {
+    Pending {
+        content_identity: String,
+        task: tokio::task::JoinHandle<anyhow::Result<crate::collect::audio::Playback>>,
+    },
+    Consumed,
+}
+
+fn prepare_playback(
+    collection: Arc<crate::collect::manager::CollectionManager>,
+    track: &crate::collect::beatmap::CalibrationTrack,
+) -> PlaybackPreparation {
+    let content_identity = track.content_identity.clone();
+    let track_id = track.id.clone();
+    let entries = track.entries.clone();
+    let task = tokio::task::spawn_blocking(move || {
+        collection.open_calibration_playback(&track_id, &entries)
+    });
+    PlaybackPreparation::Pending {
+        content_identity,
+        task,
+    }
+}
+
+async fn consume_playback_preparation(
+    preparation: &mut PlaybackPreparation,
+    expected_content_identity: &str,
+) -> Result<crate::collect::audio::Playback, String> {
+    let PlaybackPreparation::Pending {
+        content_identity,
+        task,
+    } = core::mem::replace(preparation, PlaybackPreparation::Consumed)
+    else {
+        return Err("the accepted calibration schedule has no unused audio preparation".into());
+    };
+    if content_identity != expected_content_identity {
+        return Err(format!(
+            "calibration audio identity changed before acceptance (prepared {content_identity}, accepted {expected_content_identity})"
+        ));
+    }
+    match task.await {
+        Ok(Ok(playback)) => Ok(playback),
+        Ok(Err(error)) => Err(format!("calibration audio failed: {error:#}")),
+        Err(error) => Err(format!("calibration audio task failed: {error}")),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -304,11 +401,7 @@ impl CalibrationModeAdapter {
             ));
             return;
         };
-        let playback_track_id = track.id.clone();
-        let playback_entries = track.entries.clone();
-        let mut prepared_playback = tokio::task::spawn_blocking(move || {
-            playback_collection.open_calibration_playback(&playback_track_id, &playback_entries)
-        });
+        let mut prepared_playback = prepare_playback(playback_collection.clone(), &track);
         let binding = lease.binding().clone();
         let mut heartbeat = tokio::time::interval(std::time::Duration::from_millis(u64::from(
             protocol::CALIBRATION_HEARTBEAT_INTERVAL_MILLISECONDS,
@@ -338,13 +431,17 @@ impl CalibrationModeAdapter {
                 return;
             }
         };
-        let mut chunk_ack_retry = tokio::time::interval(CHUNK_ACK_RETRY_AFTER);
-        chunk_ack_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut upload_ack_timeout = tokio::time::interval(UPLOAD_ACK_TIMEOUT);
+        upload_ack_timeout.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // Tokio intervals tick immediately. Consume that first tick so a
         // newly acknowledged Begin cannot instantly duplicate Chunk 0.
-        chunk_ack_retry.tick().await;
+        upload_ack_timeout.tick().await;
         let mut chunk_ack_retries = 0u8;
         let outcome = loop {
+            let schedule_acceptance_deadline =
+                commit_phase.acceptance_deadline().unwrap_or_else(|| {
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(365 * 24 * 60 * 60)
+                });
             tokio::select! {
                 biased;
                 changed = gate.changed() => match changed {
@@ -399,7 +496,8 @@ impl CalibrationModeAdapter {
                         );
                     }
                     Ok(Frame::CalibrationResidentActivated { activation })
-                        if activation.run == run => {
+                        if activation.run == run
+                            && activation.schedule_revision == schedule_revision => {
                         break SessionExit::Completed;
                     }
                     Ok(Frame::CalibrationScheduleAccepted { accepted })
@@ -411,7 +509,7 @@ impl CalibrationModeAdapter {
                                 "the device accepted a calibration schedule with a mismatched identity or anchor".into(),
                             );
                         }
-                        if !matches!(commit_phase, ScheduleCommitPhase::Sent) {
+                        if !matches!(commit_phase, ScheduleCommitPhase::Sent { .. }) {
                             break SessionExit::DependencyFailed(
                                 "the device accepted a schedule that this host did not commit".into(),
                             );
@@ -434,10 +532,12 @@ impl CalibrationModeAdapter {
                             Ok(deadline) => deadline,
                             Err(detail) => break SessionExit::DependencyFailed(detail.into()),
                         };
-                        let opened = match (&mut prepared_playback).await {
-                            Ok(Ok(opened)) => opened,
-                            Ok(Err(error)) => break SessionExit::TaskFailed(format!("calibration audio failed: {error:#}")),
-                            Err(error) => break SessionExit::TaskFailed(format!("calibration audio task failed: {error}")),
+                        let opened = match consume_playback_preparation(
+                            &mut prepared_playback,
+                            &track.content_identity,
+                        ).await {
+                            Ok(opened) => opened,
+                            Err(detail) => break SessionExit::TaskFailed(detail),
                         };
                         playback = PlaybackState::Armed { playback: opened };
                         playback_alarm.as_mut().reset(deadline);
@@ -468,7 +568,7 @@ impl CalibrationModeAdapter {
                         // A matching ACK authorizes the next distinct chunk;
                         // it also refreshes the deadline for that chunk.
                         chunk_ack_retries = 0;
-                        chunk_ack_retry.reset();
+                        upload_ack_timeout.reset();
                         if matches!(upload, UploadPhase::Complete)
                             && device_ready_for_commit
                             && matches!(commit_phase, ScheduleCommitPhase::AwaitingDeviceReadiness)
@@ -478,7 +578,7 @@ impl CalibrationModeAdapter {
                             ) {
                                 break delivery_failure(error);
                             }
-                            commit_phase = ScheduleCommitPhase::Sent;
+                            commit_phase = ScheduleCommitPhase::sent_at(tokio::time::Instant::now());
                         }
                     }
                     Ok(Frame::CalibrationPreparationStatus { status })
@@ -514,11 +614,13 @@ impl CalibrationModeAdapter {
                             ) {
                                 break delivery_failure(error);
                             }
-                            commit_phase = ScheduleCommitPhase::Sent;
+                            commit_phase = ScheduleCommitPhase::sent_at(tokio::time::Instant::now());
                         }
                     }
                     Ok(Frame::CalibrationSongInterrupted { interruption })
-                        if interruption.run == run => {
+                        if interruption.run == run
+                            && interruption.schedule_revision == schedule_revision
+                            && interruption.content_identity == track.content_identity => {
                         evidence = EvidenceState::Retained;
                         heartbeat_mode = HeartbeatMode::Withheld;
                         playback = PlaybackState::Dormant;
@@ -534,7 +636,9 @@ impl CalibrationModeAdapter {
                         );
                     }
                     Ok(Frame::CalibrationSongResult { result })
-                        if result.run == run => {
+                        if result.run == run
+                            && result.schedule_revision == schedule_revision
+                            && result.content_identity == track.content_identity => {
                         song_counts = result.counts;
                         evidence = EvidenceState::Retained;
                         candidate = candidate.with_validity(result.validity);
@@ -571,7 +675,7 @@ impl CalibrationModeAdapter {
                     Ok(Frame::CalibrationScheduleCommitDeferred { deferred })
                         if deferred.run == run
                             && deferred.schedule_revision == schedule_revision
-                            && matches!(commit_phase, ScheduleCommitPhase::Sent) => {
+                            && matches!(commit_phase, ScheduleCommitPhase::Sent { .. }) => {
                         // The preparation status is the retry authority.  A
                         // retryable refusal returns to its explicit ready
                         // phase; no backend stopwatch recreates that phase.
@@ -589,23 +693,43 @@ impl CalibrationModeAdapter {
                         );
                     }
                 },
-                _ = chunk_ack_retry.tick(), if matches!(upload, UploadPhase::AwaitingChunkAcknowledgement { .. }) => {
-                    if chunk_ack_retries >= MAX_CHUNK_ACK_RETRIES {
-                        break SessionExit::DependencyFailed(
-                            "calibration Chunk acknowledgement timed out after exact idempotent retries".into(),
-                        );
+                _ = upload_ack_timeout.tick(), if !matches!(upload, UploadPhase::Complete) => {
+                    match upload_timeout_action(&upload, chunk_ack_retries) {
+                        UploadTimeoutAction::FailBegin => {
+                            // Begin is not idempotent on the device: retrying it
+                            // could replace a transaction whose ACK alone was
+                            // lost. Fail explicitly and require a fresh run.
+                            break SessionExit::DependencyFailed(
+                                "calibration Begin acknowledgement timed out; restart before uploading a schedule".into(),
+                            );
+                        }
+                        UploadTimeoutAction::FailChunk => {
+                            break SessionExit::DependencyFailed(
+                                "calibration Chunk acknowledgement timed out after exact idempotent retries".into(),
+                            );
+                        }
+                        UploadTimeoutAction::RetryChunk => {
+                            // Exact duplicate chunks are idempotent and ACKed by
+                            // firmware, so only this phase may retry in place.
+                            if let Err(error) = retry_upload_chunk(
+                                &self.registry, &device, run, schedule_revision, &track, &upload,
+                            ) {
+                                break delivery_failure(error);
+                            }
+                            chunk_ack_retries = chunk_ack_retries.saturating_add(1);
+                        }
+                        UploadTimeoutAction::None => {}
                     }
-                    // Chunks alone are safe to retry: firmware records an
-                    // exact duplicate as `UploadEffect::Duplicate` and ACKs
-                    // it. Begin and Commit are intentionally never retried:
-                    // their duplicate semantics are refusal/terminal rather
-                    // than an idempotent acknowledgement.
-                    if let Err(error) = retry_upload_chunk(
-                        &self.registry, &device, run, schedule_revision, &track, &upload,
-                    ) {
-                        break delivery_failure(error);
-                    }
-                    chunk_ack_retries = chunk_ack_retries.saturating_add(1);
+                }
+                _ = tokio::time::sleep_until(schedule_acceptance_deadline),
+                    if matches!(commit_phase, ScheduleCommitPhase::Sent { .. }) => {
+                    debug_assert!(commit_phase.acceptance_timed_out(tokio::time::Instant::now()));
+                    // Commit is terminal and not idempotent. A lost acceptance
+                    // cannot safely be reconstructed by the host, especially
+                    // once its exact three-second playback anchor has passed.
+                    break SessionExit::DependencyFailed(
+                        "calibration schedule acceptance timed out after Commit; restart before playback".into(),
+                    );
                 }
                 command = actions.recv() => {
                     let Some(command) = command else {
@@ -634,9 +758,14 @@ impl CalibrationModeAdapter {
                                 Ok(upload) => upload,
                                 Err(error) => break delivery_failure(error),
                             };
+                            // The upload timer is dormant between songs and its
+                            // old deadline may be far in the past. Revision 2+
+                            // gets a full Begin acknowledgement window.
+                            upload_ack_timeout.reset();
                             commit_phase = ScheduleCommitPhase::AwaitingDeviceReadiness;
                             device_ready_for_commit = false;
                             evidence = EvidenceState::Fresh;
+                            prepared_playback = prepare_playback(playback_collection.clone(), &track);
                             heartbeat_mode = HeartbeatMode::Sending {
                                 schedule_revision,
                                 next_sequence: 0,
@@ -1354,6 +1483,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn playback_preparation_is_identity_bound_and_consumed_exactly_once() {
+        let task = tokio::spawn(async {
+            Err(anyhow::anyhow!("fixture audio failed"))
+                as anyhow::Result<crate::collect::audio::Playback>
+        });
+        let mut preparation = PlaybackPreparation::Pending {
+            content_identity: "first-song".into(),
+            task,
+        };
+
+        let mismatch =
+            match consume_playback_preparation(&mut preparation, "replacement-song").await {
+                Ok(_) => panic!("a mismatched song must not consume prepared audio"),
+                Err(detail) => detail,
+            };
+        assert!(mismatch.contains("identity changed"));
+        let reused = match consume_playback_preparation(&mut preparation, "first-song").await {
+            Ok(_) => panic!("a preparation must be affine"),
+            Err(detail) => detail,
+        };
+        assert!(reused.contains("no unused audio preparation"));
+    }
+
+    #[tokio::test]
+    async fn completed_playback_preparation_cannot_be_polled_twice() {
+        let task = tokio::spawn(async {
+            Err(anyhow::anyhow!("fixture audio failed"))
+                as anyhow::Result<crate::collect::audio::Playback>
+        });
+        let mut preparation = PlaybackPreparation::Pending {
+            content_identity: "song".into(),
+            task,
+        };
+
+        let first = match consume_playback_preparation(&mut preparation, "song").await {
+            Ok(_) => panic!("the fixture task must fail"),
+            Err(detail) => detail,
+        };
+        assert!(first.contains("fixture audio failed"));
+        let second = match consume_playback_preparation(&mut preparation, "song").await {
+            Ok(_) => panic!("a completed preparation must not be reusable"),
+            Err(detail) => detail,
+        };
+        assert!(second.contains("no unused audio preparation"));
+    }
+
+    #[tokio::test]
     async fn song_result_survives_candidate_not_yet_ready_for_continue() {
         let registry = Arc::new(Registry::new());
         let coordinator = GuidedSessionCoordinator::new();
@@ -1489,6 +1665,71 @@ mod tests {
         assert!(matches!(
             coordinator.snapshot().calibration(),
             Some(GuidedCalibrationSnapshot::BetweenSongs { .. })
+        ));
+        let snapshot = coordinator.snapshot();
+        coordinator
+            .handle_intent_for_device(
+                GuidedIntentRequest {
+                    expected_revision: snapshot.revision,
+                    expected_run_revision: snapshot.run_revision,
+                    expected_session_id: snapshot.active().map(|active| active.session_id),
+                    action: GuidedSessionAction::ContinueCalibration,
+                },
+                None,
+            )
+            .unwrap();
+        // Continue and the new Begin share the reliable writer but heartbeats
+        // may interleave, so observe the revision-2 Begin without assuming an
+        // incidental scheduling order.
+        loop {
+            if matches!(
+                receive_control(&mut device).await,
+                Frame::CalibrationScheduleBegin {
+                    schedule_revision,
+                    ..
+                } if schedule_revision == CalibrationScheduleRevision::new(2).unwrap()
+            ) {
+                break;
+            }
+        }
+        device
+            .frames
+            .send(Frame::CalibrationPreparationStatus {
+                status: protocol::CalibrationPreparationStatus {
+                    run,
+                    schedule_revision: CalibrationScheduleRevision::new(2).unwrap(),
+                    phase: protocol::CalibrationPreparationPhase::Settling {
+                        elapsed_milliseconds: 250,
+                        remaining_milliseconds: 9_750,
+                    },
+                },
+            })
+            .unwrap();
+        // A terminal frame for song 1 may still have been buffered when song 2
+        // began. Run identity alone is insufficient; it must not withhold song
+        // 2's heartbeat or replace its preparation projection.
+        device
+            .frames
+            .send(Frame::CalibrationSongResult {
+                result: protocol::CalibrationSongResult {
+                    run,
+                    schedule_revision: CalibrationScheduleRevision::new(1).unwrap(),
+                    content_identity: "test-content".into(),
+                    counts: Vec::new(),
+                    validity: protocol::CalibrationCandidateValidity {
+                        model_numerically_valid: true,
+                        record_crc_valid: true,
+                    },
+                },
+            })
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(matches!(
+            coordinator.snapshot().calibration(),
+            Some(GuidedCalibrationSnapshot::Preparing {
+                elapsed_milliseconds: 250,
+                ..
+            })
         ));
         // A new DeviceHello is a link epoch, even when the underlying serial
         // file stayed open. The actor must fail explicitly rather than use the
@@ -1642,6 +1883,50 @@ mod tests {
     }
 
     #[test]
+    fn lost_begin_ack_fails_instead_of_retrying_a_non_idempotent_begin() {
+        assert_eq!(
+            upload_timeout_action(&UploadPhase::AwaitingBeginAcknowledgement, 0),
+            UploadTimeoutAction::FailBegin
+        );
+        assert_eq!(
+            upload_timeout_action(
+                &UploadPhase::AwaitingChunkAcknowledgement { first_entry: 0 },
+                0,
+            ),
+            UploadTimeoutAction::RetryChunk
+        );
+        assert_eq!(
+            upload_timeout_action(
+                &UploadPhase::AwaitingChunkAcknowledgement { first_entry: 0 },
+                MAX_CHUNK_ACK_RETRIES,
+            ),
+            UploadTimeoutAction::FailChunk
+        );
+        assert_eq!(
+            upload_timeout_action(&UploadPhase::Complete, 0),
+            UploadTimeoutAction::None
+        );
+    }
+
+    #[test]
+    fn lost_commit_acceptance_has_a_phase_owned_deadline() {
+        let sent_at = tokio::time::Instant::now();
+        let phase = ScheduleCommitPhase::sent_at(sent_at);
+        assert_eq!(
+            phase.acceptance_deadline(),
+            Some(sent_at + SCHEDULE_ACCEPTANCE_TIMEOUT)
+        );
+        assert!(!phase
+            .acceptance_timed_out(sent_at + SCHEDULE_ACCEPTANCE_TIMEOUT - Duration::from_nanos(1)));
+        assert!(phase.acceptance_timed_out(sent_at + SCHEDULE_ACCEPTANCE_TIMEOUT));
+        assert_eq!(
+            ScheduleCommitPhase::AwaitingDeviceReadiness.acceptance_deadline(),
+            None
+        );
+        assert_eq!(ScheduleCommitPhase::Accepted.acceptance_deadline(), None);
+    }
+
+    #[test]
     fn awaited_ack_fingerprint_names_the_exact_begin_or_chunk_payload() {
         let track = track();
         let run = CalibrationRunKey {
@@ -1743,7 +2028,7 @@ mod tests {
     #[test]
     fn accepted_schedule_is_a_one_way_boundary_for_preparation_projection() {
         assert!(ScheduleCommitPhase::AwaitingDeviceReadiness.projects_preparation());
-        assert!(ScheduleCommitPhase::Sent.projects_preparation());
+        assert!(ScheduleCommitPhase::sent_at(tokio::time::Instant::now()).projects_preparation());
         assert!(!ScheduleCommitPhase::Accepted.projects_preparation());
     }
 
