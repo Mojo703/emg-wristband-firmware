@@ -53,7 +53,7 @@ impl WindowGrid {
             return None;
         }
         let start = end_sample - self.window_samples as u64;
-        if start % self.hop_samples as u64 != 0 {
+        if !start.is_multiple_of(self.hop_samples as u64) {
             return None;
         }
         Some((start / self.hop_samples as u64) as u32)

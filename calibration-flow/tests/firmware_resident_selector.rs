@@ -2,7 +2,8 @@
 mod resident_selector;
 
 use resident_selector::{
-    PhysicalSlot, ResidentIdentity, StoreSelector, StoredIdentity, StoredRole,
+    PhysicalSlot, ResidentIdentity, SelectorPersistenceCapability, StoreSelector, StoredIdentity,
+    StoredRole,
 };
 
 fn stored(physical: PhysicalSlot, generation: u32, crc: u32, role: StoredRole) -> StoredIdentity {
@@ -12,6 +13,20 @@ fn stored(physical: PhysicalSlot, generation: u32, crc: u32, role: StoredRole) -
         crc,
         role,
     }
+}
+
+#[test]
+fn selector_persists_exactly_two_sequence_and_crc_slots() {
+    assert_eq!(
+        PhysicalSlot::ALL,
+        [PhysicalSlot::First, PhysicalSlot::Second]
+    );
+
+    let selector = StoreSelector::recover([None, None]);
+    assert_eq!(
+        selector.persistence_capability(),
+        SelectorPersistenceCapability::SlotSequenceAndCrc
+    );
 }
 
 #[test]
