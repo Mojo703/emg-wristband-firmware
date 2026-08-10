@@ -19,7 +19,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering},
     mpsc, Arc, Mutex,
 };
 use std::time::{Duration, Instant};
@@ -29,9 +29,53 @@ use std::time::{Duration, Instant};
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 const PROBE_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 
+struct ConnectionWire {
+    selected: AtomicU8,
+    next_sequence: AtomicU32,
+}
+
+impl Default for ConnectionWire {
+    fn default() -> Self {
+        Self {
+            selected: AtomicU8::new(0),
+            next_sequence: AtomicU32::new(0),
+        }
+    }
+}
+
+impl ConnectionWire {
+    fn selected(&self) -> protocol::WireVersion {
+        if self.selected.load(Ordering::Acquire) == 1 {
+            protocol::WireVersion::V2
+        } else {
+            protocol::WireVersion::Legacy
+        }
+    }
+
+    fn observe(&self, version: protocol::WireVersion) {
+        if matches!(version, protocol::WireVersion::V2) {
+            self.selected.store(1, Ordering::Release);
+        }
+    }
+
+    fn encode(&self, frame: &Frame, forced: Option<protocol::WireVersion>) -> Result<Vec<u8>> {
+        let mut payload = Vec::new();
+        ciborium::into_writer(frame, &mut payload).context("encode frame")?;
+        Ok(match forced.unwrap_or_else(|| self.selected()) {
+            protocol::WireVersion::Legacy => protocol::frame_bytes(&payload),
+            protocol::WireVersion::V2 => protocol::v2_frame_bytes(
+                0,
+                self.next_sequence.fetch_add(1, Ordering::Relaxed),
+                &payload,
+            ),
+        })
+    }
+}
+
 pub struct Link {
     writer: Arc<Mutex<File>>,
     frames: mpsc::Receiver<(Instant, Frame)>,
+    wire: Arc<ConnectionWire>,
 }
 
 /// Owns the calibration-specific heartbeat worker. Dropping it stops future
@@ -68,6 +112,8 @@ impl Link {
         let raw_tap_path = std::env::var_os("PLAYBACK_HOST_RAW_TAP");
         let raw_tap = create_raw_tap(raw_tap_path.as_deref())?;
         let (decoded, frames) = mpsc::channel();
+        let wire = Arc::new(ConnectionWire::default());
+        let reader_wire = Arc::clone(&wire);
         // Everything the port produced, verbatim, beside the decoded frames: a
         // panicking console-enabled device prints its backtrace as plain text,
         // which the scanner rightly skips — and which is then the only record
@@ -87,19 +133,42 @@ impl Link {
                         scanner.extend(&buffer[..read]);
                     }
                 }
-                if decode_frames(&mut scanner, &decoded).is_err() {
+                if decode_frames(&mut scanner, &decoded, &reader_wire).is_err() {
                     return;
                 }
             }
         });
 
         let writer = Arc::new(Mutex::new(port));
-        let link = Self { writer, frames };
-        link.send(&Frame::Probe {})?;
+        let link = Self {
+            writer,
+            frames,
+            wire,
+        };
+        let v2_probe = link
+            .wire
+            .encode(&Frame::Probe {}, Some(protocol::WireVersion::V2))?;
+        write_frame(&link.writer, &v2_probe)?;
+
+        let fallback_writer = Arc::clone(&link.writer);
+        let fallback_wire = Arc::clone(&link.wire);
+        std::thread::spawn(move || {
+            std::thread::sleep(PROBE_RETRY_INTERVAL);
+            if matches!(fallback_wire.selected(), protocol::WireVersion::Legacy) {
+                if let Ok(probe) =
+                    fallback_wire.encode(&Frame::Probe {}, Some(protocol::WireVersion::Legacy))
+                {
+                    let _ = write_frame(&fallback_writer, &probe);
+                }
+            }
+        });
 
         let heartbeat_writer = Arc::clone(&link.writer);
-        let heartbeat = encode(&Frame::Heartbeat {})?;
+        let heartbeat_wire = Arc::clone(&link.wire);
         std::thread::spawn(move || loop {
+            let Ok(heartbeat) = heartbeat_wire.encode(&Frame::Heartbeat {}, None) else {
+                return;
+            };
             if write_frame(&heartbeat_writer, &heartbeat).is_err() {
                 return;
             }
@@ -110,7 +179,7 @@ impl Link {
     }
 
     pub fn send(&self, frame: &Frame) -> Result<()> {
-        let bytes = encode(frame)?;
+        let bytes = self.wire.encode(frame, None)?;
         write_frame(&self.writer, &bytes)
     }
 
@@ -125,6 +194,7 @@ impl Link {
     ) -> Result<CalibrationHeartbeatWorker> {
         start_calibration_heartbeat_worker(
             Arc::clone(&self.writer),
+            Arc::clone(&self.wire),
             run,
             schedule_revision,
             calibration_heartbeat_interval(),
@@ -166,6 +236,7 @@ fn calibration_heartbeat_interval() -> Duration {
 
 fn start_calibration_heartbeat_worker<W>(
     writer: Arc<Mutex<W>>,
+    wire: Arc<ConnectionWire>,
     run: CalibrationRunKey,
     schedule_revision: CalibrationScheduleRevision,
     interval: Duration,
@@ -185,7 +256,7 @@ where
                     sequence,
                 },
             };
-            let Ok(bytes) = encode(&frame) else {
+            let Ok(bytes) = wire.encode(&frame, None) else {
                 return;
             };
             if write_frame(&writer, &bytes).is_err() {
@@ -204,12 +275,14 @@ where
 fn decode_frames(
     scanner: &mut FrameScanner,
     decoded: &mpsc::Sender<(Instant, Frame)>,
+    wire: &ConnectionWire,
 ) -> Result<(), ()> {
-    while let Some(payload) = scanner.next_frame() {
+    while let Some(envelope) = scanner.next_envelope() {
         // Frames this build does not know are not an error: the device also
         // sends logs, telemetry, and whatever a later firmware adds, and none
         // of it should stop a bench run.
-        if let Ok(frame) = ciborium::from_reader::<Frame, _>(payload.as_slice()) {
+        if let Ok(frame) = ciborium::from_reader::<Frame, _>(envelope.payload.as_slice()) {
+            wire.observe(envelope.version);
             if decoded.send((Instant::now(), frame)).is_err() {
                 return Err(());
             }
@@ -250,12 +323,6 @@ fn await_claim(
     }
 }
 
-fn encode(frame: &Frame) -> Result<Vec<u8>> {
-    let mut payload = Vec::new();
-    ciborium::into_writer(frame, &mut payload).context("encode frame")?;
-    Ok(protocol::frame_bytes(&payload))
-}
-
 fn write_frame<W: Write>(writer: &Mutex<W>, bytes: &[u8]) -> Result<()> {
     let mut writer = writer
         .lock()
@@ -277,7 +344,7 @@ fn create_raw_tap(path: Option<&OsStr>) -> Result<Option<File>> {
 mod tests {
     use super::{
         await_claim, calibration_heartbeat_interval, create_raw_tap, decode_frames,
-        start_calibration_heartbeat_worker, write_frame,
+        start_calibration_heartbeat_worker, write_frame, ConnectionWire,
     };
     use protocol::{
         CalibrationRunId, CalibrationRunKey, CalibrationScheduleRevision, CalibrationSessionId,
@@ -330,6 +397,7 @@ mod tests {
         let writer = Arc::new(Mutex::new(RecordingWriter::default()));
         let worker = start_calibration_heartbeat_worker(
             Arc::clone(&writer),
+            Arc::new(ConnectionWire::default()),
             calibration_run(),
             CalibrationScheduleRevision::new(3).unwrap(),
             Duration::from_millis(2),
@@ -418,11 +486,40 @@ mod tests {
         let (decoded, received) = mpsc::channel();
         let before_decode = Instant::now();
 
-        decode_frames(&mut scanner, &decoded).unwrap();
+        decode_frames(&mut scanner, &decoded, &ConnectionWire::default()).unwrap();
 
         let (decoded_at, frame) = received.recv().unwrap();
         assert!(decoded_at >= before_decode);
         assert!(matches!(frame, Frame::Probe {}));
+    }
+
+    #[test]
+    fn wire_negotiation_is_v2_first_with_monotonic_legacy_fallback() {
+        let wire = ConnectionWire::default();
+        let first = wire
+            .encode(&Frame::Probe {}, Some(protocol::WireVersion::V2))
+            .unwrap();
+        let mut scanner = FrameScanner::new();
+        scanner.extend(&first);
+        assert_eq!(
+            scanner.next_envelope().unwrap().version,
+            protocol::WireVersion::V2
+        );
+        assert_eq!(wire.selected(), protocol::WireVersion::Legacy);
+
+        let fallback = wire
+            .encode(&Frame::Probe {}, Some(protocol::WireVersion::Legacy))
+            .unwrap();
+        assert_eq!(&fallback[..2], &protocol::FRAME_MAGIC);
+
+        wire.observe(protocol::WireVersion::V2);
+        wire.observe(protocol::WireVersion::Legacy);
+        let heartbeat = wire.encode(&Frame::Heartbeat {}, None).unwrap();
+        let mut scanner = FrameScanner::new();
+        scanner.extend(&heartbeat);
+        let envelope = scanner.next_envelope().unwrap();
+        assert_eq!(envelope.version, protocol::WireVersion::V2);
+        assert_eq!(envelope.sequence, Some(1));
     }
 
     fn device_hello() -> Frame {
