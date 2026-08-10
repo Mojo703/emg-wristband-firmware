@@ -148,6 +148,19 @@
           report.duration_ms,
         )}
       </p>
+      <div class="calibration-report">
+        <strong>Calibration v2 available</strong>
+        <span class="numeric">{report.calibration.cue_count} cues</span>
+        <code>{report.calibration.content_identity}</code>
+        {#if report.calibration.cue_shortfall > 0}
+          <span class="warn">
+            {report.calibration.cue_shortfall} cues short of the
+            {report.calibration.cue_count + report.calibration.cue_shortfall}-cue maximum
+          </span>
+        {:else}
+          <span class="muted">Complete Calibration level</span>
+        {/if}
+      </div>
       <table>
         <thead>
           <tr>
@@ -251,6 +264,25 @@
   .card h3,
   .card p {
     margin: 0;
+  }
+
+  .calibration-report {
+    display: grid;
+    grid-template-columns: max-content max-content 1fr;
+    gap: 4px 10px;
+    align-items: baseline;
+    padding: 10px 0;
+  }
+
+  .calibration-report code {
+    overflow-wrap: anywhere;
+    color: var(--muted-foreground);
+    font-size: 11px;
+  }
+
+  .calibration-report .warn,
+  .calibration-report .muted {
+    grid-column: 1 / -1;
   }
 
   table {

@@ -14,8 +14,12 @@
 
 use crate::frame;
 use crate::registry::{DeviceHandle, Registry};
+use crate::timing::TimingService;
 use protocol::{DeviceTransport, Frame, FrameScanner, LogLevel};
 use std::collections::HashSet;
+use std::fs::OpenOptions;
+use std::io::{self, Read};
+use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
@@ -23,7 +27,15 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
-use tokio_serial::{ErrorKind as SerialErrorKind, SerialPortType};
+use tokio_serial::SerialPortType;
+
+fn serial_frame_bytes(frame: &Frame) -> Vec<u8> {
+    protocol::frame_bytes(&frame::encode(frame))
+}
+
+fn write_serial_frame(writer: &mut impl std::io::Write, frame: &Frame) -> std::io::Result<()> {
+    writer.write_all(&serial_frame_bytes(frame))
+}
 
 /// Whether device log lines are echoed onto the backend's own tty (`tracing`).
 /// Enabled by setting `EMG_DEVICE_LOG` to anything but `0`; quiet by default.
@@ -40,6 +52,7 @@ async fn device_session(
     outgoing: mpsc::UnboundedSender<Frame>,
     registry: Arc<Registry>,
     transport: DeviceTransport,
+    timing: Arc<TimingService>,
 ) {
     // A connection is anonymous until it identifies itself.
     let (device_id, config, provenance) = loop {
@@ -70,6 +83,38 @@ async fn device_session(
         provenance,
     );
 
+    let probe_outgoing = outgoing.clone();
+    let probe_task = tokio::spawn(async move {
+        let mut sequence = 0u32;
+        for _ in 0..5 {
+            if probe_outgoing
+                .send(Frame::ClockProbeRequest {
+                    sequence,
+                    host_send_nanoseconds: unix_nanoseconds(),
+                })
+                .is_err()
+            {
+                return;
+            }
+            sequence = sequence.wrapping_add(1);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        loop {
+            interval.tick().await;
+            if probe_outgoing
+                .send(Frame::ClockProbeRequest {
+                    sequence,
+                    host_send_nanoseconds: unix_nanoseconds(),
+                })
+                .is_err()
+            {
+                return;
+            }
+            sequence = sequence.wrapping_add(1);
+        }
+    });
+
     // Forward control frames (browser → device) to the transport writer.
     let control_task = tokio::spawn(async move {
         while let Some(frame) = control_rx.recv().await {
@@ -85,6 +130,22 @@ async fn device_session(
             Frame::DeviceHello {
                 config, provenance, ..
             } => registry.update_config(&device_id, token, config, provenance),
+            Frame::ClockProbeResponse {
+                sequence: _sequence,
+                host_send_nanoseconds,
+                device_receive_microseconds,
+                device_send_microseconds,
+                acquisition_sample: _acquisition_sample,
+            } => {
+                timing.record_clock_probe(
+                    &device_id,
+                    host_send_nanoseconds,
+                    device_receive_microseconds,
+                    device_send_microseconds,
+                    unix_nanoseconds(),
+                );
+                let _ = frames.send(timing.status(&device_id));
+            }
             // Everything else is a data frame to fan out. `send` errs only when no
             // browser is subscribed, which is fine — drop it. Logs are additionally
             // retained so a browser opened later still sees them.
@@ -127,9 +188,14 @@ async fn device_session(
                 }
                 if matches!(
                     other,
-                    Frame::CalibrationState { .. } | Frame::CalibrationResult { .. }
+                    Frame::CalibrationScheduleAccepted { .. }
+                        | Frame::CalibrationSongInterrupted { .. }
+                        | Frame::CalibrationSongResult { .. }
+                        | Frame::CalibrationCandidateStatus { .. }
+                        | Frame::CalibrationResidentActivated { .. }
+                        | Frame::CalibrationTimingLoopStatus { .. }
                 ) {
-                    registry.push_calibration_frame(&device_id, token, other.clone());
+                    registry.push_replacement_calibration_frame(&device_id, token, other.clone());
                 }
                 let _ = frames.send(other);
             }
@@ -137,6 +203,7 @@ async fn device_session(
     }
 
     control_task.abort();
+    probe_task.abort();
     registry.deregister(&device_id, token);
     tracing::info!("device '{device_id}' disconnected");
 }
@@ -159,6 +226,7 @@ async fn framed_session<R, W>(
     registry: Arc<Registry>,
     transport: DeviceTransport,
     idle_timeout: Option<Duration>,
+    timing: Arc<TimingService>,
 ) where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
@@ -195,7 +263,7 @@ async fn framed_session<R, W>(
         }
     });
 
-    device_session(in_rx, out_tx, registry, transport).await;
+    device_session(in_rx, out_tx, registry, transport, timing).await;
     read_task.abort();
     write_task.abort();
 }
@@ -219,9 +287,8 @@ async fn read_within<R: AsyncRead + Unpin>(
 /// Silence on a TCP link this long means the device is gone. It streams every window, so
 /// this only trips on a genuine drop (typically wifi vanishing with no FIN).
 const DEVICE_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
-
 /// Accept devices dialing in over TCP (the wifi path). Each connection is one device.
-pub async fn run_tcp(addr: String, registry: Arc<Registry>) {
+pub async fn run_tcp(addr: String, registry: Arc<Registry>, timing: Arc<TimingService>) {
     let listener = match TcpListener::bind(&addr).await {
         Ok(listener) => listener,
         Err(e) => {
@@ -242,6 +309,7 @@ pub async fn run_tcp(addr: String, registry: Arc<Registry>) {
                     registry.clone(),
                     DeviceTransport::Wifi,
                     Some(DEVICE_IDLE_TIMEOUT),
+                    timing.clone(),
                 ));
             }
             Err(e) => tracing::warn!("device accept failed: {e}"),
@@ -282,7 +350,7 @@ fn auto_discover_ports() -> Vec<String> {
 /// (unplug, or the device ignores us). An explicit `EMG_SERIAL_PORT` override wins
 /// whenever it names a path that exists; otherwise auto-select by USB identity. The
 /// baud rate is nominal — a CDC channel ignores it.
-pub async fn run_serial_discovery(registry: Arc<Registry>) {
+pub async fn run_serial_discovery(registry: Arc<Registry>, timing: Arc<TimingService>) {
     let override_port = std::env::var(SERIAL_PORT_ENV)
         .ok()
         .filter(|s| !s.is_empty());
@@ -326,8 +394,9 @@ pub async fn run_serial_discovery(registry: Arc<Registry>) {
             let registry = registry.clone();
             let open_ports = open_ports.clone();
             let warned_ports = warned_ports.clone();
+            let session_timing = timing.clone();
             tokio::spawn(async move {
-                serial_session(&path, registry, &warned_ports).await;
+                serial_session(&path, registry, &warned_ports, session_timing).await;
                 open_ports.lock().unwrap().remove(&path);
             });
         }
@@ -344,21 +413,21 @@ async fn serial_session(
     path: &str,
     registry: Arc<Registry>,
     warned_ports: &Mutex<HashSet<String>>,
+    timing: Arc<TimingService>,
 ) {
-    let mut reader_port = match tokio_serial::new(path, 921_600)
-        .timeout(Duration::from_millis(100))
-        .open()
-    {
+    // Match the proven playback-host link exactly: a plain read/write file
+    // descriptor.  TTYPort's POLLOUT readiness and modem-line setup are not
+    // part of the USB-Serial-JTAG data contract; on this CDC endpoint they can
+    // report permanently unwritable even while the device's TX endpoint is
+    // delivering DeviceHello.
+    let reader_port = match OpenOptions::new().read(true).write(true).open(path) {
         Ok(port) => port,
         // Discovery retries every scan, so a persistent failure (above all the classic
         // "the port exists but this user can't open it") would otherwise spam the log —
         // explain each path's failure once.
         Err(e) => {
             if warned_ports.lock().unwrap().insert(path.to_string()) {
-                if matches!(
-                    e.kind(),
-                    SerialErrorKind::Io(std::io::ErrorKind::PermissionDenied)
-                ) {
+                if e.kind() == std::io::ErrorKind::PermissionDenied {
                     tracing::warn!(
                         "serial {path}: permission denied. Add your user to the port's group \
                          (`sudo usermod -aG uucp $USER` on Arch, `dialout` on Debian/Ubuntu) and \
@@ -374,16 +443,6 @@ async fn serial_session(
     // A later successful open means the earlier failure was transient — allow it to be
     // reported again if it recurs.
     warned_ports.lock().unwrap().remove(path);
-    // DTR asserted + RTS deasserted is the line state under which the CDC channel is
-    // known to move data in both directions (any other combination has been observed
-    // to stall reads or writes, and the pair also drives the chip's reset circuit —
-    // espflash-style toggling would reboot the device just for connecting to it).
-    if let Err(e) = reader_port
-        .write_data_terminal_ready(true)
-        .and_then(|()| reader_port.write_request_to_send(false))
-    {
-        tracing::warn!("serial {path} line state setup failed ({e})");
-    }
     let writer_port = match reader_port.try_clone() {
         Ok(port) => port,
         Err(e) => {
@@ -431,6 +490,14 @@ async fn serial_session(
                 if writer_dead.load(Ordering::SeqCst) {
                     return;
                 }
+                match wait_readable(&port, Duration::from_millis(100)) {
+                    Ok(false) => continue,
+                    Err(e) => {
+                        tracing::warn!("serial read wait failed ({e}); ending session");
+                        return;
+                    }
+                    Ok(true) => {}
+                }
                 match port.read(&mut chunk) {
                     Ok(n) => {
                         scanner.extend(&chunk[..n]);
@@ -442,7 +509,6 @@ async fn serial_session(
                             }
                         }
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
                     Err(e) => {
                         // Unplugged (or the port vanished); session ends.
                         tracing::warn!("serial read failed ({e}); ending session");
@@ -455,38 +521,131 @@ async fn serial_session(
     std::thread::spawn(move || {
         let mut port = writer_port;
         let mut out_rx = out_rx;
-        // Opening the port can bounce the device's reset line, so the first writes may
-        // land while it reboots and its CDC accepts nothing. Ride out the reboot before
-        // declaring the link dead; a torn frame from a partial write is fine, the
-        // device's scanner resyncs on the next magic.
-        //
-        // The budget has to cover the device's slowest path to its serve loop, since
-        // nothing reads the port until then. ADS1298 bring-up alone blocks ~4.4 s on
-        // mandated settling delays, and a failed bring-up spends another ~2 s powering
-        // the second chip for diagnostics. At ~600 ms per attempt (a 100 ms port
-        // timeout plus the sleep), 8 attempts gave under 5 s and declared a device dead
-        // exactly when it had the most to say. 30 gives ~18 s.
-        const WRITE_ATTEMPTS: u32 = 30;
         'session: while let Some(frame) = out_rx.blocking_recv() {
-            let bytes = protocol::frame_bytes(&frame::encode(&frame));
-            for attempt in 1.. {
-                match port.write_all(&bytes) {
-                    Ok(()) => break,
-                    Err(e) if attempt < WRITE_ATTEMPTS => {
-                        tracing::debug!("serial write failed ({e}); retrying");
-                        std::thread::sleep(Duration::from_millis(500));
-                    }
-                    Err(e) => {
-                        tracing::warn!("serial write failed ({e}); ending session");
-                        break 'session;
-                    }
-                }
+            if let Err(e) = write_serial_frame(&mut port, &frame) {
+                tracing::warn!("serial write failed ({e}); ending session");
+                break 'session;
             }
         }
         writer_dead.store(true, Ordering::SeqCst);
     });
 
-    device_session(in_rx, out_tx, registry, DeviceTransport::Serial).await;
+    device_session(in_rx, out_tx, registry, DeviceTransport::Serial, timing).await;
     heartbeat_task.abort();
     tracing::info!("serial device at {path} closed");
+}
+
+/// Wait for a plain-file serial descriptor to become readable without making
+/// the reader thread's blocking `File::read` the scheduler for heartbeats.
+/// This is the only readiness check: writes deliberately use the playback
+/// host's blocking `File::write_all` semantics and never poll POLLOUT.
+fn wait_readable(file: &std::fs::File, timeout: Duration) -> io::Result<bool> {
+    let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+    let mut descriptor = libc::pollfd {
+        fd: file.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        let result = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
+        if result >= 0 {
+            if result == 0 {
+                return Ok(false);
+            }
+            if descriptor.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    format!("serial poll revents 0x{:x}", descriptor.revents),
+                ));
+            }
+            return Ok(descriptor.revents & libc::POLLIN != 0);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(error);
+    }
+}
+
+fn unix_nanoseconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| {
+            duration.as_nanos().min(u64::MAX as u128) as u64
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Seek, SeekFrom};
+    #[cfg(unix)]
+    use std::os::fd::FromRawFd;
+
+    #[test]
+    fn serial_frames_use_the_same_plain_file_frame_as_firmware() {
+        // Keep this transport test independent of a tty (and therefore of a
+        // connected board).  The firmware consumes exactly this magic/length/
+        // CBOR sequence from its USB serial scanner.
+        let path = std::env::temp_dir().join(format!(
+            "dashboard-serial-probe-{}-{}.frame",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        write_serial_frame(&mut file, &Frame::Probe {}).unwrap();
+        write_serial_frame(
+            &mut file,
+            &Frame::ClockProbeRequest {
+                sequence: 7,
+                host_send_nanoseconds: 123_456_789,
+            },
+        )
+        .unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+
+        let mut encoded = Vec::new();
+        file.read_to_end(&mut encoded).unwrap();
+        let mut scanner = FrameScanner::new();
+        scanner.extend(&encoded);
+        let payload = scanner.next_frame().expect("one complete framed probe");
+        assert!(matches!(frame::decode(&payload).unwrap(), Frame::Probe {}));
+        let payload = scanner
+            .next_frame()
+            .expect("one complete framed clock probe");
+        assert!(matches!(
+            frame::decode(&payload).unwrap(),
+            Frame::ClockProbeRequest {
+                sequence: 7,
+                host_send_nanoseconds: 123_456_789,
+            }
+        ));
+        assert!(scanner.next_frame().is_none());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plain_file_reader_waits_on_readability_not_write_poll() {
+        let mut descriptors = [0; 2];
+        assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
+        // SAFETY: pipe returned two owned descriptors; each is moved into one
+        // File and therefore closed exactly once at the end of this test.
+        let mut reader = unsafe { std::fs::File::from_raw_fd(descriptors[0]) };
+        let mut writer = unsafe { std::fs::File::from_raw_fd(descriptors[1]) };
+
+        assert!(!wait_readable(&reader, Duration::from_millis(1)).unwrap());
+        std::io::Write::write_all(&mut writer, b"x").unwrap();
+        assert!(wait_readable(&reader, Duration::from_millis(50)).unwrap());
+        let mut byte = [0; 1];
+        reader.read_exact(&mut byte).unwrap();
+        assert_eq!(byte, [b'x']);
+    }
 }

@@ -1,6 +1,13 @@
 <script lang="ts">
   import { live, api } from '../lib/socket.svelte';
-  import { MediaKey, isMediaKey, type Binding } from '../lib/protocol';
+  import {
+    CALIBRATION_GESTURE_ORDER,
+    MediaKey,
+    isMediaKey,
+    type Binding,
+    type CalibrationGesture,
+  } from '../lib/protocol';
+  import { gestureLabel } from './calibrate/text';
   import Icon from '../lib/Icon.svelte';
   import Select from '../lib/ui/Select.svelte';
   import { Button } from '$lib/components/ui/button/index.js';
@@ -19,25 +26,23 @@
   // local draft. Each change applies immediately; the device re-announces and the
   // backend echoes a fresh Hello, so what's shown is always what's active.
   const config = $derived(live.hello?.selection?.config ?? null);
-  const gestures = $derived(config?.gestures ?? 0);
   const keymap = $derived(config?.keymap ?? []);
   const levels = $derived(config?.sensitivity_levels ?? []);
   const levelOptions = $derived(levels.map((level) => ({ value: level.id, label: level.label })));
-  const gestureIndices = $derived(Array.from({ length: gestures }, (_, i) => i));
+  const commandRows: readonly {
+    readonly gesture: CalibrationGesture;
+    readonly index: number;
+  }[] = CALIBRATION_GESTURE_ORDER.map((gesture, index) => ({ gesture, index }));
 
-  function keyFor(gesture: number): MediaKey {
-    const bound = keymap.find((entry) => entry.gesture === gesture)?.key;
-    if (bound !== undefined) return bound;
-    const fallback = KEYS[gesture % KEYS.length];
-    if (fallback === undefined) return MediaKey.PlayPause;
-    return fallback.value;
+  function keyFor(gesture: number): MediaKey | undefined {
+    return keymap.find((entry) => entry.gesture === gesture)?.key;
   }
 
   function setKey(gesture: number, key: MediaKey): void {
-    const next: Binding[] = Array.from({ length: gestures }, (_, g) => ({
-      gesture: g,
-      key: g === gesture ? key : keyFor(g),
-    }));
+    const next: Binding[] = keymap
+      .filter((entry) => entry.gesture !== gesture)
+      .concat({ gesture, key })
+      .sort((left, right) => left.gesture - right.gesture);
     api.keymap(next);
   }
 
@@ -76,7 +81,7 @@
   };
 </script>
 
-<h2>Config</h2>
+<h2>Settings</h2>
 
 <section>
   <div class="row"><Icon name="sliders" /><strong>Sensitivity</strong></div>
@@ -94,17 +99,18 @@
 </section>
 
 <section style="margin-top: 24px;">
-  <div class="row"><Icon name="keyboard" /><strong>Gesture → action</strong></div>
+  <div class="row"><Icon name="keyboard" /><strong>Calibrated command actions</strong></div>
   <table>
     <tbody>
-      {#each gestureIndices as gesture}
+      {#each commandRows as row (row.gesture)}
         <tr>
-          <td>Gesture {gesture}</td>
+          <td>{gestureLabel(row.gesture)}</td>
           <td>
             <Select
-              value={keyFor(gesture)}
+              value={keyFor(row.index) ?? ''}
               options={keyOptions}
-              onChange={(value) => onKeyChange(gesture, value)}
+              onChange={(value) => onKeyChange(row.index, value)}
+              placeholder="Unassigned"
             />
           </td>
         </tr>

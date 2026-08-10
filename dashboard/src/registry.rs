@@ -8,10 +8,8 @@
 //! reconnects. Device ids are not guaranteed stable across power cycles, so a
 //! reconnect under the same id replaces the entry — fresh session, fresh logs.
 
-use protocol::{
-    CalibrationPhase, DeviceConfig, DeviceInfo, DeviceProvenance, DeviceTransport, Frame,
-    PhoneStatus,
-};
+use dashboard::guided_session::DeviceConnectionIdentity;
+use protocol::{DeviceConfig, DeviceInfo, DeviceProvenance, DeviceTransport, Frame, PhoneStatus};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -40,7 +38,10 @@ struct DeviceEntry {
     /// Current phone-peripheral state. Unlike commands, device-origin state may be
     /// replayed so a late browser does not wait for the next transition.
     phone_state: Option<Frame>,
-    calibration: CalibrationNarration,
+    /// Replacement anchored-song lifecycle frames are retained independently
+    /// from the legacy device-paced narration.  A reconnect must still show
+    /// the latest interruption/result/validity/activation edge.
+    replacement_calibration: VecDeque<Frame>,
 }
 
 enum DeviceConnection {
@@ -66,71 +67,6 @@ impl DeviceConnection {
     }
 }
 
-#[derive(Default)]
-enum CalibrationNarration {
-    #[default]
-    None,
-    Running(Frame),
-    Terminal(Frame),
-    Finished {
-        terminal_state: Frame,
-        result: Frame,
-    },
-}
-
-impl CalibrationNarration {
-    fn observe(&mut self, frame: Frame) -> bool {
-        match &frame {
-            Frame::CalibrationState { phase, .. } => {
-                *self = if matches!(
-                    phase,
-                    CalibrationPhase::Complete | CalibrationPhase::Stopped
-                ) {
-                    Self::Terminal(frame)
-                } else {
-                    Self::Running(frame)
-                };
-                true
-            }
-            Frame::CalibrationResult { .. } => {
-                let previous = std::mem::take(self);
-                match previous {
-                    Self::Terminal(terminal_state) => {
-                        *self = Self::Finished {
-                            terminal_state,
-                            result: frame,
-                        };
-                        true
-                    }
-                    Self::Finished { terminal_state, .. } => {
-                        *self = Self::Finished {
-                            terminal_state,
-                            result: frame,
-                        };
-                        true
-                    }
-                    other => {
-                        *self = other;
-                        false
-                    }
-                }
-            }
-            _ => false,
-        }
-    }
-
-    fn frames(&self) -> Vec<Frame> {
-        match self {
-            Self::None => Vec::new(),
-            Self::Running(state) | Self::Terminal(state) => vec![state.clone()],
-            Self::Finished {
-                terminal_state,
-                result,
-            } => vec![terminal_state.clone(), result.clone()],
-        }
-    }
-}
-
 /// Retained log lines per device — enough scrollback to cover a boot and a few
 /// reconnects without growing forever.
 const LOG_RETENTION: usize = 200;
@@ -143,10 +79,18 @@ pub struct DeviceHandle {
     pub token: u64,
 }
 
+pub struct BoundDeviceHandle {
+    pub frames: broadcast::Receiver<Frame>,
+    pub transport: DeviceTransport,
+    pub config: DeviceConfig,
+    pub provenance: DeviceProvenance,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlDeliveryError {
     UnknownDevice,
     Disconnected,
+    StaleConnection,
     SessionClosed,
 }
 
@@ -155,6 +99,7 @@ impl ControlDeliveryError {
         match self {
             Self::UnknownDevice => "no device is selected for calibration",
             Self::Disconnected => "the selected device is offline; reconnect it before calibrating",
+            Self::StaleConnection => "the selected device reconnected; refresh before calibrating",
             Self::SessionClosed => {
                 "the selected device connection closed before the command was delivered"
             }
@@ -223,7 +168,7 @@ impl Registry {
                 logs: VecDeque::new(),
                 telemetry: HashMap::new(),
                 phone_state: None,
-                calibration: CalibrationNarration::None,
+                replacement_calibration: VecDeque::new(),
             },
         );
         drop(devices);
@@ -317,6 +262,45 @@ impl Registry {
             .map(|entry| entry.provenance.clone())
     }
 
+    /// Bind a guided run to this exact connection, not merely a device id that
+    /// could reconnect underneath an in-flight session.
+    pub fn connection_identity(&self, id: &str) -> Option<DeviceConnectionIdentity> {
+        self.devices
+            .lock()
+            .unwrap()
+            .get(id)
+            .and_then(|entry| match entry.connection {
+                DeviceConnection::Connected { token, .. } => {
+                    Some(DeviceConnectionIdentity::new(id, token))
+                }
+                DeviceConnection::Disconnected { .. } => None,
+            })
+    }
+
+    /// Snapshot and subscribe to the exact connection named by a guided lease.
+    /// A reconnect under the same device id has a different token and cannot be
+    /// substituted into an already-authorized run.
+    pub fn bind_connection(
+        &self,
+        identity: &DeviceConnectionIdentity,
+    ) -> Option<BoundDeviceHandle> {
+        let devices = self.devices.lock().unwrap();
+        let entry = devices.get(&identity.device_id)?;
+        match &entry.connection {
+            DeviceConnection::Connected { token, frames, .. }
+                if *token == identity.connection_token =>
+            {
+                Some(BoundDeviceHandle {
+                    frames: frames.subscribe(),
+                    transport: entry.transport,
+                    config: entry.config.clone(),
+                    provenance: entry.provenance.clone(),
+                })
+            }
+            DeviceConnection::Connected { .. } | DeviceConnection::Disconnected { .. } => None,
+        }
+    }
+
     /// Subscribe a browser to a device's data-frame stream. `None` for a
     /// disconnected device: there is nothing to stream, and the caller's selection
     /// then lands in its explicit selected-without-stream state.
@@ -382,8 +366,11 @@ impl Registry {
             .and_then(|entry| entry.phone_state.clone())
     }
 
-    /// Retain device-authoritative calibration state for browser reconnects.
-    pub fn push_calibration_frame(&self, id: &str, token: u64, frame: Frame) {
+    /// Retain the bounded replacement calibration lifecycle projection for a
+    /// browser that connects after a song edge.  These frames are reliable,
+    /// but unlike a full event log only the most recent bounded history is
+    /// needed to reconstruct the operator's current decision screen.
+    pub fn push_replacement_calibration_frame(&self, id: &str, token: u64, frame: Frame) {
         let mut devices = self.devices.lock().unwrap();
         let Some(entry) = devices.get_mut(id) else {
             return;
@@ -391,15 +378,20 @@ impl Registry {
         if entry.connection.token() != token {
             return;
         }
-        let _ = entry.calibration.observe(frame);
+        const RETENTION: usize = 16;
+        if entry.replacement_calibration.len() >= RETENTION {
+            entry.replacement_calibration.pop_front();
+        }
+        entry.replacement_calibration.push_back(frame);
     }
 
-    pub fn calibration_frames_of(&self, id: &str) -> Vec<Frame> {
-        let devices = self.devices.lock().unwrap();
-        let Some(entry) = devices.get(id) else {
-            return Vec::new();
-        };
-        entry.calibration.frames()
+    pub fn replacement_calibration_frames_of(&self, id: &str) -> Vec<Frame> {
+        self.devices
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|entry| entry.replacement_calibration.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// The retained log frames of a device, oldest first.
@@ -414,11 +406,35 @@ impl Registry {
 
     /// Forward a one-shot control frame to the current device connection. Commands
     /// are never retained: an offline command is dropped rather than replayed into a
-    /// later connection, where intents such as `CalibrationStart` would be unsafe.
+    /// later connection, where a guided lifecycle intent would be unsafe.
     pub fn send_control(&self, id: &str, frame: Frame) -> Result<(), ControlDeliveryError> {
         let devices = self.devices.lock().unwrap();
         let entry = devices.get(id).ok_or(ControlDeliveryError::UnknownDevice)?;
         match &entry.connection {
+            DeviceConnection::Connected { control, .. } => control
+                .send(frame)
+                .map_err(|_| ControlDeliveryError::SessionClosed),
+            DeviceConnection::Disconnected { .. } => Err(ControlDeliveryError::Disconnected),
+        }
+    }
+
+    /// Deliver only to the exact connection captured by a guided-session lease.
+    pub fn send_bound_control(
+        &self,
+        identity: &DeviceConnectionIdentity,
+        frame: Frame,
+    ) -> Result<(), ControlDeliveryError> {
+        let devices = self.devices.lock().unwrap();
+        let entry = devices
+            .get(&identity.device_id)
+            .ok_or(ControlDeliveryError::UnknownDevice)?;
+        match &entry.connection {
+            DeviceConnection::Connected { token, .. } if *token != identity.connection_token => {
+                Err(ControlDeliveryError::StaleConnection)
+            }
+            DeviceConnection::Disconnected { token } if *token != identity.connection_token => {
+                Err(ControlDeliveryError::StaleConnection)
+            }
             DeviceConnection::Connected { control, .. } => control
                 .send(frame)
                 .map_err(|_| ControlDeliveryError::SessionClosed),

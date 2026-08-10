@@ -9,6 +9,7 @@
       "$lib/*": ["./src/lib/*"]
     },
     "resolveJsonModule": true,
+    "allowImportingTsExtensions": true,
     "verbatimModuleSyntax": true,
     "isolatedModules": true,
     "noEmit": true,

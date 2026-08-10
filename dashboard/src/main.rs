@@ -19,17 +19,20 @@
 //! (optional pose inference service WebSocket the backend proxies EMG frames to).
 
 mod browser;
+mod calibration;
 mod collect;
 mod device;
 mod frame;
 mod looks;
 mod registry;
+mod timing;
 
 use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::State;
 use axum::response::Response;
 use axum::routing::{delete, get, post};
 use axum::Router;
+use dashboard::guided_session::{GuidedMode, GuidedSessionCoordinator};
 use registry::Registry;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -45,6 +48,9 @@ struct AppState {
     device_port: u16,
     /// The training-data collection session manager (the rhythm game's backend).
     collection: Arc<collect::manager::CollectionManager>,
+    guided_sessions: GuidedSessionCoordinator,
+    timing: Arc<timing::TimingService>,
+    _calibration_adapter: Arc<calibration::CalibrationModeAdapter>,
 }
 
 #[tokio::main]
@@ -57,6 +63,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let registry = Arc::new(Registry::new());
+    let timing = Arc::new(timing::TimingService::new());
     let pose_url = std::env::var("EMG_POSE_URL").ok();
 
     // Devices dialing in over wifi land on this TCP port.
@@ -68,13 +75,20 @@ async fn main() -> anyhow::Result<()> {
         .next()
         .and_then(|port| port.parse::<u16>().ok())
         .unwrap_or(9000);
-    tokio::spawn(device::run_tcp(device_addr, registry.clone()));
+    tokio::spawn(device::run_tcp(
+        device_addr,
+        registry.clone(),
+        timing.clone(),
+    ));
 
     // Serial-attached devices are discovered by USB identity and probed; no
     // configuration needed. Set EMG_NO_SERIAL=1 to keep the backend off the ports
     // (e.g. while flashing firmware with espflash).
     if std::env::var("EMG_NO_SERIAL").is_err() {
-        tokio::spawn(device::run_serial_discovery(registry.clone()));
+        tokio::spawn(device::run_serial_discovery(
+            registry.clone(),
+            timing.clone(),
+        ));
     }
 
     // The collection game's backend: vocabularies from EMG_COLLECTION_CONFIG
@@ -108,6 +122,7 @@ async fn main() -> anyhow::Result<()> {
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| collect::provenance::default_path()),
     );
+    let guided_sessions = GuidedSessionCoordinator::new();
     let collection = collect::manager::CollectionManager::new(
         catalog,
         catalog_paths,
@@ -117,13 +132,26 @@ async fn main() -> anyhow::Result<()> {
         sessions_root,
         provenance_store,
         collect::audio::output_from_environment(),
+        guided_sessions.clone(),
     );
+    guided_sessions.set_mode_adapter(GuidedMode::Collection, collection.clone());
+    let calibration_adapter = calibration::CalibrationModeAdapter::new(
+        registry.clone(),
+        guided_sessions.clone(),
+        collection.calibration_tracks(),
+    );
+    calibration_adapter.attach_collection(collection.clone());
+    calibration_adapter.attach_timing(timing.clone());
+    guided_sessions.set_mode_adapter(GuidedMode::Calibration, calibration_adapter.clone());
 
     let state = AppState {
         registry,
         pose_url,
         device_port,
         collection,
+        guided_sessions,
+        timing,
+        _calibration_adapter: calibration_adapter,
     };
 
     let web_dir = std::env::var("DASHBOARD_WEB").unwrap_or_else(|_| "web/dist".into());
@@ -133,6 +161,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/ws", get(browser_ws))
         .route("/collection/camera/preview", get(collection_camera_preview))
+        .route("/calibration/tracks", get(calibration_tracks))
         .route(
             "/collection/tracks/import/upload",
             post(import_uploaded_map).layer(axum::extract::DefaultBodyLimit::max(
@@ -211,6 +240,8 @@ async fn browser_ws(ws: WebSocketUpgrade, State(state): State<AppState>) -> Resp
             state.pose_url,
             state.device_port,
             state.collection,
+            state.guided_sessions,
+            state.timing,
         )
     })
 }
@@ -289,6 +320,14 @@ async fn delete_collection_track(
     collect::import::delete_track(&track_id, state.collection.tracks_root())?;
     state.collection.reload_catalog()?;
     Ok(axum::Json(serde_json::json!({ "id": track_id })))
+}
+
+/// Read-only setup data for the future guided calibration coordinator. Session
+/// transitions continue to come from authoritative backend state, never here.
+async fn calibration_tracks(
+    State(state): State<AppState>,
+) -> axum::Json<Vec<collect::beatmap::CalibrationTrack>> {
+    axum::Json(state.collection.calibration_tracks())
 }
 
 /// Stream the camera to the setup form's preview as motion JPEG, which an

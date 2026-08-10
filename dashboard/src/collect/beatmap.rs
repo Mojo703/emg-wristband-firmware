@@ -41,11 +41,13 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context};
 use protocol::{
-    ActivityCondition, Beatmap, BeatsPerMinute, ClassId, CollectionClass, DifficultyLevel,
+    ActivityCondition, Beatmap, BeatsPerMinute, CalibrationCueId, CalibrationGesture,
+    CalibrationModifier, CalibrationScheduleEntry, ClassId, CollectionClass, DifficultyLevel,
     DurationMilliseconds, Note, SubjectId, SweatLevel, TrackId, TrackInfo, TrackMilliseconds,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
+use super::calibration_level::CalibrationLevelProduct;
 use super::interfaces::BeatmapGenerator;
 
 /// Head of the track left empty of *rendering* time: the operator taps Start
@@ -77,7 +79,7 @@ pub struct CollectionConfig {
 
 /// One note of a track's map: its onset on the audio timeline, the lattice cell
 /// it names, and how long the hold lasts.
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub struct MapNote {
     pub time_ms: u32,
     /// Beat Saber lattice cell, column-major: `3·lineIndex + lineLayer`, 0..12.
@@ -99,10 +101,30 @@ pub struct TrackEntry {
     pub duration_ms: u32,
     /// One ready-made schedule per difficulty level, keyed by level name.
     pub levels: std::collections::BTreeMap<String, LevelEntry>,
+    /// Optional imported calibration product. Manifests written before this
+    /// product existed deserialize with no calibration and remain playable.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_calibration",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub calibration: Option<CalibrationLevelProduct>,
     /// `"static"` or `"moving"` on the synthetic rest tracks; imported music
     /// never carries this.
     #[serde(default)]
     pub rest: Option<String>,
+}
+
+/// Calibration is an optional derived product. A future, corrupt, or otherwise
+/// unreadable copy must not make the ordinary source-derived levels disappear.
+fn deserialize_optional_calibration<'de, D>(
+    deserializer: D,
+) -> Result<Option<CalibrationLevelProduct>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| serde_json::from_value(value).ok()))
 }
 
 /// One difficulty level's schedule for a track, as the ingest wrote it.
@@ -209,6 +231,30 @@ struct CatalogTrack {
     levels: std::collections::BTreeMap<DifficultyLevel, CatalogLevel>,
     audio_path: PathBuf,
     rest: Option<String>,
+    calibration: Option<CalibrationAvailability>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CalibrationAvailability {
+    pub cue_count: usize,
+    pub content_identity: String,
+    pub entries: Vec<CalibrationScheduleEntry>,
+}
+
+/// One catalog track carrying the generated product required by guided
+/// calibration. This is an HTTP projection, separate from the collection wire
+/// catalog so legacy collection clients and tracks remain unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CalibrationTrack {
+    pub id: TrackId,
+    pub title: String,
+    pub beats_per_minute: u16,
+    pub duration_ms: u32,
+    pub cue_count: usize,
+    pub content_identity: String,
+    pub cue_shortfall: usize,
+    #[serde(skip_serializing)]
+    pub entries: Vec<CalibrationScheduleEntry>,
 }
 
 /// One level's loaded schedule: its cues and, keyed by column count, the column
@@ -355,6 +401,30 @@ impl TrackCatalog {
         self.find(track_id).and_then(|track| track.rest.clone())
     }
 
+    pub fn calibration_availability(&self, track_id: &TrackId) -> Option<&CalibrationAvailability> {
+        self.find(track_id)?.calibration.as_ref()
+    }
+
+    pub fn calibration_tracks(&self) -> Vec<CalibrationTrack> {
+        self.tracks
+            .iter()
+            .filter_map(|track| {
+                let calibration = track.calibration.as_ref()?;
+                Some(CalibrationTrack {
+                    id: track.info.id.clone(),
+                    title: track.info.title.clone(),
+                    beats_per_minute: track.info.beats_per_minute.0.get(),
+                    duration_ms: track.info.duration.get(),
+                    cue_count: calibration.cue_count,
+                    content_identity: calibration.content_identity.clone(),
+                    cue_shortfall: super::calibration_level::MAXIMUM_CUES
+                        .saturating_sub(calibration.cue_count),
+                    entries: calibration.entries.clone(),
+                })
+            })
+            .collect()
+    }
+
     /// A uniform grid at the map's tempo, for the browser's debug
     /// metronome — the clock the map's note times quantize to.
     pub fn beat_times(&self, track_id: &TrackId) -> Option<Vec<TrackMilliseconds>> {
@@ -392,12 +462,51 @@ fn load_track(directory: &Path) -> anyhow::Result<CatalogTrack> {
             "track audio is missing; the track stays in the catalog"
         );
     }
+    let calibration = entry.calibration.as_ref().and_then(|product| {
+        let availability = (|| -> anyhow::Result<CalibrationAvailability> {
+            let source = entry
+                .levels
+                .get(super::calibration_level::CALIBRATION_SOURCE_LEVEL)
+                .ok_or_else(|| anyhow!("calibration product has no retained hard source level"))?;
+            product.validate_against_source(&source.map_notes, entry.duration_ms)?;
+            Ok(CalibrationAvailability {
+                cue_count: product.cue_count(),
+                content_identity: product.content_identity.clone(),
+                entries: product
+                    .notes
+                    .iter()
+                    .enumerate()
+                    .map(|(index, note)| CalibrationScheduleEntry {
+                        cue_id: CalibrationCueId::new((index + 1) as u32)
+                            .expect("validated calibration cue ids are nonzero"),
+                        gesture: CalibrationGesture::from_index(note.semantic_column % 5)
+                            .expect("validated calibration semantic column names a gesture"),
+                        modifier: if note.semantic_column < 5 {
+                            CalibrationModifier::ThumbUp
+                        } else {
+                            CalibrationModifier::ThumbDown
+                        },
+                        track_offset: TrackMilliseconds::new(note.map_note.time_ms),
+                        hold: DurationMilliseconds::new(note.map_note.hold_ms),
+                    })
+                    .collect(),
+            })
+        })();
+        match availability {
+            Ok(availability) => Some(availability),
+            Err(error) => {
+                tracing::warn!(track = %entry.id, "ignoring unusable optional Calibration metadata: {error:#}");
+                None
+            }
+        }
+    });
     Ok(CatalogTrack {
         info: entry.track_info()?,
         beats_per_minute: entry.beats_per_minute,
         levels: load_levels(&entry)?,
         audio_path,
         rest: entry.rest.clone(),
+        calibration,
     })
 }
 
@@ -598,6 +707,31 @@ mod tests {
                     levels: load_levels(&entry)?,
                     audio_path: PathBuf::from(format!("/nonexistent/{}/audio.ogg", entry.id)),
                     rest: entry.rest.clone(),
+                    calibration: entry.calibration.as_ref().map(|product| {
+                        CalibrationAvailability {
+                            cue_count: product.cue_count(),
+                            content_identity: product.content_identity.clone(),
+                            entries: product
+                                .notes
+                                .iter()
+                                .enumerate()
+                                .map(|(index, note)| CalibrationScheduleEntry {
+                                    cue_id: CalibrationCueId::new((index + 1) as u32).unwrap(),
+                                    gesture: CalibrationGesture::from_index(
+                                        note.semantic_column % 5,
+                                    )
+                                    .unwrap(),
+                                    modifier: if note.semantic_column < 5 {
+                                        CalibrationModifier::ThumbUp
+                                    } else {
+                                        CalibrationModifier::ThumbDown
+                                    },
+                                    track_offset: TrackMilliseconds::new(note.map_note.time_ms),
+                                    hold: DurationMilliseconds::new(note.map_note.hold_ms),
+                                })
+                                .collect(),
+                        }
+                    }),
                 })
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
@@ -619,6 +753,7 @@ mod tests {
                 .into_iter()
                 .map(|difficulty| (difficulty.to_string(), level.clone()))
                 .collect(),
+            calibration: None,
             duration_ms,
             rest: None,
         }
@@ -705,6 +840,156 @@ mod tests {
         // The library lives outside the repo, so a checkout has no tracks
         // until something is imported — and that has to be a valid catalog.
         assert!(catalog.tracks().is_empty());
+    }
+
+    #[test]
+    fn a_legacy_track_without_calibration_stays_collection_playable() {
+        let entry = track_entry("legacy", one_note_per_cell(), 60_000);
+        let mut json = serde_json::to_value(&entry).unwrap();
+        json.as_object_mut().unwrap().remove("calibration");
+        let legacy: TrackEntry = serde_json::from_value(json).unwrap();
+        let catalog = catalog_of(vec![legacy]).unwrap();
+        let track_id = TrackId("legacy".into());
+
+        assert_eq!(catalog.calibration_availability(&track_id), None);
+        assert!(catalog
+            .generate(&track_id, &catalog.class_ids(), DifficultyLevel::Medium, 7,)
+            .is_ok());
+    }
+
+    #[test]
+    fn unusable_optional_calibration_metadata_does_not_remove_collection_track() {
+        let mut entry = track_entry("collection-survives", one_note_per_cell(), 60_000);
+        entry.calibration = Some(
+            crate::collect::calibration_level::CalibrationLevelProduct::generate(
+                &entry.levels["hard"].map_notes,
+                entry.duration_ms,
+            ),
+        );
+        let base = serde_json::to_value(&entry).unwrap();
+        let cases = [
+            ("malformed", serde_json::json!({ "unexpected": true })),
+            {
+                let mut product = base["calibration"].clone();
+                product["schema_version"] = serde_json::json!(1);
+                product["generator_version"] = serde_json::json!(1);
+                ("legacy-v1", product)
+            },
+            {
+                let mut product = base["calibration"].clone();
+                product["schema_version"] = serde_json::json!(u32::MAX);
+                ("unknown-version", product)
+            },
+            {
+                let mut product = base["calibration"].clone();
+                product["content_identity"] = serde_json::json!("0".repeat(64));
+                ("corrupt-identity", product)
+            },
+        ];
+
+        for (case, calibration) in cases {
+            let directory = std::env::temp_dir().join(format!(
+                "dashboard-optional-calibration-{case}-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&directory).unwrap();
+            let mut stored = base.clone();
+            stored["calibration"] = calibration;
+            std::fs::write(
+                directory.join(TRACK_FILE_NAME),
+                serde_json::to_vec(&stored).unwrap(),
+            )
+            .unwrap();
+
+            let track = load_track(&directory)
+                .unwrap_or_else(|error| panic!("{case} removed the collection track: {error:#}"));
+            assert!(track.calibration.is_none(), "{case} exposed Calibration");
+            assert_eq!(track.levels.len(), DifficultyLevel::ALL.len());
+            let catalog = TrackCatalog::from_parts(example_config(), vec![track]).unwrap();
+            let track_id = TrackId("collection-survives".into());
+            assert!(catalog
+                .generate(&track_id, &catalog.class_ids(), DifficultyLevel::Medium, 7,)
+                .is_ok());
+            let _ = std::fs::remove_dir_all(directory);
+        }
+    }
+
+    #[test]
+    fn catalog_exposes_calibration_availability_without_changing_tracks() {
+        let mut entry = track_entry("calibrated", one_note_per_cell(), 60_000);
+        entry.calibration = Some(
+            crate::collect::calibration_level::CalibrationLevelProduct::generate(
+                &entry.levels["hard"].map_notes,
+                entry.duration_ms,
+            ),
+        );
+        let expected_count = entry.calibration.as_ref().unwrap().cue_count();
+        let expected_identity = entry.calibration.as_ref().unwrap().content_identity.clone();
+        let catalog = catalog_of(vec![entry]).unwrap();
+        let availability = catalog
+            .calibration_availability(&TrackId("calibrated".into()))
+            .unwrap();
+
+        assert_eq!(availability.cue_count, expected_count);
+        assert_eq!(availability.content_identity, expected_identity);
+        assert_eq!(catalog.tracks().len(), 1);
+    }
+
+    #[test]
+    fn calibration_tracks_project_only_supported_catalog_entries() {
+        let legacy = track_entry("legacy", one_note_per_cell(), 60_000);
+        let mut calibrated = track_entry("calibrated", one_note_per_cell(), 90_000);
+        calibrated.title = "Calibration song".into();
+        calibrated.beats_per_minute = 128.0;
+        calibrated.calibration = Some(
+            crate::collect::calibration_level::CalibrationLevelProduct::generate(
+                &calibrated.levels["hard"].map_notes,
+                calibrated.duration_ms,
+            ),
+        );
+        let expected_count = calibrated.calibration.as_ref().unwrap().cue_count();
+        let expected_identity = calibrated
+            .calibration
+            .as_ref()
+            .unwrap()
+            .content_identity
+            .clone();
+        let catalog = catalog_of(vec![legacy, calibrated.clone()]).unwrap();
+
+        assert_eq!(
+            catalog.calibration_tracks(),
+            vec![CalibrationTrack {
+                id: TrackId("calibrated".into()),
+                title: "Calibration song".into(),
+                beats_per_minute: 128,
+                duration_ms: 90_000,
+                cue_count: expected_count,
+                content_identity: expected_identity,
+                cue_shortfall: crate::collect::calibration_level::MAXIMUM_CUES - expected_count,
+                entries: calibrated
+                    .calibration
+                    .as_ref()
+                    .unwrap()
+                    .notes
+                    .iter()
+                    .enumerate()
+                    .map(|(index, note)| CalibrationScheduleEntry {
+                        cue_id: CalibrationCueId::new((index + 1) as u32).unwrap(),
+                        gesture: CalibrationGesture::from_index(note.semantic_column % 5).unwrap(),
+                        modifier: if note.semantic_column < 5 {
+                            CalibrationModifier::ThumbUp
+                        } else {
+                            CalibrationModifier::ThumbDown
+                        },
+                        track_offset: TrackMilliseconds::new(note.map_note.time_ms),
+                        hold: DurationMilliseconds::new(note.map_note.hold_ms),
+                    })
+                    .collect(),
+            }]
+        );
     }
 
     #[test]
@@ -1099,6 +1384,7 @@ mod tests {
             ]
             .into_iter()
             .collect(),
+            calibration: None,
             duration_ms: 60_000,
             rest: None,
         };

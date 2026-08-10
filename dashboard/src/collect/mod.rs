@@ -22,6 +22,7 @@
 pub mod audio;
 pub mod beatmap;
 pub mod beatsaber;
+pub mod calibration_level;
 pub mod import;
 pub mod interfaces;
 pub mod manager;

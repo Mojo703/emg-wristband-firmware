@@ -5,7 +5,12 @@
 use crate::frame;
 use crate::looks;
 use crate::registry::Registry;
+use crate::timing::TimingService;
 use axum::extract::ws::{Message, WebSocket};
+use dashboard::guided_session::{
+    DeviceConnectionIdentity, GuidedBrowserConnection, GuidedIntentRequest,
+    GuidedSessionCoordinator, GuidedSessionId, RunRevision, SnapshotRevision,
+};
 use dashboard::signal_quality::SignalQualityMonitor;
 use futures_util::{SinkExt, StreamExt};
 use protocol::Frame;
@@ -104,11 +109,15 @@ fn delivery_for(frame: &Frame) -> Delivery {
         Frame::Event { .. } | Frame::Log { .. } | Frame::PhoneState { .. } => Delivery::Reliable,
         // A calibration run narrates itself in edges. Coalescing can erase the
         // transition that explains the state currently on screen.
-        Frame::CalibrationState { .. }
-        | Frame::CalibrationResult { .. }
-        | Frame::CalibrationRowsDump { .. }
-        | Frame::CalibrationProbe { .. }
-        | Frame::BenchError { .. } => Delivery::Reliable,
+        Frame::CalibrationScheduleAccepted { .. }
+        | Frame::CalibrationSongInterrupted { .. }
+        | Frame::CalibrationSongResult { .. }
+        | Frame::CalibrationCandidateStatus { .. }
+        | Frame::CalibrationResidentActivated { .. }
+        | Frame::CalibrationTimingStatus { .. }
+        | Frame::CalibrationTimingLoopStatus { .. }
+        | Frame::BenchError { .. }
+        | Frame::GuidedSessionSnapshot { .. } => Delivery::Reliable,
         Frame::Emg { .. } => Delivery::Live(LiveKind::Emg),
         Frame::Prediction { .. } => Delivery::Live(LiveKind::Prediction),
         Frame::Telemetry { source, .. } => Delivery::Live(LiveKind::Telemetry(source.clone())),
@@ -225,7 +234,7 @@ async fn replay_retained(
             .into_iter()
             .chain(registry.telemetry_of(id))
             .chain(registry.phone_state_of(id))
-            .chain(registry.calibration_frames_of(id))
+            .chain(registry.replacement_calibration_frames_of(id))
         {
             let msg = Message::Binary(frame::encode(&frame));
             send_reliable(tx, msg).await?;
@@ -338,11 +347,14 @@ pub async fn handle_browser(
     pose_url: Option<String>,
     device_port: u16,
     collection: Arc<crate::collect::manager::CollectionManager>,
+    guided_sessions: GuidedSessionCoordinator,
+    timing: Arc<TimingService>,
 ) {
     tracing::info!("browser connected");
-    // Held for the whole handler: dropping it is what tells a running session
-    // that nobody is watching it any more.
-    let _attachment = collection.attach_browser();
+    // A socket is generic until the frontend explicitly declares that a guided
+    // view is visible. Logs and telemetry tabs therefore cannot keep cues alive.
+    let guided_connection = guided_sessions.connect_browser();
+    let mut guided_snapshots = guided_sessions.subscribe();
     let (browser_sink, mut browser_stream) = socket.split();
 
     // All outbound browser traffic funnels through this channel so the pose proxy doesn't
@@ -414,6 +426,28 @@ pub async fn handle_browser(
     {
         return;
     }
+    if send_reliable(
+        &browser_tx,
+        Message::Binary(frame::encode(&Frame::GuidedSessionSnapshot {
+            snapshot: guided_sessions.snapshot().to_wire(),
+        })),
+    )
+    .await
+    .is_err()
+    {
+        return;
+    }
+    if let Some(device_id) = selection.device_id() {
+        if send_reliable(
+            &browser_tx,
+            Message::Binary(frame::encode(&timing.status(device_id))),
+        )
+        .await
+        .is_err()
+        {
+            return;
+        }
+    }
 
     // Collection: catch this browser up on the current session reality, then
     // stream every later collection frame it broadcasts.
@@ -452,12 +486,52 @@ pub async fn handle_browser(
                             if replay_retained(&registry, selection.device_id(), &browser_tx).await.is_err() {
                                 break;
                             }
+                            if let Some(device_id) = selection.device_id() {
+                                if send_reliable(
+                                    &browser_tx,
+                                    Message::Binary(frame::encode(&timing.status(device_id))),
+                                ).await.is_err() { break; }
+                            }
                         }
                         Frame::DismissDevice { device_id } => {
                             // Removal notifies every browser (this one included), and
                             // the `changed` branch below re-reconciles and re-hellos,
                             // so nothing else to do here.
                             registry.dismiss(&device_id);
+                        }
+                        guided @ (Frame::GuidedViewPresence { .. }
+                        | Frame::GuidedSessionIntent { .. }) => {
+                            apply_guided_frame(
+                                &guided_connection,
+                                &guided_sessions,
+                                selection
+                                    .device_id()
+                                    .and_then(|id| registry.connection_identity(id)),
+                                guided,
+                            );
+                        }
+                        Frame::CalibrationTimingIntent { intent } => {
+                            let Some(device_id) = selection.device_id() else { continue };
+                            if guided_sessions.snapshot().active.is_some() {
+                                let refusal = Frame::BenchError {
+                                    stage: "timing".into(),
+                                    detail: "Timing is available only while collection and calibration are idle.".into(),
+                                };
+                                if send_reliable(&browser_tx, Message::Binary(frame::encode(&refusal))).await.is_err() { break; }
+                                continue;
+                            }
+                            let (status, control) = timing.intent(device_id, intent);
+                            if let Some(control) = control {
+                                if let Err(error) = registry.send_control(device_id, control) {
+                                    let refusal = Frame::BenchError {
+                                        stage: "timing".into(),
+                                        detail: error.calibration_message().into(),
+                                    };
+                                    if send_reliable(&browser_tx, Message::Binary(frame::encode(&refusal))).await.is_err() { break; }
+                                    continue;
+                                }
+                            }
+                            if send_reliable(&browser_tx, Message::Binary(frame::encode(&status))).await.is_err() { break; }
                         }
                         // The board a device is soldered to is host knowledge:
                         // remembered here, echoed straight back so the form shows
@@ -469,44 +543,18 @@ pub async fn handle_browser(
                                 break;
                             }
                         }
-                        // Forward control frames to the selected device. The three
-                        // calibration frames are the whole of the panel's authority
-                        // over a run: it starts one, stops one, and asks a stored
-                        // slot for its rows. The device paces everything else.
+                        // Forward ordinary device controls. Calibration lifecycle
+                        // controls arrive only through GuidedSessionIntent, which
+                        // preserves the exact connection lease.
                         control @ (Frame::SetSensitivity { .. }
                         | Frame::SetKeymap { .. }
                         | Frame::SetWifi { .. }
                         | Frame::SetServer { .. }
-                        | Frame::SetPhone { .. }
-                        | Frame::CalibrationStart { .. }
-                        | Frame::CalibrationAbort {}
-                        | Frame::CalibrationRowsRequest { .. }) => {
-                            let calibration_control = matches!(
-                                control,
-                                Frame::CalibrationStart { .. } | Frame::CalibrationAbort {}
-                            );
-                            let delivery = selection.device_id().map_or(
+                        | Frame::SetPhone { .. }) => {
+                            let _ = selection.device_id().map_or(
                                 Err(crate::registry::ControlDeliveryError::UnknownDevice),
                                 |id| registry.send_control(id, control),
                             );
-                            match (calibration_control, delivery) {
-                                (true, Err(error)) => {
-                                    let refusal = Frame::BenchError {
-                                        stage: "calibration".into(),
-                                        detail: error.calibration_message().into(),
-                                    };
-                                    if send_reliable(
-                                        &browser_tx,
-                                        Message::Binary(frame::encode(&refusal)),
-                                    )
-                                    .await
-                                    .is_err()
-                                    {
-                                        break;
-                                    }
-                                }
-                                _ => {}
-                            }
                         }
                         // Collection control frames go to the session manager.
                         Frame::StartCollection { metadata, track_id, difficulty, record_video } => {
@@ -561,6 +609,12 @@ pub async fn handle_browser(
                     Frame::Telemetry { source, metrics, .. } => {
                         signal_quality.accept_telemetry(source, metrics)
                     }
+                    Frame::CalibrationTimingLoopStatus { status } => {
+                        if let Some(device_id) = selection.device_id() {
+                            let projection = timing.observe_loop_status(device_id, *status);
+                            if send_reliable(&browser_tx, Message::Binary(frame::encode(&projection))).await.is_err() { break; }
+                        }
+                    }
                     _ => {}
                 }
                 // A browser that draws no waveforms has already been served by
@@ -590,6 +644,21 @@ pub async fn handle_browser(
                 Err(broadcast::error::RecvError::Lagged(_)) => {}
                 Err(broadcast::error::RecvError::Closed) => {} // manager lives as long as the process
             },
+            changed = guided_snapshots.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                let snapshot = guided_snapshots.borrow_and_update().clone().to_wire();
+                if send_reliable(
+                    &browser_tx,
+                    Message::Binary(frame::encode(&Frame::GuidedSessionSnapshot { snapshot })),
+                )
+                .await
+                .is_err()
+                {
+                    break;
+                }
+            },
             _ = changed.recv() => {
                 // A device came or went: keep a valid selection (and a fresh
                 // subscription — reconcile resubscribes) and refresh the picker.
@@ -613,6 +682,49 @@ pub async fn handle_browser(
     // browser it feeds.
     if let Some((_, _, handle)) = pose {
         handle.abort();
+    }
+}
+
+fn apply_guided_frame(
+    connection: &GuidedBrowserConnection,
+    coordinator: &GuidedSessionCoordinator,
+    device: Option<DeviceConnectionIdentity>,
+    frame: Frame,
+) {
+    let result = match frame {
+        Frame::GuidedViewPresence { mode } => connection
+            .set_visible_mode(mode.map(Into::into))
+            .map(|_| ()),
+        Frame::GuidedSessionIntent {
+            expected_revision,
+            expected_run_revision,
+            expected_session_id,
+            action,
+        } => {
+            let expected_session_id = match expected_session_id {
+                Some(value) => match GuidedSessionId::new(value) {
+                    Some(value) => Some(value),
+                    None => {
+                        tracing::warn!("guided intent carried a zero session id");
+                        return;
+                    }
+                },
+                None => None,
+            };
+            coordinator.handle_intent_for_device(
+                GuidedIntentRequest {
+                    expected_revision: SnapshotRevision::from_wire(expected_revision),
+                    expected_run_revision: RunRevision::from_wire(expected_run_revision),
+                    expected_session_id,
+                    action,
+                },
+                device,
+            )
+        }
+        _ => return,
+    };
+    if let Err(error) = result {
+        tracing::warn!("guided browser intent rejected: {error}");
     }
 }
 
@@ -677,43 +789,129 @@ async fn run_pose_proxy(
 #[cfg(test)]
 mod tests {
     use super::{
-        delivery_for, next_frame, replay_retained, send_live, send_reliable, Delivery,
-        DeviceSelection, LiveKind, Out,
+        apply_guided_frame, delivery_for, next_frame, replay_retained, send_live, send_reliable,
+        Delivery, DeviceSelection, LiveKind, Out,
     };
     use crate::frame;
-    use crate::registry::{ControlDeliveryError, Registry};
-    use axum::extract::ws::Message;
+    use crate::registry::{ControlDeliveryError, DeviceHandle, Registry};
+    use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+    use axum::extract::State;
+    use axum::response::Response;
+    use axum::routing::get;
+    use axum::Router;
+    use dashboard::guided_session::{
+        DeviceConnectionIdentity, GuidedMode, GuidedModeAdapter, GuidedSessionBinding,
+        GuidedSessionCoordinator, SessionExit,
+    };
+    use futures_util::{SinkExt, StreamExt};
     use protocol::{
         DeviceConfig, DeviceProvenance, DeviceTransport, FirmwareBuild, Frame, PhoneStatus,
     };
     use tokio::sync::{broadcast, mpsc};
+    use tokio_tungstenite::tungstenite::Message as ClientMessage;
+
+    struct PauseProbe(mpsc::UnboundedSender<u64>);
+
+    impl GuidedModeAdapter for PauseProbe {
+        fn pause_for_no_visible_views(&self, session: &GuidedSessionBinding) {
+            let _ = self.0.send(session.session_id.get());
+        }
+    }
+
+    async fn guided_websocket(
+        websocket: WebSocketUpgrade,
+        State(coordinator): State<GuidedSessionCoordinator>,
+    ) -> Response {
+        websocket.on_upgrade(move |socket| guided_socket(socket, coordinator))
+    }
+
+    async fn guided_socket(mut socket: WebSocket, coordinator: GuidedSessionCoordinator) {
+        let connection = coordinator.connect_browser();
+        let mut snapshots = coordinator.subscribe();
+        let initial = Frame::GuidedSessionSnapshot {
+            snapshot: coordinator.snapshot().to_wire(),
+        };
+        if socket
+            .send(Message::Binary(frame::encode(&initial)))
+            .await
+            .is_err()
+        {
+            return;
+        }
+        loop {
+            tokio::select! {
+                incoming = socket.recv() => match incoming {
+                    Some(Ok(Message::Binary(bytes))) => match frame::decode(&bytes) {
+                        Ok(frame) => apply_guided_frame(&connection, &coordinator, None, frame),
+                        Err(_) => continue,
+                    },
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                    _ => {}
+                },
+                changed = snapshots.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    let update = Frame::GuidedSessionSnapshot {
+                        snapshot: snapshots.borrow_and_update().clone().to_wire(),
+                    };
+                    if socket.send(Message::Binary(frame::encode(&update))).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn next_guided_snapshot<S>(socket: &mut S) -> protocol::GuidedSessionSnapshot
+    where
+        S: futures_util::Stream<
+                Item = Result<ClientMessage, tokio_tungstenite::tungstenite::Error>,
+            > + Unpin,
+    {
+        loop {
+            let message = socket
+                .next()
+                .await
+                .expect("websocket remained open")
+                .unwrap();
+            let ClientMessage::Binary(bytes) = message else {
+                continue;
+            };
+            if let Frame::GuidedSessionSnapshot { snapshot } = frame::decode(&bytes).unwrap() {
+                return snapshot;
+            }
+        }
+    }
+
+    fn register_device_handle(registry: &Registry) -> DeviceHandle {
+        registry.register(
+            "opal-test".to_string(),
+            "Test device".to_string(),
+            DeviceTransport::Serial,
+            DeviceConfig {
+                gestures: 0,
+                keymap: Vec::new(),
+                wifi_ssid: None,
+                sensitivity: String::new(),
+                sensitivity_levels: Vec::new(),
+                tau: 0.0,
+                needed: 0,
+            },
+            DeviceProvenance {
+                firmware: FirmwareBuild {
+                    crate_version: String::new(),
+                    git_commit: String::new(),
+                    working_tree_modified: false,
+                    built_at: String::new(),
+                },
+                analog_front_ends: Vec::new(),
+            },
+        )
+    }
 
     fn register_device(registry: &Registry) -> u64 {
-        registry
-            .register(
-                "opal-test".to_string(),
-                "Test device".to_string(),
-                DeviceTransport::Serial,
-                DeviceConfig {
-                    gestures: 0,
-                    keymap: Vec::new(),
-                    wifi_ssid: None,
-                    sensitivity: String::new(),
-                    sensitivity_levels: Vec::new(),
-                    tau: 0.0,
-                    needed: 0,
-                },
-                DeviceProvenance {
-                    firmware: FirmwareBuild {
-                        crate_version: String::new(),
-                        git_commit: String::new(),
-                        working_tree_modified: false,
-                        built_at: String::new(),
-                    },
-                    analog_front_ends: Vec::new(),
-                },
-            )
-            .token
+        register_device_handle(registry).token
     }
 
     fn emg() -> Frame {
@@ -728,42 +926,139 @@ mod tests {
         }
     }
 
-    fn calibration_state(phase: protocol::CalibrationPhase) -> Frame {
-        Frame::CalibrationState {
-            phase,
-            round: 0,
-            rounds_planned: 10,
-            round_floor: 10,
-            prompt: None,
-            prompt_generation: 0,
-            prompt_hold_milliseconds: 1_500,
-            phase_remaining_milliseconds: Some(30_000),
-            classes: Vec::new(),
-            accepted_reps: 0,
-            rejected_reps: 0,
-            last_rejection: None,
-            fit_passes_done: 0,
-            fit_passes_planned: 0,
-            pass_milliseconds: 0,
-            flash_flushes: 0,
-            elapsed_milliseconds: 0,
-        }
+    #[test]
+    fn a_guided_binding_cannot_follow_a_reconnected_device_id() {
+        let registry = Registry::new();
+        let mut first_handle = register_device_handle(&registry);
+        let first_token = first_handle.token;
+        let first = DeviceConnectionIdentity::new("opal-test", first_token);
+        assert!(registry.bind_connection(&first).is_some());
+        assert_eq!(registry.send_bound_control(&first, Frame::Probe {}), Ok(()));
+        assert!(matches!(
+            first_handle.control_rx.try_recv(),
+            Ok(Frame::Probe {})
+        ));
+
+        let second_token = register_device(&registry);
+        let second = DeviceConnectionIdentity::new("opal-test", second_token);
+        assert!(registry.bind_connection(&first).is_none());
+        assert!(registry.bind_connection(&second).is_some());
+        assert_eq!(
+            registry.send_bound_control(&first, Frame::Probe {}),
+            Err(ControlDeliveryError::StaleConnection)
+        );
     }
 
-    fn calibration_result() -> Frame {
-        Frame::CalibrationResult {
-            outcome: protocol::CalibrationOutcome::Aborted,
-            installed: None,
-            rounds_completed: 0,
-            rows_stored: 0,
-            accepted_reps: 0,
-            rejected_reps: 0,
-            quality: None,
-            weak_pair: None,
-            classes: Vec::new(),
-            fit_wall_milliseconds: 0,
-            previous_retained: true,
-        }
+    #[tokio::test]
+    async fn real_websockets_pause_only_after_the_final_visible_browser_leaves() {
+        let coordinator = GuidedSessionCoordinator::new();
+        let (pause_tx, mut pause_rx) = mpsc::unbounded_channel();
+        let adapter = std::sync::Arc::new(PauseProbe(pause_tx));
+        coordinator.set_mode_adapter(GuidedMode::Calibration, adapter.clone());
+        let lease = coordinator
+            .acquire_current(GuidedMode::Calibration, None)
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/ws", get(guided_websocket))
+                    .with_state(coordinator.clone()),
+            )
+            .await
+            .unwrap();
+        });
+
+        let (mut first, _) = tokio_tungstenite::connect_async(format!("ws://{address}/ws"))
+            .await
+            .unwrap();
+        let (mut second, _) = tokio_tungstenite::connect_async(format!("ws://{address}/ws"))
+            .await
+            .unwrap();
+        let _ = next_guided_snapshot(&mut first).await;
+        let _ = next_guided_snapshot(&mut second).await;
+
+        let visible = frame::encode(&Frame::GuidedViewPresence {
+            mode: Some(protocol::GuidedMode::Calibration),
+        });
+        first
+            .send(ClientMessage::Binary(visible.clone()))
+            .await
+            .unwrap();
+        while next_guided_snapshot(&mut first)
+            .await
+            .visible_calibration_views
+            != 1
+        {}
+        second.send(ClientMessage::Binary(visible)).await.unwrap();
+        let second_two = loop {
+            let snapshot = next_guided_snapshot(&mut second).await;
+            if snapshot.visible_calibration_views == 2 {
+                break snapshot;
+            }
+        };
+        let first_two = loop {
+            let snapshot = next_guided_snapshot(&mut first).await;
+            if snapshot.visible_calibration_views == 2 {
+                break snapshot;
+            }
+        };
+        assert_eq!(first_two, second_two);
+
+        first.close(None).await.unwrap();
+        let one_visible = loop {
+            let snapshot = next_guided_snapshot(&mut second).await;
+            if snapshot.visible_calibration_views == 1 {
+                break snapshot;
+            }
+        };
+        assert!(pause_rx.try_recv().is_err());
+
+        let (mut reconnected, _) = tokio_tungstenite::connect_async(format!("ws://{address}/ws"))
+            .await
+            .unwrap();
+        assert_eq!(next_guided_snapshot(&mut reconnected).await, one_visible);
+        let visible = frame::encode(&Frame::GuidedViewPresence {
+            mode: Some(protocol::GuidedMode::Calibration),
+        });
+        reconnected
+            .send(ClientMessage::Binary(visible))
+            .await
+            .unwrap();
+        let reconnected_two = loop {
+            let snapshot = next_guided_snapshot(&mut reconnected).await;
+            if snapshot.visible_calibration_views == 2 {
+                break snapshot;
+            }
+        };
+        let second_two_again = loop {
+            let snapshot = next_guided_snapshot(&mut second).await;
+            if snapshot.visible_calibration_views == 2 {
+                break snapshot;
+            }
+        };
+        assert_eq!(reconnected_two, second_two_again);
+
+        reconnected.close(None).await.unwrap();
+        while next_guided_snapshot(&mut second)
+            .await
+            .visible_calibration_views
+            != 1
+        {}
+        assert!(pause_rx.try_recv().is_err());
+
+        second.close(None).await.unwrap();
+        let paused_session =
+            tokio::time::timeout(std::time::Duration::from_secs(1), pause_rx.recv())
+                .await
+                .expect("final visible socket triggered pause")
+                .expect("pause probe remained connected");
+        assert_eq!(paused_session, lease.binding().session_id.get());
+
+        lease.finish(SessionExit::Completed);
+        server.abort();
     }
 
     #[test]
@@ -868,33 +1163,6 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn browser_reconnect_receives_current_calibration_state() {
-        let registry = Registry::new();
-        let token = register_device(&registry);
-        registry.push_calibration_frame(
-            "opal-test",
-            token,
-            calibration_state(protocol::CalibrationPhase::Settling),
-        );
-        let (tx, mut rx) = mpsc::channel(1);
-
-        assert!(replay_retained(&registry, Some("opal-test"), &tx)
-            .await
-            .is_ok());
-
-        let Out::Reliable(Message::Binary(bytes)) = rx.recv().await.unwrap() else {
-            panic!("expected retained calibration state");
-        };
-        assert!(matches!(
-            frame::decode(&bytes).unwrap(),
-            Frame::CalibrationState {
-                phase: protocol::CalibrationPhase::Settling,
-                ..
-            }
-        ));
-    }
-
     #[test]
     fn disconnected_device_rejects_control_with_a_typed_reason() {
         let registry = Registry::new();
@@ -902,84 +1170,13 @@ mod tests {
         registry.deregister("opal-test", token);
 
         assert_eq!(
-            registry.send_control("opal-test", Frame::CalibrationAbort {}),
+            registry.send_control(
+                "opal-test",
+                Frame::SetSensitivity {
+                    level: "high".into(),
+                },
+            ),
             Err(ControlDeliveryError::Disconnected)
         );
-    }
-
-    #[test]
-    fn calibration_result_requires_a_terminal_state() {
-        let registry = Registry::new();
-        let token = register_device(&registry);
-
-        registry.push_calibration_frame("opal-test", token, calibration_result());
-
-        assert!(registry.calibration_frames_of("opal-test").is_empty());
-    }
-
-    #[tokio::test]
-    async fn browser_reconnect_receives_terminal_state_before_result() {
-        let registry = Registry::new();
-        let token = register_device(&registry);
-        registry.push_calibration_frame(
-            "opal-test",
-            token,
-            calibration_state(protocol::CalibrationPhase::Stopped),
-        );
-        registry.push_calibration_frame("opal-test", token, calibration_result());
-        let (tx, mut rx) = mpsc::channel(2);
-
-        assert!(replay_retained(&registry, Some("opal-test"), &tx)
-            .await
-            .is_ok());
-
-        let Out::Reliable(Message::Binary(state)) = rx.recv().await.unwrap() else {
-            panic!("expected terminal calibration state");
-        };
-        let Out::Reliable(Message::Binary(result)) = rx.recv().await.unwrap() else {
-            panic!("expected calibration result");
-        };
-        assert!(matches!(
-            frame::decode(&state).unwrap(),
-            Frame::CalibrationState {
-                phase: protocol::CalibrationPhase::Stopped,
-                ..
-            }
-        ));
-        assert!(matches!(
-            frame::decode(&result).unwrap(),
-            Frame::CalibrationResult {
-                outcome: protocol::CalibrationOutcome::Aborted,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn a_new_run_replaces_the_retained_terminal_pair() {
-        let registry = Registry::new();
-        let token = register_device(&registry);
-        registry.push_calibration_frame(
-            "opal-test",
-            token,
-            calibration_state(protocol::CalibrationPhase::Stopped),
-        );
-        registry.push_calibration_frame("opal-test", token, calibration_result());
-
-        registry.push_calibration_frame(
-            "opal-test",
-            token,
-            calibration_state(protocol::CalibrationPhase::Settling),
-        );
-
-        let frames = registry.calibration_frames_of("opal-test");
-        assert_eq!(frames.len(), 1);
-        assert!(matches!(
-            frames[0],
-            Frame::CalibrationState {
-                phase: protocol::CalibrationPhase::Settling,
-                ..
-            }
-        ));
     }
 }

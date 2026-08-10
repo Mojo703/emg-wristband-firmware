@@ -16,14 +16,16 @@
 //! place, so an import that fails partway leaves nothing for
 //! [`TrackCatalog::load`](super::beatmap::TrackCatalog::load) to trip over.
 
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{anyhow, Context};
 use serde::Serialize;
 
-use super::beatmap::{TrackEntry, TRACK_AUDIO_NAME, TRACK_FILE_NAME};
+use super::beatmap::{LevelEntry, TrackEntry, TRACK_AUDIO_NAME, TRACK_FILE_NAME};
 use super::beatsaber::{self, LevelSummary};
+use super::calibration_level::{CalibrationLevelProduct, CALIBRATION_SOURCE_LEVEL};
 
 /// The largest map archive accepted. Beat Saber maps run a few megabytes of Ogg
 /// plus a cover image; ten times the largest map in the library is room enough
@@ -53,6 +55,21 @@ pub struct ImportReport {
     /// The Beat Saber difficulty file the map's own preference order chose.
     pub difficulty_file: String,
     pub levels: Vec<LevelSummary>,
+    pub calibration: CalibrationImportReport,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CalibrationImportAvailability {
+    Available,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CalibrationImportReport {
+    pub availability: CalibrationImportAvailability,
+    pub cue_count: usize,
+    pub content_identity: String,
+    pub cue_shortfall: usize,
 }
 
 /// Convert one map archive into a track directory under `tracks_root`.
@@ -116,16 +133,14 @@ pub fn import_archive(archive_bytes: &[u8], tracks_root: &Path) -> anyhow::Resul
 
     let (levels, summaries) =
         beatsaber::convert(&difficulty, info.beats_per_minute, audio_clock, duration_ms)?;
-
     let track_id = track_id_of(&info.title)?;
-    let entry = TrackEntry {
-        id: protocol::TrackId(track_id.clone()),
-        title: info.title.clone(),
-        beats_per_minute: (info.beats_per_minute * 100.0).round() / 100.0,
-        levels,
+    let entry = build_imported_track_entry(
+        protocol::TrackId(track_id.clone()),
+        info.title.clone(),
+        info.beats_per_minute,
         duration_ms,
-        rest: None,
-    };
+        levels,
+    );
 
     let mut source_files = vec![
         (info_name.as_str(), info_text.as_bytes()),
@@ -149,7 +164,47 @@ pub fn import_archive(archive_bytes: &[u8], tracks_root: &Path) -> anyhow::Resul
         duration_ms,
         difficulty_file: difficulty_name,
         levels: summaries,
+        calibration: calibration_import_report(&entry),
     })
+}
+
+fn calibration_import_report(entry: &TrackEntry) -> CalibrationImportReport {
+    let product = entry
+        .calibration
+        .as_ref()
+        .expect("new imports always contain a calibration product");
+    CalibrationImportReport {
+        availability: CalibrationImportAvailability::Available,
+        cue_count: product.cue_count(),
+        content_identity: product.content_identity.clone(),
+        cue_shortfall: crate::collect::calibration_level::MAXIMUM_CUES
+            .saturating_sub(product.cue_count()),
+    }
+}
+
+fn build_imported_track_entry(
+    id: protocol::TrackId,
+    title: String,
+    beats_per_minute: f64,
+    duration_ms: u32,
+    levels: std::collections::BTreeMap<String, LevelEntry>,
+) -> TrackEntry {
+    let calibration_source = levels
+        .get(CALIBRATION_SOURCE_LEVEL)
+        .expect("the converter always produces the hard source level");
+    let calibration = Some(CalibrationLevelProduct::generate(
+        &calibration_source.map_notes,
+        duration_ms,
+    ));
+    TrackEntry {
+        id,
+        title,
+        beats_per_minute: (beats_per_minute * 100.0).round() / 100.0,
+        duration_ms,
+        levels,
+        calibration,
+        rest: None,
+    }
 }
 
 /// Remove one track's directory from the library.
@@ -247,6 +302,74 @@ fn write_track_directory(
     }
     std::fs::rename(&staging, &destination)
         .with_context(|| format!("moving the imported track into {}", destination.display()))
+}
+
+/// Atomically replace only a track's derived manifest. The retained source and
+/// personal audio are outside the destination path and are never opened here.
+/// HTTP regeneration wiring can call this after rebuilding a [`TrackEntry`]
+/// from the retained source directory.
+pub fn replace_derived_metadata(track_directory: &Path, entry: &TrackEntry) -> anyhow::Result<()> {
+    if let Some(calibration) = &entry.calibration {
+        let source = entry
+            .levels
+            .get(CALIBRATION_SOURCE_LEVEL)
+            .ok_or_else(|| anyhow!("regenerated metadata has no hard source level"))?;
+        calibration
+            .validate_against_source(&source.map_notes, entry.duration_ms)
+            .context("validating regenerated calibration metadata")?;
+    }
+    let bytes =
+        serde_json::to_vec_pretty(entry).context("serializing regenerated track metadata")?;
+    let destination = track_directory.join(TRACK_FILE_NAME);
+    replace_file_atomically(&destination, |file| {
+        file.write_all(&bytes)?;
+        file.write_all(b"\n")
+    })
+    .with_context(|| format!("replacing {}", destination.display()))
+}
+
+static ATOMIC_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn replace_file_atomically(
+    destination: &Path,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let parent = destination.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "atomic destination has no parent directory",
+        )
+    })?;
+    let file_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "atomic destination has no UTF-8 file name",
+            )
+        })?;
+    let sequence = ATOMIC_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temporary = parent.join(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        sequence
+    ));
+
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        write(&mut file)?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, destination)?;
+        std::fs::File::open(parent)?.sync_all()
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
 }
 
 /// Read one archive entry by file name, ignoring whatever directory path the
@@ -444,6 +567,48 @@ pub async fn download_map(key: &BeatSaverKey) -> anyhow::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::collect::beatmap::{assign_columns, LevelEntry, MapNote, MAXIMUM_COLUMNS};
+
+    fn unique_test_directory(name: &str) -> std::path::PathBuf {
+        let sequence = ATOMIC_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "dashboard-import-{name}-{}-{sequence}",
+            std::process::id()
+        ))
+    }
+
+    fn test_track_entry(id: &str) -> TrackEntry {
+        let map_notes = (0..12)
+            .map(|index| MapNote {
+                time_ms: 1_000 + index * 2_500,
+                cell: (index % 12) as u8,
+                hold_ms: 1_250,
+            })
+            .collect::<Vec<_>>();
+        let level = LevelEntry {
+            column_assignments: (1..=MAXIMUM_COLUMNS)
+                .map(|count| (count.to_string(), assign_columns(&map_notes, count)))
+                .collect(),
+            map_notes,
+        };
+        let levels = ["easy", "medium", "hard"]
+            .into_iter()
+            .map(|name| (name.to_string(), level.clone()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let calibration = Some(CalibrationLevelProduct::generate(
+            &levels[CALIBRATION_SOURCE_LEVEL].map_notes,
+            60_000,
+        ));
+        TrackEntry {
+            id: protocol::TrackId(id.to_string()),
+            title: id.to_string(),
+            beats_per_minute: 120.0,
+            duration_ms: 60_000,
+            levels,
+            calibration,
+            rest: None,
+        }
+    }
 
     #[test]
     fn a_title_becomes_a_track_id_and_a_directory_name() {
@@ -560,5 +725,91 @@ mod tests {
         let stream = ogg_page(48_000, 7, b"\x80theora placeholder payload");
         let error = ogg_duration_milliseconds(&stream).unwrap_err().to_string();
         assert!(error.contains("no Vorbis stream"), "{error}");
+    }
+
+    #[test]
+    fn atomic_metadata_replacement_never_touches_audio() {
+        let directory = unique_test_directory("atomic-metadata");
+        std::fs::create_dir_all(&directory).unwrap();
+        let audio_path = directory.join(TRACK_AUDIO_NAME);
+        std::fs::write(&audio_path, b"personal audio").unwrap();
+        std::fs::write(directory.join(TRACK_FILE_NAME), b"old metadata").unwrap();
+        let entry = test_track_entry("replacement");
+
+        replace_derived_metadata(&directory, &entry).unwrap();
+
+        assert_eq!(std::fs::read(&audio_path).unwrap(), b"personal audio");
+        let loaded: TrackEntry =
+            serde_json::from_slice(&std::fs::read(directory.join(TRACK_FILE_NAME)).unwrap())
+                .unwrap();
+        assert_eq!(loaded.id.0, "replacement");
+        assert!(loaded.calibration.is_some());
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn imported_entry_adds_calibration_from_hard_without_changing_ordinary_levels() {
+        let original = test_track_entry("source");
+        let levels = original.levels.clone();
+        let entry = build_imported_track_entry(
+            protocol::TrackId("imported".into()),
+            "Imported".into(),
+            120.0,
+            60_000,
+            levels.clone(),
+        );
+        let calibration = entry.calibration.as_ref().unwrap();
+
+        assert_eq!(
+            serde_json::to_vec(&entry.levels).unwrap(),
+            serde_json::to_vec(&levels).unwrap()
+        );
+        assert_eq!(calibration.source_level, "hard");
+        assert!(calibration.notes.iter().all(|cue| {
+            let source = &entry.levels["hard"].map_notes[cue.source_index];
+            cue.map_note.time_ms == source.time_ms && cue.map_note.cell == source.cell
+        }));
+        calibration.validate().unwrap();
+    }
+
+    #[test]
+    fn import_report_exposes_calibration_availability_count_and_identity() {
+        let entry = test_track_entry("reported");
+        let report = calibration_import_report(&entry);
+        let product = entry.calibration.as_ref().unwrap();
+
+        assert_eq!(
+            report.availability,
+            CalibrationImportAvailability::Available
+        );
+        assert_eq!(report.cue_count, product.cue_count());
+        assert_eq!(report.content_identity, product.content_identity);
+        assert_eq!(
+            report.cue_shortfall,
+            crate::collect::calibration_level::MAXIMUM_CUES - product.cue_count()
+        );
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["availability"], "available");
+        assert!(json.get("available").is_none());
+    }
+
+    #[test]
+    fn failed_atomic_write_keeps_previous_metadata_and_audio() {
+        let directory = unique_test_directory("failed-atomic-metadata");
+        std::fs::create_dir_all(&directory).unwrap();
+        let metadata_path = directory.join(TRACK_FILE_NAME);
+        let audio_path = directory.join(TRACK_AUDIO_NAME);
+        std::fs::write(&metadata_path, b"old metadata").unwrap();
+        std::fs::write(&audio_path, b"personal audio").unwrap();
+
+        let result = replace_file_atomically(&metadata_path, |file| {
+            file.write_all(b"partial replacement")?;
+            Err(std::io::Error::other("injected failure"))
+        });
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&metadata_path).unwrap(), b"old metadata");
+        assert_eq!(std::fs::read(&audio_path).unwrap(), b"personal audio");
+        let _ = std::fs::remove_dir_all(directory);
     }
 }

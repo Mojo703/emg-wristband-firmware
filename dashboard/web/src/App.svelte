@@ -3,6 +3,7 @@
   import { Tabs, ToggleGroup } from 'bits-ui';
   import * as Tooltip from '$lib/components/ui/tooltip/index.js';
   import { panels } from './lib/panels';
+  import { GuidedPresenceLifecycle } from './lib/guidedVisibility';
   import { api, connect, live } from './lib/socket.svelte';
   import { theme, type ThemeChoice } from './lib/theme.svelte';
   import Icon from './lib/Icon.svelte';
@@ -12,6 +13,8 @@
 
   const firstPanel = panels[0]!;
   let active = $state<string>(firstPanel.id);
+  let documentVisible = $state(true);
+  const guidedPresence = new GuidedPresenceLifecycle();
 
   const THEME_CHOICES: readonly { readonly value: ThemeChoice; readonly icon: string; readonly title: string }[] = [
     { value: 'system', icon: 'monitor', title: 'Follow system theme' },
@@ -28,7 +31,15 @@
     if (value === 'system' || value === 'light' || value === 'dark') theme.set(value);
   }
 
-  onMount(connect);
+  onMount(() => {
+    const updateVisibility = (): void => {
+      documentVisible = document.visibilityState === 'visible';
+    };
+    updateVisibility();
+    document.addEventListener('visibilitychange', updateVisibility);
+    connect();
+    return () => document.removeEventListener('visibilitychange', updateVisibility);
+  });
 
   // Only the panels that draw waveforms ask for the EMG stream. Sent on every
   // switch (and re-sent on reconnect, because a fresh socket starts subscribed
@@ -38,6 +49,15 @@
   $effect(() => {
     if (live.status !== 'online') return;
     api.setEmgStream(drawsEmg);
+  });
+
+  $effect(() => {
+    guidedPresence.update(
+      live.status === 'online',
+      active,
+      documentVisible,
+      api.setGuidedViewPresence,
+    );
   });
 </script>
 

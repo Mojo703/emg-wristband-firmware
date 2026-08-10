@@ -44,6 +44,11 @@ use crate::collect::recorder::FileSessionRecorder;
 use crate::collect::video::{CameraSettings, FfmpegVideoCapture};
 use crate::registry::Registry;
 use anyhow::Context;
+use dashboard::guided_session::{
+    CoordinatorError, DeviceConnectionIdentity, GuidedMode, GuidedModeAdapter,
+    GuidedSessionBinding, GuidedSessionCoordinator, SessionExit, SessionLease,
+};
+use futures_util::FutureExt;
 use protocol::{
     Beatmap, BoardRevision, ClassId, CollectionPause, CollectionPhase, CollectionSummary,
     DifficultyLevel, DurationMilliseconds, FileReport, Frame, LogLevel, NoteIndex, PauseCause,
@@ -52,7 +57,6 @@ use protocol::{
 };
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
@@ -131,8 +135,11 @@ enum SessionControl {
 enum Phase {
     Idle,
     /// An arming task is in flight; further starts are rejected.
-    Starting,
+    Starting {
+        session_id: dashboard::guided_session::GuidedSessionId,
+    },
     Running {
+        session_id: dashboard::guided_session::GuidedSessionId,
         control: mpsc::UnboundedSender<SessionControl>,
     },
     /// The wire-facing session/summary data lives in the cached `latest_state`
@@ -168,17 +175,6 @@ impl AudioSettings {
             AudioOutput::Named(name) => Some(name.clone()),
             AudioOutput::Default | AudioOutput::Silent => None,
         }
-    }
-}
-
-/// One browser's presence, held for the life of its socket.
-pub struct BrowserAttachment {
-    manager: Arc<CollectionManager>,
-}
-
-impl Drop for BrowserAttachment {
-    fn drop(&mut self) {
-        self.manager.browser_detached();
     }
 }
 
@@ -221,9 +217,7 @@ pub struct CollectionManager {
     /// cues. Both are live — a running session is told about a change rather
     /// than waiting for the next one.
     audio_settings: Mutex<AudioSettings>,
-    /// Browsers currently holding a socket. A cue nobody can see is a cue the
-    /// subject was never given, so the last one leaving freezes the session.
-    browsers: AtomicUsize,
+    guided_sessions: GuidedSessionCoordinator,
     state: Mutex<ManagerState>,
 }
 
@@ -238,6 +232,7 @@ impl CollectionManager {
         sessions_root: PathBuf,
         provenance: ProvenanceStore,
         audio_output: AudioOutput,
+        guided_sessions: GuidedSessionCoordinator,
     ) -> Arc<Self> {
         let (outbound, _) = broadcast::channel(OUTBOUND_CAPACITY);
         // The environment names the sink this run starts on; the stored
@@ -266,7 +261,7 @@ impl CollectionManager {
             outbound,
             provenance,
             audio_settings: Mutex::new(audio_settings),
-            browsers: AtomicUsize::new(0),
+            guided_sessions,
             state: Mutex::new(ManagerState {
                 phase: Phase::Idle,
                 placement_photo: None,
@@ -289,17 +284,6 @@ impl CollectionManager {
     /// Subscribe a browser session to collection frames.
     pub fn subscribe(&self) -> broadcast::Receiver<Frame> {
         self.outbound.subscribe()
-    }
-
-    /// Register a browser for as long as it holds the returned guard. A running
-    /// session freezes when the last guard drops: the playfield is how the
-    /// subject is told what to do, so a session with no page watching it has
-    /// stopped asking for anything.
-    pub fn attach_browser(self: &Arc<Self>) -> BrowserAttachment {
-        self.browsers.fetch_add(1, Ordering::AcqRel);
-        BrowserAttachment {
-            manager: Arc::clone(self),
-        }
     }
 
     /// The frames a freshly connected browser needs to render the current
@@ -337,6 +321,39 @@ impl CollectionManager {
     /// The track library's root, for the import and delete routes.
     pub fn tracks_root(&self) -> &std::path::Path {
         &self.catalog_paths.tracks_root
+    }
+
+    /// Tracks carrying a validated generated Calibration product. Kept outside
+    /// the collection frame until the guided-session protocol owns this state.
+    pub fn calibration_tracks(&self) -> Vec<crate::collect::beatmap::CalibrationTrack> {
+        self.catalog.read().unwrap().calibration_tracks()
+    }
+
+    /// Open the exact imported audio for an authored guided-calibration
+    /// schedule.  The playback object remains owned by the calibration adapter;
+    /// this method only supplies the same mixer configuration as collection.
+    pub fn open_calibration_playback(
+        &self,
+        track_id: &TrackId,
+        entries: &[protocol::CalibrationScheduleEntry],
+    ) -> anyhow::Result<audio::Playback> {
+        let catalog = self.catalog.read().unwrap();
+        let audio_path = catalog
+            .audio_path(track_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown calibration track '{track_id}'"))?;
+        let beat_times = catalog.beat_times(track_id).unwrap_or_default();
+        let note_onsets = entries
+            .iter()
+            .map(|entry| entry.track_offset)
+            .collect::<Vec<_>>();
+        let settings = self.audio_settings.lock().unwrap();
+        audio::Playback::open(
+            &audio_path,
+            &note_onsets,
+            &beat_times,
+            &settings.output,
+            settings.gain(),
+        )
     }
 
     /// Re-read the library from disk and tell every browser what it now holds.
@@ -396,25 +413,77 @@ impl CollectionManager {
             self.publish_error(format!("rejected session start: {reason}"));
             return;
         }
+        let device = match device_id.as_deref() {
+            Some(device_id) => match self.registry.connection_identity(device_id) {
+                Some(device) => Some(device),
+                None => {
+                    self.publish_error(format!(
+                        "rejected session start: device '{device_id}' is not connected"
+                    ));
+                    return;
+                }
+            },
+            None => None,
+        };
+        let lease = match self
+            .guided_sessions
+            .acquire_current(GuidedMode::Collection, device)
+        {
+            Ok(lease) => lease,
+            Err(CoordinatorError::LeaseHeld { mode }) => {
+                self.publish_error(format!(
+                    "rejected session start: a {mode:?} guided session already exists"
+                ));
+                return;
+            }
+            Err(error) => {
+                self.publish_error(format!("rejected session start: {error}"));
+                return;
+            }
+        };
         {
             let mut state = self.state.lock().unwrap();
             if !matches!(state.phase, Phase::Idle) {
                 drop(state);
+                lease.finish(SessionExit::OperatorStopped);
                 self.publish_error("rejected session start: a session already exists".into());
                 return;
             }
-            state.phase = Phase::Starting;
+            state.phase = Phase::Starting {
+                session_id: lease.binding().session_id,
+            };
         }
         let manager = Arc::clone(self);
+        let guided_session_id = lease.binding().session_id;
         tokio::spawn(async move {
-            if let Err(error) = manager
-                .clone()
-                .arm(metadata, track_id, difficulty, record_video, device_id)
-                .await
-            {
-                manager.publish_error(format!("session start failed: {error:#}"));
-                manager.state.lock().unwrap().phase = Phase::Idle;
-                manager.publish_idle();
+            let mut lease = Some(lease);
+            let result = std::panic::AssertUnwindSafe(manager.clone().arm(
+                metadata,
+                track_id,
+                difficulty,
+                record_video,
+                &mut lease,
+            ))
+            .catch_unwind()
+            .await;
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    if let Some(lease) = lease.take() {
+                        lease.finish(SessionExit::DependencyFailed(format!("{error:#}")));
+                    }
+                    manager.publish_error(format!("session start failed: {error:#}"));
+                    manager.restore_idle_after_task(guided_session_id);
+                }
+                Err(_) => {
+                    if let Some(lease) = lease.take() {
+                        lease.finish(SessionExit::TaskFailed(
+                            "collection arming task panicked".into(),
+                        ));
+                    }
+                    manager.publish_error("session start failed: arming task panicked".into());
+                    manager.restore_idle_after_task(guided_session_id);
+                }
             }
         });
     }
@@ -450,11 +519,15 @@ impl CollectionManager {
 
     /// Subscribe to a device's stream and read the hardware identity off its
     /// first EMG window.
-    async fn acquire_device(&self, device_id: &str) -> anyhow::Result<AcquiredDevice> {
-        let mut emg_receiver = self
+    async fn acquire_device(
+        &self,
+        identity: &DeviceConnectionIdentity,
+    ) -> anyhow::Result<AcquiredDevice> {
+        let bound = self
             .registry
-            .subscribe(device_id)
-            .ok_or_else(|| anyhow::anyhow!("device '{device_id}' is not connected"))?;
+            .bind_connection(identity)
+            .ok_or_else(|| anyhow::anyhow!("leased device connection is no longer current"))?;
+        let mut emg_receiver = bound.frames;
         let (channels, sample_rate, scale_uv) = tokio::time::timeout(FIRST_WINDOW_TIMEOUT, async {
             loop {
                 match emg_receiver.recv().await {
@@ -473,34 +546,18 @@ impl CollectionManager {
             }
         })
         .await
-        .map_err(|_| anyhow::anyhow!("no EMG from '{device_id}' within 3 s"))??;
-
-        let transport = self
-            .registry
-            .list()
-            .into_iter()
-            .find(|device| device.id == device_id)
-            .map(|device| device.transport)
-            .ok_or_else(|| anyhow::anyhow!("device '{device_id}' disappeared"))?;
-        let device_config = self
-            .registry
-            .config_of(device_id)
-            .ok_or_else(|| anyhow::anyhow!("device '{device_id}' has no config"))?;
-        let provenance = self
-            .registry
-            .provenance_of(device_id)
-            .ok_or_else(|| anyhow::anyhow!("device '{device_id}' reported no provenance"))?;
+        .map_err(|_| anyhow::anyhow!("no EMG from '{}' within 3 s", identity.device_id))??;
         Ok(AcquiredDevice {
             emg_receiver,
             hardware: HardwareIdentity {
-                device_id: device_id.to_string(),
-                transport,
+                device_id: identity.device_id.clone(),
+                transport: bound.transport,
                 channels,
                 sample_rate,
                 scale_uv,
-                device_config,
-                provenance,
-                board_revision: self.provenance.board_revision(device_id),
+                device_config: bound.config,
+                provenance: bound.provenance,
+                board_revision: self.provenance.board_revision(&identity.device_id),
             },
         })
     }
@@ -516,7 +573,7 @@ impl CollectionManager {
         track_id: TrackId,
         difficulty: DifficultyLevel,
         record_video: bool,
-        device_id: Option<String>,
+        lease: &mut Option<SessionLease>,
     ) -> anyhow::Result<()> {
         // Everything device-independent happens first, and the order is
         // load-bearing: subscribing to the device starts buffering EMG, and
@@ -568,8 +625,11 @@ impl CollectionManager {
             playback.output_latency().get()
         );
 
-        let acquired = match device_id {
-            Some(device_id) => Some(self.acquire_device(&device_id).await?),
+        let leased_device = lease
+            .as_ref()
+            .and_then(|lease| lease.binding().device.clone());
+        let acquired = match leased_device {
+            Some(identity) => Some(self.acquire_device(&identity).await?),
             None => None,
         };
 
@@ -662,9 +722,17 @@ impl CollectionManager {
         };
 
         let (control, control_receiver) = mpsc::unbounded_channel();
+        let guided_session_id = lease
+            .as_ref()
+            .expect("arming owns the guided-session lease")
+            .binding()
+            .session_id;
         {
             let mut state = self.state.lock().unwrap();
-            state.phase = Phase::Running { control };
+            state.phase = Phase::Running {
+                session_id: guided_session_id,
+                control,
+            };
             // The photo now belongs to this session; a practice session leaves
             // it pending for the next real one.
             if !practice {
@@ -692,8 +760,19 @@ impl CollectionManager {
             track,
             rest_label,
             playback,
+            lease.take().expect("arming owns the guided-session lease"),
         );
-        tokio::spawn(session.run());
+        let manager = Arc::clone(&self);
+        tokio::spawn(async move {
+            if std::panic::AssertUnwindSafe(session.run())
+                .catch_unwind()
+                .await
+                .is_err()
+            {
+                manager.publish_error("session failed: running task panicked".into());
+                manager.restore_idle_after_task(guided_session_id);
+            }
+        });
         Ok(())
     }
 
@@ -764,15 +843,34 @@ impl CollectionManager {
 
     fn command(&self, control: SessionControl) {
         let state = self.state.lock().unwrap();
-        if let Phase::Running { control: sender } = &state.phase {
+        if let Phase::Running {
+            control: sender, ..
+        } = &state.phase
+        {
             let _ = sender.send(control);
         }
     }
 
-    /// The last browser let go of its socket.
-    fn browser_detached(&self) {
-        if self.browsers.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.command(SessionControl::BrowserGone);
+    fn restore_idle_after_task(&self, session_id: dashboard::guided_session::GuidedSessionId) {
+        let restored = {
+            let mut state = self.state.lock().unwrap();
+            let matching_task = match state.phase {
+                Phase::Starting {
+                    session_id: current,
+                }
+                | Phase::Running {
+                    session_id: current,
+                    ..
+                } => current == session_id,
+                Phase::Idle | Phase::Reviewing { .. } => false,
+            };
+            if matching_task {
+                state.phase = Phase::Idle;
+            }
+            matching_task
+        };
+        if restored {
+            self.publish_idle();
         }
     }
 
@@ -788,13 +886,12 @@ impl CollectionManager {
     pub fn stop_collection(&self, save: bool) {
         let reviewed = {
             let mut state = self.state.lock().unwrap();
-            match &state.phase {
-                Phase::Reviewing { directory } => {
-                    let directory = directory.clone();
-                    state.phase = Phase::Idle;
-                    Some(directory)
+            match std::mem::replace(&mut state.phase, Phase::Idle) {
+                Phase::Reviewing { directory } => Some(directory),
+                phase @ (Phase::Idle | Phase::Starting { .. } | Phase::Running { .. }) => {
+                    state.phase = phase;
+                    None
                 }
-                Phase::Idle | Phase::Starting | Phase::Running { .. } => None,
             }
         };
         if let Some(directory) = reviewed {
@@ -862,6 +959,21 @@ impl CollectionManager {
                 }
             }
         });
+    }
+}
+
+impl GuidedModeAdapter for CollectionManager {
+    fn pause_for_no_visible_views(&self, session: &GuidedSessionBinding) {
+        let state = self.state.lock().unwrap();
+        if let Phase::Running {
+            session_id,
+            control,
+        } = &state.phase
+        {
+            if *session_id == session.session_id {
+                let _ = control.send(SessionControl::BrowserGone);
+            }
+        }
     }
 }
 
@@ -994,6 +1106,7 @@ struct RunningSession {
     activity_hits: u32,
     cues_per_class: BTreeMap<ClassId, u16>,
     latest_health: RecordingHealth,
+    lease: Option<SessionLease>,
 }
 
 impl RunningSession {
@@ -1011,6 +1124,7 @@ impl RunningSession {
         track: TrackInfo,
         rest_label: Option<String>,
         playback: Playback,
+        lease: SessionLease,
     ) -> Self {
         let cues = beatmap
             .iter()
@@ -1054,13 +1168,14 @@ impl RunningSession {
                 video: None,
                 recorded: None,
             },
+            lease: Some(lease),
         }
     }
 
     async fn run(mut self) {
         let mut ticker = tokio::time::interval(TICK);
         let mut publish_health = false;
-        loop {
+        let outcome = loop {
             tokio::select! {
                 message = self.control.recv() => match message {
                     Some(SessionControl::StartTrack) => self.start_track().await,
@@ -1069,8 +1184,8 @@ impl RunningSession {
                     Some(SessionControl::SetMusicGain(gain)) => self.playback.set_music_gain(gain),
                     Some(SessionControl::SetOutput(output)) => self.set_output(&output).await,
                     Some(SessionControl::ResumeTrack) => self.resume_track().await,
-                    Some(SessionControl::Finish) => break,
-                    None => break, // manager dropped; shouldn't happen
+                    Some(SessionControl::Finish) => break SessionExit::OperatorStopped,
+                    None => break SessionExit::TaskFailed("collection control channel closed".into()),
                 },
                 frame = next_emg(&mut self.emg_receiver) => match frame {
                     Ok(Frame::Emg { seq, t0_us, channels, samples, missing, .. }) => {
@@ -1082,12 +1197,12 @@ impl RunningSession {
                         self.manager.publish_error(
                             "device stream ended mid-session; finalizing".into(),
                         );
-                        break;
+                        break SessionExit::DependencyFailed("device stream ended mid-session".into());
                     }
                 },
                 _ = ticker.tick() => {
                     if self.tick().await {
-                        break;
+                        break SessionExit::Completed;
                     }
                     self.publish_playback_position();
                     publish_health = !publish_health;
@@ -1097,8 +1212,8 @@ impl RunningSession {
                     }
                 }
             }
-        }
-        self.finalize().await;
+        };
+        self.finalize(outcome).await;
     }
 
     /// The operator tapped Start: play the track, then take the anchor off the
@@ -1571,7 +1686,7 @@ impl RunningSession {
     /// Stop everything, write the files, and hand the take to review. Every
     /// ending arrives here: a take that reached disk is the operator's to keep
     /// or discard, never this function's.
-    async fn finalize(mut self) {
+    async fn finalize(mut self, outcome: SessionExit) {
         self.playback.pause();
         // A session whose track never started still recorded EMG from arming;
         // that whole stretch is the unlabelled prefix.
@@ -1683,6 +1798,10 @@ impl RunningSession {
             },
             placement_photo: None,
         });
+        self.lease
+            .take()
+            .expect("a running session retains its guided-session lease")
+            .finish(outcome);
     }
 }
 
@@ -1693,7 +1812,7 @@ mod tests {
     /// A manager with nothing behind it but the pieces the attachment count
     /// touches. It never arms a session, so the catalog and the camera are
     /// never read.
-    fn bare_manager(name: &str) -> Arc<CollectionManager> {
+    fn bare_manager(name: &str) -> (Arc<CollectionManager>, GuidedSessionCoordinator) {
         // Its own directory per test: these run in parallel, and a shared
         // config file is one test reading what another is still writing.
         let directory = std::env::temp_dir().join(format!("collection-attachment-{name}"));
@@ -1711,7 +1830,8 @@ mod tests {
         )
         .expect("the temp directory is writable");
         let catalog = paths.load().expect("a track-less catalog loads");
-        CollectionManager::new(
+        let guided_sessions = GuidedSessionCoordinator::new();
+        let manager = CollectionManager::new(
             catalog,
             paths,
             PathBuf::from("/dev/null"),
@@ -1720,26 +1840,44 @@ mod tests {
             directory.clone(),
             ProvenanceStore::load(directory.join("provenance.cbor")),
             AudioOutput::Silent,
-        )
+            guided_sessions.clone(),
+        );
+        guided_sessions.set_mode_adapter(GuidedMode::Collection, manager.clone());
+        (manager, guided_sessions)
     }
 
     /// Pretend a session is running, and hand back the end of the control
     /// channel a real session task would be reading.
-    fn pretend_running(manager: &CollectionManager) -> mpsc::UnboundedReceiver<SessionControl> {
+    fn pretend_running(
+        manager: &CollectionManager,
+        session_id: dashboard::guided_session::GuidedSessionId,
+    ) -> mpsc::UnboundedReceiver<SessionControl> {
         let (control, receiver) = mpsc::unbounded_channel();
-        manager.state.lock().unwrap().phase = Phase::Running { control };
+        manager.state.lock().unwrap().phase = Phase::Running {
+            session_id,
+            control,
+        };
         receiver
     }
 
-    /// The point of the count: one page closing while another still watches
-    /// changes nothing, because someone can still see the cues.
     #[test]
-    fn a_session_freezes_only_when_the_last_browser_leaves() {
-        let manager = bare_manager("last-leaves");
-        let mut control = pretend_running(&manager);
+    fn collection_pauses_only_when_the_last_visible_guided_view_leaves() {
+        let (manager, guided_sessions) = bare_manager("last-leaves");
+        let lease = guided_sessions
+            .acquire_current(GuidedMode::Collection, None)
+            .unwrap();
+        let mut control = pretend_running(&manager, lease.binding().session_id);
+        let generic = guided_sessions.connect_browser();
+        let first = guided_sessions.connect_browser();
+        let second = guided_sessions.connect_browser();
+        first
+            .set_visible_mode(Some(GuidedMode::Collection))
+            .unwrap();
+        second
+            .set_visible_mode(Some(GuidedMode::Collection))
+            .unwrap();
 
-        let first = manager.attach_browser();
-        let second = manager.attach_browser();
+        drop(generic);
         drop(first);
         assert!(
             control.try_recv().is_err(),
@@ -1749,27 +1887,93 @@ mod tests {
         drop(second);
         assert!(
             matches!(control.try_recv(), Ok(SessionControl::BrowserGone)),
-            "the last browser leaving did not freeze the session"
+            "the last visible guided view leaving did not freeze the session"
         );
+        lease.finish(SessionExit::Completed);
     }
 
-    /// Reconnecting arms the count again, so a second round of closures freezes
-    /// the session a second time rather than going quiet forever.
     #[test]
-    fn a_reconnecting_browser_can_freeze_the_session_again() {
-        let manager = bare_manager("reconnecting");
-        let mut control = pretend_running(&manager);
+    fn a_reconnected_visible_view_can_pause_collection_again() {
+        let (manager, guided_sessions) = bare_manager("reconnecting");
+        let lease = guided_sessions
+            .acquire_current(GuidedMode::Collection, None)
+            .unwrap();
+        let mut control = pretend_running(&manager, lease.binding().session_id);
 
-        drop(manager.attach_browser());
+        for _ in 0..2 {
+            let connection = guided_sessions.connect_browser();
+            connection
+                .set_visible_mode(Some(GuidedMode::Collection))
+                .unwrap();
+            drop(connection);
+            assert!(matches!(
+                control.try_recv(),
+                Ok(SessionControl::BrowserGone)
+            ));
+        }
+        lease.finish(SessionExit::Completed);
+    }
+
+    #[test]
+    fn stale_pause_callback_cannot_pause_a_replacement_session() {
+        let (manager, guided_sessions) = bare_manager("stale-pause");
+        let old = guided_sessions
+            .acquire_current(GuidedMode::Collection, None)
+            .unwrap();
+        let old_binding = old.binding().clone();
+        old.finish(SessionExit::Completed);
+        let replacement = guided_sessions
+            .acquire_current(GuidedMode::Collection, None)
+            .unwrap();
+        let mut control = pretend_running(&manager, replacement.binding().session_id);
+
+        manager.pause_for_no_visible_views(&old_binding);
+        assert!(control.try_recv().is_err());
+        manager.pause_for_no_visible_views(replacement.binding());
         assert!(matches!(
             control.try_recv(),
             Ok(SessionControl::BrowserGone)
         ));
-        drop(manager.attach_browser());
-        assert!(matches!(
-            control.try_recv(),
-            Ok(SessionControl::BrowserGone)
-        ));
+        replacement.finish(SessionExit::Completed);
+    }
+
+    #[tokio::test]
+    async fn supervised_task_panic_restores_phase_and_releases_lease() {
+        for running in [false, true] {
+            let (manager, guided_sessions) = bare_manager(if running {
+                "running-panic"
+            } else {
+                "arming-panic"
+            });
+            let lease = guided_sessions
+                .acquire_current(GuidedMode::Collection, None)
+                .unwrap();
+            let session_id = lease.binding().session_id;
+            if running {
+                let _control = pretend_running(&manager, session_id);
+            } else {
+                manager.state.lock().unwrap().phase = Phase::Starting { session_id };
+            }
+
+            let result = std::panic::AssertUnwindSafe(async {
+                panic!("injected task panic");
+            })
+            .catch_unwind()
+            .await;
+            assert!(result.is_err());
+            drop(lease);
+            manager.restore_idle_after_task(session_id);
+
+            assert!(matches!(manager.state.lock().unwrap().phase, Phase::Idle));
+            assert!(guided_sessions.snapshot().active.is_none());
+            assert!(matches!(
+                guided_sessions.snapshot().failure,
+                Some(dashboard::guided_session::GuidedFailure {
+                    kind: dashboard::guided_session::GuidedFailureKind::TaskFailed,
+                    ..
+                })
+            ));
+        }
     }
 
     /// Channel-major blob from per-channel sample runs.

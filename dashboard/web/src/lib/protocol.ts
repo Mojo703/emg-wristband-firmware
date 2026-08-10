@@ -52,6 +52,9 @@ export const FrameType = {
   Log: 'log',
   SelectDevice: 'select_device',
   DismissDevice: 'dismiss_device',
+  GuidedViewPresence: 'guided_view_presence',
+  GuidedSessionSnapshot: 'guided_session_snapshot',
+  GuidedSessionIntent: 'guided_session_intent',
   SetSensitivity: 'set_sensitivity',
   SetKeymap: 'set_keymap',
   SetWifi: 'set_wifi',
@@ -74,13 +77,23 @@ export const FrameType = {
   Beatmap: 'beatmap',
   PlaybackPosition: 'playback_position',
   NoteResult: 'note_result',
-  CalibrationStart: 'calibration_start',
-  CalibrationAbort: 'calibration_abort',
-  CalibrationRowsRequest: 'calibration_rows_request',
-  CalibrationState: 'calibration_state',
-  CalibrationProbe: 'calibration_probe',
-  CalibrationResult: 'calibration_result',
-  CalibrationRowsDump: 'calibration_rows_dump',
+  CalibrationTimingStatus: 'calibration_timing_status',
+  CalibrationTimingIntent: 'calibration_timing_intent',
+  CalibrationTimingLoopStart: 'calibration_timing_loop_start',
+  CalibrationTimingLoopStop: 'calibration_timing_loop_stop',
+  CalibrationTimingLoopStatus: 'calibration_timing_loop_status',
+  CalibrationScheduleBegin: 'calibration_schedule_begin',
+  CalibrationScheduleChunk: 'calibration_schedule_chunk',
+  CalibrationScheduleCommit: 'calibration_schedule_commit',
+  CalibrationScheduleAccepted: 'calibration_schedule_accepted',
+  CalibrationHeartbeat: 'calibration_heartbeat',
+  CalibrationSongInterrupted: 'calibration_song_interrupted',
+  CalibrationSongResult: 'calibration_song_result',
+  CalibrationContinue: 'calibration_continue',
+  CalibrationSave: 'calibration_save',
+  CalibrationDiscard: 'calibration_discard',
+  CalibrationCandidateStatus: 'calibration_candidate_status',
+  CalibrationResidentActivated: 'calibration_resident_activated',
   PlaybackCredit: 'playback_credit',
   BenchFeatures: 'bench_features',
   BenchCommits: 'bench_commits',
@@ -223,6 +236,8 @@ export const asTrackMilliseconds = (value: number): TrackMilliseconds =>
 export const asDurationMilliseconds = (value: number): DurationMilliseconds =>
   value as DurationMilliseconds;
 export const asNoteIndex = (value: number): NoteIndex => value as NoteIndex;
+export const asOffsetMilliseconds = (value: number): OffsetMilliseconds =>
+  value as OffsetMilliseconds;
 
 /** `Date.now()`, branded as the shared wall clock it is. */
 export const nowUnixMilliseconds = (): UnixMilliseconds =>
@@ -726,16 +741,183 @@ export interface NoteResultFrame {
 }
 
 // ---------------------------------------------------------------------------
-// On-device calibration (firmware-bench/CALIBRATION-PLAN.md)
-//
-// The device paces the run; the panel starts it, aborts it, and watches. The
-// scripted-wearer schedule (calibration_cue_schedule) is bench-host only and
-// deliberately absent here, like the other host → device bench frames.
-//
-// Quality figures arrive as permille integers rather than floats, so the whole
-// calibration vocabulary survives the device's float-free inbound path and a
-// panel divides by ten to show a percentage.
+// Anchored authored calibration and the dedicated timing loop. Browser intents
+// stay backend-owned; the backend uploads schedules and forwards only the
+// guided-session lifecycle to the selected device.
 // ---------------------------------------------------------------------------
+
+export type CalibrationTimingColor = 'red' | 'green' | 'blue';
+export type CalibrationTimingState = 'stopped' | 'running';
+
+/** Device → backend: fixed RGB loop state on the device monotonic clock. */
+export interface CalibrationTimingLoopStatusFrame {
+  readonly type: 'calibration_timing_loop_status';
+  readonly status: {
+    readonly state: CalibrationTimingState;
+    readonly color: CalibrationTimingColor;
+    readonly color_elapsed_milliseconds: number;
+    readonly anchor_device_monotonic_microseconds: number;
+    readonly observed_device_monotonic_microseconds: number;
+  };
+}
+
+/** Browser-facing projection of the bounded automatic timing estimate. */
+export interface CalibrationTimingStatusFrame {
+  readonly type: 'calibration_timing_status';
+  readonly status: {
+    readonly state: CalibrationTimingState;
+    readonly color: CalibrationTimingColor;
+    readonly color_elapsed_milliseconds: number;
+    readonly anchor_device_monotonic_microseconds: number | null;
+    readonly automatic_offset_milliseconds: OffsetMilliseconds | null;
+    readonly median_round_trip_milliseconds: DurationMilliseconds | null;
+    readonly round_trip_spread_milliseconds: DurationMilliseconds | null;
+    readonly manual_trim_milliseconds: OffsetMilliseconds;
+    readonly total_correction_milliseconds: OffsetMilliseconds | null;
+    readonly probe_window: {
+      readonly sample_count: number;
+      readonly capacity: number;
+    };
+  };
+}
+
+export type CalibrationTimingIntent =
+  | { readonly name: 'start' }
+  | { readonly name: 'stop' }
+  | { readonly name: 'reset' }
+  | { readonly name: 'adjust_host_timeline'; readonly delta_milliseconds: OffsetMilliseconds };
+
+export interface CalibrationTimingIntentFrame {
+  readonly type: 'calibration_timing_intent';
+  readonly intent: CalibrationTimingIntent;
+}
+
+export interface CalibrationTimingLoopStartFrame {
+  readonly type: 'calibration_timing_loop_start';
+}
+
+export interface CalibrationTimingLoopStopFrame {
+  readonly type: 'calibration_timing_loop_stop';
+}
+
+export interface CalibrationScheduleEntry {
+  readonly cue_id: number;
+  readonly gesture: CalibrationGesture;
+  readonly modifier: 'thumb_up' | 'thumb_down';
+  readonly track_offset: TrackMilliseconds;
+  readonly hold: DurationMilliseconds;
+}
+
+export interface CalibrationScheduleBeginFrame {
+  readonly type: 'calibration_schedule_begin';
+  readonly run: CalibrationRunKey;
+  readonly schedule_revision: number;
+  readonly content_identity: string;
+  readonly total_count: number;
+}
+
+export interface CalibrationScheduleChunkFrame {
+  readonly type: 'calibration_schedule_chunk';
+  readonly run: CalibrationRunKey;
+  readonly schedule_revision: number;
+  readonly content_identity: string;
+  readonly total_count: number;
+  readonly first_entry: number;
+  readonly entries: readonly CalibrationScheduleEntry[];
+}
+
+export interface CalibrationScheduleCommitFrame {
+  readonly type: 'calibration_schedule_commit';
+  readonly run: CalibrationRunKey;
+  readonly schedule_revision: number;
+  readonly content_identity: string;
+  readonly total_count: number;
+}
+
+export interface CalibrationScheduleAcceptedFrame {
+  readonly type: 'calibration_schedule_accepted';
+  readonly accepted: {
+    readonly run: CalibrationRunKey;
+    readonly schedule_revision: number;
+    readonly content_identity: string;
+    readonly acknowledged_device_monotonic_microseconds: number;
+    readonly anchor_device_monotonic_microseconds: number;
+    readonly acquisition_sample: number;
+  };
+}
+
+export interface CalibrationHeartbeatFrame {
+  readonly type: 'calibration_heartbeat';
+  readonly heartbeat: {
+    readonly run: CalibrationRunKey;
+    readonly schedule_revision: number;
+    readonly sequence: number;
+  };
+}
+
+export interface CalibrationSongInterruptedFrame {
+  readonly type: 'calibration_song_interrupted';
+  readonly interruption: {
+    readonly run: CalibrationRunKey;
+    readonly schedule_revision: number;
+    readonly content_identity: string;
+    readonly reason:
+      | 'operator'
+      | 'heartbeat_timeout'
+      | 'device_link_lost'
+      | 'schedule_replaced';
+    readonly open_cue: number | null;
+  };
+}
+
+export interface CalibrationClassCounts {
+  readonly gesture: CalibrationGesture;
+  readonly modifier: 'thumb_up' | 'thumb_down';
+  readonly accepted_count: number;
+  readonly rejected_count: number;
+  readonly target_count: number;
+  readonly deficit_count: number;
+}
+
+export interface CalibrationCandidateValidity {
+  readonly model_numerically_valid: boolean;
+  readonly record_crc_valid: boolean;
+}
+
+export interface CalibrationSongResultFrame {
+  readonly type: 'calibration_song_result';
+  readonly result: {
+    readonly run: CalibrationRunKey;
+    readonly schedule_revision: number;
+    readonly content_identity: string;
+    readonly counts: readonly CalibrationClassCounts[];
+    readonly validity: CalibrationCandidateValidity;
+  };
+}
+
+export interface CalibrationContinueFrame { readonly type: 'calibration_continue'; readonly run: CalibrationRunKey; }
+export interface CalibrationSaveFrame { readonly type: 'calibration_save'; readonly run: CalibrationRunKey; }
+export interface CalibrationDiscardFrame { readonly type: 'calibration_discard'; readonly run: CalibrationRunKey; }
+
+export interface CalibrationCandidateStatusFrame {
+  readonly type: 'calibration_candidate_status';
+  readonly candidate: {
+    readonly run: CalibrationRunKey;
+    readonly schedule_revision: number;
+    readonly validity: CalibrationCandidateValidity;
+    readonly candidate_present: boolean;
+  };
+}
+
+export interface CalibrationResidentActivatedFrame {
+  readonly type: 'calibration_resident_activated';
+  readonly activation: {
+    readonly run: CalibrationRunKey;
+    readonly schedule_revision: number;
+    readonly validity: CalibrationCandidateValidity;
+    readonly resident_sequence: number;
+  };
+}
 
 /** The gestures a calibration collects, in the fixed order they are prompted. */
 export const CalibrationGesture = {
@@ -760,226 +942,143 @@ export const CALIBRATION_GESTURE_ORDER: readonly CalibrationGesture[] = [
   CalibrationGesture.ThumbExtension,
 ];
 
-export const CalibrationPhase = {
-  Idle: 'idle',
-  Settling: 'settling',
-  ThumbUpRounds: 'thumb_up_rounds',
-  Handover: 'handover',
-  ThumbDownRounds: 'thumb_down_rounds',
-  Polish: 'polish',
-  Install: 'install',
-  Complete: 'complete',
-  Stopped: 'stopped',
+export interface CalibrationRunKey {
+  readonly session_id: number;
+  readonly run_id: number;
+}
+
+export const GuidedMode = {
+  Collection: 'collection',
+  Calibration: 'calibration',
 } as const;
 
-export type CalibrationPhase =
-  (typeof CalibrationPhase)[keyof typeof CalibrationPhase];
+export type GuidedMode = (typeof GuidedMode)[keyof typeof GuidedMode];
 
-/** Report only. `weak` means the self-test recovers this class poorly — worth
- * showing — and changes nothing about the schedule. Not a failure either: the
- * instrument names the weak pair reliably, but its threshold is uncalibrated,
- * so it reports rather than decides. */
-export const GateStatus = {
-  Unknown: 'unknown',
-  Holding: 'holding',
-  Weak: 'weak',
-} as const;
-
-export type GateStatus = (typeof GateStatus)[keyof typeof GateStatus];
-
-/** Why a labeled span was thrown away and its gesture re-prompted. */
-export const RepRejection = {
-  AtRestBaseline: 'at_rest_baseline',
-  LeadOffChannels: 'lead_off_channels',
-  AdcRecoverySettle: 'adc_recovery_settle',
-  FlashOperationOverlap: 'flash_operation_overlap',
-  MissingSamples: 'missing_samples',
-} as const;
-
-export type RepRejection = (typeof RepRejection)[keyof typeof RepRejection];
-
-export const CalibrationOutcome = {
-  Installed: 'installed',
-  Aborted: 'aborted',
-  FrontEndLost: 'front_end_lost',
-  GestureFailed: 'gesture_failed',
-  StorageFailed: 'storage_failed',
-  FitFailed: 'fit_failed',
-} as const;
-
-export type CalibrationOutcome =
-  (typeof CalibrationOutcome)[keyof typeof CalibrationOutcome];
-
-export interface CalibrationClassState {
-  readonly gesture: CalibrationGesture;
-  readonly accepted_reps: number;
-  readonly rejected_reps: number;
-  readonly gate: GateStatus;
-  /** Reps the self-test recovered out of reps it held out; both zero while the
-   * gate is `unknown`. */
-  readonly self_test_correct: number;
-  readonly self_test_held_out: number;
+export interface GuidedViewPresenceFrame {
+  readonly type: 'guided_view_presence';
+  readonly mode: GuidedMode | null;
 }
 
-export interface InstalledSlot {
-  readonly slot: number;
-  /** Monotonic across slots; eviction overwrites the lowest. */
-  readonly sequence: number;
+export interface GuidedSessionBinding {
+  readonly session_id: number;
+  readonly run_revision: number;
+  readonly mode: GuidedMode;
+  readonly device_id: string | null;
 }
 
-/** The device's own estimate of the four numbers, in permille. A self-test over
- * the wearer's own reps, not a measurement against the golden fixtures. */
-export interface CalibrationQuality {
-  readonly false_negative_permille: number;
-  readonly misclassification_permille: number;
-  readonly false_fire_permille: number;
-  /** Anything but zero is a regression against the golden baseline. */
-  readonly rest_commits: number;
+export interface GuidedSessionFailure {
+  readonly run_revision: number;
+  readonly mode: GuidedMode;
+  readonly kind: 'dependency_failed' | 'task_failed';
+  readonly detail: string;
 }
 
-/** The last rep the run threw away, with enough attached to name it. */
-export interface RejectedRep {
-  readonly reason: RepRejection;
-  readonly gesture: CalibrationGesture;
-  /** Counting from zero within its block. */
-  readonly round: number;
+export interface GuidedCalibrationTrack {
+  readonly id: string;
+  readonly title: string;
+  readonly beats_per_minute: number;
+  readonly duration_ms: number;
+  readonly cue_count: number;
+  readonly content_identity: string;
+  readonly cue_shortfall: number;
 }
 
-/** One stored calibration as the reuse probe sees it. Information only. */
-export interface SlotProbe {
-  readonly slot: number;
-  readonly sequence: number;
-  /** How well this don's settling samples match the slot's stored statistics,
-   * in permille; a thousand is a perfect match. */
-  readonly match_quality_permille: number;
-  /** Spine commits over the probe window. The wearer was asked to hold still,
-   * so anything above zero is the stored calibration firing at nothing. */
-  readonly spine_commits: number;
+export interface GuidedCalibrationLane {
+  readonly visual_lane: 0 | 1 | 2 | 3 | 4;
+  readonly id: string;
+  readonly label: string;
+  readonly color_name: string;
+  readonly motion: GestureMotion | null;
 }
 
-export interface ClassPair {
-  readonly first: CalibrationGesture;
-  readonly second: CalibrationGesture;
+export interface GuidedCalibrationCue {
+  readonly visual_lane: 0 | 1 | 2 | 3 | 4;
+  readonly at: number;
+  readonly hold: number;
+  readonly thumb_variant: 'up' | 'down';
 }
 
-/** Where the run stands. Sent on every phase change, prompt, and rejection, and
- * periodically in between. */
-export interface CalibrationStateFrame {
-  readonly type: 'calibration_state';
-  readonly phase: CalibrationPhase;
-  readonly round: number;
-  readonly rounds_planned: number;
-  /** The validated floor for this block — ten thumb-up, twelve thumb-down.
-   * Equal to `rounds_planned`, always: the gate reports and never changes the
-   * round count. Both travel because progress wants a denominator and an
-   * explanation wants the floor. */
-  readonly round_floor: number;
-  readonly prompt: CalibrationGesture | null;
-  /** Changes on every prompt. Two prompts for the same gesture are otherwise
-   * indistinguishable, so this counter is what makes the second one an event. */
-  readonly prompt_generation: number;
-  /** How long to hold the gesture, in milliseconds. Longer than the labeled
-   * span on purpose — the span starts at the first grid boundary after the
-   * hold-off, so a prompt's alignment pushes the last labeled window later.
-   * Render this rather than a local constant. */
-  readonly prompt_hold_milliseconds: number;
-  /** Device-clock time left for settling or handover. Other phases use their
-   * rep or fit counters instead of inventing a time estimate. */
-  readonly phase_remaining_milliseconds: number | null;
-  readonly classes: readonly CalibrationClassState[];
-  readonly accepted_reps: number;
-  readonly rejected_reps: number;
-  readonly last_rejection: RejectedRep | null;
-  readonly fit_passes_done: number;
-  readonly fit_passes_planned: number;
-  readonly pass_milliseconds: number;
-  /** Flushes happen strictly between rounds, so this is what proves no labeled
-   * window overlapped one. */
-  readonly flash_flushes: number;
-  readonly elapsed_milliseconds: number;
+export interface GuidedCalibrationCount {
+  readonly class_id: string;
+  readonly label: string;
+  readonly thumb_up: number;
+  readonly thumb_down: number;
+  readonly invalid: number;
 }
 
-/** The run is over, whichever way it ended. */
-export interface CalibrationResultFrame {
-  readonly type: 'calibration_result';
-  readonly outcome: CalibrationOutcome;
-  readonly installed: InstalledSlot | null;
-  readonly rounds_completed: number;
-  readonly rows_stored: number;
-  readonly accepted_reps: number;
-  readonly rejected_reps: number;
-  readonly quality: CalibrationQuality | null;
-  /** The two classes the self-test confused most — what a wearer can act on. */
-  readonly weak_pair: ClassPair | null;
-  readonly classes: readonly CalibrationClassState[];
-  readonly fit_wall_milliseconds: number;
-  /** Whether whatever was installed before this run still is. The slot
-   * protocol guarantees it for every outcome but `installed`; it travels so
-   * the panel states the promise from the device rather than in its own copy. */
-  readonly previous_retained: boolean;
+export type GuidedCalibrationSnapshot =
+  | {
+      readonly phase: 'setup';
+      readonly tracks: readonly GuidedCalibrationTrack[];
+      readonly selected_track_id: string | null;
+    }
+  | {
+      readonly phase: 'playing';
+      readonly track: GuidedCalibrationTrack;
+      readonly lanes: readonly [
+        GuidedCalibrationLane,
+        GuidedCalibrationLane,
+        GuidedCalibrationLane,
+        GuidedCalibrationLane,
+        GuidedCalibrationLane,
+      ];
+      readonly cues: readonly GuidedCalibrationCue[];
+      readonly position_ms: number;
+      readonly valid_reps: number;
+      readonly invalid_reps: number;
+      readonly paused_reason: string | null;
+      readonly counts: readonly GuidedCalibrationCount[];
+    }
+  | {
+      readonly phase: 'between_songs';
+      readonly track_title: string;
+      readonly candidate_available: boolean;
+      readonly continue_available: boolean;
+      readonly valid_reps: number;
+      readonly invalid_reps: number;
+      readonly deficits: readonly string[];
+    }
+  | {
+      readonly phase: 'technical_failure';
+      readonly detail: string;
+    };
+
+export interface GuidedSessionSnapshot {
+  readonly revision: number;
+  readonly run_revision: number;
+  readonly active: GuidedSessionBinding | null;
+  readonly visible_collection_views: number;
+  readonly visible_calibration_views: number;
+  readonly failure: GuidedSessionFailure | null;
+  readonly calibration: GuidedCalibrationSnapshot | null;
 }
 
-/**
- * What the reuse probe made of the stored calibrations, measured against this
- * don's own settling samples. Reuse ships disabled — the accept threshold
- * cannot be set honestly from the data that exists — and `reuse_enabled` says
- * so from the frame.
- */
-export interface CalibrationProbeFrame {
-  readonly type: 'calibration_probe';
-  readonly reuse_enabled: boolean;
-  readonly slots: readonly SlotProbe[];
+export interface GuidedSessionSnapshotFrame {
+  readonly type: 'guided_session_snapshot';
+  readonly snapshot: GuidedSessionSnapshot;
 }
 
-/**
- * A stored slot's record and a run of its rows. `record` and `rows` are the
- * slot's own on-flash bytes, so a host replays what the device fitted on rather
- * than a re-encoding of it.
- */
-export interface CalibrationRowsDumpFrame {
-  readonly type: 'calibration_rows_dump';
-  readonly slot: number;
-  readonly sequence: number;
-  /** The prior image the slot was built against; a host replaying these rows
-   * has to know which prior they mean. */
-  readonly prior_hash: number;
-  /** False when the CRC or prior hash did not check out. The rows still travel
-   * — a torn slot is the interesting case — but nothing in them is trustworthy. */
-  readonly valid: boolean;
-  readonly record: Uint8Array;
-  readonly first_row: number;
-  readonly row_count: number;
-  readonly total_rows: number;
-  readonly row_stride: number;
-  /** 0 float32, 1 float16, 2 int8. */
-  readonly precision: number;
-  readonly rows: Uint8Array;
-}
+export type GuidedSessionAction =
+  | { readonly name: 'select_calibration_track'; readonly track_id: string }
+  | { readonly name: 'start_calibration' }
+  | { readonly name: 'pause_calibration' }
+  | { readonly name: 'resume_calibration' }
+  | { readonly name: 'save_calibration' }
+  | { readonly name: 'continue_calibration' }
+  | { readonly name: 'discard_calibration' };
 
-/** Browser → device: begin a calibration run. */
-export interface CalibrationStartFrame {
-  readonly type: 'calibration_start';
-  /** Always false from a browser: the scripted wearer is the bench host's. */
-  readonly scripted_wearer: boolean;
-}
-
-/** Browser → device: stop now. The previous calibration stays installed. */
-export interface CalibrationAbortFrame {
-  readonly type: 'calibration_abort';
-}
-
-/** Browser → device: send back a stored slot's record and rows. */
-export interface CalibrationRowsRequestFrame {
-  readonly type: 'calibration_rows_request';
-  readonly slot: number;
-  readonly first_row: number;
-  readonly max_rows: number;
+export interface GuidedSessionIntentFrame {
+  readonly type: 'guided_session_intent';
+  readonly expected_revision: number;
+  readonly expected_run_revision: number;
+  readonly expected_session_id: number | null;
+  readonly action: GuidedSessionAction;
 }
 
 export type OutgoingFrame =
-  | CalibrationStartFrame
-  | CalibrationAbortFrame
-  | CalibrationRowsRequestFrame
+  | GuidedViewPresenceFrame
+  | GuidedSessionIntentFrame
+  | CalibrationTimingIntentFrame
   | SelectDeviceFrame
   | DismissDeviceFrame
   | SetSensitivityFrame
@@ -1105,6 +1204,7 @@ export interface BenchErrorFrame {
 }
 
 export type IncomingFrame =
+  | GuidedSessionSnapshotFrame
   | HelloFrame
   | EmgFrame
   | PredictionFrame
@@ -1120,10 +1220,13 @@ export type IncomingFrame =
   | PlaybackPositionFrame
   | AudioSettingsFrame
   | NoteResultFrame
-  | CalibrationStateFrame
-  | CalibrationProbeFrame
-  | CalibrationResultFrame
-  | CalibrationRowsDumpFrame
+  | CalibrationTimingStatusFrame
+  | CalibrationTimingLoopStatusFrame
+  | CalibrationScheduleAcceptedFrame
+  | CalibrationSongInterruptedFrame
+  | CalibrationSongResultFrame
+  | CalibrationCandidateStatusFrame
+  | CalibrationResidentActivatedFrame
   | PlaybackCreditFrame
   | BenchFeaturesFrame
   | BenchCommitsFrame
@@ -1151,6 +1254,14 @@ function hasType(value: unknown, type: string): boolean {
 
 function isNumber(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value);
+}
+
+function isPositiveInteger(value: unknown): value is number {
+  return isNumber(value) && Number.isInteger(value) && value > 0;
+}
+
+function isNonnegativeInteger(value: unknown): value is number {
+  return isNumber(value) && Number.isInteger(value) && value >= 0;
 }
 
 function isBoolean(value: unknown): value is boolean {
@@ -1501,6 +1612,167 @@ function isGestureMotion(value: unknown): value is GestureMotion {
   return isObject(value) && isMotionArrow(value['arrow']) && isString(value['hint']);
 }
 
+function isGuidedMode(value: unknown): value is GuidedMode {
+  return Object.values<string>(GuidedMode).includes(value as string);
+}
+
+function isGuidedCalibrationTrack(value: unknown): value is GuidedCalibrationTrack {
+  return (
+    isObject(value) &&
+    isString(value['id']) &&
+    isString(value['title']) &&
+    isPositiveInteger(value['beats_per_minute']) &&
+    isNonnegativeInteger(value['duration_ms']) &&
+    isNonnegativeInteger(value['cue_count']) &&
+    isString(value['content_identity']) &&
+    /^[0-9a-f]{64}$/.test(value['content_identity']) &&
+    isNonnegativeInteger(value['cue_shortfall'])
+  );
+}
+
+function isVisualLane(value: unknown): value is 0 | 1 | 2 | 3 | 4 {
+  return isNonnegativeInteger(value) && value <= 4;
+}
+
+function isGuidedCalibrationLane(value: unknown): value is GuidedCalibrationLane {
+  return (
+    isObject(value) &&
+    isVisualLane(value['visual_lane']) &&
+    isString(value['id']) &&
+    isString(value['label']) &&
+    isString(value['color_name']) &&
+    (value['motion'] === null || isGestureMotion(value['motion']))
+  );
+}
+
+function isGuidedCalibrationCue(value: unknown): value is GuidedCalibrationCue {
+  return (
+    isObject(value) &&
+    isVisualLane(value['visual_lane']) &&
+    isNonnegativeInteger(value['at']) &&
+    isPositiveInteger(value['hold']) &&
+    (value['thumb_variant'] === 'up' || value['thumb_variant'] === 'down')
+  );
+}
+
+function isGuidedCalibrationCount(value: unknown): value is GuidedCalibrationCount {
+  return (
+    isObject(value) &&
+    isString(value['class_id']) &&
+    isString(value['label']) &&
+    isNonnegativeInteger(value['thumb_up']) &&
+    isNonnegativeInteger(value['thumb_down']) &&
+    isNonnegativeInteger(value['invalid'])
+  );
+}
+
+export function isGuidedCalibrationSnapshot(
+  value: unknown,
+): value is GuidedCalibrationSnapshot {
+  if (!isObject(value)) return false;
+  switch (value['phase']) {
+    case 'setup':
+      return (
+        Array.isArray(value['tracks']) &&
+        value['tracks'].every(isGuidedCalibrationTrack) &&
+        (value['selected_track_id'] === null || isString(value['selected_track_id']))
+      );
+    case 'playing': {
+      if (
+        !isGuidedCalibrationTrack(value['track']) ||
+        !Array.isArray(value['lanes']) ||
+        value['lanes'].length !== 5 ||
+        !value['lanes'].every(isGuidedCalibrationLane)
+      ) {
+        return false;
+      }
+      const lanes = value['lanes'] as readonly GuidedCalibrationLane[];
+      return (
+        lanes.every((lane, index) => lane.visual_lane === index) &&
+        Array.isArray(value['cues']) &&
+        value['cues'].every(isGuidedCalibrationCue) &&
+        isNonnegativeInteger(value['position_ms']) &&
+        isNonnegativeInteger(value['valid_reps']) &&
+        isNonnegativeInteger(value['invalid_reps']) &&
+        (value['paused_reason'] === null || isString(value['paused_reason'])) &&
+        Array.isArray(value['counts']) &&
+        value['counts'].every(isGuidedCalibrationCount)
+      );
+    }
+    case 'between_songs':
+      return (
+        isString(value['track_title']) &&
+        isBoolean(value['candidate_available']) &&
+        isBoolean(value['continue_available']) &&
+        isNonnegativeInteger(value['valid_reps']) &&
+        isNonnegativeInteger(value['invalid_reps']) &&
+        isStringArray(value['deficits'])
+      );
+    case 'technical_failure':
+      return isString(value['detail']);
+    default:
+      return false;
+  }
+}
+
+function isGuidedSessionBinding(value: unknown): value is GuidedSessionBinding {
+  return (
+    isObject(value) &&
+    isPositiveInteger(value['session_id']) &&
+    isPositiveInteger(value['run_revision']) &&
+    isGuidedMode(value['mode']) &&
+    (value['device_id'] === null || isString(value['device_id']))
+  );
+}
+
+function isGuidedSessionFailure(value: unknown): value is GuidedSessionFailure {
+  return (
+    isObject(value) &&
+    isPositiveInteger(value['run_revision']) &&
+    isGuidedMode(value['mode']) &&
+    (value['kind'] === 'dependency_failed' || value['kind'] === 'task_failed') &&
+    isString(value['detail'])
+  );
+}
+
+export function isGuidedSessionSnapshotFrame(
+  value: unknown,
+): value is GuidedSessionSnapshotFrame {
+  if (!hasType(value, 'guided_session_snapshot') || !isObject(value)) return false;
+  const snapshot = value['snapshot'];
+  if (!isObject(snapshot)) return false;
+  const active = snapshot['active'];
+  const failure = snapshot['failure'];
+  return (
+    isNonnegativeInteger(snapshot['revision']) &&
+    isNonnegativeInteger(snapshot['run_revision']) &&
+    (active === null || isGuidedSessionBinding(active)) &&
+    (active === null || active.run_revision === snapshot['run_revision']) &&
+    isNonnegativeInteger(snapshot['visible_collection_views']) &&
+    isNonnegativeInteger(snapshot['visible_calibration_views']) &&
+    (failure === null || isGuidedSessionFailure(failure)) &&
+    (snapshot['calibration'] === null ||
+      isGuidedCalibrationSnapshot(snapshot['calibration']))
+  );
+}
+
+function isGuidedSessionAction(value: unknown): value is GuidedSessionAction {
+  if (!isObject(value)) return false;
+  switch (value['name']) {
+    case 'select_calibration_track':
+      return isString(value['track_id']);
+    case 'start_calibration':
+    case 'pause_calibration':
+    case 'resume_calibration':
+    case 'save_calibration':
+    case 'continue_calibration':
+    case 'discard_calibration':
+      return true;
+    default:
+      return false;
+  }
+}
+
 function isCollectionClass(value: unknown): value is CollectionClass {
   return (
     isObject(value) &&
@@ -1714,6 +1986,18 @@ function isDifficultyLevel(value: unknown): value is DifficultyLevel {
 export function isOutgoingFrame(value: unknown): value is OutgoingFrame {
   if (!isObject(value)) return false;
   switch (value['type']) {
+    case 'guided_view_presence':
+      return value['mode'] === null || isGuidedMode(value['mode']);
+    case 'guided_session_intent':
+      return (
+        isNonnegativeInteger(value['expected_revision']) &&
+        isNonnegativeInteger(value['expected_run_revision']) &&
+        (value['expected_session_id'] === null ||
+          isPositiveInteger(value['expected_session_id'])) &&
+        isGuidedSessionAction(value['action'])
+      );
+    case 'calibration_timing_intent':
+      return isCalibrationTimingIntent(value['intent']);
     case 'select_device':
       return isString(value['device_id']);
     case 'dismiss_device':
@@ -1755,167 +2039,211 @@ export function isOutgoingFrame(value: unknown): value is OutgoingFrame {
       return isNumber(value['volume_permille']);
     case 'set_audio_output':
       return value['output'] === null || isString(value['output']);
-    case 'calibration_start':
-      return isBoolean(value['scripted_wearer']);
-    case 'calibration_abort':
-      return true;
-    case 'calibration_rows_request':
-      return (
-        isNumber(value['slot']) &&
-        isNumber(value['first_row']) &&
-        isNumber(value['max_rows'])
-      );
     default:
       return false;
   }
 }
 
-function isCalibrationGesture(value: unknown): value is CalibrationGesture {
-  return CALIBRATION_GESTURE_ORDER.includes(value as CalibrationGesture);
-}
-
-function isCalibrationClassState(
-  value: unknown,
-): value is CalibrationClassState {
+function isCalibrationRunKey(value: unknown): value is CalibrationRunKey {
   return (
     isObject(value) &&
-    isCalibrationGesture(value['gesture']) &&
-    isNumber(value['accepted_reps']) &&
-    isNumber(value['rejected_reps']) &&
-    isString(value['gate']) &&
-    Object.values(GateStatus).includes(value['gate'] as GateStatus) &&
-    isNumber(value['self_test_correct']) &&
-    isNumber(value['self_test_held_out'])
+    isPositiveInteger(value['session_id']) &&
+    isPositiveInteger(value['run_id'])
   );
 }
 
-function isCalibrationClassStateArray(
-  value: unknown,
-): value is readonly CalibrationClassState[] {
-  return Array.isArray(value) && value.every(isCalibrationClassState);
-}
-
-function isInstalledSlot(value: unknown): value is InstalledSlot {
-  return isObject(value) && isNumber(value['slot']) && isNumber(value['sequence']);
-}
-
-function isCalibrationQuality(value: unknown): value is CalibrationQuality {
+function isCalibrationTimingIntent(value: unknown): value is CalibrationTimingIntent {
+  if (!isObject(value) || !isString(value['name'])) return false;
+  if (['start', 'stop', 'reset'].includes(value['name'])) return true;
   return (
-    isObject(value) &&
-    isNumber(value['false_negative_permille']) &&
-    isNumber(value['misclassification_permille']) &&
-    isNumber(value['false_fire_permille']) &&
-    isNumber(value['rest_commits'])
+    value['name'] === 'adjust_host_timeline' &&
+    isInteger(value['delta_milliseconds']) &&
+    [5, -5, 50, -50].includes(value['delta_milliseconds'])
   );
 }
 
-function isClassPair(value: unknown): value is ClassPair {
+function isInteger(value: unknown): value is number {
+  return isNumber(value) && Number.isInteger(value);
+}
+
+function isCalibrationScheduleEntry(value: unknown): value is CalibrationScheduleEntry {
   return (
     isObject(value) &&
-    isCalibrationGesture(value['first']) &&
-    isCalibrationGesture(value['second'])
+    isPositiveInteger(value['cue_id']) &&
+    Object.values(CalibrationGesture).includes(value['gesture'] as CalibrationGesture) &&
+    (value['modifier'] === 'thumb_up' || value['modifier'] === 'thumb_down') &&
+    isNonnegativeInteger(value['track_offset']) &&
+    isPositiveInteger(value['hold'])
   );
 }
 
-export function isCalibrationStateFrame(
+function isContentIdentity(value: unknown): value is string {
+  return isString(value) && value.length > 0;
+}
+
+export function isCalibrationTimingStatusFrame(
   value: unknown,
-): value is CalibrationStateFrame {
+): value is CalibrationTimingStatusFrame {
   return (
-    hasType(value, 'calibration_state') &&
+    hasType(value, 'calibration_timing_status') &&
     isObject(value) &&
-    Object.values(CalibrationPhase).includes(
-      value['phase'] as CalibrationPhase,
+    isObject(value['status']) &&
+    (value['status']['state'] === 'stopped' || value['status']['state'] === 'running') &&
+    ['red', 'green', 'blue'].includes(value['status']['color'] as string) &&
+    isNonnegativeInteger(value['status']['color_elapsed_milliseconds']) &&
+    value['status']['color_elapsed_milliseconds'] < 500 &&
+    (value['status']['anchor_device_monotonic_microseconds'] === null ||
+      isNonnegativeInteger(value['status']['anchor_device_monotonic_microseconds'])) &&
+    (value['status']['automatic_offset_milliseconds'] === null ||
+      isInteger(value['status']['automatic_offset_milliseconds'])) &&
+    (value['status']['median_round_trip_milliseconds'] === null ||
+      isNonnegativeInteger(value['status']['median_round_trip_milliseconds'])) &&
+    (value['status']['round_trip_spread_milliseconds'] === null ||
+      isNonnegativeInteger(value['status']['round_trip_spread_milliseconds'])) &&
+    isInteger(value['status']['manual_trim_milliseconds']) &&
+    Math.abs(value['status']['manual_trim_milliseconds']) <= 1000 &&
+    (value['status']['total_correction_milliseconds'] === null ||
+      isInteger(value['status']['total_correction_milliseconds'])) &&
+    isObject(value['status']['probe_window']) &&
+    isNonnegativeInteger(value['status']['probe_window']['sample_count']) &&
+    isPositiveInteger(value['status']['probe_window']['capacity']) &&
+    value['status']['probe_window']['capacity'] === 11 &&
+    value['status']['probe_window']['sample_count'] <=
+      value['status']['probe_window']['capacity']
+  );
+}
+
+export function isCalibrationTimingLoopStatusFrame(
+  value: unknown,
+): value is CalibrationTimingLoopStatusFrame {
+  return (
+    hasType(value, 'calibration_timing_loop_status') &&
+    isObject(value) &&
+    isObject(value['status']) &&
+    (value['status']['state'] === 'stopped' || value['status']['state'] === 'running') &&
+    ['red', 'green', 'blue'].includes(value['status']['color'] as string) &&
+    isNonnegativeInteger(value['status']['color_elapsed_milliseconds']) &&
+    value['status']['color_elapsed_milliseconds'] < 500 &&
+    isNonnegativeInteger(value['status']['anchor_device_monotonic_microseconds']) &&
+    isNonnegativeInteger(value['status']['observed_device_monotonic_microseconds'])
+  );
+}
+
+export function isCalibrationScheduleChunkFrame(
+  value: unknown,
+): value is CalibrationScheduleChunkFrame {
+  return (
+    hasType(value, 'calibration_schedule_chunk') &&
+    isObject(value) &&
+    isCalibrationRunKey(value['run']) &&
+    isPositiveInteger(value['schedule_revision']) &&
+    isContentIdentity(value['content_identity']) &&
+    isNonnegativeInteger(value['total_count']) &&
+    isNonnegativeInteger(value['first_entry']) &&
+    Array.isArray(value['entries']) &&
+    value['entries'].length > 0 &&
+    value['entries'].length <= 32 &&
+    value['entries'].every(isCalibrationScheduleEntry)
+  );
+}
+
+function isReplacementCalibrationIdentity(value: unknown): boolean {
+  return (
+    isCalibrationRunKey((value as Record<string, unknown>)['run']) &&
+    isPositiveInteger((value as Record<string, unknown>)['schedule_revision'])
+  );
+}
+
+export function isCalibrationScheduleAcceptedFrame(
+  value: unknown,
+): value is CalibrationScheduleAcceptedFrame {
+  return (
+    hasType(value, 'calibration_schedule_accepted') && isObject(value) &&
+    isObject(value['accepted']) &&
+    isReplacementCalibrationIdentity(value['accepted']) &&
+    isContentIdentity(value['accepted']['content_identity']) &&
+    isNonnegativeInteger(value['accepted']['acknowledged_device_monotonic_microseconds']) &&
+    isNonnegativeInteger(value['accepted']['anchor_device_monotonic_microseconds']) &&
+    isNonnegativeInteger(value['accepted']['acquisition_sample'])
+  );
+}
+
+export function isCalibrationHeartbeatFrame(value: unknown): value is CalibrationHeartbeatFrame {
+  return (
+    hasType(value, 'calibration_heartbeat') && isObject(value) && isObject(value['heartbeat']) &&
+    isReplacementCalibrationIdentity(value['heartbeat']) &&
+    isNonnegativeInteger(value['heartbeat']['sequence'])
+  );
+}
+
+export function isCalibrationSongInterruptedFrame(
+  value: unknown,
+): value is CalibrationSongInterruptedFrame {
+  return (
+    hasType(value, 'calibration_song_interrupted') && isObject(value) &&
+    isObject(value['interruption']) &&
+    isReplacementCalibrationIdentity(value['interruption']) &&
+    isContentIdentity(value['interruption']['content_identity']) &&
+    ['operator', 'heartbeat_timeout', 'device_link_lost', 'schedule_replaced'].includes(
+      value['interruption']['reason'] as string,
     ) &&
-    isNumber(value['round']) &&
-    isNumber(value['rounds_planned']) &&
-    isNumber(value['round_floor']) &&
-    (value['prompt'] === null || isCalibrationGesture(value['prompt'])) &&
-    isNumber(value['prompt_generation']) &&
-    isNumber(value['prompt_hold_milliseconds']) &&
-    (value['phase_remaining_milliseconds'] === null ||
-      isNumber(value['phase_remaining_milliseconds'])) &&
-    isCalibrationClassStateArray(value['classes']) &&
-    isNumber(value['accepted_reps']) &&
-    isNumber(value['rejected_reps']) &&
-    (value['last_rejection'] === null || isRejectedRep(value['last_rejection'])) &&
-    isNumber(value['fit_passes_done']) &&
-    isNumber(value['fit_passes_planned']) &&
-    isNumber(value['pass_milliseconds']) &&
-    isNumber(value['flash_flushes']) &&
-    isNumber(value['elapsed_milliseconds'])
+    (value['interruption']['open_cue'] === null ||
+      isPositiveInteger(value['interruption']['open_cue']))
   );
 }
 
-function isRejectedRep(value: unknown): value is RejectedRep {
+function isCalibrationClassCounts(value: unknown): value is CalibrationClassCounts {
   return (
     isObject(value) &&
-    Object.values(RepRejection).includes(value['reason'] as RepRejection) &&
-    isCalibrationGesture(value['gesture']) &&
-    isNumber(value['round'])
+    Object.values(CalibrationGesture).includes(value['gesture'] as CalibrationGesture) &&
+    (value['modifier'] === 'thumb_up' || value['modifier'] === 'thumb_down') &&
+    isNonnegativeInteger(value['accepted_count']) &&
+    isNonnegativeInteger(value['rejected_count']) &&
+    isNonnegativeInteger(value['target_count']) &&
+    isNonnegativeInteger(value['deficit_count'])
   );
 }
 
-function isSlotProbe(value: unknown): value is SlotProbe {
+function isCalibrationCandidateValidity(value: unknown): value is CalibrationCandidateValidity {
   return (
     isObject(value) &&
-    isNumber(value['slot']) &&
-    isNumber(value['sequence']) &&
-    isNumber(value['match_quality_permille']) &&
-    isNumber(value['spine_commits'])
+    isBoolean(value['model_numerically_valid']) &&
+    isBoolean(value['record_crc_valid'])
   );
 }
 
-export function isCalibrationProbeFrame(
+export function isCalibrationSongResultFrame(value: unknown): value is CalibrationSongResultFrame {
+  return (
+    hasType(value, 'calibration_song_result') && isObject(value) && isObject(value['result']) &&
+    isReplacementCalibrationIdentity(value['result']) &&
+    isContentIdentity(value['result']['content_identity']) &&
+    Array.isArray(value['result']['counts']) &&
+    value['result']['counts'].every(isCalibrationClassCounts) &&
+    isCalibrationCandidateValidity(value['result']['validity'])
+  );
+}
+
+export function isCalibrationCandidateStatusFrame(
   value: unknown,
-): value is CalibrationProbeFrame {
+): value is CalibrationCandidateStatusFrame {
   return (
-    hasType(value, 'calibration_probe') &&
-    isObject(value) &&
-    isBoolean(value['reuse_enabled']) &&
-    Array.isArray(value['slots']) &&
-    value['slots'].every(isSlotProbe)
+    hasType(value, 'calibration_candidate_status') && isObject(value) &&
+    isObject(value['candidate']) &&
+    isReplacementCalibrationIdentity(value['candidate']) &&
+    isCalibrationCandidateValidity(value['candidate']['validity']) &&
+    isBoolean(value['candidate']['candidate_present'])
   );
 }
 
-export function isCalibrationResultFrame(
+export function isCalibrationResidentActivatedFrame(
   value: unknown,
-): value is CalibrationResultFrame {
+): value is CalibrationResidentActivatedFrame {
   return (
-    hasType(value, 'calibration_result') &&
-    isObject(value) &&
-    Object.values(CalibrationOutcome).includes(
-      value['outcome'] as CalibrationOutcome,
-    ) &&
-    (value['installed'] === null || isInstalledSlot(value['installed'])) &&
-    isNumber(value['rounds_completed']) &&
-    isNumber(value['rows_stored']) &&
-    isNumber(value['accepted_reps']) &&
-    isNumber(value['rejected_reps']) &&
-    (value['quality'] === null || isCalibrationQuality(value['quality'])) &&
-    (value['weak_pair'] === null || isClassPair(value['weak_pair'])) &&
-    isCalibrationClassStateArray(value['classes']) &&
-    isNumber(value['fit_wall_milliseconds']) &&
-    isBoolean(value['previous_retained'])
-  );
-}
-
-export function isCalibrationRowsDumpFrame(
-  value: unknown,
-): value is CalibrationRowsDumpFrame {
-  return (
-    hasType(value, 'calibration_rows_dump') &&
-    isObject(value) &&
-    isNumber(value['slot']) &&
-    isNumber(value['sequence']) &&
-    isNumber(value['prior_hash']) &&
-    isBoolean(value['valid']) &&
-    isUint8Array(value['record']) &&
-    isNumber(value['first_row']) &&
-    isNumber(value['row_count']) &&
-    isNumber(value['total_rows']) &&
-    isNumber(value['row_stride']) &&
-    isNumber(value['precision']) &&
-    isUint8Array(value['rows'])
+    hasType(value, 'calibration_resident_activated') && isObject(value) &&
+    isObject(value['activation']) &&
+    isReplacementCalibrationIdentity(value['activation']) &&
+    isCalibrationCandidateValidity(value['activation']['validity']) &&
+    isNonnegativeInteger(value['activation']['resident_sequence'])
   );
 }
 
@@ -2004,6 +2332,7 @@ export function isBenchErrorFrame(value: unknown): value is BenchErrorFrame {
 }
 
 export function asIncomingFrame(value: unknown): IncomingFrame | null {
+  if (isGuidedSessionSnapshotFrame(value)) return value;
   if (isHelloFrame(value)) return value;
   if (isEmgFrame(value)) return value;
   if (isPredictionFrame(value)) return value;
@@ -2019,10 +2348,13 @@ export function asIncomingFrame(value: unknown): IncomingFrame | null {
   if (isPlaybackPositionFrame(value)) return value;
   if (isAudioSettingsFrame(value)) return value;
   if (isNoteResultFrame(value)) return value;
-  if (isCalibrationStateFrame(value)) return value;
-  if (isCalibrationProbeFrame(value)) return value;
-  if (isCalibrationResultFrame(value)) return value;
-  if (isCalibrationRowsDumpFrame(value)) return value;
+  if (isCalibrationTimingStatusFrame(value)) return value;
+  if (isCalibrationTimingLoopStatusFrame(value)) return value;
+  if (isCalibrationScheduleAcceptedFrame(value)) return value;
+  if (isCalibrationSongInterruptedFrame(value)) return value;
+  if (isCalibrationSongResultFrame(value)) return value;
+  if (isCalibrationCandidateStatusFrame(value)) return value;
+  if (isCalibrationResidentActivatedFrame(value)) return value;
   if (isPlaybackCreditFrame(value)) return value;
   if (isBenchFeaturesFrame(value)) return value;
   if (isBenchCommitsFrame(value)) return value;

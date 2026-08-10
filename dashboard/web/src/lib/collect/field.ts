@@ -23,6 +23,23 @@ import type { CollectionClass, Note, TrackMilliseconds } from '../protocol';
 /** How long a block's leading edge is on screen before it reaches the hit line. */
 export const FALL_DURATION_MILLISECONDS = 3000;
 
+export const ThumbVariant = {
+  Up: 'up',
+  Down: 'down',
+} as const;
+
+export type ThumbVariant = (typeof ThumbVariant)[keyof typeof ThumbVariant];
+
+export const VisualLane = {
+  Gesture0: 0,
+  Gesture1: 1,
+  Gesture2: 2,
+  Gesture3: 3,
+  Gesture4: 4,
+} as const;
+
+export type VisualLane = (typeof VisualLane)[keyof typeof VisualLane];
+
 /** How long a block keeps fading after its release. */
 const FADE_DURATION_MILLISECONDS = 320;
 
@@ -43,6 +60,7 @@ const STREAK_FULL = 12;
 export interface Block {
   readonly at: number;
   readonly release: number;
+  readonly thumbVariant: ThumbVariant;
 }
 
 /** One lane: a collection class and its hold blocks, ascending by onset. Built
@@ -61,6 +79,28 @@ export interface Playfield {
   readonly totalNotes: number;
 }
 
+export interface VisualLanePresentation {
+  readonly visualLane: VisualLane;
+  readonly classId: string;
+  readonly label: string;
+  readonly colorName: string;
+}
+
+export type FiveVisualLanes = readonly [
+  VisualLanePresentation,
+  VisualLanePresentation,
+  VisualLanePresentation,
+  VisualLanePresentation,
+  VisualLanePresentation,
+];
+
+export interface CuePresentation {
+  readonly visualLane: VisualLane;
+  readonly at: number;
+  readonly hold: number;
+  readonly thumbVariant: ThumbVariant;
+}
+
 /** Lanes follow the catalog order. A note whose class is not in the catalog is
  * dropped rather than guessed at. `BeatmapFrame.notes` arrives time-ordered and
  * non-overlapping (the protocol guard enforces it), so each lane's blocks come
@@ -77,7 +117,11 @@ export function buildPlayfield(
   for (const note of notes) {
     const blocks = byClassId.get(note.class_id);
     if (blocks === undefined) continue;
-    blocks.push({ at: note.at, release: note.at + note.hold });
+    blocks.push({
+      at: note.at,
+      release: note.at + note.hold,
+      thumbVariant: ThumbVariant.Up,
+    });
     totalNotes += 1;
   }
   const lanes = classes.map((collectionClass): Lane => ({
@@ -87,6 +131,78 @@ export function buildPlayfield(
     blocks: byClassId.get(collectionClass.id) ?? [],
   }));
   return { lanes, totalNotes };
+}
+
+/** Build the renderer's five-lane model from mode-neutral presentation data.
+ * Session authority remains outside this module. */
+export function buildPresentedPlayfield(
+  lanes: FiveVisualLanes,
+  cues: readonly CuePresentation[],
+): Playfield {
+  const blocks = new Map<VisualLane, Block[]>();
+  for (const lane of lanes) blocks.set(lane.visualLane, []);
+  let totalNotes = 0;
+  for (const cue of cues) {
+    const laneBlocks = blocks.get(cue.visualLane);
+    if (laneBlocks === undefined) continue;
+    laneBlocks.push({
+      at: cue.at,
+      release: cue.at + cue.hold,
+      thumbVariant: cue.thumbVariant,
+    });
+    totalNotes += 1;
+  }
+  return {
+    lanes: lanes.map((lane) => ({
+      classId: lane.classId,
+      label: lane.label,
+      colorName: lane.colorName,
+      blocks: blocks.get(lane.visualLane) ?? [],
+    })),
+    totalNotes,
+  };
+}
+
+export interface BlockBounds {
+  readonly left: number;
+  readonly width: number;
+  readonly top: number;
+  readonly bottom: number;
+}
+
+interface Point {
+  readonly x: number;
+  readonly y: number;
+}
+
+export interface ThumbDownMarkerGeometry {
+  readonly line: { readonly x: number; readonly top: number; readonly bottom: number };
+  readonly diamond: {
+    readonly top: Point;
+    readonly right: Point;
+    readonly bottom: Point;
+    readonly left: Point;
+  };
+  readonly shadowLineWidth: number;
+  readonly blackLineWidth: number;
+  readonly shadowOutlineWidth: number;
+}
+
+export function thumbDownMarkerGeometry(bounds: BlockBounds): ThumbDownMarkerGeometry {
+  const centerX = bounds.left + bounds.width / 2;
+  const radius = Math.min(9, bounds.width / 2);
+  return {
+    line: { x: centerX, top: bounds.top, bottom: bounds.bottom },
+    diamond: {
+      top: { x: centerX, y: bounds.bottom - radius },
+      right: { x: centerX + radius, y: bounds.bottom },
+      bottom: { x: centerX, y: bounds.bottom + radius },
+      left: { x: centerX - radius, y: bounds.bottom },
+    },
+    shadowLineWidth: 5,
+    blackLineWidth: 2,
+    shadowOutlineWidth: 2,
+  };
 }
 
 /** Canvas chrome (anything not per-class), resolved from app.css's --canvas-*
@@ -279,6 +395,18 @@ export function renderField(context: CanvasRenderingContext2D, frame: FieldFrame
         context.fillStyle = withAlpha(color, alpha);
         context.fillRect(blockLeft, bottom - 3, blockWidth, 3);
       }
+      if (block.thumbVariant === ThumbVariant.Down) {
+        drawThumbDownMarker(
+          context,
+          thumbDownMarkerGeometry({
+            left: blockLeft,
+            width: blockWidth,
+            top: bottom - blockHeight,
+            bottom,
+          }),
+          alpha,
+        );
+      }
     }
 
     drawTargetRing(context, {
@@ -296,6 +424,37 @@ export function renderField(context: CanvasRenderingContext2D, frame: FieldFrame
       impact: holding,
     });
   }
+}
+
+function drawThumbDownMarker(
+  context: CanvasRenderingContext2D,
+  geometry: ThumbDownMarkerGeometry,
+  alpha: number,
+): void {
+  context.lineCap = 'round';
+  context.beginPath();
+  context.moveTo(geometry.line.x, geometry.line.top);
+  context.lineTo(geometry.line.x, geometry.line.bottom);
+  context.strokeStyle = `rgb(255 255 255 / ${0.82 * alpha})`;
+  context.lineWidth = geometry.shadowLineWidth;
+  context.stroke();
+  context.strokeStyle = `rgb(0 0 0 / ${alpha})`;
+  context.lineWidth = geometry.blackLineWidth;
+  context.stroke();
+  context.lineCap = 'butt';
+
+  const diamond = geometry.diamond;
+  context.beginPath();
+  context.moveTo(diamond.top.x, diamond.top.y);
+  context.lineTo(diamond.right.x, diamond.right.y);
+  context.lineTo(diamond.bottom.x, diamond.bottom.y);
+  context.lineTo(diamond.left.x, diamond.left.y);
+  context.closePath();
+  context.fillStyle = `rgb(0 0 0 / ${alpha})`;
+  context.fill();
+  context.strokeStyle = `rgb(255 255 255 / ${0.9 * alpha})`;
+  context.lineWidth = geometry.shadowOutlineWidth;
+  context.stroke();
 }
 
 interface TargetRing {

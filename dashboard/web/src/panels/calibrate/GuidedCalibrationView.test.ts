@@ -1,0 +1,133 @@
+import assert from 'node:assert/strict';
+import test, { after, before } from 'node:test';
+import { createServer, type ViteDevServer } from 'vite';
+
+import { asIncomingFrame } from '../../lib/protocol.ts';
+import type { GuidedCalibrationSnapshot } from './guidedCalibration.ts';
+import { presentGuidedCalibration } from './guidedCalibration.ts';
+
+let server: ViteDevServer;
+let originalDocument: PropertyDescriptor | undefined;
+
+before(async () => {
+  originalDocument = Object.getOwnPropertyDescriptor(globalThis, 'document');
+  Object.defineProperty(globalThis, 'document', {
+    configurable: true,
+    value: { documentElement: { setAttribute(): void {} } },
+  });
+  server = await createServer({ server: { middlewareMode: true }, appType: 'custom' });
+});
+
+after(async () => {
+  await server.close();
+  if (originalDocument === undefined) {
+    Reflect.deleteProperty(globalThis, 'document');
+  } else {
+    Object.defineProperty(globalThis, 'document', originalDocument);
+  }
+});
+
+async function modules(): Promise<{
+  render: (component: unknown, options: { props: { snapshot: GuidedCalibrationSnapshot } }) => { body: string };
+  component: unknown;
+  fixtures: Record<string, GuidedCalibrationSnapshot>;
+}> {
+  const [{ render }, component, fixtures] = await Promise.all([
+    server.ssrLoadModule('svelte/server'),
+    server.ssrLoadModule('/src/panels/calibrate/GuidedCalibrationView.svelte'),
+    server.ssrLoadModule('/src/panels/calibrate/guidedCalibrationFixtures.ts'),
+  ]);
+  return { render, component: component['default'], fixtures };
+}
+
+async function render(snapshot: GuidedCalibrationSnapshot): Promise<string> {
+  const loaded = await modules();
+  return loaded.render(loaded.component, { props: { snapshot } }).body;
+}
+
+function button(body: string, label: string): string {
+  const match = body
+    .match(/<button\b[^>]*>[\s\S]*?<\/button>/g)
+    ?.find((candidate) => candidate.includes(label));
+  assert.ok(match, `missing ${label} button`);
+  return match;
+}
+
+const DISABLED_ATTRIBUTE = /\sdisabled(?:=|(?=\s|>))/;
+
+test('setup renders tracks and disables Start without an authoritative selection', async () => {
+  const { fixtures } = await modules();
+  const setup = fixtures['calibrationSetupFixture'];
+  assert.ok(setup?.phase === 'setup');
+  const body = await render({ ...setup, selected_track_id: null });
+
+  assert.match(body, /Choose a Calibration track/);
+  assert.match(body, /Fixture Track/);
+  assert.match(button(body, 'Start calibration'), DISABLED_ATTRIBUTE);
+});
+
+test('strict authoritative wire snapshot reaches the real guided component', async () => {
+  const { fixtures } = await modules();
+  const setup = fixtures['calibrationSetupFixture'];
+  assert.ok(setup?.phase === 'setup');
+  const frame = asIncomingFrame({
+    type: 'guided_session_snapshot',
+    snapshot: {
+      revision: 7,
+      run_revision: 0,
+      active: null,
+      visible_collection_views: 0,
+      visible_calibration_views: 1,
+      failure: null,
+      calibration: setup,
+    },
+  });
+  assert.ok(frame?.type === 'guided_session_snapshot');
+  assert.notEqual(frame.snapshot.calibration, null);
+  const body = await render(presentGuidedCalibration(frame.snapshot.calibration!));
+
+  assert.match(body, /Choose a Calibration track/);
+  assert.match(body, /Fixture Track/);
+});
+
+test('playing renders a persistent thumb legend and accessible cue narration', async () => {
+  const { fixtures } = await modules();
+  const playing = fixtures['calibrationPlayingFixture'];
+  assert.ok(playing?.phase === 'playing');
+  const body = await render(playing);
+
+  assert.match(body, /aria-label="Thumb cue legend"/);
+  assert.match(body, /Thumb up/);
+  assert.match(body, /Thumb down/);
+  assert.match(body, /Current cue:/);
+  assert.match(body, /Next cue:/);
+  assert.match(body, /<canvas[^>]*aria-hidden="true"/);
+});
+
+test('song end keeps unavailable actions visible and disabled', async () => {
+  const { fixtures } = await modules();
+  const songEnd = fixtures['calibrationSongEndFixture'];
+  assert.ok(songEnd?.phase === 'between_songs');
+  const body = await render({
+    ...songEnd,
+    candidate_available: false,
+    continue_available: false,
+  });
+
+  assert.match(button(body, 'Save'), DISABLED_ATTRIBUTE);
+  assert.match(button(body, 'Continue'), DISABLED_ATTRIBUTE);
+  assert.doesNotMatch(button(body, 'Discard'), DISABLED_ATTRIBUTE);
+});
+
+test('technical failure is an alert with no candidate actions', async () => {
+  const { fixtures } = await modules();
+  const failure = fixtures['calibrationTechnicalFailureFixture'];
+  assert.ok(failure?.phase === 'technical_failure');
+  const body = await render(failure);
+
+  assert.match(body, /role="alert"/);
+  assert.match(body, /No candidate is available to save/);
+  assert.doesNotMatch(body, />Save</);
+  assert.doesNotMatch(body, />Continue</);
+  assert.doesNotMatch(body, />Discard</);
+});

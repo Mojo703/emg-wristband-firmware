@@ -10,7 +10,7 @@
   import { live, on } from '../socket.svelte';
   import { theme } from '../theme.svelte';
   import Icon from '../Icon.svelte';
-  import GestureArrow from './GestureArrow.svelte';
+  import PlayfieldView from './PlayfieldView.svelte';
   import { Button } from '$lib/components/ui/button/index.js';
   import {
     asTrackMilliseconds,
@@ -21,7 +21,7 @@
     type StreamProgress,
     type TrackMilliseconds,
   } from '../protocol';
-  import { buildPlayfield, renderField, type FieldChrome } from './field';
+  import { buildPlayfield } from './field';
 
   /** The two phases that have a field to draw. Narrowed by the shell. */
   type PlayablePhase = Extract<CollectionPhase, { name: 'armed' } | { name: 'playing' }>;
@@ -46,7 +46,6 @@
     onFinish,
   }: Props = $props();
 
-  let canvas: HTMLCanvasElement | undefined = $state(undefined);
   // Local view flags only — none of these is game state the backend also holds.
   let confirmingFinish = $state(false);
   let positionMilliseconds = $state<TrackMilliseconds>(asTrackMilliseconds(0));
@@ -63,25 +62,6 @@
   const collectionClasses = $derived(catalog.collection_classes);
   const playfield = $derived(buildPlayfield(collectionClasses, beatmap.notes));
   const laneColors = $derived(collectionClasses.map((entry) => theme.color(entry.color)));
-
-  const EMPTY_CHROME: FieldChrome = {
-    background: '', grid: '', gridFaint: '', label: '', textStrong: '',
-  };
-  // Canvas 2D cannot reference CSS variables, so app.css's --canvas-* values are
-  // resolved to literals here and recomputed only when the theme flips.
-  const chrome = $derived.by((): FieldChrome => {
-    theme.effective; // reactive dependency: recompute on a theme change
-    if (canvas === undefined) return EMPTY_CHROME;
-    const style = getComputedStyle(canvas);
-    const read = (name: string): string => style.getPropertyValue(name).trim();
-    return {
-      background: read('--canvas-bg'),
-      grid: read('--canvas-grid'),
-      gridFaint: read('--canvas-grid-faint'),
-      label: read('--canvas-label'),
-      textStrong: read('--canvas-text-strong'),
-    };
-  });
 
   const durationMilliseconds = $derived(beatmap.track.duration);
   const recording = $derived(phase.recording);
@@ -152,16 +132,7 @@
         laneMisses = { ...laneMisses, [classId]: (laneMisses[classId] ?? 0) + 1 };
       }
     });
-    let animationFrame = requestAnimationFrame(frame);
-    return () => {
-      offNoteResult();
-      cancelAnimationFrame(animationFrame);
-    };
-
-    function frame(): void {
-      animationFrame = requestAnimationFrame(frame);
-      render();
-    }
+    return offNoteResult;
   });
 
   /** Where the backend's playhead is right now. Between readings the local
@@ -177,39 +148,8 @@
     return asTrackMilliseconds(Math.max(0, reading.position_ms + ahead));
   }
 
-  function render(): void {
-    if (canvas === undefined) return;
-    const ratio = window.devicePixelRatio || 1;
-    const cssWidth = canvas.clientWidth;
-    const cssHeight = canvas.clientHeight;
-    const pixelWidth = Math.round(cssWidth * ratio);
-    const pixelHeight = Math.round(cssHeight * ratio);
-    // Assigning width/height reallocates and clears the backing store, so only
-    // touch it on a real size change.
-    if (canvas.width !== pixelWidth) canvas.width = pixelWidth;
-    if (canvas.height !== pixelHeight) canvas.height = pixelHeight;
-
-    const context = canvas.getContext('2d');
-    if (context === null) return;
-    context.setTransform(ratio, 0, 0, ratio, 0, 0); // draw in CSS pixels
-
-    const position = currentPosition();
-    // The canvas redraws every frame; the clock beside it reads in seconds, so
-    // it is only assigned when its displayed value would change. Writing it
-    // every frame would put a reactive update — and the DOM work behind it —
-    // on the same 60 Hz loop as the drawing, for text that moves once a second.
-    if (Math.floor(position / 1000) !== Math.floor(positionMilliseconds / 1000)) {
-      positionMilliseconds = position;
-    }
-    renderField(context, {
-      playfield,
-      laneColors,
-      chrome,
-      position,
-      streak,
-      width: cssWidth,
-      height: cssHeight,
-    });
+  function reportPosition(position: TrackMilliseconds): void {
+    positionMilliseconds = position;
   }
 
   function togglePause(): void {
@@ -311,22 +251,16 @@
   </div>
 
   <div class="field">
-    <canvas bind:this={canvas}></canvas>
-
-    <div class="lane-labels">
-      {#each collectionClasses as collectionClass, index (collectionClass.id)}
-        <span class="lane-label" style:color={laneColors[index]}>
-          {#if collectionClass.motion !== null}
-            <GestureArrow motion={collectionClass.motion} size={15} />
-          {/if}
-          {collectionClass.label}
-          <span class="tally muted">
-            {laneHits[collectionClass.id] ?? 0}/{(laneHits[collectionClass.id] ?? 0) +
-              (laneMisses[collectionClass.id] ?? 0)}
-          </span>
-        </span>
-      {/each}
-    </div>
+    <PlayfieldView
+      {playfield}
+      lanes={collectionClasses}
+      {laneColors}
+      {currentPosition}
+      {streak}
+      {laneHits}
+      {laneMisses}
+      onPosition={reportPosition}
+    />
 
     {#if gate === 'start'}
       <div class="gate">
@@ -424,29 +358,6 @@
      canvas paints signal only, all text lives in DOM above it. */
   .field {
     position: relative;
-  }
-  .field canvas {
-    height: 68vh;
-  }
-  .lane-labels {
-    position: absolute;
-    left: 0;
-    right: 0;
-    bottom: 6px;
-    display: flex;
-    pointer-events: none;
-  }
-  .lane-label {
-    flex: 1;
-    text-align: center;
-    font-size: 12px;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .tally {
-    margin-left: 4px;
-    font-variant-numeric: tabular-nums;
   }
   .gate {
     position: absolute;

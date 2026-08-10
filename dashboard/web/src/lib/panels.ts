@@ -8,6 +8,7 @@ import ConfigApp from '../panels/ConfigApp.svelte';
 import LogViewer from '../panels/LogViewer.svelte';
 import PoseViewer from '../panels/PoseViewer.svelte';
 import Telemetry from '../panels/Telemetry.svelte';
+import Timing from '../panels/Timing.svelte';
 
 export interface Panel {
   readonly id: string;
@@ -24,13 +25,14 @@ export interface Panel {
 export const panels: readonly Panel[] = [
   // Stream folds in the inference readout: the live confidence track + status.
   { id: 'emg', title: 'Stream', icon: 'activity', component: EmgViewer, drawsEmg: true },
-  { id: 'config', title: 'Config', icon: 'sliders', component: ConfigApp },
+  { id: 'config', title: 'Settings', icon: 'sliders', component: ConfigApp },
   // Training-data capture: the falling-notes game and its session bookkeeping.
   { id: 'collect', title: 'Collect', icon: 'play', component: Collect },
   { id: 'pose', title: 'Pose', icon: 'scan', component: PoseViewer, drawsEmg: true },
   // On-device calibration: start a run, watch the device narrate it, pull a
   // stored slot back for host replay.
   { id: 'calibrate', title: 'Calibrate', icon: 'target', component: Calibrate },
+  { id: 'timing', title: 'Timing', icon: 'clock', component: Timing },
   // Periodic device measurements as live values + session trend plots.
   { id: 'telemetry', title: 'Telemetry', icon: 'chart', component: Telemetry },
   // The device's log console (replaces the serial text monitor).

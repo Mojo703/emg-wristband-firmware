@@ -23,6 +23,14 @@ export interface ImportReport {
   readonly duration_ms: number;
   readonly difficulty_file: string;
   readonly levels: readonly LevelSummary[];
+  readonly calibration: CalibrationImportReport;
+}
+
+export interface CalibrationImportReport {
+  readonly availability: 'available';
+  readonly cue_count: number;
+  readonly content_identity: string;
+  readonly cue_shortfall: number;
 }
 
 const UPLOAD_URL = '/collection/tracks/import/upload';
@@ -47,10 +55,65 @@ function parseJson(text: string): unknown {
   }
 }
 
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+function isNonnegativeInteger(value: unknown): value is number {
+  return Number.isInteger(value) && (value as number) >= 0;
+}
+
+function isLevelSummary(value: unknown): value is LevelSummary {
+  return (
+    isObject(value) &&
+    typeof value['name'] === 'string' &&
+    isNonnegativeInteger(value['cue_count']) &&
+    isFiniteNumber(value['cues_per_second']) &&
+    value['cues_per_second'] >= 0 &&
+    isFiniteNumber(value['seconds_held']) &&
+    value['seconds_held'] >= 0 &&
+    Array.isArray(value['column_balance']) &&
+    value['column_balance'].every(isNonnegativeInteger)
+  );
+}
+
+function isCalibrationImportReport(value: unknown): value is CalibrationImportReport {
+  return (
+    isObject(value) &&
+    value['availability'] === 'available' &&
+    isNonnegativeInteger(value['cue_count']) &&
+    isNonnegativeInteger(value['cue_shortfall']) &&
+    typeof value['content_identity'] === 'string' &&
+    /^[0-9a-f]{64}$/.test(value['content_identity'])
+  );
+}
+
+export function parseImportReport(value: unknown): ImportReport {
+  if (
+    !isObject(value) ||
+    typeof value['id'] !== 'string' ||
+    typeof value['title'] !== 'string' ||
+    !isFiniteNumber(value['beats_per_minute']) ||
+    value['beats_per_minute'] <= 0 ||
+    !isNonnegativeInteger(value['duration_ms']) ||
+    typeof value['difficulty_file'] !== 'string' ||
+    !Array.isArray(value['levels']) ||
+    !value['levels'].every(isLevelSummary) ||
+    !isCalibrationImportReport(value['calibration'])
+  ) {
+    throw new Error('the dashboard backend returned an unrecognised import report');
+  }
+  return value as unknown as ImportReport;
+}
+
 async function readReport(response: Response): Promise<ImportReport> {
   const body = parseJson(await response.text());
   if (!response.ok) throw new Error(refusalMessage(body, response.status));
-  return body as ImportReport;
+  return parseImportReport(body);
 }
 
 /**
@@ -74,7 +137,11 @@ export function importUploadedArchive(
     request.onload = () => {
       const body = parseJson(request.responseText);
       if (request.status === 200) {
-        resolve(body as ImportReport);
+        try {
+          resolve(parseImportReport(body));
+        } catch (error) {
+          reject(error);
+        }
       } else {
         reject(new Error(refusalMessage(body, request.status)));
       }
