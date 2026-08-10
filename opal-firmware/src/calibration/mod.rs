@@ -72,9 +72,18 @@ use resident_selector::{
 /// round in front of the next flush and nothing more.
 const ROUND_ROW_CAPACITY: usize = 128;
 const CALIBRATION_CLASS_CAPACITY: usize = 12;
+const ANCHORED_COMMAND_TARGET: u32 = 10;
+const ANCHORED_NO_OP_TARGET: u32 = 16;
 const _: () = assert!(
     flash_image::CALIBRATION_RECIPE_ROW_CAPACITY <= flash_image::slot_row_capacity(),
     "the audited calibration recipe must fit one physical slot"
+);
+const _: () = assert!(
+    flash_image::CALIBRATION_RECIPE_ROW_CAPACITY
+        >= CalibrationGesture::ALL.len()
+            * (ANCHORED_COMMAND_TARGET + ANCHORED_NO_OP_TARGET) as usize
+            * Constants::DEFAULT.labeled_windows as usize,
+    "the flash recipe must hold every targeted anchored row"
 );
 
 /// A round has to fit, and the two numbers that decide whether it does live
@@ -155,6 +164,21 @@ fn anchored_label(entry: protocol::CalibrationScheduleEntry) -> u8 {
             CalibrationModifier::ThumbUp => 0,
             CalibrationModifier::ThumbDown => CalibrationGesture::ALL.len() as u8,
         }
+}
+
+fn anchored_class_index(entry: protocol::CalibrationScheduleEntry) -> usize {
+    usize::from(anchored_label(entry))
+}
+
+const fn anchored_target_count(modifier: CalibrationModifier) -> u32 {
+    match modifier {
+        CalibrationModifier::ThumbUp => ANCHORED_COMMAND_TARGET,
+        CalibrationModifier::ThumbDown => ANCHORED_NO_OP_TARGET,
+    }
+}
+
+const fn anchored_class_accepts_rows(accepted_count: u32, modifier: CalibrationModifier) -> bool {
+    accepted_count < anchored_target_count(modifier)
 }
 
 fn record_is_numerically_valid(record: &SlotRecord) -> bool {
@@ -1734,13 +1758,24 @@ impl Calibration {
         capture.evidence.flash_operation =
             capture.flash_microseconds_at_open != self.flash_microseconds;
         capture.evidence.windows_expected = capture.span.window_count;
-        if self.rows.capacity().saturating_sub(self.rows.len()) < self.rep_rows.len() {
+        // Continue replays a complete authored song, including classes whose
+        // quota was already met. Those clean surplus cues remain useful
+        // operator feedback, but retaining their rows would exceed the
+        // audited 130-rep/1,170-row recipe and poison the scratch slot before
+        // the candidate metadata could be committed.
+        let retain_rows = self.anchored_class_needs_rows(entry);
+        if retain_rows && self.rows.capacity().saturating_sub(self.rows.len()) < self.rep_rows.len()
+        {
             // Reuse the existing missing-samples rejection: the candidate must
             // never claim an accepted cue whose rows could not be retained.
             capture.evidence.windows_expected = capture.evidence.windows_present.saturating_add(1);
         }
         let evidence = capture.evidence;
-        let accepted_rows = self.rep_rows.len() as u32;
+        let accepted_rows = if retain_rows {
+            self.rep_rows.len() as u32
+        } else {
+            0
+        };
         let result = self
             .anchored
             .song_mut()
@@ -1748,16 +1783,21 @@ impl Calibration {
             .record_closed_evidence(evidence, accepted_rows);
         match result {
             Ok(Ok(())) => {
-                let label = anchored_label(entry);
-                let mut rows = core::mem::take(&mut self.rep_rows);
-                for features in &rows {
-                    let pushed = self.push_row(features, label);
-                    debug_assert!(pushed, "capacity was checked before anchored append");
+                if retain_rows {
+                    let label = anchored_label(entry);
+                    let mut rows = core::mem::take(&mut self.rep_rows);
+                    for features in &rows {
+                        let pushed = self.push_row(features, label);
+                        debug_assert!(pushed, "capacity was checked before anchored append");
+                    }
+                    rows.clear();
+                    self.rep_rows = rows;
+                } else {
+                    self.rep_rows.clear();
                 }
-                rows.clear();
-                self.rep_rows = rows;
-                self.anchored_count_mut(entry).accepted += 1;
-                if self.flush_anchored_rows() {
+                let count = self.anchored_count_mut(entry);
+                count.accepted = count.accepted.saturating_add(1);
+                if retain_rows && self.flush_anchored_rows() {
                     self.request_anchored_checkpoint();
                 }
             }
@@ -2057,14 +2097,19 @@ impl Calibration {
         &mut self,
         entry: protocol::CalibrationScheduleEntry,
     ) -> &mut AnchoredClassCount {
-        let index = usize::from(entry.gesture.index())
-            + match entry.modifier {
-                CalibrationModifier::ThumbUp => 0,
-                CalibrationModifier::ThumbDown => CalibrationGesture::ALL.len(),
-            };
+        let index = anchored_class_index(entry);
         self.anchored
             .count_mut(index)
             .expect("anchored class counts belong to an active run")
+    }
+
+    fn anchored_class_needs_rows(&self, entry: protocol::CalibrationScheduleEntry) -> bool {
+        let accepted = self
+            .anchored
+            .counts()
+            .expect("anchored class counts belong to an active run")[anchored_class_index(entry)]
+        .accepted;
+        anchored_class_accepts_rows(accepted, entry.modifier)
     }
 
     fn emit_anchored_interruption(
@@ -2170,10 +2215,7 @@ impl Calibration {
                     .anchored
                     .counts()
                     .expect("a song result belongs to an active run")[index];
-                let target_count = match modifier {
-                    CalibrationModifier::ThumbUp => 10,
-                    CalibrationModifier::ThumbDown => 16,
-                };
+                let target_count = anchored_target_count(modifier);
                 counts.push(CalibrationClassCounts {
                     gesture,
                     modifier,
@@ -3661,6 +3703,35 @@ mod anchored_lifecycle_tests {
             None,
             "the bounded nine-row capture must not be compared with every window in the hold"
         );
+    }
+
+    #[test]
+    fn continue_never_retains_more_than_the_audited_recipe() {
+        let constants = Constants::DEFAULT;
+        let mut retained_rows = 0usize;
+        for modifier in [CalibrationModifier::ThumbUp, CalibrationModifier::ThumbDown] {
+            let target = anchored_target_count(modifier);
+            for accepted in 0..target + 20 {
+                if anchored_class_accepts_rows(accepted, modifier) {
+                    retained_rows += constants.labeled_windows as usize;
+                }
+            }
+        }
+        retained_rows *= CalibrationGesture::ALL.len();
+
+        assert_eq!(
+            retained_rows,
+            flash_image::CALIBRATION_RECIPE_ROW_CAPACITY,
+            "surplus clean cues from Continue must not consume flash rows"
+        );
+        assert!(!anchored_class_accepts_rows(
+            ANCHORED_COMMAND_TARGET,
+            CalibrationModifier::ThumbUp
+        ));
+        assert!(!anchored_class_accepts_rows(
+            ANCHORED_NO_OP_TARGET,
+            CalibrationModifier::ThumbDown
+        ));
     }
 
     #[test]

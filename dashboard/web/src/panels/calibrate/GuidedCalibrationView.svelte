@@ -221,6 +221,12 @@
         </ul>
       </div>
     {/if}
+    {#if !snapshot.candidate_available}
+      <p class="candidate-progress" aria-live="polite">
+        Finalizing and validating the candidate on the wristband. Save will unlock when it is ready;
+        Continue remains available if you want to fill the remaining deficits.
+      </p>
+    {/if}
     <div class="track-grid" aria-label="Choose the next calibration track">
       {#each snapshot.tracks as track (track.id)}
         <button
@@ -299,6 +305,7 @@
   .eyebrow { color: var(--brand-tint-foreground); font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; }
   .deficits { display: flex; flex-direction: column; gap: 6px; }
   .deficits ul { display: grid; gap: 4px 24px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); margin: 0; padding-left: 20px; }
+  .candidate-progress { margin: 0; color: var(--muted-foreground); }
   @media (max-width: 640px) {
     .topbar { align-items: flex-start; }
     .topbar .spacer { display: none; }

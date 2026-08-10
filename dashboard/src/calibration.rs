@@ -1101,6 +1101,15 @@ impl CalibrationModeAdapter {
                             next_sequence: 0,
                         };
                     }
+                    Ok(Frame::BenchError {
+                        source: protocol::BenchErrorSource::Calibration,
+                        detail,
+                    }) => {
+                        // Candidate construction happens after SongResult. A
+                        // flash/fit failure must replace the silently disabled
+                        // Save button with an explicit terminal explanation.
+                        break SessionExit::DependencyFailed(detail);
+                    }
                     Ok(_) => {}
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         break SessionExit::DependencyFailed(
