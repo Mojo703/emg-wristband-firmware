@@ -1,8 +1,8 @@
 //! Device ingest. A device reaches the backend over one of two byte pipes — a TCP
 //! socket (wifi) or a serial port (the device's USB-Serial-JTAG CDC) — carrying the
-//! *same* framing: `protocol::FRAME_MAGIC`, a 4-byte little-endian length, then that
-//! many CBOR bytes, with resynchronization on garbage (the ESP32 ROM bootloader
-//! prints text on the CDC at reset). Both reduce to a reader/writer pair handed to
+//! *same* dual framing: deployed magic+length CBOR and integrity-protected V2, with
+//! resynchronization on garbage (the ESP32 ROM bootloader prints text on the CDC at
+//! reset). Both reduce to a reader/writer pair handed to
 //! [`framed_session`], so the link is genuinely transport-independent; only
 //! [`device_session`] knows about the registry, and it knows nothing of bytes.
 //!
@@ -15,13 +15,13 @@
 use crate::frame;
 use crate::registry::{DeviceHandle, Registry};
 use crate::timing::TimingService;
-use protocol::{DeviceTransport, Frame, FrameScanner, LogLevel};
+use protocol::{DeviceTransport, Frame, FrameScanEvent, FrameScanner, LogLevel, WireVersion};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::io::{self, Read};
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -33,6 +33,7 @@ use tokio_serial::SerialPortType;
 /// An opened CDC node is not a connected wristband until its flushed Probe
 /// produces DeviceHello. Bound the anonymous phase so it cannot pin a path.
 const DEVICE_HELLO_TIMEOUT: Duration = Duration::from_secs(5);
+const V2_PROBE_FALLBACK: Duration = Duration::from_millis(250);
 
 /// One local USB path's lifecycle. A path claim is not equivalent to a device
 /// connection: only a `DeviceHello` after the flushed Probe reaches Connected.
@@ -161,6 +162,77 @@ fn serial_frame_bytes(frame: &Frame) -> Vec<u8> {
     protocol::frame_bytes(&frame::encode(frame))
 }
 
+#[derive(Debug)]
+struct ConnectionWire {
+    selected: AtomicU8,
+    next_sequence: AtomicU32,
+}
+
+impl Default for ConnectionWire {
+    fn default() -> Self {
+        Self {
+            selected: AtomicU8::new(0),
+            next_sequence: AtomicU32::new(0),
+        }
+    }
+}
+
+impl ConnectionWire {
+    fn selected(&self) -> WireVersion {
+        if self.selected.load(Ordering::Acquire) == 1 {
+            WireVersion::V2
+        } else {
+            WireVersion::Legacy
+        }
+    }
+
+    fn observe(&self, version: WireVersion) {
+        if matches!(version, WireVersion::V2) {
+            self.selected.store(1, Ordering::Release);
+        }
+    }
+
+    fn encode(&self, frame: &Frame, forced: Option<WireVersion>) -> Vec<u8> {
+        let payload = frame::encode(frame);
+        match forced.unwrap_or_else(|| self.selected()) {
+            WireVersion::Legacy => protocol::frame_bytes(&payload),
+            WireVersion::V2 => protocol::v2_frame_bytes(
+                0,
+                self.next_sequence.fetch_add(1, Ordering::Relaxed),
+                &payload,
+            ),
+        }
+    }
+}
+
+struct OutboundFrame {
+    frame: Frame,
+    forced_wire: Option<WireVersion>,
+}
+
+#[derive(Clone)]
+struct DeviceSender(mpsc::UnboundedSender<OutboundFrame>);
+
+impl DeviceSender {
+    fn send(&self, frame: Frame) -> Result<(), ()> {
+        self.0
+            .send(OutboundFrame {
+                frame,
+                forced_wire: None,
+            })
+            .map_err(|_| ())
+    }
+
+    fn send_as(&self, frame: Frame, wire: WireVersion) -> Result<(), ()> {
+        self.0
+            .send(OutboundFrame {
+                frame,
+                forced_wire: Some(wire),
+            })
+            .map_err(|_| ())
+    }
+}
+
 /// Small dependency-free wire fingerprint for matching a host's encoded payload
 /// to the firmware scanner trace. This is diagnostic evidence, not an integrity
 /// mechanism (the production framing remains magic + length + CBOR).
@@ -184,8 +256,13 @@ const SERIAL_CONTROL_WRITE_CHUNK_BYTES: usize = 64;
 /// unchanged.
 const SERIAL_CONTROL_WRITE_PACKET_PACE: Duration = Duration::from_millis(1);
 
+#[cfg(test)]
 fn write_serial_frame(writer: &mut impl std::io::Write, frame: &Frame) -> std::io::Result<()> {
     let bytes = serial_frame_bytes(frame);
+    write_serial_bytes(writer, &bytes)
+}
+
+fn write_serial_bytes(writer: &mut impl std::io::Write, bytes: &[u8]) -> std::io::Result<()> {
     let chunk_count = bytes.len().div_ceil(SERIAL_CONTROL_WRITE_CHUNK_BYTES);
     for (index, chunk) in bytes.chunks(SERIAL_CONTROL_WRITE_CHUNK_BYTES).enumerate() {
         writer.write_all(chunk)?;
@@ -223,7 +300,7 @@ fn device_log_echo_enabled() -> bool {
 /// frames from the device; `outgoing` is written back to it.
 async fn device_session(
     mut incoming: mpsc::UnboundedReceiver<Frame>,
-    outgoing: mpsc::UnboundedSender<Frame>,
+    outgoing: DeviceSender,
     registry: Arc<Registry>,
     transport: DeviceTransport,
     timing: Arc<TimingService>,
@@ -445,6 +522,22 @@ fn decode_wire_frame(payload: &[u8]) -> Option<Frame> {
     Some(frame)
 }
 
+fn report_scan_events(scanner: &mut FrameScanner, link: &str) {
+    while let Some(event) = scanner.next_event() {
+        match event {
+            FrameScanEvent::DuplicateSequence { sequence } => {
+                tracing::debug!("{link}: duplicate V2 wire sequence {sequence}");
+            }
+            FrameScanEvent::SequenceDiscontinuity { expected, received } => {
+                tracing::warn!(
+                    "{link}: V2 wire sequence discontinuity: expected {expected}, received {received}"
+                );
+            }
+            other => tracing::warn!("{link}: rejected wire candidate: {other:?}"),
+        }
+    }
+}
+
 /// Wrap an async byte-stream reader/writer as framed CBOR and run a device session
 /// over it (the TCP path).
 async fn framed_session<R, W>(
@@ -459,8 +552,11 @@ async fn framed_session<R, W>(
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let (in_tx, in_rx) = mpsc::unbounded_channel();
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Frame>();
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<OutboundFrame>();
+    let outgoing = DeviceSender(out_tx);
+    let wire = Arc::new(ConnectionWire::default());
 
+    let read_wire = wire.clone();
     let read_task = tokio::spawn(async move {
         let mut reader = reader;
         let mut scanner = FrameScanner::new();
@@ -471,26 +567,29 @@ async fn framed_session<R, W>(
                 _ => break,
             };
             scanner.extend(&chunk[..n]);
-            while let Some(payload) = scanner.next_frame() {
-                if let Some(frame) = decode_wire_frame(&payload) {
+            while let Some(envelope) = scanner.next_envelope() {
+                if let Some(frame) = decode_wire_frame(&envelope.payload) {
+                    read_wire.observe(envelope.version);
                     if in_tx.send(frame).is_err() {
                         return;
                     }
                 }
             }
+            report_scan_events(&mut scanner, "device byte stream");
         }
     });
+    let write_wire = wire;
     let write_task = tokio::spawn(async move {
         let mut writer = writer;
-        while let Some(frame) = out_rx.recv().await {
-            let bytes = protocol::frame_bytes(&frame::encode(&frame));
+        while let Some(outbound) = out_rx.recv().await {
+            let bytes = write_wire.encode(&outbound.frame, outbound.forced_wire);
             if writer.write_all(&bytes).await.is_err() {
                 break;
             }
         }
     });
 
-    device_session(in_rx, out_tx, registry, transport, timing).await;
+    device_session(in_rx, outgoing, registry, transport, timing).await;
     read_task.abort();
     write_task.abort();
 }
@@ -721,20 +820,31 @@ async fn serial_session(
     tracing::info!("probing serial device at {path}");
 
     let (in_tx, in_rx) = mpsc::unbounded_channel();
-    let (out_tx, out_rx) = mpsc::unbounded_channel::<Frame>();
+    let (out_tx, out_rx) = mpsc::unbounded_channel::<OutboundFrame>();
+    let outgoing = DeviceSender(out_tx);
+    let wire = Arc::new(ConnectionWire::default());
 
     // Claim the link, then keep the claim alive. A quiet port needs no idle timeout:
     // the device may simply be streaming over wifi; unplug surfaces as a read error.
     let heartbeat_task = {
-        let out_tx = out_tx.clone();
+        let outgoing = outgoing.clone();
+        let heartbeat_wire = wire.clone();
         tokio::spawn(async move {
-            if out_tx.send(Frame::Probe {}).is_err() {
+            if outgoing.send_as(Frame::Probe {}, WireVersion::V2).is_err() {
+                return;
+            }
+            tokio::time::sleep(V2_PROBE_FALLBACK).await;
+            if matches!(heartbeat_wire.selected(), WireVersion::Legacy)
+                && outgoing
+                    .send_as(Frame::Probe {}, WireVersion::Legacy)
+                    .is_err()
+            {
                 return;
             }
             let mut ticks = tokio::time::interval(Duration::from_secs(2));
             loop {
                 ticks.tick().await;
-                if out_tx.send(Frame::Heartbeat {}).is_err() {
+                if outgoing.send(Frame::Heartbeat {}).is_err() {
                     return;
                 }
             }
@@ -751,6 +861,7 @@ async fn serial_session(
         let writer_lifecycle = writer_lifecycle.clone();
         let reader_path = path.to_owned();
         let connections = connections.clone();
+        let reader_wire = wire.clone();
         std::thread::spawn(move || {
             let mut port = reader_port;
             let mut scanner = FrameScanner::new();
@@ -771,10 +882,14 @@ async fn serial_session(
                 match port.read(&mut chunk) {
                     Ok(n) => {
                         scanner.extend(&chunk[..n]);
-                        while let Some(payload) = scanner.next_frame() {
-                            if let Some(frame) = decode_wire_frame(&payload) {
+                        while let Some(envelope) = scanner.next_envelope() {
+                            if let Some(frame) = decode_wire_frame(&envelope.payload) {
+                                reader_wire.observe(envelope.version);
                                 if matches!(frame, Frame::DeviceHello { .. }) {
-                                    tracing::info!("serial {reader_path} received DeviceHello");
+                                    tracing::info!(
+                                        "serial {reader_path} received {:?} DeviceHello",
+                                        envelope.version
+                                    );
                                     connections.hello(&reader_path);
                                 }
                                 if in_tx.send(frame).is_err() {
@@ -782,6 +897,7 @@ async fn serial_session(
                                 }
                             }
                         }
+                        report_scan_events(&mut scanner, &reader_path);
                     }
                     Err(e) => {
                         // Unplugged (or the port vanished); session ends.
@@ -793,10 +909,12 @@ async fn serial_session(
         });
     }
     let writer_path = path.to_owned();
+    let writer_wire = wire;
     std::thread::spawn(move || {
         let mut port = writer_port;
         let mut out_rx = out_rx;
-        'session: while let Some(frame) = out_rx.blocking_recv() {
+        'session: while let Some(outbound) = out_rx.blocking_recv() {
+            let frame = outbound.frame;
             if matches!(frame, Frame::Probe {}) {
                 tracing::info!("serial {writer_path} writing flushed Probe");
             }
@@ -837,7 +955,8 @@ async fn serial_session(
                 }
                 _ => {}
             }
-            if let Err(e) = write_serial_frame(&mut port, &frame) {
+            let bytes = writer_wire.encode(&frame, outbound.forced_wire);
+            if let Err(e) = write_serial_bytes(&mut port, &bytes) {
                 tracing::warn!("serial write failed ({e}); ending session");
                 break 'session;
             }
@@ -866,7 +985,7 @@ async fn serial_session(
         writer_lifecycle.store(SerialWriterLifecycle::Closed as u8, Ordering::SeqCst);
     });
 
-    device_session(in_rx, out_tx, registry, DeviceTransport::Serial, timing).await;
+    device_session(in_rx, outgoing, registry, DeviceTransport::Serial, timing).await;
     heartbeat_task.abort();
     tracing::info!("serial device at {path} closed");
 }
@@ -1030,6 +1149,45 @@ mod tests {
         ));
         assert!(scanner.next_frame().is_none());
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn connection_wire_probes_v2_without_abandoning_legacy_fallback() {
+        let wire = ConnectionWire::default();
+        let v2_probe = wire.encode(&Frame::Probe {}, Some(WireVersion::V2));
+        assert_eq!(wire.selected(), WireVersion::Legacy);
+
+        let mut scanner = FrameScanner::new();
+        scanner.extend(&v2_probe);
+        let probe = scanner.next_envelope().unwrap();
+        assert_eq!(probe.version, WireVersion::V2);
+        assert_eq!(probe.sequence, Some(0));
+        assert!(matches!(
+            frame::decode(&probe.payload).unwrap(),
+            Frame::Probe {}
+        ));
+
+        wire.observe(WireVersion::Legacy);
+        let fallback = wire.encode(&Frame::Probe {}, None);
+        assert_eq!(&fallback[..2], &protocol::FRAME_MAGIC);
+
+        wire.observe(WireVersion::V2);
+        wire.observe(WireVersion::Legacy);
+        assert_eq!(
+            wire.selected(),
+            WireVersion::V2,
+            "legacy cannot downgrade V2"
+        );
+        let heartbeat = wire.encode(&Frame::Heartbeat {}, None);
+        let mut scanner = FrameScanner::new();
+        scanner.extend(&heartbeat);
+        let heartbeat = scanner.next_envelope().unwrap();
+        assert_eq!(heartbeat.version, WireVersion::V2);
+        assert_eq!(heartbeat.sequence, Some(1));
+        assert!(matches!(
+            frame::decode(&heartbeat.payload).unwrap(),
+            Frame::Heartbeat {}
+        ));
     }
 
     #[test]
