@@ -621,6 +621,7 @@ async fn device_session(
                         | Frame::CalibrationSongResult { .. }
                         | Frame::CalibrationCandidateStatus { .. }
                         | Frame::CalibrationResidentActivated { .. }
+                        | Frame::CalibrationRunFailed { .. }
                 ) {
                     registry.push_replacement_calibration_frame(&device_id, token, other.clone());
                 }

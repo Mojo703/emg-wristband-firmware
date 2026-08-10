@@ -27,6 +27,10 @@ pub(crate) use feedback_vocabulary::ActiveLink;
 /// `send_window` still follows immediately in that same pass.
 const LOG_RECORDS_PER_WINDOW: usize = 1;
 const TELEMETRY_FRAMES_PER_WINDOW: usize = 1;
+/// Bound both returned controls and locally consumed Probe/Heartbeat frames.
+/// A hostile or duplicated CDC burst must return to acquisition and the task
+/// watchdog instead of draining until heap or time is exhausted.
+const CONTROL_ITEMS_PER_POLL: usize = 16;
 
 fn retained_logs_to_send(pending: usize) -> usize {
     pending.min(LOG_RECORDS_PER_WINDOW)
@@ -57,8 +61,11 @@ impl Links {
     /// Drain serial controls, applying link ownership controls locally and
     /// returning device controls to the application in arrival order.
     pub fn poll(&mut self, device_id: &str, settings: &Settings) -> Vec<Control> {
-        let mut controls = Vec::new();
-        while let Some(control) = self.serial.poll() {
+        let mut controls = Vec::with_capacity(CONTROL_ITEMS_PER_POLL);
+        for _ in 0..CONTROL_ITEMS_PER_POLL {
+            let Some(control) = self.serial.poll() else {
+                break;
+            };
             match control {
                 Control::Probe {} => {
                     let outcome = self.claim.on_probe(Instant::now());

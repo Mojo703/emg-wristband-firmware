@@ -25,6 +25,8 @@ pub const SLOT_BYTES: usize = 0x3_0000;
 /// else.
 pub const SLOT_OFFSETS: [usize; 2] = [0x9_0000, 0xC_0000];
 pub const SLOT_COUNT: usize = SLOT_OFFSETS.len();
+/// The product command vocabulary persisted in a calibration slot.
+pub const CALIBRATION_CLASS_COUNT: usize = 12;
 pub const CALIBRATION_RECIPE_ROW_CAPACITY: usize = 1_170;
 
 pub const PRIOR_MAGIC: [u8; 8] = *b"OPALROW2";
@@ -614,6 +616,31 @@ impl SlotRecord {
         }
     }
 
+    /// Whether this is a numerically usable product calibration model.
+    ///
+    /// Flash-layout validation deliberately admits generic class counts so it
+    /// can decode historic slots and tombstones. The firmware should apply
+    /// this stricter product check before accepting a fitted candidate or
+    /// activating a resident model for inference.
+    pub fn is_product_calibration_model(&self) -> bool {
+        self.class_count == CALIBRATION_CLASS_COUNT
+            && self.centroids.len() == CALIBRATION_CLASS_COUNT * FEATURE_COUNT
+            && self.spreads.len() == CALIBRATION_CLASS_COUNT * FEATURE_COUNT
+            && self.weights.len() == INPUT_COUNT * CALIBRATION_CLASS_COUNT
+            && self.reference_gains.iter().all(|value| value.is_finite())
+            && self.mean.iter().all(|value| value.is_finite())
+            && self
+                .deviation
+                .iter()
+                .all(|value| value.is_finite() && *value > 0.0)
+            && self.centroids.iter().all(|value| value.is_finite())
+            && self
+                .spreads
+                .iter()
+                .all(|value| value.is_finite() && *value >= 0.0)
+            && self.weights.iter().all(|value| value.is_finite())
+    }
+
     /// The metadata block exactly as it sits in flash: header through the
     /// fitted model, zero-padded out to [`SLOT_ROWS_OFFSET`] so the block is
     /// one aligned write and the CRC covers a fixed prefix.
@@ -899,8 +926,18 @@ pub fn next_sequence<const COUNT: usize>(sequences: [Option<u32>; COUNT]) -> Opt
         .filter(|sequence| *sequence != SEQUENCE_ERASED)
 }
 
+// Compile the firmware's real selector into host flash-image tests. This keeps
+// torn-write coverage from reimplementing the most important recovery choice
+// in a test-only approximation.
+#[cfg(test)]
+#[path = "../../opal-firmware/src/calibration/resident_selector.rs"]
+mod production_resident_selector;
+
 #[cfg(test)]
 mod tests {
+    use super::production_resident_selector::{
+        PhysicalSlot, SelectorPersistenceCapability, StoreSelector, StoredIdentity, StoredRole,
+    };
     use super::*;
 
     fn write_f32s(image: &mut Vec<u8>, values: &[f32]) {
@@ -1007,6 +1044,52 @@ mod tests {
     }
 
     #[test]
+    fn product_calibration_model_requires_the_shipped_finite_shape() {
+        let record = SlotRecord::empty(CALIBRATION_CLASS_COUNT);
+        assert!(record.is_product_calibration_model());
+
+        let mut wrong_classes = record.clone();
+        wrong_classes.class_count = CALIBRATION_CLASS_COUNT - 1;
+        assert!(!wrong_classes.is_product_calibration_model());
+
+        let mut missing_centroid = record.clone();
+        missing_centroid.centroids.pop();
+        assert!(!missing_centroid.is_product_calibration_model());
+
+        let mut missing_spread = record.clone();
+        missing_spread.spreads.pop();
+        assert!(!missing_spread.is_product_calibration_model());
+
+        let mut missing_weight = record.clone();
+        missing_weight.weights.pop();
+        assert!(!missing_weight.is_product_calibration_model());
+
+        let mut non_finite_gain = record.clone();
+        non_finite_gain.reference_gains[0] = f32::NAN;
+        assert!(!non_finite_gain.is_product_calibration_model());
+
+        let mut non_finite_mean = record.clone();
+        non_finite_mean.mean[0] = f32::INFINITY;
+        assert!(!non_finite_mean.is_product_calibration_model());
+
+        let mut zero_deviation = record.clone();
+        zero_deviation.deviation[0] = 0.0;
+        assert!(!zero_deviation.is_product_calibration_model());
+
+        let mut non_finite_centroid = record.clone();
+        non_finite_centroid.centroids[0] = f32::NEG_INFINITY;
+        assert!(!non_finite_centroid.is_product_calibration_model());
+
+        let mut negative_spread = record.clone();
+        negative_spread.spreads[0] = -0.25;
+        assert!(!negative_spread.is_product_calibration_model());
+
+        let mut non_finite_weight = record;
+        non_finite_weight.weights[0] = f32::NAN;
+        assert!(!non_finite_weight.is_product_calibration_model());
+    }
+
+    #[test]
     fn slot_roles_roundtrip_and_legacy_zero_means_resident() {
         for role in [
             SlotRole::Resident,
@@ -1045,6 +1128,295 @@ mod tests {
         for (stored, desired) in destination.iter_mut().zip(source) {
             *stored &= *desired;
         }
+    }
+
+    fn metadata_chunks(record: &SlotRecord, live_row_count: usize) -> Vec<(usize, Vec<u8>)> {
+        let mut chunks = Vec::new();
+        record
+            .write_metadata_chunks(live_row_count, |offset, bytes| {
+                chunks.push((offset, bytes.to_vec()));
+                Ok::<(), ()>(())
+            })
+            .unwrap();
+
+        let mut assembled = Vec::new();
+        for (offset, bytes) in &chunks {
+            assert_eq!(*offset, assembled.len());
+            assembled.extend_from_slice(bytes);
+        }
+        assert_eq!(assembled, record.to_metadata_block(live_row_count));
+        chunks
+    }
+
+    /// Program a slot in the same order as the device: rows are already
+    /// flushed, then the real metadata chunks, then one CRC commit word.
+    fn commit_slot_bytewise(slot: &mut [u8], record: &SlotRecord, rows: &[u8]) {
+        assert_eq!(rows.len() % ROW_STRIDE, 0);
+        let live_row_count = rows.len() / ROW_STRIDE;
+        nor_program(
+            &mut slot[SLOT_ROWS_OFFSET..SLOT_ROWS_OFFSET + rows.len()],
+            rows,
+        );
+        for (offset, bytes) in metadata_chunks(record, live_row_count) {
+            nor_program(&mut slot[offset..offset + bytes.len()], &bytes);
+        }
+        let crc = crc32(&slot[..covered_bytes(live_row_count)]);
+        nor_program(
+            &mut slot[SLOT_CRC_OFFSET..SLOT_CRC_OFFSET + 4],
+            &crc.to_le_bytes(),
+        );
+    }
+
+    fn selected_resident(slots: &[Vec<u8>; SLOT_COUNT], prior_hash: u32) -> Option<usize> {
+        let stored = core::array::from_fn(|index| {
+            let live = parse_slot(index, &slots[index], prior_hash).ok()?;
+            Some(StoredIdentity {
+                physical: PhysicalSlot::ALL[index],
+                generation: live.record.sequence,
+                crc: live.crc,
+                role: match live.record.role {
+                    SlotRole::Resident => StoredRole::Resident,
+                    SlotRole::ExportableCandidate => StoredRole::ExportableCandidate,
+                    SlotRole::Inactive => StoredRole::Inactive,
+                },
+            })
+        });
+        let selector = StoreSelector::recover(stored);
+        assert_eq!(
+            selector.persistence_capability(),
+            SelectorPersistenceCapability::SlotSequenceAndCrc
+        );
+        selector
+            .resident()
+            .map(|resident| resident.physical.index())
+    }
+
+    #[test]
+    fn host_bytewise_nor_lifecycle_keeps_the_resident_through_commit_save_and_discard() {
+        let prior_hash = 0xD15C_A11B;
+        let rows = some_rows(CALIBRATION_RECIPE_ROW_CAPACITY);
+        assert_eq!(rows.len() / ROW_STRIDE, 1_170);
+
+        let mut old_resident = SlotRecord::empty(CALIBRATION_CLASS_COUNT);
+        old_resident.sequence = 7;
+        old_resident.prior_hash = prior_hash;
+        old_resident.reference_gains = [1.0; 16];
+        assert!(old_resident.is_product_calibration_model());
+
+        let mut candidate = old_resident.clone();
+        candidate.sequence = 8;
+        candidate.role = SlotRole::ExportableCandidate;
+        assert!(candidate.is_product_calibration_model());
+
+        let mut old_slot = vec![0xFF; SLOT_BYTES];
+        commit_slot_bytewise(&mut old_slot, &old_resident, &rows);
+        assert_eq!(
+            parse_slot(0, &old_slot, prior_hash).unwrap().record.role,
+            SlotRole::Resident
+        );
+
+        let candidate_chunks = metadata_chunks(&candidate, CALIBRATION_RECIPE_ROW_CAPACITY);
+        let mut candidate_without_crc = vec![0xFF; SLOT_BYTES];
+        nor_program(
+            &mut candidate_without_crc[SLOT_ROWS_OFFSET..SLOT_ROWS_OFFSET + rows.len()],
+            &rows,
+        );
+        for (offset, bytes) in &candidate_chunks {
+            nor_program(
+                &mut candidate_without_crc[*offset..*offset + bytes.len()],
+                bytes,
+            );
+        }
+        let candidate_crc =
+            crc32(&candidate_without_crc[..covered_bytes(CALIBRATION_RECIPE_ROW_CAPACITY)]);
+        assert_ne!(candidate_crc, u32::MAX);
+        assert_ne!(candidate_crc, 0);
+
+        // Row writes happen before metadata. A watchdog at every representative
+        // byte cut cannot create a plausible slot while magic is still erased.
+        for cut in [0, 1, rows.len() / 2, rows.len() - 1] {
+            let mut torn = vec![0xFF; SLOT_BYTES];
+            nor_program(
+                &mut torn[SLOT_ROWS_OFFSET..SLOT_ROWS_OFFSET + cut],
+                &rows[..cut],
+            );
+            assert!(parse_slot(1, &torn, prior_hash).is_err());
+            assert_eq!(
+                selected_resident(&[old_slot.clone(), torn], prior_hash),
+                Some(0)
+            );
+        }
+
+        // Each production metadata chunk has a beginning, middle, and final
+        // byte cut. The legacy CRC is still erased at all of them.
+        for (chunk_index, (offset, bytes)) in candidate_chunks.iter().enumerate() {
+            for cut in [0, 1, bytes.len() / 2, bytes.len() - 1] {
+                let mut torn = vec![0xFF; SLOT_BYTES];
+                nor_program(
+                    &mut torn[SLOT_ROWS_OFFSET..SLOT_ROWS_OFFSET + rows.len()],
+                    &rows,
+                );
+                for (earlier_offset, earlier_bytes) in &candidate_chunks[..chunk_index] {
+                    nor_program(
+                        &mut torn[*earlier_offset..*earlier_offset + earlier_bytes.len()],
+                        earlier_bytes,
+                    );
+                }
+                nor_program(&mut torn[*offset..*offset + cut], &bytes[..cut]);
+                assert!(parse_slot(1, &torn, prior_hash).is_err());
+                assert_eq!(
+                    selected_resident(&[old_slot.clone(), torn], prior_hash),
+                    Some(0)
+                );
+            }
+        }
+        assert!(parse_slot(1, &candidate_without_crc, prior_hash).is_err());
+        assert_eq!(
+            selected_resident(
+                &[old_slot.clone(), candidate_without_crc.clone()],
+                prior_hash
+            ),
+            Some(0)
+        );
+
+        // The four-byte legacy CRC is the candidate's commit edge. Test every
+        // physical cut; a byte that was already FF can make a shorter write
+        // complete, so derive the expectation from the resulting NOR bytes.
+        for cut in 0..=4 {
+            let mut torn = candidate_without_crc.clone();
+            nor_program(
+                &mut torn[SLOT_CRC_OFFSET..SLOT_CRC_OFFSET + cut],
+                &candidate_crc.to_le_bytes()[..cut],
+            );
+            let complete = read_u32(&torn, SLOT_CRC_OFFSET) == candidate_crc;
+            assert_eq!(parse_slot(1, &torn, prior_hash).is_ok(), complete);
+            assert_eq!(
+                selected_resident(&[old_slot.clone(), torn], prior_hash),
+                Some(0)
+            );
+        }
+
+        let mut committed_candidate = candidate_without_crc.clone();
+        nor_program(
+            &mut committed_candidate[SLOT_CRC_OFFSET..SLOT_CRC_OFFSET + 4],
+            &candidate_crc.to_le_bytes(),
+        );
+        let parsed_candidate = parse_slot(1, &committed_candidate, prior_hash).unwrap();
+        assert_eq!(
+            parsed_candidate.rows().len(),
+            CALIBRATION_RECIPE_ROW_CAPACITY
+        );
+        assert_eq!(parsed_candidate.record.role, SlotRole::ExportableCandidate);
+        assert!(parsed_candidate.record.is_product_calibration_model());
+        assert_eq!(
+            selected_resident(&[old_slot.clone(), committed_candidate.clone()], prior_hash),
+            Some(0),
+            "a valid candidate must not displace the previous resident"
+        );
+
+        let promotion_crc =
+            resident_promotion_crc(&committed_candidate, CALIBRATION_RECIPE_ROW_CAPACITY).unwrap();
+        for cut in 0..=4 {
+            let mut torn = committed_candidate.clone();
+            nor_program(
+                &mut torn[SLOT_PROMOTION_CRC_OFFSET..SLOT_PROMOTION_CRC_OFFSET + cut],
+                &promotion_crc.to_le_bytes()[..cut],
+            );
+            assert_eq!(
+                parse_slot(1, &torn, prior_hash).unwrap().record.role,
+                SlotRole::ExportableCandidate
+            );
+            assert_eq!(
+                selected_resident(&[old_slot.clone(), torn], prior_hash),
+                Some(0)
+            );
+        }
+
+        // The promotion CRC must be entirely in place before role bit 0 is
+        // cleared. Any cut of the final role word is a reboot boundary.
+        let mut promotion_ready = committed_candidate.clone();
+        nor_program(
+            &mut promotion_ready[SLOT_PROMOTION_CRC_OFFSET..SLOT_PROMOTION_CRC_OFFSET + 4],
+            &promotion_crc.to_le_bytes(),
+        );
+        for cut in 0..=4 {
+            let mut torn = promotion_ready.clone();
+            nor_program(
+                &mut torn[SLOT_ROLE_OFFSET..SLOT_ROLE_OFFSET + cut],
+                &SlotRole::Resident.value().to_le_bytes()[..cut],
+            );
+            let live = parse_slot(1, &torn, prior_hash).unwrap();
+            if cut == 0 {
+                assert_eq!(live.record.role, SlotRole::ExportableCandidate);
+                assert_eq!(
+                    selected_resident(&[old_slot.clone(), torn], prior_hash),
+                    Some(0)
+                );
+            } else {
+                assert_eq!(live.record.role, SlotRole::Resident);
+                assert_eq!(
+                    selected_resident(&[old_slot.clone(), torn], prior_hash),
+                    Some(1)
+                );
+            }
+        }
+
+        // A torn promotion checksum followed by the role commit is never a
+        // new resident unless the bytes happened to reach the intended word.
+        for cut in 0..=4 {
+            let mut torn = committed_candidate.clone();
+            nor_program(
+                &mut torn[SLOT_PROMOTION_CRC_OFFSET..SLOT_PROMOTION_CRC_OFFSET + cut],
+                &promotion_crc.to_le_bytes()[..cut],
+            );
+            nor_program(
+                &mut torn[SLOT_ROLE_OFFSET..SLOT_ROLE_OFFSET + 4],
+                &SlotRole::Resident.value().to_le_bytes(),
+            );
+            let complete = read_u32(&torn, SLOT_PROMOTION_CRC_OFFSET) == promotion_crc;
+            assert_eq!(parse_slot(1, &torn, prior_hash).is_ok(), complete);
+            assert_eq!(
+                selected_resident(&[old_slot.clone(), torn], prior_hash),
+                complete.then_some(1).or(Some(0))
+            );
+        }
+
+        // Discard only clears legacy CRC bits. Every interrupted write leaves
+        // either the old resident or an ignored candidate selected; a complete
+        // write makes the candidate an orphan that reboot may erase safely.
+        for cut in 0..=4 {
+            let mut torn = committed_candidate.clone();
+            nor_program(
+                &mut torn[SLOT_CRC_OFFSET..SLOT_CRC_OFFSET + cut],
+                &0u32.to_le_bytes()[..cut],
+            );
+            assert_eq!(
+                selected_resident(&[old_slot.clone(), torn], prior_hash),
+                Some(0)
+            );
+        }
+        let mut invalidated_orphan = committed_candidate;
+        nor_program(
+            &mut invalidated_orphan[SLOT_CRC_OFFSET..SLOT_CRC_OFFSET + 4],
+            &0u32.to_le_bytes(),
+        );
+        assert!(parse_slot(1, &invalidated_orphan, prior_hash).is_err());
+        assert_eq!(
+            selected_resident(&[old_slot.clone(), invalidated_orphan.clone()], prior_hash),
+            Some(0)
+        );
+
+        // Reboot recovery erases the dead orphan before its slot becomes the
+        // next scratch region; the established resident remains bootable.
+        invalidated_orphan.fill(0xFF);
+        assert_eq!(
+            parse_slot(1, &invalidated_orphan, prior_hash).unwrap_err(),
+            ImageError::Absent
+        );
+        assert_eq!(
+            selected_resident(&[old_slot, invalidated_orphan], prior_hash),
+            Some(0)
+        );
     }
 
     #[test]

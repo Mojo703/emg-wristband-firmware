@@ -21,7 +21,11 @@ const OPERATIONAL_SCHEDULE_UPLOAD_ENTRIES: usize = 8;
 const UPLOAD_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_CHUNK_ACK_RETRIES: u8 = 3;
 const SCHEDULE_ACCEPTANCE_TIMEOUT: Duration = Duration::from_secs(2);
-const TERMINAL_DECISION_TIMEOUT: Duration = Duration::from_secs(5);
+const INTERRUPT_OR_DISCARD_DECISION_TIMEOUT: Duration = Duration::from_secs(5);
+// Finalization includes queued checkpoint processing, fit/polish work, CRC,
+// and an atomic resident-record promotion on the wristband.  It is not an
+// interruption round trip, so preserve a realistic independent deadline.
+const SAVE_DECISION_TIMEOUT: Duration = Duration::from_secs(120);
 const RUN_ACTION_CAPACITY: usize = 8;
 
 pub struct CalibrationModeAdapter {
@@ -415,6 +419,10 @@ impl EvidenceState {
 #[derive(Clone, Copy)]
 enum CandidateState {
     Absent,
+    /// A matching SongResult is sufficient authority to ask the wristband to
+    /// build and atomically promote its candidate. The device deliberately
+    /// does that work only after an explicit Save.
+    Buildable,
     Present(protocol::CalibrationCandidateValidity),
 }
 
@@ -478,6 +486,7 @@ impl TerminalDecision {
 fn run_action_is_authorized(
     action: &RunAction,
     evidence: &EvidenceState,
+    song_counts: &[protocol::CalibrationClassCounts],
     candidate: CandidateState,
     terminal: &TerminalDecision,
 ) -> bool {
@@ -485,8 +494,11 @@ fn run_action_is_authorized(
         return false;
     }
     match action {
-        RunAction::Continue | RunAction::SelectNextTrack(_) => evidence.is_retained(),
-        RunAction::Save => evidence.is_retained() && candidate.permits_activation(),
+        RunAction::Continue => evidence.is_retained() && counts_have_deficits(song_counts),
+        RunAction::SelectNextTrack(_) => {
+            evidence.is_retained() && counts_have_deficits(song_counts)
+        }
+        RunAction::Save => evidence.is_retained() && candidate.permits_save(),
         RunAction::Discard => evidence.is_retained(),
         RunAction::Exit => true,
     }
@@ -502,30 +514,25 @@ impl CandidateState {
         }
     }
 
-    fn with_validity(self, validity: protocol::CalibrationCandidateValidity) -> Self {
+    fn preserves_buildable_after_status(
+        self,
+        presence: &protocol::CalibrationCandidatePresence,
+    ) -> bool {
+        matches!(self, Self::Buildable)
+            && matches!(presence, protocol::CalibrationCandidatePresence::Absent)
+    }
+
+    fn permits_save(self) -> bool {
         match self {
-            Self::Absent => Self::Absent,
-            Self::Present(_) => Self::Present(validity),
+            Self::Absent => false,
+            Self::Buildable => true,
+            Self::Present(validity) => validity.permits_activation(),
         }
     }
+}
 
-    fn present(self) -> bool {
-        matches!(self, Self::Present(_))
-    }
-
-    fn validity(self) -> protocol::CalibrationCandidateValidity {
-        match self {
-            Self::Absent => protocol::CalibrationCandidateValidity {
-                model_numerically_valid: false,
-                record_crc_valid: false,
-            },
-            Self::Present(validity) => validity,
-        }
-    }
-
-    fn permits_activation(self) -> bool {
-        self.present() && self.validity().permits_activation()
-    }
+fn counts_have_deficits(counts: &[protocol::CalibrationClassCounts]) -> bool {
+    counts.iter().any(|count| count.deficit_count > 0)
 }
 
 impl CalibrationModeAdapter {
@@ -733,9 +740,9 @@ impl CalibrationModeAdapter {
             // playback alarm cannot starve behind the device broadcast.
             tokio::select! {
                 changed = gate.changed() => match changed {
-                    Ok(()) => match *gate.borrow_and_update() {
-                        RunGate::Interrupted => {
-                            gate_state = RunGate::Interrupted;
+                    Ok(()) => {
+                        gate_state = effective_gate(*gate.borrow_and_update(), &commit_phase);
+                        if gate_withholds_heartbeat(gate_state, &commit_phase) {
                             // Before Commit, heartbeats keep the device-owned
                             // 30-second preparation transaction alive.  They
                             // do not authorize playback, so a hidden view can
@@ -743,38 +750,33 @@ impl CalibrationModeAdapter {
                             // gated.  Once Commit has crossed the wire,
                             // withholding heartbeat is the device's bounded
                             // interruption mechanism.
-                            if gate_withholds_heartbeat(gate_state, &commit_phase) {
-                                heartbeat_mode = HeartbeatMode::Withheld;
-                                if let PlaybackState::Playing(opened) = &playback {
-                                    opened.pause();
-                                }
-                                if let Err(error) = request_device_interruption(
-                                    &self.registry,
-                                    &device,
-                                    run,
-                                    schedule_revision,
-                                    &mut device_interruption,
-                                ) {
-                                    break delivery_failure(error);
-                                }
+                            heartbeat_mode = HeartbeatMode::Withheld;
+                            if let PlaybackState::Playing(opened) = &playback {
+                                opened.pause();
+                            }
+                            if let Err(error) = request_device_interruption(
+                                &self.registry,
+                                &device,
+                                run,
+                                schedule_revision,
+                                &mut device_interruption,
+                            ) {
+                                break delivery_failure(error);
                             }
                         }
-                        RunGate::Running => {
-                            gate_state = effective_gate(RunGate::Running, &commit_phase);
-                            if schedule_commit_is_authorized(
-                                gate_state,
-                                &upload,
-                                device_readiness,
-                                prepared_playback.is_ready(),
-                                &commit_phase,
+                        if schedule_commit_is_authorized(
+                            gate_state,
+                            &upload,
+                            device_readiness,
+                            prepared_playback.is_ready(),
+                            &commit_phase,
+                        ) {
+                            if let Err(error) = send_schedule_commit(
+                                &self.registry, &device, run, schedule_revision, &track,
                             ) {
-                                if let Err(error) = send_schedule_commit(
-                                    &self.registry, &device, run, schedule_revision, &track,
-                                ) {
-                                    break delivery_failure(error);
-                                }
-                                commit_phase = ScheduleCommitPhase::sent_at(tokio::time::Instant::now());
+                                break delivery_failure(error);
                             }
+                            commit_phase = ScheduleCommitPhase::sent_at(tokio::time::Instant::now());
                         }
                     },
                     Err(_) => break SessionExit::TaskFailed(
@@ -1005,7 +1007,7 @@ impl CalibrationModeAdapter {
                                 break delivery_failure(error);
                             }
                             terminal = TerminalDecision::AwaitingDiscard {
-                                deadline: tokio::time::Instant::now() + TERMINAL_DECISION_TIMEOUT,
+                                deadline: tokio::time::Instant::now() + INTERRUPT_OR_DISCARD_DECISION_TIMEOUT,
                             };
                             continue;
                         }
@@ -1027,7 +1029,11 @@ impl CalibrationModeAdapter {
                             && result.schedule_revision == schedule_revision
                             && result.content_identity == track.content_identity => {
                         song_counts = result.counts;
-                        candidate = candidate.with_validity(result.validity);
+                        // A completed, identity-matching song is the explicit
+                        // boundary at which Save becomes available. Firmware
+                        // defers fitting/polishing and resident promotion until
+                        // it receives that Save request.
+                        candidate = CandidateState::Buildable;
                         if matches!(terminal, TerminalDecision::AwaitingInterruption { .. }) {
                             heartbeat_mode = HeartbeatMode::Withheld;
                             playback = PlaybackState::Dormant;
@@ -1038,7 +1044,7 @@ impl CalibrationModeAdapter {
                                 break delivery_failure(error);
                             }
                             terminal = TerminalDecision::AwaitingDiscard {
-                                deadline: tokio::time::Instant::now() + TERMINAL_DECISION_TIMEOUT,
+                                deadline: tokio::time::Instant::now() + INTERRUPT_OR_DISCARD_DECISION_TIMEOUT,
                             };
                             continue;
                         }
@@ -1069,7 +1075,16 @@ impl CalibrationModeAdapter {
                         if status.run == run
                             && status.schedule_revision == schedule_revision
                             && candidate_presence_matches_track(&status.presence, &track) => {
-                        candidate = CandidateState::from_presence(status.presence);
+                        // The exact AwaitingDiscard/Absent pair was consumed
+                        // before this arm. Any status received while Save or
+                        // another durable operation is pending is progress
+                        // noise, not authority to replace its projection.
+                        if !matches!(terminal, TerminalDecision::Open) {
+                            continue;
+                        }
+                        if !candidate.preserves_buildable_after_status(&status.presence) {
+                            candidate = CandidateState::from_presence(status.presence);
+                        }
                         if matches!(heartbeat_mode, HeartbeatMode::Withheld)
                             && evidence.is_retained() {
                             let _ = self.coordinator.update_calibration(
@@ -1105,10 +1120,16 @@ impl CalibrationModeAdapter {
                         source: protocol::BenchErrorSource::Calibration,
                         detail,
                     }) => {
-                        // Candidate construction happens after SongResult. A
-                        // flash/fit failure must replace the silently disabled
-                        // Save button with an explicit terminal explanation.
-                        break SessionExit::DependencyFailed(detail);
+                        // Uncorrelated diagnostics are observable to the
+                        // browser but cannot terminate an exact guided run.
+                        // Firmware uses CalibrationRunFailed for that, so an
+                        // old actor's delayed BenchError cannot kill a newer
+                        // revision with the same device id.
+                        tracing::warn!(%detail, "ignoring uncorrelated calibration diagnostic");
+                    }
+                    Ok(Frame::CalibrationRunFailed { failure })
+                        if failure.run == run && failure.schedule_revision == schedule_revision => {
+                        break SessionExit::DependencyFailed(failure.detail);
                     }
                     Ok(_) => {}
                     Err(broadcast::error::RecvError::Lagged(_)) => {
@@ -1183,7 +1204,13 @@ impl CalibrationModeAdapter {
                     // Re-check the actor-owned boundary so a racing or forged
                     // Continue cannot replace an upload that is still being
                     // prepared, acknowledged, or played.
-                    if !run_action_is_authorized(&command, &evidence, candidate, &terminal) {
+                    if !run_action_is_authorized(
+                        &command,
+                        &evidence,
+                        &song_counts,
+                        candidate,
+                        &terminal,
+                    ) {
                         continue;
                     }
                     if matches!(&command, RunAction::Exit) {
@@ -1211,7 +1238,7 @@ impl CalibrationModeAdapter {
                                 break delivery_failure(error);
                             }
                             terminal = TerminalDecision::AwaitingDiscard {
-                                deadline: tokio::time::Instant::now() + TERMINAL_DECISION_TIMEOUT,
+                                deadline: tokio::time::Instant::now() + INTERRUPT_OR_DISCARD_DECISION_TIMEOUT,
                             };
                         } else {
                             if let Err(error) = request_device_interruption(
@@ -1224,7 +1251,7 @@ impl CalibrationModeAdapter {
                                 break delivery_failure(error);
                             }
                             terminal = TerminalDecision::AwaitingInterruption {
-                                deadline: tokio::time::Instant::now() + TERMINAL_DECISION_TIMEOUT,
+                                deadline: tokio::time::Instant::now() + INTERRUPT_OR_DISCARD_DECISION_TIMEOUT,
                             };
                         }
                         continue;
@@ -1297,16 +1324,24 @@ impl CalibrationModeAdapter {
                         RunAction::Discard => Frame::CalibrationDiscard { run },
                         RunAction::Exit => unreachable!("Exit is handled before song-end decisions"),
                     };
+                    if save_requested {
+                        let _ = self.coordinator.update_calibration(
+                            &binding,
+                            GuidedCalibrationSnapshot::Finalizing {
+                                detail: "Building, validating, and saving calibration on the wristband…".into(),
+                            },
+                        );
+                    }
                     if let Err(error) = self.registry.send_bound_control(&device, frame) {
                         break delivery_failure(error);
                     }
                     terminal = if save_requested {
                         TerminalDecision::AwaitingSave {
-                            deadline: tokio::time::Instant::now() + TERMINAL_DECISION_TIMEOUT,
+                            deadline: tokio::time::Instant::now() + SAVE_DECISION_TIMEOUT,
                         }
                     } else {
                         TerminalDecision::AwaitingDiscard {
-                            deadline: tokio::time::Instant::now() + TERMINAL_DECISION_TIMEOUT,
+                            deadline: tokio::time::Instant::now() + INTERRUPT_OR_DISCARD_DECISION_TIMEOUT,
                         }
                     };
                 }
@@ -1948,8 +1983,8 @@ fn between_songs_snapshot(
             .to_owned(),
         tracks: tracks.iter().map(guided_track).collect(),
         selected_track_id: Some(track.id.0.clone()),
-        candidate_available: candidate.permits_activation(),
-        continue_available: evidence.is_retained(),
+        candidate_available: candidate.permits_save(),
+        continue_available: evidence.is_retained() && counts_have_deficits(counts),
         valid_reps,
         invalid_reps,
         deficits,
@@ -1980,32 +2015,45 @@ mod tests {
         };
         let mut playback = PlaybackState::Dormant;
         let absent = CandidateState::Absent;
+        let buildable = CandidateState::Buildable;
         let valid = CandidateState::Present(protocol::CalibrationCandidateValidity {
             model_numerically_valid: true,
             record_crc_valid: true,
         });
+        let with_deficit = [protocol::CalibrationClassCounts {
+            gesture: protocol::CalibrationGesture::WristPronation,
+            modifier: protocol::CalibrationModifier::ThumbUp,
+            accepted_count: 9,
+            rejected_count: 0,
+            target_count: 10,
+            deficit_count: 1,
+        }];
 
         assert!(!run_action_is_authorized(
             &RunAction::Continue,
             &evidence,
+            &with_deficit,
             absent,
             &TerminalDecision::Open,
         ));
         assert!(!run_action_is_authorized(
             &RunAction::Save,
             &evidence,
+            &[],
             valid,
             &TerminalDecision::Open,
         ));
         assert!(!run_action_is_authorized(
             &RunAction::Discard,
             &evidence,
+            &[],
             absent,
             &TerminalDecision::Open,
         ));
         assert!(run_action_is_authorized(
             &RunAction::Exit,
             &evidence,
+            &[],
             absent,
             &TerminalDecision::Open,
         ));
@@ -2024,24 +2072,56 @@ mod tests {
         assert!(run_action_is_authorized(
             &RunAction::Continue,
             &evidence,
+            &with_deficit,
+            absent,
+            &TerminalDecision::Open,
+        ));
+        assert!(run_action_is_authorized(
+            &RunAction::SelectNextTrack(track()),
+            &evidence,
+            &with_deficit,
+            absent,
+            &TerminalDecision::Open,
+        ));
+        assert!(!run_action_is_authorized(
+            &RunAction::Continue,
+            &evidence,
+            &[],
+            absent,
+            &TerminalDecision::Open,
+        ));
+        assert!(!run_action_is_authorized(
+            &RunAction::SelectNextTrack(track()),
+            &evidence,
+            &[],
             absent,
             &TerminalDecision::Open,
         ));
         assert!(run_action_is_authorized(
             &RunAction::Save,
             &evidence,
+            &[],
+            buildable,
+            &TerminalDecision::Open,
+        ));
+        assert!(run_action_is_authorized(
+            &RunAction::Save,
+            &evidence,
+            &[],
             valid,
             &TerminalDecision::Open,
         ));
         assert!(run_action_is_authorized(
             &RunAction::Discard,
             &evidence,
+            &[],
             absent,
             &TerminalDecision::Open,
         ));
         assert!(!run_action_is_authorized(
             &RunAction::Discard,
             &evidence,
+            &[],
             valid,
             &TerminalDecision::AwaitingSave {
                 deadline: tokio::time::Instant::now(),
@@ -2076,7 +2156,7 @@ mod tests {
             run_id: CalibrationRunId::new(3).unwrap(),
         };
         let revision = CalibrationScheduleRevision::new(2).unwrap();
-        let deadline = tokio::time::Instant::now() + TERMINAL_DECISION_TIMEOUT;
+        let deadline = tokio::time::Instant::now() + INTERRUPT_OR_DISCARD_DECISION_TIMEOUT;
         let discarded = Frame::CalibrationCandidateStatus {
             candidate: protocol::CalibrationCandidateStatus {
                 run,
@@ -2113,6 +2193,23 @@ mod tests {
                 run,
                 next_revision
             )
+        );
+    }
+
+    #[test]
+    fn song_result_buildability_survives_an_unrelated_absent_candidate_status() {
+        let mut candidate = CandidateState::Buildable;
+        let absent = protocol::CalibrationCandidatePresence::Absent;
+
+        assert!(candidate.preserves_buildable_after_status(&absent));
+        if !candidate.preserves_buildable_after_status(&absent) {
+            candidate = CandidateState::from_presence(absent.clone());
+        }
+        assert!(candidate.permits_save());
+        assert_eq!(SAVE_DECISION_TIMEOUT, Duration::from_secs(120));
+        assert_eq!(
+            INTERRUPT_OR_DISCARD_DECISION_TIMEOUT,
+            Duration::from_secs(5)
         );
     }
 
@@ -2218,6 +2315,22 @@ mod tests {
             RunGate::Running,
             "the next revision may use the latest browser presence again"
         );
+    }
+
+    #[test]
+    fn collapsed_pause_then_resume_after_commit_still_withholds_heartbeat() {
+        let (gate, mut observed_gate) = tokio::sync::watch::channel(RunGate::Running);
+        let committed = ScheduleCommitPhase::sent_at(tokio::time::Instant::now());
+
+        gate.send(RunGate::Interrupted).unwrap();
+        gate.send(RunGate::Running).unwrap();
+
+        // A watch receiver can observe only the latest Running value. The
+        // actor must nevertheless convert it through the committed boundary
+        // and execute the same interruption effects as a visible pause.
+        let effective = effective_gate(*observed_gate.borrow_and_update(), &committed);
+        assert_eq!(effective, RunGate::Interrupted);
+        assert!(gate_withholds_heartbeat(effective, &committed));
     }
 
     fn register_device(registry: &Registry) -> crate::registry::DeviceHandle {
@@ -2446,6 +2559,155 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn save_finalizes_a_buildable_song_and_waits_for_resident_promotion() {
+        let registry = Arc::new(Registry::new());
+        let coordinator = GuidedSessionCoordinator::new();
+        let adapter =
+            CalibrationModeAdapter::new(registry.clone(), coordinator.clone(), vec![track()]);
+        attach_test_collection(&adapter, registry.clone(), coordinator.clone());
+        coordinator.set_mode_adapter(GuidedMode::Calibration, adapter.clone());
+        let mut device = register_device(&registry);
+        let identity = registry.connection_identity("opal-test").unwrap();
+
+        let setup = coordinator.snapshot();
+        coordinator
+            .handle_intent_for_device(
+                GuidedIntentRequest {
+                    authority: setup.action_authority,
+                    action: GuidedSessionAction::SelectCalibrationTrack {
+                        track_id: "calibration-track".into(),
+                    },
+                },
+                None,
+            )
+            .unwrap();
+        let selected = coordinator.snapshot();
+        coordinator
+            .handle_intent_for_device(
+                GuidedIntentRequest {
+                    authority: selected.action_authority,
+                    action: GuidedSessionAction::StartCalibration,
+                },
+                Some(identity),
+            )
+            .unwrap();
+
+        let run = CalibrationRunKey {
+            session_id: CalibrationSessionId::new(1).unwrap(),
+            run_id: CalibrationRunId::new(1).unwrap(),
+        };
+        let schedule_revision = CalibrationScheduleRevision::new(1).unwrap();
+        device
+            .frames
+            .send(Frame::CalibrationSongResult {
+                result: protocol::CalibrationSongResult {
+                    run,
+                    schedule_revision,
+                    content_identity: "test-content".into(),
+                    // Save remains available even with no deficits; the
+                    // wristband owns the final queued checkpoint/fit work.
+                    counts: vec![protocol::CalibrationClassCounts {
+                        gesture: protocol::CalibrationGesture::WristPronation,
+                        modifier: protocol::CalibrationModifier::ThumbUp,
+                        accepted_count: 10,
+                        rejected_count: 0,
+                        target_count: 10,
+                        deficit_count: 0,
+                    }],
+                    validity: protocol::CalibrationCandidateValidity {
+                        model_numerically_valid: false,
+                        record_crc_valid: false,
+                    },
+                },
+            })
+            .unwrap();
+        // Firmware can still report its old absence before it receives Save.
+        // That status must not withdraw the freshly earned Save authority.
+        device
+            .frames
+            .send(Frame::CalibrationCandidateStatus {
+                candidate: protocol::CalibrationCandidateStatus {
+                    run,
+                    schedule_revision,
+                    presence: protocol::CalibrationCandidatePresence::Absent,
+                },
+            })
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(matches!(
+            coordinator.snapshot().calibration(),
+            Some(GuidedCalibrationSnapshot::BetweenSongs {
+                candidate_available: true,
+                continue_available: false,
+                ..
+            })
+        ));
+
+        let save_snapshot = coordinator.snapshot();
+        coordinator
+            .handle_intent_for_device(
+                GuidedIntentRequest {
+                    authority: save_snapshot.action_authority,
+                    action: GuidedSessionAction::SaveCalibration,
+                },
+                None,
+            )
+            .unwrap();
+        loop {
+            if matches!(
+                receive_control(&mut device).await,
+                Frame::CalibrationSave { run: saved_run } if saved_run == run
+            ) {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(matches!(
+            coordinator.snapshot().calibration(),
+            Some(GuidedCalibrationSnapshot::Finalizing { .. })
+        ));
+
+        // A normal status during finalization must not make the browser offer
+        // Save/Continue/Discard again while the durable operation is pending.
+        device
+            .frames
+            .send(Frame::CalibrationCandidateStatus {
+                candidate: protocol::CalibrationCandidateStatus {
+                    run,
+                    schedule_revision,
+                    presence: protocol::CalibrationCandidatePresence::Absent,
+                },
+            })
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(matches!(
+            coordinator.snapshot().calibration(),
+            Some(GuidedCalibrationSnapshot::Finalizing { .. })
+        ));
+
+        device
+            .frames
+            .send(Frame::CalibrationResidentActivated {
+                activation: protocol::CalibrationResidentActivation {
+                    run,
+                    schedule_revision,
+                    validity: protocol::CalibrationCandidateValidity {
+                        model_numerically_valid: true,
+                        record_crc_valid: true,
+                    },
+                    resident_sequence: 1,
+                },
+            })
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(matches!(
+            coordinator.snapshot().calibration(),
+            Some(GuidedCalibrationSnapshot::Setup { .. })
+        ));
+        assert!(coordinator.snapshot().active().is_none());
+    }
+
+    #[tokio::test]
     async fn failed_playback_preparation_never_becomes_ready() {
         let task = tokio::spawn(async {
             Err(anyhow::anyhow!("fixture audio failed"))
@@ -2601,6 +2863,7 @@ mod tests {
         assert!(matches!(
             coordinator.snapshot().calibration(),
             Some(GuidedCalibrationSnapshot::BetweenSongs {
+                candidate_available: true,
                 continue_available: true,
                 valid_reps: 3,
                 invalid_reps: 1,
@@ -3099,7 +3362,7 @@ mod tests {
                 track_title,
                 selected_track_id: Some(selected),
                 candidate_available: true,
-                continue_available: true,
+                continue_available: false,
                 ..
             } if track_title == completed.title && selected == next.id.0
         ));
@@ -3147,8 +3410,11 @@ mod tests {
 
         assert!(matches!(
             snapshot,
-            GuidedCalibrationSnapshot::BetweenSongs { deficits, .. }
-                if deficits == ["Tilt in, command: 8 short", "Tilt in, no-op: 13 short"]
+            GuidedCalibrationSnapshot::BetweenSongs {
+                deficits,
+                continue_available: true,
+                ..
+            } if deficits == ["Tilt in, command: 8 short", "Tilt in, no-op: 13 short"]
         ));
     }
 

@@ -704,6 +704,7 @@ enum CalibrationActionPhase {
     PlayingRunning,
     PlayingPaused,
     BetweenSongs,
+    Finalizing,
     TechnicalFailure,
     Exiting,
 }
@@ -725,6 +726,9 @@ fn calibration_action_phase(
         }
         protocol::GuidedCalibrationSnapshot::BetweenSongs { .. } => {
             CalibrationActionPhase::BetweenSongs
+        }
+        protocol::GuidedCalibrationSnapshot::Finalizing { .. } => {
+            CalibrationActionPhase::Finalizing
         }
         protocol::GuidedCalibrationSnapshot::TechnicalFailure { .. } => {
             CalibrationActionPhase::TechnicalFailure

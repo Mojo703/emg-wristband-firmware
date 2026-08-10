@@ -143,6 +143,7 @@ fn delivery_for(frame: &Frame) -> Delivery {
         | Frame::CalibrationSongResult { .. }
         | Frame::CalibrationCandidateStatus { .. }
         | Frame::CalibrationResidentActivated { .. }
+        | Frame::CalibrationRunFailed { .. }
         | Frame::CalibrationTimingStatus { .. }
         | Frame::CalibrationTimingLoopStatus { .. }
         | Frame::BenchError { .. }
@@ -893,7 +894,9 @@ mod tests {
     };
     use futures_util::{SinkExt, StreamExt};
     use protocol::{
-        DeviceConfig, DeviceProvenance, DeviceTransport, FirmwareBuild, Frame, PhoneStatus,
+        CalibrationRunFailure, CalibrationRunId, CalibrationRunKey, CalibrationScheduleRevision,
+        CalibrationSessionId, DeviceConfig, DeviceProvenance, DeviceTransport, FirmwareBuild,
+        Frame, PhoneStatus,
     };
     use std::sync::Arc;
     use std::time::Duration;
@@ -1327,6 +1330,56 @@ mod tests {
             Frame::PhoneState {
                 status: PhoneStatus::Advertising
             }
+        ));
+    }
+
+    #[tokio::test]
+    async fn browser_reconnect_receives_the_new_link_typed_calibration_terminal() {
+        let registry = Registry::new();
+        let _old_token = register_device(&registry);
+        // A device-link reconnect replaces the registry identity. The old
+        // guided actor must not be rebound, but the new link's terminal is a
+        // retained browser-visible explanation rather than lost cleanup.
+        let new_token = register_device(&registry);
+        let run = CalibrationRunKey {
+            session_id: CalibrationSessionId::new(4).unwrap(),
+            run_id: CalibrationRunId::new(2).unwrap(),
+        };
+        let revision = CalibrationScheduleRevision::new(3).unwrap();
+        registry.push_replacement_calibration_frame(
+            "opal-test",
+            new_token,
+            Frame::CalibrationRunFailed {
+                failure: CalibrationRunFailure {
+                    run,
+                    schedule_revision: revision,
+                    detail:
+                        "dashboard link changed during guided calibration; restart after reboot"
+                            .into(),
+                },
+            },
+        );
+        let (reliable, mut receiver) = mpsc::channel(1);
+        let tx = BrowserSender {
+            reliable,
+            live: Arc::new(LiveMailbox::default()),
+        };
+
+        assert!(
+            replay_retained(&registry, Some("opal-test"), &tx)
+                .await
+                .is_ok(),
+            "retained terminal reaches a fresh browser"
+        );
+        let Message::Binary(bytes) = receiver.recv().await.unwrap() else {
+            panic!("expected retained calibration terminal");
+        };
+        assert!(matches!(
+            frame::decode(&bytes).unwrap(),
+            Frame::CalibrationRunFailed { failure }
+                if failure.run == run
+                    && failure.schedule_revision == revision
+                    && failure.detail.contains("restart after reboot")
         ));
     }
 

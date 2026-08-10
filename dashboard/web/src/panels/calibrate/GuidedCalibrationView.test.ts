@@ -137,8 +137,9 @@ test('song end keeps unavailable actions visible and disabled', async () => {
   assert.match(button(body, 'Save'), DISABLED_ATTRIBUTE);
   assert.match(button(body, 'Continue'), DISABLED_ATTRIBUTE);
   assert.doesNotMatch(button(body, 'Discard'), DISABLED_ATTRIBUTE);
+  assert.match(button(body, 'Fixture Track'), DISABLED_ATTRIBUTE);
   assert.match(body, /<li[^>]*>Tip back, thumb down: 14\/16<\/li>/);
-  assert.match(body, /Finalizing and validating the candidate/);
+  assert.match(body, /No saveable result is available for this song/);
 });
 
 test('technical failure is an alert with no candidate actions', async () => {
@@ -149,6 +150,20 @@ test('technical failure is an alert with no candidate actions', async () => {
 
   assert.match(body, /role="alert"/);
   assert.match(body, /No candidate is available to save/);
+  assert.doesNotMatch(body, />Save</);
+  assert.doesNotMatch(body, />Continue</);
+  assert.doesNotMatch(body, />Discard</);
+});
+
+test('save finalization is status-only while the wristband performs durable work', async () => {
+  const { fixtures } = await modules();
+  const finalizing = fixtures['calibrationFinalizingFixture'];
+  assert.ok(finalizing?.phase === 'finalizing');
+  const body = await render(finalizing);
+
+  assert.match(body, /Saving calibration/);
+  assert.match(body, /Building, validating, and saving calibration on the wristband/);
+  assert.match(body, /up to two minutes/);
   assert.doesNotMatch(body, />Save</);
   assert.doesNotMatch(body, />Continue</);
   assert.doesNotMatch(body, />Discard</);

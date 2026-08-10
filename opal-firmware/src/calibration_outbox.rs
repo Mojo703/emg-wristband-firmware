@@ -35,6 +35,7 @@ enum ReliableIdentity {
     SongResult(CalibrationRunKey, CalibrationScheduleRevision),
     CandidateStatus(CalibrationRunKey, CalibrationScheduleRevision),
     ResidentActivated(CalibrationRunKey, CalibrationScheduleRevision),
+    RunFailed(CalibrationRunKey, CalibrationScheduleRevision),
     /// Refusals have no run identity. Only the newest undelivered diagnostic
     /// is useful, and coalescing them prevents a malformed host from growing a
     /// second log queue through the calibration path.
@@ -215,6 +216,9 @@ fn classify(frame: &Frame) -> Option<FrameClass> {
         Frame::CalibrationResidentActivated { activation } => FrameClass::Reliable(
             ReliableIdentity::ResidentActivated(activation.run, activation.schedule_revision),
         ),
+        Frame::CalibrationRunFailed { failure } => FrameClass::Reliable(
+            ReliableIdentity::RunFailed(failure.run, failure.schedule_revision),
+        ),
         Frame::BenchError {
             source: protocol::BenchErrorSource::Calibration,
             ..
@@ -228,8 +232,8 @@ fn classify(frame: &Frame) -> Option<FrameClass> {
 mod tests {
     use super::*;
     use protocol::{
-        CalibrationPreparationPhase, CalibrationPreparationStatus, CalibrationRunId,
-        CalibrationScheduleAccepted, CalibrationSessionId,
+        CalibrationPreparationPhase, CalibrationPreparationStatus, CalibrationRunFailure,
+        CalibrationRunId, CalibrationScheduleAccepted, CalibrationSessionId,
     };
 
     fn run(session: u64, run: u32) -> CalibrationRunKey {
@@ -301,6 +305,29 @@ mod tests {
             } => Some(*elapsed_milliseconds),
             _ => None,
         }
+    }
+
+    fn failed(run: CalibrationRunKey, revision: CalibrationScheduleRevision) -> Frame {
+        Frame::CalibrationRunFailed {
+            failure: CalibrationRunFailure {
+                run,
+                schedule_revision: revision,
+                detail: "dashboard link changed during guided calibration; restart after reboot"
+                    .into(),
+            },
+        }
+    }
+
+    fn is_failure_for(
+        frame: &Frame,
+        expected_run: CalibrationRunKey,
+        expected_revision: CalibrationScheduleRevision,
+    ) -> bool {
+        matches!(
+            frame,
+            Frame::CalibrationRunFailed { failure }
+                if failure.run == expected_run && failure.schedule_revision == expected_revision
+        )
     }
 
     #[test]
@@ -377,5 +404,32 @@ mod tests {
 
         assert!(outbox.try_send_one(1, true, |frame| is_accepted_for(frame, key, rev)));
         assert!(outbox.try_send_one(1, true, |frame| preparation_elapsed(frame) == Some(100)));
+    }
+
+    #[test]
+    fn reconnect_replays_a_reconstructed_terminal_but_not_the_old_epoch_queue() {
+        let key = run(5, 7);
+        let revision = revision(9);
+        let mut outbox = CalibrationOutbox::new();
+        outbox.push(40, true, accepted(key, revision)).unwrap();
+        assert!(!outbox.try_send_one(40, true, |_| false));
+
+        // A fresh Probe drops the old actor's acknowledgement. Calibration
+        // then reconstructs its typed terminal from live state and queues it
+        // under this new epoch.
+        outbox.push(41, true, failed(key, revision)).unwrap();
+        assert_eq!(outbox.len(), 1);
+        assert!(outbox.try_send_one(41, true, |frame| is_failure_for(frame, key, revision)));
+    }
+
+    #[test]
+    fn disconnected_terminal_replays_when_the_same_epoch_recovers() {
+        let key = run(8, 1);
+        let revision = revision(2);
+        let mut outbox = CalibrationOutbox::new();
+        outbox.push(77, true, failed(key, revision)).unwrap();
+
+        assert!(!outbox.try_send_one(77, false, |_| true));
+        assert!(outbox.try_send_one(77, true, |frame| is_failure_for(frame, key, revision)));
     }
 }

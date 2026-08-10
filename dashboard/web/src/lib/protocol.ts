@@ -96,6 +96,7 @@ export const FrameType = {
   CalibrationDiscard: 'calibration_discard',
   CalibrationCandidateStatus: 'calibration_candidate_status',
   CalibrationResidentActivated: 'calibration_resident_activated',
+  CalibrationRunFailed: 'calibration_run_failed',
   PlaybackCredit: 'playback_credit',
   BenchFeatures: 'bench_features',
   BenchCommits: 'bench_commits',
@@ -989,6 +990,15 @@ export interface CalibrationResidentActivatedFrame {
   };
 }
 
+export interface CalibrationRunFailedFrame {
+  readonly type: 'calibration_run_failed';
+  readonly failure: {
+    readonly run: CalibrationRunKey;
+    readonly schedule_revision: number;
+    readonly detail: string;
+  };
+}
+
 /** The gestures a calibration collects, in the fixed order they are prompted. */
 export const CalibrationGesture = {
   WristPronation: 'wrist_pronation',
@@ -1105,6 +1115,10 @@ export type GuidedCalibrationSnapshot =
       readonly valid_reps: number;
       readonly invalid_reps: number;
       readonly deficits: readonly string[];
+    }
+  | {
+      readonly phase: 'finalizing';
+      readonly detail: string;
     }
   | {
       readonly phase: 'exiting';
@@ -1364,6 +1378,7 @@ export type IncomingFrame =
   | CalibrationSongResultFrame
   | CalibrationCandidateStatusFrame
   | CalibrationResidentActivatedFrame
+  | CalibrationRunFailedFrame
   | PlaybackCreditFrame
   | BenchFeaturesFrame
   | BenchCommitsFrame
@@ -1860,6 +1875,7 @@ export function isGuidedCalibrationSnapshot(
         isNonnegativeInteger(value['invalid_reps']) &&
         isStringArray(value['deficits'])
       );
+    case 'finalizing':
     case 'exiting':
     case 'technical_failure':
       return isString(value['detail']);
@@ -2571,6 +2587,14 @@ export function isCalibrationResidentActivatedFrame(
   );
 }
 
+export function isCalibrationRunFailedFrame(value: unknown): value is CalibrationRunFailedFrame {
+  return (
+    hasType(value, 'calibration_run_failed') && isObject(value) &&
+    isObject(value['failure']) && isReplacementCalibrationIdentity(value['failure']) &&
+    isString(value['failure']['detail'])
+  );
+}
+
 export function isPlaybackCreditFrame(value: unknown): value is PlaybackCreditFrame {
   return (
     hasType(value, 'playback_credit') &&
@@ -2717,6 +2741,7 @@ export function asIncomingFrame(value: unknown): IncomingFrame | null {
   if (isCalibrationSongResultFrame(value)) return value;
   if (isCalibrationCandidateStatusFrame(value)) return value;
   if (isCalibrationResidentActivatedFrame(value)) return value;
+  if (isCalibrationRunFailedFrame(value)) return value;
   if (isPlaybackCreditFrame(value)) return value;
   if (isBenchFeaturesFrame(value)) return value;
   if (isBenchCommitsFrame(value)) return value;

@@ -3,6 +3,7 @@ import type {
   CalibrationPlayingSnapshot,
   CalibrationSetupSnapshot,
   CalibrationSongEndSnapshot,
+  CalibrationFinalizingSnapshot,
   CalibrationTechnicalFailureSnapshot,
   FiveCalibrationLanes,
 } from './guidedCalibration';
@@ -113,4 +114,9 @@ export const calibrationSongEndFixture: CalibrationSongEndSnapshot = {
 export const calibrationTechnicalFailureFixture: CalibrationTechnicalFailureSnapshot = {
   phase: 'technical_failure',
   detail: 'Fitting stopped before a structurally valid candidate was produced.',
+};
+
+export const calibrationFinalizingFixture: CalibrationFinalizingSnapshot = {
+  phase: 'finalizing',
+  detail: 'Building, validating, and saving calibration on the wristband…',
 };

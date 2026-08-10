@@ -17,6 +17,11 @@ use crate::RepEvidence;
 /// The confirmed maximum at the upload boundary.  This is intentionally local
 /// while the protocol crate's cancelled partial implementation still says 16.
 pub const MAX_ANCHORED_SONG_CHUNK_CUES: usize = 32;
+/// A complete upload is bounded before either of its two exact-reserve calls.
+/// The shipped recipe needs 130 cues; 256 leaves room for alternate authored
+/// songs while keeping malformed input from consuming the device heap or
+/// flooding the 24-frame reliable acknowledgement outbox.
+pub const MAX_ANCHORED_SONG_CUES: u32 = 256;
 pub const REQUIRED_CUE_HOLD_MILLISECONDS: u32 = 1_500;
 pub const REQUIRED_CUE_RECOVERY_MILLISECONDS: u32 = 500;
 pub const HEARTBEAT_INTERVAL_MICROSECONDS: u64 = 500_000;
@@ -58,6 +63,12 @@ impl AnchoredSongIdentity {
         }
         if self.total_count == 0 {
             return Err(AnchoredSongError::EmptySchedule);
+        }
+        if self.total_count > MAX_ANCHORED_SONG_CUES {
+            return Err(AnchoredSongError::TooManyCues {
+                limit: MAX_ANCHORED_SONG_CUES,
+                received: self.total_count,
+            });
         }
         Ok(())
     }
@@ -146,6 +157,10 @@ pub struct RetainedSongProgress {
 pub enum AnchoredSongError {
     EmptyContentIdentity,
     EmptySchedule,
+    TooManyCues {
+        limit: u32,
+        received: u32,
+    },
     /// The device could not reserve its bounded upload transaction before
     /// accepting it.  This is a protocol refusal, never an allocator panic or
     /// watchdog-reset halfway through a calibration.
@@ -814,6 +829,24 @@ mod tests {
             .unwrap();
         let anchor = song.commit(&identity, 10_000, 77).unwrap();
         (song, identity, anchor)
+    }
+
+    #[test]
+    fn complete_song_allocation_is_bounded_before_upload_begins() {
+        let error = AnchoredSongIdentity::new(
+            run(),
+            CalibrationScheduleRevision::new(1).unwrap(),
+            "oversized".to_string(),
+            MAX_ANCHORED_SONG_CUES + 1,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            AnchoredSongError::TooManyCues {
+                limit: MAX_ANCHORED_SONG_CUES,
+                received: MAX_ANCHORED_SONG_CUES + 1,
+            }
+        );
     }
 
     #[test]

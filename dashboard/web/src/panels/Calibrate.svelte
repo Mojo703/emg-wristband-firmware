@@ -23,7 +23,9 @@
   const guidedCalibration = $derived(
     calibrationSnapshot === null ? null : presentGuidedCalibration(calibrationSnapshot),
   );
-  const exitPending = $derived(calibrationSnapshot?.phase === 'exiting');
+  const terminalPending = $derived(
+    calibrationSnapshot?.phase === 'exiting' || calibrationSnapshot?.phase === 'finalizing',
+  );
   function sendGuided(action: GuidedSessionAction): void {
     const snapshot = live.guidedSession;
     if (snapshot === null) return;
@@ -46,10 +48,14 @@
   <h2>Calibrate</h2>
   <Button
     variant="secondary"
-    disabled={guidedSnapshot === null || exitPending}
+    disabled={guidedSnapshot === null || terminalPending}
     onclick={() => sendGuided({ name: 'exit_calibration' })}
   >
-    {exitPending ? 'Exiting…' : 'Exit calibration'}
+    {calibrationSnapshot?.phase === 'finalizing'
+      ? 'Saving…'
+      : calibrationSnapshot?.phase === 'exiting'
+        ? 'Exiting…'
+        : 'Exit calibration'}
   </Button>
 </div>
 

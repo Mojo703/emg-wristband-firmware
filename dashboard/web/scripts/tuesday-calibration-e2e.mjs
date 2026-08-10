@@ -192,9 +192,9 @@ async function main() {
   const playingAuthority = playing.snapshot.action_authority;
 
   // Let the first authored cue become eligible, then use the UI pause intent
-  // to withhold the backend heartbeat. Exercise an authority captured before
-  // many projection-only updates: telemetry revisions must not invalidate the
-  // control for the still-current actionable phase.
+  // to request an explicit device interruption. Exercise an authority captured
+  // before many projection-only updates: telemetry revisions must not
+  // invalidate the control for the still-current actionable phase.
   let samePhaseUpdates = 0;
   const requiredSamePhaseUpdates = playbackObservationMilliseconds >= 20_000
     ? 41
@@ -210,11 +210,11 @@ async function main() {
   }
   record('stable_action_authority', { authority: playingAuthority, same_phase_updates: samePhaseUpdates });
   guidedWithAuthority(playingAuthority, { name: 'pause_calibration' });
-  const interruption = await waitFor('heartbeat-timeout interruption', value =>
+  const interruption = await waitFor('operator interruption', value =>
     value.type === 'calibration_song_interrupted' &&
     value.interruption.run.session_id === schedule.run.session_id &&
     value.interruption.run.run_id === schedule.run.run_id, 8_000);
-  if (interruption.interruption.reason !== 'heartbeat_timeout') fail(`unexpected interruption ${interruption.interruption.reason}`);
+  if (interruption.interruption.reason !== 'operator') fail(`unexpected interruption ${interruption.interruption.reason}`);
   await waitFor('between-songs snapshot', value =>
     value.type === 'guided_session_snapshot' &&
     value.snapshot.lifecycle.state === 'calibration' &&

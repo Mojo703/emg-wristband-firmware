@@ -21,17 +21,24 @@ extern crate alloc;
 
 use core::num::NonZeroU32;
 
+mod anchored_fit;
+mod anchored_recipe;
 mod anchored_song;
 mod gate;
 mod grid;
 mod machine;
 mod validity;
 
+pub use anchored_fit::{AnchoredFitPlan, AnchoredFitStage};
+pub use anchored_recipe::{
+    anchored_class_index, anchored_labeled_span, anchored_target_count, AnchoredClassCount,
+    AnchoredRecipeProgress, ANCHORED_CLASS_COUNT, ANCHORED_COMMAND_TARGET, ANCHORED_NO_OP_TARGET,
+};
 pub use anchored_song::{
     AnchoredSong, AnchoredSongAction, AnchoredSongError, AnchoredSongIdentity,
     RetainedSongProgress, SongAnchor, SongInterruption, SongState, UploadEffect,
     HEARTBEAT_INTERVAL_MICROSECONDS, HEARTBEAT_TIMEOUT_MICROSECONDS, MAX_ANCHORED_SONG_CHUNK_CUES,
-    REQUIRED_CUE_HOLD_MILLISECONDS, REQUIRED_CUE_RECOVERY_MILLISECONDS,
+    MAX_ANCHORED_SONG_CUES, REQUIRED_CUE_HOLD_MILLISECONDS, REQUIRED_CUE_RECOVERY_MILLISECONDS,
     SONG_ANCHOR_LEAD_MICROSECONDS,
 };
 pub use gate::{ClassScore, GateVerdict, QualityGate};

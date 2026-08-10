@@ -388,6 +388,14 @@ fn timing_status_due(anchor: Option<u64>, last_reported_at: Option<u64>, observe
         }
 }
 
+/// A fresh link epoch is a state boundary, not another application control in
+/// the same batch. Keep that ordering explicit so Probe+Begin cannot start a
+/// run before calibration has retired the previous dashboard actor.
+fn controls_after_link_reconciliation<T>(controls: Vec<T>, reconcile: impl FnOnce()) -> Vec<T> {
+    reconcile();
+    controls
+}
+
 struct App {
     device_id: String,
     store: Store,
@@ -400,6 +408,8 @@ struct App {
     feedback: Feedback,
     calibration: Box<Calibration>,
     calibration_outbox: CalibrationOutbox,
+    /// Last link epoch reconciled with calibration's typed terminal cache.
+    calibration_link_generation: u32,
     calibrated: Option<CalibrationModel>,
     source: Option<AdcSource>,
     #[cfg(feature = "playback")]
@@ -760,6 +770,7 @@ impl App {
         let committed: Option<MediaKey> = None;
         let timing_loop_anchor = None;
         let timing_status_reported_at = None;
+        let calibration_link_generation = links.generation();
 
         Ok(Box::new(Self {
             device_id,
@@ -773,6 +784,7 @@ impl App {
             feedback,
             calibration,
             calibration_outbox: CalibrationOutbox::new(),
+            calibration_link_generation,
             calibrated,
             source,
             #[cfg(feature = "playback")]
@@ -827,7 +839,15 @@ impl App {
 
     fn apply_pending_controls(&mut self) -> bool {
         let mut config_changed = false;
-        for control in self.links.poll(&self.device_id, &self.settings) {
+        let controls = controls_after_link_reconciliation(
+            self.links.poll(&self.device_id, &self.settings),
+            || self.reconcile_calibration_link_generation(),
+        );
+        // A bounded link poll can contain a fresh Probe followed immediately
+        // by Begin. Reconcile the new epoch before applying any returned
+        // calibration controls, otherwise that valid Begin starts a run only
+        // for this same pass to abort it as stale.
+        for control in controls {
             let control = match control {
                 Control::ClockProbeRequest {
                     sequence,
@@ -873,6 +893,14 @@ impl App {
         }
         self.config_generation += u32::from(config_changed);
         config_changed
+    }
+
+    fn reconcile_calibration_link_generation(&mut self) {
+        let generation = self.links.generation();
+        if generation != self.calibration_link_generation {
+            self.calibration.link_generation_changed();
+            self.calibration_link_generation = generation;
+        }
     }
 
     fn apply_timing_control(&mut self, control: Control) {
@@ -1356,6 +1384,30 @@ fn apply_control(
 #[cfg(test)]
 mod decision_pipeline_tests {
     use super::*;
+
+    #[test]
+    fn probe_epoch_reconciliation_precedes_a_batched_calibration_begin() {
+        let run = protocol::CalibrationRunKey {
+            session_id: protocol::CalibrationSessionId::new(1).unwrap(),
+            run_id: protocol::CalibrationRunId::new(1).unwrap(),
+        };
+        let mut order = Vec::new();
+        let controls = controls_after_link_reconciliation(
+            vec![Control::CalibrationScheduleBegin {
+                run,
+                schedule_revision: protocol::CalibrationScheduleRevision::new(1).unwrap(),
+                content_identity: "sha256:test".into(),
+                total_count: 1,
+            }],
+            || order.push("reconcile"),
+        );
+        for control in controls {
+            if control.is_calibration() {
+                order.push("calibration control");
+            }
+        }
+        assert_eq!(order, ["reconcile", "calibration control"]);
+    }
 
     #[test]
     fn sensitivity_updates_both_reject_spines_and_survives_activation_reset() {

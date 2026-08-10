@@ -33,7 +33,11 @@ use crate::config::Settings;
 use crate::feedback::{Calibrating, Prompt, RepNotice};
 use crate::transport::Control;
 use adapter_guard::{rows_ready_to_install, ActionGuard, FitPassSchedule, FitScheduleProgress};
-use calibration_flow::{Action, Constants, LabeledSpan, RepEvidence, Run, RunOutcome};
+use calibration_flow::{
+    anchored_labeled_span, anchored_target_count, Action, AnchoredClassCount, AnchoredFitPlan,
+    AnchoredFitStage, AnchoredRecipeProgress, Constants, LabeledSpan, RepEvidence, Run, RunOutcome,
+    ANCHORED_CLASS_COUNT, ANCHORED_COMMAND_TARGET, ANCHORED_NO_OP_TARGET,
+};
 use calibration_flow::{
     AnchoredSong, AnchoredSongAction, AnchoredSongError, AnchoredSongIdentity, SongInterruption,
     SongState,
@@ -51,10 +55,11 @@ use protocol::{
     CalibrationCandidatePresence, CalibrationCandidateStatus, CalibrationCandidateValidity,
     CalibrationClassCounts, CalibrationGesture, CalibrationModifier, CalibrationOutcome,
     CalibrationPreparationPhase, CalibrationPreparationStatus, CalibrationResidentActivation,
-    CalibrationRunKey, CalibrationScheduleAccepted, CalibrationScheduleCommitDeferral,
-    CalibrationScheduleCommitDeferralReason, CalibrationScheduleRevision,
-    CalibrationScheduleUploadAcknowledgement, CalibrationScheduleUploadOperationAcknowledgement,
-    CalibrationSongInterruption, CalibrationSongInterruptionReason, CalibrationSongResult, Frame,
+    CalibrationRunFailure, CalibrationRunKey, CalibrationScheduleAccepted,
+    CalibrationScheduleCommitDeferral, CalibrationScheduleCommitDeferralReason,
+    CalibrationScheduleRevision, CalibrationScheduleUploadAcknowledgement,
+    CalibrationScheduleUploadOperationAcknowledgement, CalibrationSongInterruption,
+    CalibrationSongInterruptionReason, CalibrationSongResult, Frame,
 };
 use training_rows::CalibrationPartition;
 
@@ -72,18 +77,16 @@ use resident_selector::{
 /// round in front of the next flush and nothing more.
 const ROUND_ROW_CAPACITY: usize = 128;
 const CALIBRATION_CLASS_CAPACITY: usize = 12;
-const ANCHORED_COMMAND_TARGET: u32 = 10;
-const ANCHORED_NO_OP_TARGET: u32 = 16;
 const _: () = assert!(
     flash_image::CALIBRATION_RECIPE_ROW_CAPACITY <= flash_image::slot_row_capacity(),
     "the audited calibration recipe must fit one physical slot"
 );
 const _: () = assert!(
     flash_image::CALIBRATION_RECIPE_ROW_CAPACITY
-        >= CalibrationGesture::ALL.len()
+        == CalibrationGesture::ALL.len()
             * (ANCHORED_COMMAND_TARGET + ANCHORED_NO_OP_TARGET) as usize
             * Constants::DEFAULT.labeled_windows as usize,
-    "the flash recipe must hold every targeted anchored row"
+    "the flash recipe budget must equal every targeted anchored row"
 );
 
 /// A round has to fit, and the two numbers that decide whether it does live
@@ -166,37 +169,6 @@ fn anchored_label(entry: protocol::CalibrationScheduleEntry) -> u8 {
         }
 }
 
-fn anchored_class_index(entry: protocol::CalibrationScheduleEntry) -> usize {
-    usize::from(anchored_label(entry))
-}
-
-const fn anchored_target_count(modifier: CalibrationModifier) -> u32 {
-    match modifier {
-        CalibrationModifier::ThumbUp => ANCHORED_COMMAND_TARGET,
-        CalibrationModifier::ThumbDown => ANCHORED_NO_OP_TARGET,
-    }
-}
-
-const fn anchored_class_accepts_rows(accepted_count: u32, modifier: CalibrationModifier) -> bool {
-    accepted_count < anchored_target_count(modifier)
-}
-
-fn record_is_numerically_valid(record: &SlotRecord) -> bool {
-    record.class_count == CALIBRATION_CLASS_CAPACITY
-        && record.reference_gains.iter().all(|value| value.is_finite())
-        && record.mean.iter().all(|value| value.is_finite())
-        && record
-            .deviation
-            .iter()
-            .all(|value| value.is_finite() && *value > 0.0)
-        && record.centroids.iter().all(|value| value.is_finite())
-        && record
-            .spreads
-            .iter()
-            .all(|value| value.is_finite() && *value >= 0.0)
-        && record.weights.iter().all(|value| value.is_finite())
-}
-
 #[cfg(test)]
 fn anchored_gain_collection_active(
     constants: Constants,
@@ -206,22 +178,6 @@ fn anchored_gain_collection_active(
     let settle_end = started + constants.samples_in(ANCHORED_SETTLE_MILLISECONDS);
     let gain_end = settle_end + constants.samples_in(ANCHORED_GAIN_MILLISECONDS);
     acquisition_sample >= settle_end && acquisition_sample < gain_end
-}
-
-fn acquisition_sample_at_device_instant(
-    constants: Constants,
-    anchor: calibration_flow::SongAnchor,
-    device_monotonic_microseconds: u64,
-) -> u64 {
-    debug_assert!(
-        device_monotonic_microseconds >= anchor.acknowledged_device_monotonic_microseconds
-    );
-    let elapsed_microseconds = device_monotonic_microseconds
-        .saturating_sub(anchor.acknowledged_device_monotonic_microseconds);
-    let elapsed_samples = (u128::from(elapsed_microseconds) * u128::from(constants.sample_rate_hz)
-        / 1_000_000)
-        .min(u128::from(u64::MAX)) as u64;
-    anchor.acquisition_sample.saturating_add(elapsed_samples)
 }
 
 fn anchored_song_is_runnable(song: &AnchoredSong) -> bool {
@@ -270,15 +226,6 @@ enum FitStage {
     Polish,
 }
 
-/// The anchored path fits between authored cues, then runs one final polish
-/// after the complete song. It shares the 64-row fitter implementation but
-/// never borrows the legacy wearer state machine.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AnchoredFitStage {
-    Checkpoint,
-    Polish,
-}
-
 /// A checkpoint's passes, drained one per poll.
 #[derive(Debug)]
 struct PendingFit {
@@ -291,29 +238,73 @@ struct PendingFit {
 #[derive(Debug)]
 struct AnchoredPendingFit {
     stage: AnchoredFitStage,
+    remaining: AnchoredFitPlan,
     schedule: FitPassSchedule,
     pass: Option<FitPass>,
     pass_work_microseconds: u64,
 }
 
-/// Bounded fitting has one lifecycle.  In particular, a cue that finishes
-/// while a checkpoint is running becomes `RunningThenCheckpoint`, rather than
-/// a second boolean that can disagree with the pending-fit option.
+/// Bounded fitting has one lifecycle. The pure [`AnchoredFitPlan`] owns the
+/// bounded queue; this adapter only adds the in-flight device fitter and the
+/// CRC-validated candidate ownership.
 #[derive(Debug)]
 enum AnchoredFitLifecycle {
     Idle,
-    CheckpointRequested,
+    Requested(AnchoredFitPlan),
     Running(AnchoredPendingFit),
-    RunningThenCheckpoint(AnchoredPendingFit),
     CandidateReady(CandidateOwnership),
+}
+
+/// The only calibration terminal data retained across a dashboard-link epoch.
+///
+/// This deliberately stores typed state rather than an old wire frame. The
+/// current link reconstructs a fresh frame from it, so a retry cannot leak an
+/// old actor's opaque queue into a new connection generation.
+#[derive(Debug, Clone)]
+enum AnchoredTerminalReplay {
+    Activated(CalibrationResidentActivation),
+    Discarded {
+        run: CalibrationRunKey,
+        schedule_revision: CalibrationScheduleRevision,
+    },
+    Failed(CalibrationRunFailure),
+}
+
+impl AnchoredTerminalReplay {
+    fn frame(&self) -> Frame {
+        match self {
+            Self::Activated(activation) => Frame::CalibrationResidentActivated {
+                activation: *activation,
+            },
+            Self::Discarded {
+                run,
+                schedule_revision,
+            } => Frame::CalibrationCandidateStatus {
+                candidate: CalibrationCandidateStatus {
+                    run: *run,
+                    schedule_revision: *schedule_revision,
+                    presence: CalibrationCandidatePresence::Absent,
+                },
+            },
+            Self::Failed(failure) => Frame::CalibrationRunFailed {
+                failure: failure.clone(),
+            },
+        }
+    }
 }
 
 impl AnchoredFitLifecycle {
     fn request_checkpoint(self) -> Self {
         match self {
-            Self::Idle | Self::CheckpointRequested => Self::CheckpointRequested,
-            Self::Running(pending) | Self::RunningThenCheckpoint(pending) => {
-                Self::RunningThenCheckpoint(pending)
+            Self::Idle => Self::Requested(AnchoredFitPlan::Checkpoint),
+            Self::Requested(plan) => Self::Requested(plan.request_checkpoint()),
+            Self::Running(mut pending) if pending.stage != AnchoredFitStage::FinalPolish => {
+                pending.remaining = pending.remaining.request_checkpoint();
+                Self::Running(pending)
+            }
+            Self::Running(pending) => {
+                warn!("anchored checkpoint requested during final polish");
+                Self::Running(pending)
             }
             // Final polish is terminal. A cue reaching this transition would
             // be an executor bug, not permission to orphan the candidate.
@@ -321,6 +312,30 @@ impl AnchoredFitLifecycle {
                 warn!("anchored checkpoint requested after candidate became ready");
                 Self::CandidateReady(owner)
             }
+        }
+    }
+
+    fn request_finalization(self) -> Self {
+        match self {
+            Self::Idle => Self::Requested(AnchoredFitPlan::Finalize),
+            Self::Requested(plan) => Self::Requested(plan.request_finalization()),
+            Self::Running(mut pending) if pending.stage != AnchoredFitStage::FinalPolish => {
+                pending.remaining = pending.remaining.request_finalization();
+                Self::Running(pending)
+            }
+            // Save is idempotent while its final polish is already running.
+            Self::Running(pending) => Self::Running(pending),
+            Self::CandidateReady(owner) => Self::CandidateReady(owner),
+        }
+    }
+
+    fn is_finalizing(&self) -> bool {
+        match self {
+            Self::Requested(plan) => plan.is_finalizing(),
+            Self::Running(pending) => {
+                pending.stage == AnchoredFitStage::FinalPolish || pending.remaining.is_finalizing()
+            }
+            Self::Idle | Self::CandidateReady(_) => false,
         }
     }
 }
@@ -540,7 +555,7 @@ enum AnchoredRunLifecycle {
     Active {
         song: AnchoredSong,
         cue: AnchoredCueLifecycle,
-        counts: [AnchoredClassCount; CALIBRATION_CLASS_CAPACITY],
+        counts: AnchoredRecipeProgress,
         fit: AnchoredFitLifecycle,
     },
 }
@@ -550,7 +565,7 @@ impl AnchoredRunLifecycle {
         Self::Active {
             song: AnchoredSong::new(run),
             cue: AnchoredCueLifecycle::Idle,
-            counts: [AnchoredClassCount::default(); CALIBRATION_CLASS_CAPACITY],
+            counts: AnchoredRecipeProgress::default(),
             fit: AnchoredFitLifecycle::Idle,
         }
     }
@@ -597,14 +612,21 @@ impl AnchoredRunLifecycle {
         }
     }
 
-    fn count_mut(&mut self, index: usize) -> Option<&mut AnchoredClassCount> {
+    fn counts(&self) -> Option<&[AnchoredClassCount; ANCHORED_CLASS_COUNT]> {
         match self {
-            Self::Active { counts, .. } => counts.get_mut(index),
+            Self::Active { counts, .. } => Some(counts.counts()),
             Self::Idle => None,
         }
     }
 
-    fn counts(&self) -> Option<&[AnchoredClassCount; CALIBRATION_CLASS_CAPACITY]> {
+    fn recipe(&self) -> Option<&AnchoredRecipeProgress> {
+        match self {
+            Self::Active { counts, .. } => Some(counts),
+            Self::Idle => None,
+        }
+    }
+
+    fn recipe_mut(&mut self) -> Option<&mut AnchoredRecipeProgress> {
         match self {
             Self::Active { counts, .. } => Some(counts),
             Self::Idle => None,
@@ -614,12 +636,6 @@ impl AnchoredRunLifecycle {
     fn reset(&mut self) {
         *self = Self::Idle;
     }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct AnchoredClassCount {
-    accepted: u32,
-    rejected: u32,
 }
 
 /// Preparation is an acquisition-clock state machine, not a start timestamp
@@ -847,6 +863,9 @@ pub(crate) struct Calibration {
 
     prompt: Option<Prompt>,
     notice: Option<RepNotice>,
+    /// Replayed only after a fresh link generation, never as an old outbox
+    /// entry. A new explicit Begin clears it.
+    anchored_terminal: Option<AnchoredTerminalReplay>,
     outbound: Vec<Frame>,
 }
 
@@ -957,7 +976,11 @@ impl Calibration {
             lead_off_channels: None,
             prompt: None,
             notice: None,
-            outbound: Vec::new(),
+            anchored_terminal: None,
+            // A bounded control poll can produce at most a small burst. Keep
+            // this allocation across drains so status narration does not
+            // fragment the heap during a long multi-song run.
+            outbound: Vec::with_capacity(32),
         }
     }
 
@@ -1018,6 +1041,7 @@ impl Calibration {
                 // failure has been reported. It receives a fresh acquisition
                 // start rather than inheriting the failed phase.
                 self.anchored_preparation = AnchoredPreparation::Idle;
+                self.anchored_terminal = None;
             }
         }
         if self.partition.is_none() {
@@ -1117,7 +1141,8 @@ impl Calibration {
                         .constants
                         .samples_in(ANCHORED_SETTLE_MILLISECONDS + ANCHORED_GAIN_MILLISECONDS) =>
             {
-                let gains = self.gains.freeze();
+                let estimated = self.gains.freeze();
+                let gains = self.adopted_gains.unwrap_or(estimated);
                 self.gains_latched = true;
                 self.pending_gain_update = Some(FeatureGainUpdate::Prepared(gains));
                 info!(
@@ -1152,7 +1177,7 @@ impl Calibration {
             detail: detail.into(),
         };
         self.emit_anchored_preparation_status();
-        self.refuse(detail);
+        self.emit_anchored_failure(run, schedule_revision, detail);
     }
 
     fn emit_anchored_preparation_status(&mut self) {
@@ -1258,6 +1283,14 @@ impl Calibration {
                     self.refuse(
                         "a completed candidate requires Save or Discard before another schedule",
                     );
+                    return None;
+                }
+                if self
+                    .anchored
+                    .fit()
+                    .is_some_and(AnchoredFitLifecycle::is_finalizing)
+                {
+                    self.refuse("Save finalization is already in progress");
                     return None;
                 }
                 if !self.begin_anchored_lifecycle(run, schedule_revision) {
@@ -1696,11 +1729,6 @@ impl Calibration {
                     .song()
                     .and_then(AnchoredSong::anchor)
                     .expect("an open cue belongs to a committed song");
-                let prompt_sample = acquisition_sample_at_device_instant(
-                    self.constants,
-                    anchor,
-                    device_monotonic_microseconds,
-                );
                 self.rep_rows.clear();
                 *self
                     .anchored
@@ -1708,11 +1736,10 @@ impl Calibration {
                     .expect("a song action belongs to an active run") =
                     AnchoredCueLifecycle::open(AnchoredCapture {
                         entry,
-                        span: LabeledSpan::after_prompt(
-                            self.constants.grid(),
-                            prompt_sample,
-                            self.constants.prompt_delay_samples(),
-                            self.constants.labeled_windows,
+                        span: anchored_labeled_span(
+                            self.constants,
+                            anchor,
+                            device_monotonic_microseconds,
                         ),
                         evidence: RepEvidence::default(),
                         flash_microseconds_at_open: self.flash_microseconds,
@@ -1731,13 +1758,18 @@ impl Calibration {
                     .clear();
                 self.rep_rows.clear();
                 if let Some(entry) = rejected_open_cue {
-                    self.anchored_count_mut(entry).rejected += 1;
+                    self.anchored
+                        .recipe_mut()
+                        .expect("an active run owns recipe progress")
+                        .record_rejected(entry);
                 }
                 self.emit_anchored_interruption(reason, rejected_open_cue);
             }
             Ok(Some(AnchoredSongAction::Completed)) => self.emit_anchored_song_result(),
             Ok(None) => {}
-            Err(error) => self.refuse(&format!("anchored song execution failed: {error}")),
+            Err(error) => {
+                self.fail_anchored_execution(&format!("anchored song execution failed: {error}"))
+            }
         }
     }
 
@@ -1747,11 +1779,11 @@ impl Calibration {
             .cue_mut()
             .and_then(AnchoredCueLifecycle::take_capture)
         else {
-            self.refuse("anchored cue closed without an open capture");
+            self.fail_anchored_execution("anchored cue closed without an open capture");
             return;
         };
         if capture.entry != entry {
-            self.refuse("anchored cue close did not match the open cue");
+            self.fail_anchored_execution("anchored cue close did not match the open cue");
             self.rep_rows.clear();
             return;
         }
@@ -1795,19 +1827,26 @@ impl Calibration {
                 } else {
                     self.rep_rows.clear();
                 }
-                let count = self.anchored_count_mut(entry);
-                count.accepted = count.accepted.saturating_add(1);
+                let recorded_retention = self
+                    .anchored
+                    .recipe_mut()
+                    .expect("an active run owns recipe progress")
+                    .record_accepted(entry);
+                debug_assert_eq!(recorded_retention, retain_rows);
                 if retain_rows && self.flush_anchored_rows() {
                     self.request_anchored_checkpoint();
                 }
             }
             Ok(Err(_)) => {
                 self.rep_rows.clear();
-                self.anchored_count_mut(entry).rejected += 1;
+                self.anchored
+                    .recipe_mut()
+                    .expect("an active run owns recipe progress")
+                    .record_rejected(entry);
             }
             Err(error) => {
                 self.rep_rows.clear();
-                self.refuse(&format!("anchored cue evidence rejected: {error}"));
+                self.fail_anchored_execution(&format!("anchored cue evidence rejected: {error}"));
             }
         }
     }
@@ -1819,7 +1858,7 @@ impl Calibration {
         let slot = self.slot;
         let pending = self.rows.len();
         if !self.authorize_active_slot_programming() {
-            self.refuse(
+            self.fail_anchored_execution(
                 "anchored calibration has no erased-slot capability; reboot before calibrating again",
             );
             return false;
@@ -1837,28 +1876,28 @@ impl Calibration {
             }
             Some(Err(error)) => {
                 self.poison_active_slot_after_write_failure();
-                self.refuse(&format!("anchored calibration row flush failed: {error}"));
+                self.fail_anchored_execution(&format!(
+                    "anchored calibration row flush failed: {error}"
+                ));
                 false
             }
             None => {
-                self.refuse("anchored calibration row flush has no partition");
+                self.fail_anchored_execution("anchored calibration row flush has no partition");
                 false
             }
         }
     }
 
-    fn begin_anchored_fit(&mut self, stage: AnchoredFitStage) {
-        if !matches!(
-            self.anchored.fit(),
-            Some(AnchoredFitLifecycle::Idle | AnchoredFitLifecycle::CheckpointRequested)
-        ) || self.checkpoint.is_none()
-            || self.rows_flushed() == 0
+    fn begin_anchored_fit(&mut self, stage: AnchoredFitStage, remaining: AnchoredFitPlan) {
+        if self.checkpoint.is_none()
+            || (stage == AnchoredFitStage::Checkpoint && self.rows_flushed() == 0)
         {
+            self.fail_anchored_execution("bounded fitter has no checkpoint or retained rows");
             return;
         }
         let passes = match stage {
             AnchoredFitStage::Checkpoint => self.constants.passes_per_round,
-            AnchoredFitStage::Polish => self.constants.final_passes,
+            AnchoredFitStage::FinalPolish => self.constants.final_passes,
         };
         *self
             .anchored
@@ -1866,6 +1905,7 @@ impl Calibration {
             .expect("anchored fit work belongs to an active run") =
             AnchoredFitLifecycle::Running(AnchoredPendingFit {
                 stage,
+                remaining,
                 schedule: FitPassSchedule::new(passes),
                 pass: None,
                 pass_work_microseconds: 0,
@@ -1884,6 +1924,78 @@ impl Calibration {
         *fit = core::mem::replace(fit, AnchoredFitLifecycle::Idle).request_checkpoint();
     }
 
+    fn request_anchored_finalization(&mut self) {
+        let fit = self
+            .anchored
+            .fit_mut()
+            .expect("a Save request belongs to an active run");
+        *fit = core::mem::replace(fit, AnchoredFitLifecycle::Idle).request_finalization();
+    }
+
+    fn fail_anchored_execution(&mut self, detail: &str) {
+        if let Some((run, schedule_revision)) = self.active_anchored_identity() {
+            self.emit_anchored_failure(run, schedule_revision, detail);
+        } else {
+            self.refuse(detail);
+        }
+        self.queue_resident_gain_restore();
+        self.reset_anchored_lifecycle();
+    }
+
+    fn active_anchored_identity(&self) -> Option<(CalibrationRunKey, CalibrationScheduleRevision)> {
+        self.anchored
+            .song()
+            .and_then(AnchoredSong::identity)
+            .map(|identity| (identity.run, identity.revision))
+            .or_else(|| self.anchored_preparation.identity())
+    }
+
+    fn remember_anchored_terminal(&mut self, terminal: AnchoredTerminalReplay) {
+        self.outbound.push(terminal.frame());
+        self.anchored_terminal = Some(terminal);
+    }
+
+    fn emit_anchored_failure(
+        &mut self,
+        run: CalibrationRunKey,
+        schedule_revision: CalibrationScheduleRevision,
+        detail: &str,
+    ) {
+        warn!(
+            "guided calibration run {:?} revision {:?} failed: {detail}",
+            run, schedule_revision
+        );
+        self.remember_anchored_terminal(AnchoredTerminalReplay::Failed(CalibrationRunFailure {
+            run,
+            schedule_revision,
+            detail: detail.into(),
+        }));
+    }
+
+    /// A Probe creates a fresh dashboard-link epoch. Its old actor may already
+    /// be gone, so never move its queued frames into the new epoch. Abort work
+    /// that cannot safely be resumed from the device alone and publish a typed
+    /// terminal for the new link; if a previous terminal was lost, replay only
+    /// that reconstructed terminal state.
+    pub(crate) fn link_generation_changed(&mut self) {
+        if let Some((run, schedule_revision)) = self
+            .active_anchored_identity()
+            .filter(|_| self.anchored.song().is_some() || self.anchored_preparation.is_live())
+        {
+            self.emit_anchored_failure(
+                run,
+                schedule_revision,
+                "dashboard link changed during guided calibration; restart after reboot",
+            );
+            self.queue_resident_gain_restore();
+            self.reset_anchored_lifecycle();
+        } else if self.run.is_none() {
+            if let Some(terminal) = self.anchored_terminal.as_ref() {
+                self.outbound.push(terminal.frame());
+            }
+        }
+    }
+
     fn advance_anchored_fit(&mut self) {
         if self
             .anchored
@@ -1892,37 +2004,35 @@ impl Calibration {
         {
             return;
         }
-        if matches!(
-            self.anchored.fit(),
-            Some(AnchoredFitLifecycle::CheckpointRequested)
-        ) {
-            self.begin_anchored_fit(AnchoredFitStage::Checkpoint);
+        let requested = match self.anchored.fit() {
+            Some(AnchoredFitLifecycle::Requested(plan)) => Some(*plan),
+            _ => None,
+        };
+        if let Some(plan) = requested {
+            let Some((stage, remaining)) = plan.take_first() else {
+                *self
+                    .anchored
+                    .fit_mut()
+                    .expect("an active run owns fit state") = AnchoredFitLifecycle::Idle;
+                return;
+            };
+            self.begin_anchored_fit(stage, remaining);
         }
         let Some(fit) = self.anchored.fit_mut() else {
             return;
         };
-        let (mut pending, queued_checkpoint) =
-            match core::mem::replace(fit, AnchoredFitLifecycle::Idle) {
-                AnchoredFitLifecycle::Running(pending) => (pending, false),
-                AnchoredFitLifecycle::RunningThenCheckpoint(pending) => (pending, true),
-                lifecycle => {
-                    *self
-                        .anchored
-                        .fit_mut()
-                        .expect("the active run retains its fit lifecycle") = lifecycle;
-                    return;
-                }
-            };
+        let mut pending = match core::mem::replace(fit, AnchoredFitLifecycle::Idle) {
+            AnchoredFitLifecycle::Running(pending) => pending,
+            lifecycle => {
+                *self
+                    .anchored
+                    .fit_mut()
+                    .expect("the active run retains its fit lifecycle") = lifecycle;
+                return;
+            }
+        };
         let Some((progress, microseconds)) = self.run_fit_chunk_for_anchored(&mut pending) else {
-            *self
-                .anchored
-                .fit_mut()
-                .expect("the active run retains its fit lifecycle") = if queued_checkpoint {
-                AnchoredFitLifecycle::RunningThenCheckpoint(pending)
-            } else {
-                AnchoredFitLifecycle::Running(pending)
-            };
-            self.refuse("anchored bounded fitter could not start or resume");
+            self.fail_anchored_execution("anchored bounded fitter could not start or resume");
             return;
         };
         pending.pass_work_microseconds += microseconds;
@@ -1931,11 +2041,8 @@ impl Calibration {
                 *self
                     .anchored
                     .fit_mut()
-                    .expect("the active run retains its fit lifecycle") = if queued_checkpoint {
-                    AnchoredFitLifecycle::RunningThenCheckpoint(pending)
-                } else {
-                    AnchoredFitLifecycle::Running(pending)
-                };
+                    .expect("the active run retains its fit lifecycle") =
+                    AnchoredFitLifecycle::Running(pending);
             }
             FitScheduleProgress::CheckpointComplete => {
                 if let Some(song) = self.anchored.song_mut() {
@@ -1952,13 +2059,29 @@ impl Calibration {
                             .anchored
                             .fit_mut()
                             .expect("the active run retains its fit lifecycle") =
-                            if queued_checkpoint {
-                                AnchoredFitLifecycle::CheckpointRequested
-                            } else {
+                            if matches!(pending.remaining, AnchoredFitPlan::Idle) {
                                 AnchoredFitLifecycle::Idle
+                            } else {
+                                AnchoredFitLifecycle::Requested(pending.remaining)
                             };
                     }
-                    AnchoredFitStage::Polish => self.finalize_anchored_candidate(),
+                    AnchoredFitStage::FinalPolish => {
+                        debug_assert_eq!(pending.remaining, AnchoredFitPlan::Idle);
+                        let run = self
+                            .anchored
+                            .song()
+                            .and_then(AnchoredSong::identity)
+                            .map(|identity| identity.run);
+                        self.finalize_anchored_candidate();
+                        if let Some(run) = run {
+                            if matches!(
+                                self.anchored.fit(),
+                                Some(AnchoredFitLifecycle::CandidateReady(_))
+                            ) {
+                                self.save_anchored_candidate(run);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1998,16 +2121,6 @@ impl Calibration {
         Some((progress, crate::device_now_us() - started))
     }
 
-    fn maybe_begin_anchored_polish(&mut self) {
-        let song_completed = self
-            .anchored
-            .song()
-            .is_some_and(|song| song.state() == SongState::Completed);
-        if song_completed && matches!(self.anchored.fit(), Some(AnchoredFitLifecycle::Idle)) {
-            self.begin_anchored_fit(AnchoredFitStage::Polish);
-        }
-    }
-
     fn finalize_anchored_candidate(&mut self) {
         if matches!(
             self.anchored.fit(),
@@ -2026,30 +2139,31 @@ impl Calibration {
         let (Some(checkpoint), Some(partition)) =
             (self.checkpoint.as_ref(), self.partition.as_ref())
         else {
-            self.refuse("anchored final polish produced no fitted checkpoint");
+            self.fail_anchored_execution("anchored final polish produced no fitted checkpoint");
             return;
         };
         let prior = partition.prior();
         let standardization = prior.standardization();
-        let model = self.fitter.model(checkpoint, &standardization);
         let mut record = SlotRecord::empty(checkpoint.class_count());
         record.role = flash_image::SlotRole::ExportableCandidate;
         record.sequence = self.sequence;
         record.prior_hash = prior.hash();
-        record.reference_gains = self.gains.frozen().unwrap_or([1.0; CHANNEL_COUNT]);
+        record.reference_gains = self
+            .adopted_gains
+            .or_else(|| self.gains.frozen())
+            .unwrap_or([1.0; CHANNEL_COUNT]);
         record.mean = standardization.mean;
         record.deviation = standardization.deviation;
-        record.weights = checkpoint.weights().to_vec();
+        record.weights.copy_from_slice(checkpoint.weights());
         self.fill_class_statistics(&mut record);
-        if !record_is_numerically_valid(&record) {
-            self.refuse("anchored fitter produced a non-finite candidate model");
-            self.emit_anchored_candidate_status(identity.run, identity.revision);
+        if !record.is_product_calibration_model() {
+            self.fail_anchored_execution("anchored fitter produced a non-finite candidate model");
             return;
         }
         let slot = self.slot;
         let rows = self.rows_flushed();
         if !self.authorize_active_slot_programming() {
-            self.refuse(
+            self.fail_anchored_execution(
                 "candidate commit has no erased-slot capability; reboot before calibrating again",
             );
             return;
@@ -2068,8 +2182,9 @@ impl Calibration {
                         .stored_identities(),
                 );
                 let Some(stored) = self.active_selector.exportable() else {
-                    self.refuse("candidate CRC validation failed after final polish");
-                    self.emit_anchored_candidate_status(identity.run, identity.revision);
+                    self.fail_anchored_execution(
+                        "candidate CRC validation failed after final polish",
+                    );
                     return;
                 };
                 *self
@@ -2080,36 +2195,21 @@ impl Calibration {
                         schedule: identity.clone(),
                         stored,
                     });
-                // Keep `model` alive only long enough to prove its shape was
-                // constructible; Save reloads the CRC-validated flash record.
-                let _ = model;
                 self.emit_anchored_candidate_status(identity.run, identity.revision);
             }
             Some(Err(error)) => {
                 self.poison_active_slot_after_write_failure();
-                self.refuse(&format!("candidate record commit failed: {error}"));
+                self.fail_anchored_execution(&format!("candidate record commit failed: {error}"));
             }
-            None => self.refuse("candidate record commit has no partition"),
+            None => self.fail_anchored_execution("candidate record commit has no partition"),
         }
     }
 
-    fn anchored_count_mut(
-        &mut self,
-        entry: protocol::CalibrationScheduleEntry,
-    ) -> &mut AnchoredClassCount {
-        let index = anchored_class_index(entry);
-        self.anchored
-            .count_mut(index)
-            .expect("anchored class counts belong to an active run")
-    }
-
     fn anchored_class_needs_rows(&self, entry: protocol::CalibrationScheduleEntry) -> bool {
-        let accepted = self
-            .anchored
-            .counts()
-            .expect("anchored class counts belong to an active run")[anchored_class_index(entry)]
-        .accepted;
-        anchored_class_accepts_rows(accepted, entry.modifier)
+        self.anchored
+            .recipe()
+            .expect("anchored class counts belong to an active run")
+            .retains_next(entry)
     }
 
     fn emit_anchored_interruption(
@@ -2180,18 +2280,21 @@ impl Calibration {
             .clear();
         self.rep_rows.clear();
         if let Some(entry) = rejected_open_cue {
-            self.anchored_count_mut(entry).rejected += 1;
+            self.anchored
+                .recipe_mut()
+                .expect("an active run owns recipe progress")
+                .record_rejected(entry);
         }
         self.emit_anchored_interruption(reason, rejected_open_cue);
     }
 
     fn queue_resident_gain_restore(&mut self) {
-        if let Some(resident) = self.active_selector.resident() {
-            if let Some(activation) = self.resident_activation(resident) {
-                self.pending_gain_update =
-                    Some(FeatureGainUpdate::RestoreResident(activation.gains));
-            }
-        }
+        let gains = self
+            .active_selector
+            .resident()
+            .and_then(|resident| self.resident_activation(resident))
+            .map_or([1.0; CHANNEL_COUNT], |activation| activation.gains);
+        self.pending_gain_update = Some(FeatureGainUpdate::RestoreResident(gains));
     }
 
     fn emit_anchored_song_result(&mut self) {
@@ -2267,7 +2370,7 @@ impl Calibration {
                 partition
                     .slot(candidate.physical.index())
                     .ok()
-                    .map(|slot| record_is_numerically_valid(&slot.record))
+                    .map(|slot| slot.record.is_product_calibration_model())
             })
             .unwrap_or(false);
         // `StoreSelector` only sees a candidate after `parse_slot` has checked
@@ -2317,52 +2420,91 @@ impl Calibration {
             self.refuse("Save did not identify the retained calibration run");
             return;
         };
-        let CalibrationCandidatePresence::Present { validity, .. } =
-            self.anchored_candidate_presence(&identity)
-        else {
-            self.emit_anchored_candidate_status(identity.run, identity.revision);
-            self.refuse("Save requires a numerically valid, CRC-validated candidate model");
+        let presence = self.anchored_candidate_presence(&identity);
+        let CalibrationCandidatePresence::Present { validity, .. } = presence else {
+            if matches!(
+                self.anchored.fit(),
+                Some(AnchoredFitLifecycle::CandidateReady(_))
+            ) {
+                self.emit_anchored_candidate_status(identity.run, identity.revision);
+                self.fail_anchored_execution(
+                    "Save requires a numerically valid, CRC-validated candidate model",
+                );
+                return;
+            }
+            if !matches!(
+                self.anchored.song().map(AnchoredSong::state),
+                Some(SongState::Completed | SongState::Interrupted)
+            ) {
+                self.refuse("Save requires a completed or interrupted calibration song");
+                return;
+            }
+            // Save is the explicit terminal boundary. Until this request the
+            // scratch contains only appendable rows, so Continue cannot race a
+            // metadata/CRC commit. Complete all queued checkpoints, then one
+            // final polish; its completion commits and promotes immediately.
+            self.request_anchored_finalization();
             return;
         };
         if !validity.permits_activation() {
             self.emit_anchored_candidate_status(identity.run, identity.revision);
-            self.refuse("Save requires a numerically valid, CRC-validated candidate model");
+            self.fail_anchored_execution(
+                "Save requires a numerically valid, CRC-validated candidate model",
+            );
             return;
         }
         let Some(candidate) = self.owned_candidate(&identity) else {
             unreachable!("candidate validity required an exportable candidate")
         };
         let Some(partition) = self.partition.as_mut() else {
-            self.refuse("Save has no calibration partition");
+            self.fail_anchored_execution("Save has no calibration partition");
             return;
         };
-        match partition.promote_candidate(candidate.physical) {
+        let promotion = partition.promote_candidate(candidate.physical);
+        // Recover from what flash actually contains even when the driver call
+        // reports an error. The role word is the promotion commit edge: a
+        // timeout/readback failure after that write must not leave the host
+        // believing Save failed while the device has already made the model
+        // resident.
+        self.active_selector = StoreSelector::recover(partition.stored_identities());
+        match promotion {
             Ok(microseconds) => {
                 self.flash_microseconds += microseconds;
-                self.active_selector = StoreSelector::recover(partition.stored_identities());
             }
             Err(error) => {
-                self.refuse(&format!("Save resident activation write failed: {error}"));
-                return;
+                let promotion_committed = self.active_selector.resident().is_some_and(|resident| {
+                    resident.physical == candidate.physical
+                        && resident.generation == candidate.generation
+                });
+                if promotion_committed {
+                    warn!(
+                        "Save promotion reported an error after its resident commit edge; recovered committed resident: {error}"
+                    );
+                } else {
+                    self.fail_anchored_execution(&format!(
+                        "Save resident activation write failed: {error}"
+                    ));
+                    return;
+                }
             }
         }
         let Some(resident) = self.active_selector.resident() else {
-            self.refuse("Save resident activation failed CRC revalidation");
+            self.fail_anchored_execution("Save resident activation failed CRC revalidation");
             return;
         };
         let Some(activation) = self.resident_activation(resident) else {
-            self.refuse("Save resident model could not be reloaded");
+            self.fail_anchored_execution("Save resident model could not be reloaded");
             return;
         };
         self.pending_resident_update = Some(ResidentRuntimeUpdate::Activated(activation));
-        self.outbound.push(Frame::CalibrationResidentActivated {
-            activation: CalibrationResidentActivation {
+        self.remember_anchored_terminal(AnchoredTerminalReplay::Activated(
+            CalibrationResidentActivation {
                 run: identity.run,
                 schedule_revision: identity.revision,
                 validity,
                 resident_sequence: resident.generation,
             },
-        });
+        ));
         self.reset_anchored_lifecycle();
     }
 
@@ -2395,12 +2537,9 @@ impl Calibration {
         if !schedule_matches_run {
             self.queue_resident_gain_restore();
             if let Some((run, schedule_revision)) = decision_identity {
-                self.outbound.push(Frame::CalibrationCandidateStatus {
-                    candidate: CalibrationCandidateStatus {
-                        run,
-                        schedule_revision,
-                        presence: CalibrationCandidatePresence::Absent,
-                    },
+                self.remember_anchored_terminal(AnchoredTerminalReplay::Discarded {
+                    run,
+                    schedule_revision,
                 });
             }
             self.reset_anchored_lifecycle();
@@ -2432,22 +2571,25 @@ impl Calibration {
                     self.queue_resident_gain_restore();
                 }
                 Some(Err(error)) => {
-                    self.refuse(&format!("Discard candidate invalidation failed: {error}"));
+                    self.fail_anchored_execution(&format!(
+                        "Discard candidate invalidation failed: {error}"
+                    ));
                     return;
                 }
                 None => {
-                    self.refuse("Discard has no calibration partition");
+                    self.fail_anchored_execution("Discard has no calibration partition");
                     return;
                 }
             }
         }
+        // Discarding a row-only run has no candidate write to invalidate, but
+        // it still has preparation gains installed in the feature pipeline.
+        // Restore the resident (or neutral gains) on every successful route.
+        self.queue_resident_gain_restore();
         if let Some((run, schedule_revision)) = decision_identity {
-            self.outbound.push(Frame::CalibrationCandidateStatus {
-                candidate: CalibrationCandidateStatus {
-                    run,
-                    schedule_revision,
-                    presence: CalibrationCandidatePresence::Absent,
-                },
+            self.remember_anchored_terminal(AnchoredTerminalReplay::Discarded {
+                run,
+                schedule_revision,
             });
         }
         self.reset_anchored_lifecycle();
@@ -2479,7 +2621,6 @@ impl Calibration {
         self.poll_anchored_preparation();
         self.poll_anchored_song();
         self.advance_anchored_fit();
-        self.maybe_begin_anchored_polish();
         // A checkpoint's chunks come first, one per call. Return even when the
         // pass is incomplete so the outer serve loop services links, completed
         // windows, feedback outputs, and the watchdog before the next chunk.
@@ -3038,7 +3179,13 @@ impl Calibration {
     /// Announce a run's front end going away. The previous calibration stays
     /// installed; the slot under construction never gets its CRC.
     pub fn front_end_lost(&mut self) {
-        self.stop_run(CalibrationOutcome::FrontEndLost);
+        if self.anchored.song().is_some() || self.anchored_preparation.is_live() {
+            self.fail_anchored_execution(
+                "front end stopped during guided calibration; resident calibration restored",
+            );
+        } else {
+            self.stop_run(CalibrationOutcome::FrontEndLost);
+        }
     }
 
     fn post_state(&mut self) {
@@ -3110,6 +3257,14 @@ impl Calibration {
         }
         let live = partition.slot(identity.physical.index()).ok()?;
         let record = &live.record;
+        if !record.is_product_calibration_model() {
+            warn!(
+                "refusing resident generation {} in slot {}: product calibration model is malformed",
+                identity.generation,
+                identity.physical.index()
+            );
+            return None;
+        }
         Some(ResidentActivation {
             identity,
             model: CalibrationModel::from_parts(
@@ -3138,8 +3293,8 @@ impl Calibration {
         self.pending_resident_update.take()
     }
 
-    pub fn drain_outbound(&mut self) -> Vec<Frame> {
-        core::mem::take(&mut self.outbound)
+    pub fn drain_outbound(&mut self) -> impl Iterator<Item = Frame> + '_ {
+        self.outbound.drain(..)
     }
 
     /// Rows the slot holds. The partition's own count rather than a second
@@ -3349,10 +3504,12 @@ mod anchored_lifecycle_tests {
             AnchoredCueLifecycle::open(capture(4));
         *lifecycle.fit_mut().expect("active run owns fit state") =
             AnchoredFitLifecycle::CandidateReady(candidate_owner(run));
-        lifecycle
-            .count_mut(0)
-            .expect("active run owns counts")
-            .accepted = 7;
+        for _ in 0..7 {
+            lifecycle
+                .recipe_mut()
+                .expect("active run owns counts")
+                .record_accepted(cue_entry(1));
+        }
 
         lifecycle.reset();
 
@@ -3677,15 +3834,8 @@ mod anchored_lifecycle_tests {
             device_monotonic_microseconds: 13_000_000,
             acquisition_sample: 1_001,
         };
-        let prompt_sample = acquisition_sample_at_device_instant(constants, anchor, 13_000_000);
-        assert_eq!(prompt_sample, 7_001);
-
-        let span = LabeledSpan::after_prompt(
-            constants.grid(),
-            prompt_sample,
-            constants.prompt_delay_samples(),
-            constants.labeled_windows,
-        );
+        let span = anchored_labeled_span(constants, anchor, 13_000_000);
+        let prompt_sample = 7_001;
         assert_eq!(span.window_count, constants.labeled_windows);
         assert_eq!(span.windows().count(), 9);
         assert!(
@@ -3709,29 +3859,26 @@ mod anchored_lifecycle_tests {
     fn continue_never_retains_more_than_the_audited_recipe() {
         let constants = Constants::DEFAULT;
         let mut retained_rows = 0usize;
-        for modifier in [CalibrationModifier::ThumbUp, CalibrationModifier::ThumbDown] {
-            let target = anchored_target_count(modifier);
-            for accepted in 0..target + 20 {
-                if anchored_class_accepts_rows(accepted, modifier) {
-                    retained_rows += constants.labeled_windows as usize;
+        let mut progress = AnchoredRecipeProgress::default();
+        for gesture in CalibrationGesture::ALL {
+            for modifier in [CalibrationModifier::ThumbUp, CalibrationModifier::ThumbDown] {
+                let mut entry = cue_entry(1);
+                entry.gesture = gesture;
+                entry.modifier = modifier;
+                for _ in 0..anchored_target_count(modifier) + 20 {
+                    if progress.record_accepted(entry) {
+                        retained_rows += constants.labeled_windows as usize;
+                    }
                 }
             }
         }
-        retained_rows *= CalibrationGesture::ALL.len();
 
         assert_eq!(
             retained_rows,
             flash_image::CALIBRATION_RECIPE_ROW_CAPACITY,
             "surplus clean cues from Continue must not consume flash rows"
         );
-        assert!(!anchored_class_accepts_rows(
-            ANCHORED_COMMAND_TARGET,
-            CalibrationModifier::ThumbUp
-        ));
-        assert!(!anchored_class_accepts_rows(
-            ANCHORED_NO_OP_TARGET,
-            CalibrationModifier::ThumbDown
-        ));
+        assert_eq!(progress.retained_rep_count(), 130);
     }
 
     #[test]
@@ -3808,12 +3955,12 @@ mod anchored_lifecycle_tests {
     #[test]
     fn candidate_requires_all_fitted_numbers_to_be_finite_before_save() {
         let mut record = SlotRecord::empty(CALIBRATION_CLASS_CAPACITY);
-        assert!(record_is_numerically_valid(&record));
+        assert!(record.is_product_calibration_model());
         record.weights[0] = f32::NAN;
-        assert!(!record_is_numerically_valid(&record));
+        assert!(!record.is_product_calibration_model());
         record.weights[0] = 0.0;
         record.deviation[0] = 0.0;
-        assert!(!record_is_numerically_valid(&record));
+        assert!(!record.is_product_calibration_model());
     }
 
     #[test]

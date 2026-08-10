@@ -223,8 +223,8 @@
     {/if}
     {#if !snapshot.candidate_available}
       <p class="candidate-progress" aria-live="polite">
-        Finalizing and validating the candidate on the wristband. Save will unlock when it is ready;
-        Continue remains available if you want to fill the remaining deficits.
+        No saveable result is available for this song. Continue is available only when this song
+        reports remaining deficits.
       </p>
     {/if}
     <div class="track-grid" aria-label="Choose the next calibration track">
@@ -233,6 +233,7 @@
           class="track-card"
           class:selected={snapshot.selected_track_id === track.id}
           aria-pressed={snapshot.selected_track_id === track.id}
+          disabled={!snapshot.continue_available}
           onclick={() => onSelectTrack?.(track.id)}
         >
           <strong>{track.title}</strong>
@@ -251,6 +252,13 @@
         </Button>
       {/each}
     </div>
+  </section>
+{:else if snapshot.phase === 'finalizing'}
+  <section class="song-end card" role="status" aria-live="polite">
+    <span class="eyebrow">Saving calibration</span>
+    <h3>Finalizing on the wristband</h3>
+    <p>{snapshot.detail}</p>
+    <p class="muted">This can take up to two minutes. Keep the wristband connected.</p>
   </section>
 {:else if snapshot.phase === 'technical_failure'}
   <section class="card failure" role="alert">

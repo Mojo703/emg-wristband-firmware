@@ -10,6 +10,7 @@ import {
   calibrationPlayingFixture,
   calibrationSetupFixture,
   calibrationSongEndFixture,
+  calibrationFinalizingFixture,
   calibrationTechnicalFailureFixture,
 } from './guidedCalibrationFixtures.ts';
 import { isGuidedCalibrationSnapshot } from '../../lib/protocol.ts';
@@ -56,9 +57,10 @@ test('fixtures cover every guided calibration presentation phase', () => {
       calibrationSetupFixture.phase,
       calibrationPlayingFixture.phase,
       calibrationSongEndFixture.phase,
+      calibrationFinalizingFixture.phase,
       calibrationTechnicalFailureFixture.phase,
     ],
-    ['setup', 'playing', 'between_songs', 'technical_failure'],
+    ['setup', 'playing', 'between_songs', 'finalizing', 'technical_failure'],
   );
   assert.equal(calibrationPlayingFixture.lanes.length, 5);
   assert.equal(calibrationPlayingFixture.cues.length, 130);
@@ -77,6 +79,11 @@ test('fixtures cover every guided calibration presentation phase', () => {
     new Set(calibrationPlayingFixture.cues.map((cue) => cue.thumbVariant)),
     new Set(['up', 'down']),
   );
+});
+
+test('finalizing wire snapshots require a user-facing progress detail', () => {
+  assert.equal(isGuidedCalibrationSnapshot(calibrationFinalizingFixture), true);
+  assert.equal(isGuidedCalibrationSnapshot({ phase: 'finalizing' }), false);
 });
 
 test('calibration lanes carry the same user-facing Collect presentation', () => {

@@ -79,11 +79,17 @@ export interface CalibrationExitingSnapshot {
   readonly detail: string;
 }
 
+export interface CalibrationFinalizingSnapshot {
+  readonly phase: 'finalizing';
+  readonly detail: string;
+}
+
 export type GuidedCalibrationSnapshot =
   | CalibrationSetupSnapshot
   | CalibrationPreparingSnapshot
   | CalibrationPlayingSnapshot
   | CalibrationSongEndSnapshot
+  | CalibrationFinalizingSnapshot
   | CalibrationExitingSnapshot
   | CalibrationTechnicalFailureSnapshot;
 

@@ -638,6 +638,11 @@ pub enum Frame {
         activation: CalibrationResidentActivation,
     },
 
+    /// Device → host: one exact guided-calibration run could not continue.
+    /// Unlike a diagnostic [`Frame::BenchError`], this is terminal authority
+    /// for the named run and schedule revision and is safe to retain/replay.
+    CalibrationRunFailed { failure: CalibrationRunFailure },
+
     // ------------------------------------------------------------------
     // Firmware validation bench (`firmware-bench/PROTOCOL.md`).
     //
@@ -994,6 +999,13 @@ pub enum GuidedCalibrationSnapshot {
         valid_reps: u32,
         invalid_reps: u32,
         deficits: Vec<String>,
+    },
+    /// Save was accepted by the host and the wristband is now building,
+    /// validating, and atomically promoting the resident calibration record.
+    /// This is intentionally distinct from `BetweenSongs`: no further song
+    /// decisions are valid while the durable operation is in flight.
+    Finalizing {
+        detail: String,
     },
     /// A single-use operator exit is in progress. The backend keeps this
     /// projection authoritative until the exact device-side Discard result is
@@ -1451,6 +1463,16 @@ pub struct CalibrationResidentActivation {
     pub schedule_revision: CalibrationScheduleRevision,
     pub validity: CalibrationCandidateValidity,
     pub resident_sequence: u32,
+}
+
+/// A terminal guided-calibration failure, correlated to the exact schedule
+/// authority that owns it. This lets a reconnecting browser distinguish a
+/// previous actor's diagnostic from the active run's terminal state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CalibrationRunFailure {
+    pub run: CalibrationRunKey,
+    pub schedule_revision: CalibrationScheduleRevision,
+    pub detail: String,
 }
 
 /// Thumb state paired with the wrist gesture in an interleaved schedule.
@@ -4587,6 +4609,13 @@ mod tests {
                     resident_sequence: u32::MAX,
                 },
             },
+            Frame::CalibrationRunFailed {
+                failure: CalibrationRunFailure {
+                    run,
+                    schedule_revision: schedule_revision(),
+                    detail: "link generation changed".into(),
+                },
+            },
             Frame::CalibrationScheduleUploadAcknowledged {
                 acknowledgement: CalibrationScheduleUploadAcknowledgement {
                     run,
@@ -5182,8 +5211,8 @@ mod tests {
                     lifecycle: GuidedSessionState::Calibration {
                         session_id: 9,
                         device_id: Some("opal-test".into()),
-                        calibration: Some(GuidedCalibrationSnapshot::Exiting {
-                            detail: "waiting for exact Discard acknowledgement".into(),
+                        calibration: Some(GuidedCalibrationSnapshot::Finalizing {
+                            detail: "building and saving the resident calibration record".into(),
                         }),
                     },
                 },
