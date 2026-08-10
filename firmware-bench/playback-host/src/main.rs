@@ -12,7 +12,6 @@
 //! arithmetic is not this tool's business: it moves the fixtures' exact bytes.
 
 mod capture;
-mod link;
 mod numpy;
 mod partition_v2;
 mod sources;
@@ -25,11 +24,14 @@ use emg_runtime::flash_image::{
     build_prior, whole_partition, PriorBuildInputs, PriorImage, StandardizationVariant,
 };
 use emg_runtime::streaming_fit::{Standardization, StandardizedQuantization};
-use link::Link;
+use playback_host::link::Link;
 use protocol::{
-    CalibrationGesture, CalibrationOutcome, Frame, CALIBRATION_SCHEDULE_ENTRY_BYTES,
+    CalibrationCueId, CalibrationGesture, CalibrationModifier, CalibrationRunId, CalibrationRunKey,
+    CalibrationScheduleEntry, CalibrationScheduleRevision, CalibrationSessionId,
+    DurationMilliseconds, Frame, TrackMilliseconds, CALIBRATION_SCHEDULE_CHUNK_MAX_ENTRIES,
     PLAYBACK_CHANNEL_COUNT, PLAYBACK_MAX_CHUNK_SAMPLES,
 };
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -80,34 +82,45 @@ enum Step {
         #[arg(long)]
         windows: Option<usize>,
     },
-    /// Run a whole on-device calibration against a recorded session.
-    ///
-    /// The scripted wearer: the device's own state machine runs every phase,
-    /// validity check, and fit, and the recording's cue spans stand in for a
-    /// person. This is the hardware-validation vehicle — deterministic, because
-    /// the flow is paced by the session's sample indices rather than by the
-    /// wall clock, so the same bytes give the same run every time.
-    Calibrate {
-        /// A session manifest whose `cue_spans` become the prompt schedule.
-        /// Repeatable, and **order matters**: the state machine collects the
-        /// thumb-up block first, so the thumb-up session comes first. The two
-        /// are spliced into one sample space, so a full run is
-        /// `--manifest .../22-08-47.../manifest.json --manifest .../22-16-46.../manifest.json`.
+    /// Upload and run one complete device-anchored calibration song.
+    CalibrationSong {
+        /// Fixture manifests whose cue spans form one authored song. The first
+        /// is thumb-up and every following manifest is thumb-down.
         #[arg(long, required = true)]
         manifest: Vec<PathBuf>,
-        #[arg(long, default_value_t = DEFAULT_CHUNK_SAMPLES)]
-        chunk_samples: usize,
-        /// How long to wait after the last sample for the run to finish. The
-        /// polish passes happen in this window, so it has to cover them.
+        /// Exact guided-session identity chosen by the caller.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..))]
+        session_id: u64,
+        /// Exact firmware-run identity chosen by the caller.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+        run_id: u32,
+        /// Fresh schedule revision for this upload.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+        schedule_revision: u32,
+        /// Maximum time to await a song result or interruption.
         #[arg(long, default_value_t = 120)]
         finish_seconds: u64,
-        /// Request an abort as soon as the first fit checkpoint has begun.
-        #[arg(long, conflicts_with = "abort_after_fit_passes")]
-        abort_after_fit_start: bool,
-        /// Request an abort after a fit checkpoint reports at least this many
-        /// completed passes.
-        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
-        abort_after_fit_passes: Option<u32>,
+    },
+    /// Retain accepted evidence and make the next authored song eligible.
+    CalibrationContinue {
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..))]
+        session_id: u64,
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+        run_id: u32,
+    },
+    /// Activate a numerically and storage-valid candidate calibration.
+    CalibrationSave {
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..))]
+        session_id: u64,
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+        run_id: u32,
+    },
+    /// Discard the candidate and retain the previous resident calibration.
+    CalibrationDiscard {
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..))]
+        session_id: u64,
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+        run_id: u32,
     },
     /// Install a host-fitted calibration model.
     LoadModel {
@@ -209,67 +222,68 @@ enum Step {
         #[arg(long, default_value_t = DEFAULT_CHUNK_SAMPLES)]
         chunk_samples: usize,
     },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CalibrationAbort {
-    FitStarted,
-    FitPasses(u32),
-}
-
-impl CalibrationAbort {
-    fn from_args(after_start: bool, after_passes: Option<u32>) -> Option<Self> {
-        if after_start {
-            Some(Self::FitStarted)
-        } else {
-            after_passes.map(Self::FitPasses)
-        }
-    }
-
-    fn reached(self, fit_passes_done: u32, fit_passes_planned: u32) -> bool {
-        if fit_passes_planned == 0 {
-            return false;
-        }
-        match self {
-            Self::FitStarted => true,
-            Self::FitPasses(threshold) => fit_passes_done >= threshold,
-        }
-    }
-}
-
-struct AbortController {
-    policy: CalibrationAbort,
-    requested: bool,
-}
-
-impl AbortController {
-    fn new(policy: CalibrationAbort) -> Self {
-        Self {
-            policy,
-            requested: false,
-        }
-    }
-
-    fn request_if_due(&mut self, link: &mut Link, capture: &Capture) -> Result<()> {
-        if self.requested || capture.has_calibration_result() {
-            return Ok(());
-        }
-        let Some((phase, done, planned)) = capture
-            .calibration_fit_progress()
-            .rev()
-            .find(|(_, done, planned)| self.policy.reached(*done, *planned))
-        else {
-            return Ok(());
-        };
-        eprintln!("requesting calibration abort in {phase:?} after {done}/{planned} fit passes");
-        link.send(&Frame::CalibrationAbort {})?;
-        self.requested = true;
-        Ok(())
-    }
+    /// Capture a fixed number of serial clock probes, then exit.
+    #[cfg(feature = "clock-probe")]
+    ClockCapture {
+        #[arg(long, default_value_t = 1_000, value_parser = clap::value_parser!(u32).range(1..))]
+        count: u32,
+        #[arg(long, default_value_t = 10)]
+        interval_milliseconds: u64,
+        #[arg(long, default_value_t = 2_000)]
+        timeout_milliseconds: u64,
+        #[arg(long, default_value = "default-output")]
+        output_device: String,
+        #[arg(long, default_value_t = 0)]
+        pause_revision: u64,
+        #[arg(long, default_value_t = 10_000)]
+        scheduling_horizon_milliseconds: u64,
+        /// Board-evidence threshold. Omit to produce a provisional, non-GO fit.
+        #[arg(long)]
+        maximum_device_uncertainty_microseconds: Option<f64>,
+        /// Board-evidence threshold for acquisition-sample mapping. Omit for provisional.
+        #[arg(long)]
+        maximum_acquisition_uncertainty_samples: Option<f64>,
+    },
+    /// Replay a clock capture and print its original accept/reject decision.
+    #[cfg(feature = "clock-probe")]
+    ClockReplay { capture: PathBuf },
 }
 
 fn main() -> Result<()> {
     let arguments = Arguments::parse();
+    #[cfg(feature = "clock-probe")]
+    if let Step::ClockCapture {
+        count,
+        interval_milliseconds,
+        timeout_milliseconds,
+        output_device,
+        pause_revision,
+        scheduling_horizon_milliseconds,
+        maximum_device_uncertainty_microseconds,
+        maximum_acquisition_uncertainty_samples,
+    } = &arguments.step
+    {
+        return playback_host::clock_capture::capture(
+            &arguments.port,
+            &arguments.output,
+            *count,
+            Duration::from_millis(*interval_milliseconds),
+            Duration::from_millis(*timeout_milliseconds),
+            output_device,
+            *pause_revision,
+            Duration::from_millis(*scheduling_horizon_milliseconds),
+            *maximum_device_uncertainty_microseconds,
+            *maximum_acquisition_uncertainty_samples,
+        );
+    }
+    #[cfg(feature = "clock-probe")]
+    if let Step::ClockReplay { capture } = &arguments.step {
+        println!(
+            "accepted={}",
+            playback_host::clock_capture::replay(capture)?
+        );
+        return Ok(());
+    }
     if let Step::BuildPartitionV2 {
         model,
         exclude_sessions,
@@ -364,11 +378,11 @@ fn read_plan(path: &Path) -> Result<Vec<Step>> {
     }
     if steps
         .iter()
-        .filter(|step| matches!(step, Step::Calibrate { .. }))
+        .filter(|step| matches!(step, Step::CalibrationSong { .. }))
         .count()
         > 1
     {
-        bail!("plan contains more than one calibrate step");
+        bail!("plan contains more than one calibration-song step");
     }
     Ok(steps)
 }
@@ -387,22 +401,41 @@ fn run(step: &Step, link: &mut Link, capture: &mut Capture) -> Result<()> {
             raw.as_deref(),
             *chunk_samples,
             *windows,
-            None,
         ),
-        Step::Calibrate {
+        Step::CalibrationSong {
             manifest,
-            chunk_samples,
+            session_id,
+            run_id,
+            schedule_revision,
             finish_seconds,
-            abort_after_fit_start,
-            abort_after_fit_passes,
-        } => calibrate(
+        } => calibration_song(
             link,
             capture,
             manifest,
-            *chunk_samples,
+            calibration_run(*session_id, *run_id),
+            calibration_revision(*schedule_revision),
             *finish_seconds,
-            CalibrationAbort::from_args(*abort_after_fit_start, *abort_after_fit_passes),
         ),
+        Step::CalibrationContinue { session_id, run_id } => {
+            link.send(&Frame::CalibrationContinue {
+                run: calibration_run(*session_id, *run_id),
+            })?;
+            settle(link, capture, SETTLE);
+            Ok(())
+        }
+        Step::CalibrationSave { session_id, run_id } => {
+            link.send(&Frame::CalibrationSave {
+                run: calibration_run(*session_id, *run_id),
+            })?;
+            await_resident_activation(link, capture)
+        }
+        Step::CalibrationDiscard { session_id, run_id } => {
+            link.send(&Frame::CalibrationDiscard {
+                run: calibration_run(*session_id, *run_id),
+            })?;
+            settle(link, capture, SETTLE);
+            Ok(())
+        }
         Step::LoadModel { model } => load_model(link, capture, model),
         Step::Replay { rows, first_window } => replay(link, capture, rows, *first_window),
         Step::Fit {
@@ -443,6 +476,10 @@ fn run(step: &Step, link: &mut Link, capture: &mut Capture) -> Result<()> {
         Step::Inspect { .. } => bail!("inspect does not run over a link"),
         Step::BuildPartitionV2 { .. } => bail!("build-partition-v2 does not run over a link"),
         Step::InspectPartition { .. } => bail!("inspect-partition does not run over a link"),
+        #[cfg(feature = "clock-probe")]
+        Step::ClockCapture { .. } => bail!("clock-capture owns its serial link"),
+        #[cfg(feature = "clock-probe")]
+        Step::ClockReplay { .. } => bail!("clock-replay does not run over a link"),
     }
 }
 
@@ -923,7 +960,6 @@ fn stream(
     raw_override: Option<&Path>,
     chunk_samples: usize,
     window_limit: Option<usize>,
-    mut abort: Option<&mut AbortController>,
 ) -> Result<()> {
     let manifest = read_manifest(manifest_path)?;
     if chunk_samples == 0 || chunk_samples > PLAYBACK_MAX_CHUNK_SAMPLES {
@@ -960,9 +996,6 @@ fn stream(
         constants: manifest.constants.clone(),
     })?;
     let (mut next_sequence, mut free_chunks) = await_credit(link, capture)?;
-    if let Some(controller) = abort.as_mut() {
-        controller.request_if_due(link, capture)?;
-    }
 
     eprintln!(
         "streaming {} : {records} records, {sample_count} samples, chunks of {chunk_samples}",
@@ -1006,9 +1039,6 @@ fn stream(
             for frame in link.drain() {
                 capture.accept(frame);
             }
-            if let Some(controller) = abort.as_mut() {
-                controller.request_if_due(link, capture)?;
-            }
             if let Some((sequence, chunks)) = capture.credit.take() {
                 next_sequence = sequence;
                 free_chunks = chunks;
@@ -1023,9 +1053,6 @@ fn stream(
     // The final status is the device saying it has drained everything, so it is
     // what "the stream is done" means here rather than the last write returning.
     await_status(link, capture)?;
-    if let Some(controller) = abort.as_mut() {
-        controller.request_if_due(link, capture)?;
-    }
 
     if capture.dropped_chunks().unwrap_or(0) != 0 {
         bail!(
@@ -1379,225 +1406,231 @@ fn gesture_for(class_id: &str) -> Option<CalibrationGesture> {
     }
 }
 
-/// The prompt schedule a session's cue spans describe, shifted into the run's
-/// own sample space.
-///
-/// Sample indices straight out of the manifest: the device labels by sample
-/// index on its own grid, and the recording's cue clock is the same clock, so
-/// nothing is converted and nothing rounds. `sample_offset` is how many
-/// instants the sessions before this one contributed — a spliced run is one
-/// monotonic space, because the labeling arithmetic cannot have time run
-/// backwards halfway through.
-fn cue_schedule(
-    manifest_path: &Path,
-    sample_offset: u64,
-    block: u8,
-) -> Result<(Vec<u8>, [u32; 5])> {
-    let text = std::fs::read_to_string(manifest_path)
-        .with_context(|| format!("read {}", manifest_path.display()))?;
-    let json: serde_json::Value = serde_json::from_str(&text).context("parse manifest")?;
-    let spans = json["cue_spans"]
-        .as_array()
-        .context("manifest has no cue_spans; this session cannot script a calibration")?;
-    if spans.is_empty() {
-        bail!("the manifest's cue_spans is empty; there is nothing to prompt from");
-    }
+const FIXTURE_SAMPLE_MILLISECONDS: u64 = 2;
+const CALIBRATION_HOLD_MILLISECONDS: u32 = 1_500;
 
-    let mut entries = Vec::with_capacity(spans.len() * CALIBRATION_SCHEDULE_ENTRY_BYTES);
-    let mut skipped = Vec::new();
-    let mut written = 0usize;
-    let mut per_gesture = [0u32; 5];
-    for span in spans {
-        let class_id = span["class_id"]
-            .as_str()
-            .context("cue span has no class_id")?;
-        let Some(gesture) = gesture_for(class_id) else {
-            // Named rather than counted: a session whose classes do not map is
-            // the wrong session for this, and a silent zero-length schedule is
-            // how that becomes a confusing device refusal instead.
-            if !skipped.contains(&class_id.to_string()) {
-                skipped.push(class_id.to_string());
-            }
-            continue;
-        };
-        let start = span["start"].as_u64().context("cue span has no start")?;
-        let stop = span["stop"].as_u64().context("cue span has no stop")?;
-        entries.extend_from_slice(&((start + sample_offset) as u32).to_le_bytes());
-        entries.extend_from_slice(&((stop.saturating_sub(start)) as u32).to_le_bytes());
-        entries.push(gesture.index());
-        // The round this cue answers: its position among that gesture's cues
-        // in this block. Load-bearing, not informational — the device looks a
-        // cue up by (gesture, block, round), so that a rejected rep's retry
-        // takes a spare rather than eating the next round's cue and starving
-        // the block's last round many rounds later.
-        entries.push(per_gesture[gesture.index() as usize] as u8);
-        entries.push(block);
-        entries.push(0);
-        per_gesture[gesture.index() as usize] += 1;
-        written += 1;
+fn calibration_run(session_id: u64, run_id: u32) -> CalibrationRunKey {
+    CalibrationRunKey {
+        session_id: CalibrationSessionId::new(session_id).expect("clap rejects zero session ids"),
+        run_id: CalibrationRunId::new(run_id).expect("clap rejects zero run ids"),
     }
-    if !skipped.is_empty() {
-        eprintln!("skipped cue classes with no calibration gesture: {skipped:?}");
-    }
-    if written == 0 {
-        bail!("no cue span in this session maps to a calibration gesture");
-    }
-    eprintln!(
-        "cue schedule: {written} prompts from {}",
-        manifest_path.display()
-    );
-    Ok((entries, per_gesture))
 }
 
-/// Send the schedule, start the run, stream every session in turn, and wait
-/// for it to finish.
-fn calibrate(
+fn calibration_revision(revision: u32) -> CalibrationScheduleRevision {
+    CalibrationScheduleRevision::new(revision).expect("clap rejects zero schedule revisions")
+}
+
+/// Construct the complete, immutable schedule before writing a byte to the
+/// device. A fixture provides cue positions, not device labels: the resulting
+/// entries use audio-relative milliseconds and the fixed Tuesday hold.
+fn anchored_schedule(
+    manifest_paths: &[PathBuf],
+) -> Result<(Vec<CalibrationScheduleEntry>, String)> {
+    let mut entries = Vec::new();
+    let mut sample_offset = 0u64;
+    for (manifest_index, path) in manifest_paths.iter().enumerate() {
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        let json: serde_json::Value = serde_json::from_str(&text).context("parse manifest")?;
+        let spans = json["cue_spans"]
+            .as_array()
+            .context("manifest has no cue_spans; it cannot provide a calibration song")?;
+        if spans.is_empty() {
+            bail!("{} has no cue spans", path.display());
+        }
+        let modifier = if manifest_index == 0 {
+            CalibrationModifier::ThumbUp
+        } else {
+            CalibrationModifier::ThumbDown
+        };
+        for span in spans {
+            let class_id = span["class_id"]
+                .as_str()
+                .context("cue span has no class_id")?;
+            let Some(gesture) = gesture_for(class_id) else {
+                bail!("cue class {class_id:?} has no calibration gesture");
+            };
+            let start = span["start"].as_u64().context("cue span has no start")?;
+            let track_milliseconds = (sample_offset + start)
+                .checked_mul(FIXTURE_SAMPLE_MILLISECONDS)
+                .context("fixture track offset overflow")?;
+            let track_milliseconds = u32::try_from(track_milliseconds)
+                .context("fixture track offset exceeds protocol range")?;
+            let cue_id = u32::try_from(entries.len() + 1)
+                .ok()
+                .and_then(CalibrationCueId::new)
+                .context("too many calibration schedule entries")?;
+            entries.push(CalibrationScheduleEntry {
+                cue_id,
+                gesture,
+                modifier,
+                track_offset: TrackMilliseconds::new(track_milliseconds),
+                hold: DurationMilliseconds::new(CALIBRATION_HOLD_MILLISECONDS),
+            });
+        }
+        let manifest = read_manifest(path)?;
+        sample_offset = sample_offset
+            .checked_add((manifest.records * manifest.samples_per_record) as u64)
+            .context("fixture sample offset overflow")?;
+    }
+    if entries.is_empty() {
+        bail!("the manifests contain no calibration cues");
+    }
+    let canonical =
+        serde_json::to_vec(&entries).context("serialize complete calibration schedule")?;
+    let content_identity = format!("sha256:{:x}", Sha256::digest(canonical));
+    Ok((entries, content_identity))
+}
+
+/// Upload one complete schedule, require the matching device anchor, then
+/// maintain the calibration-specific liveness clock until the terminal song
+/// event. No streamed fixture samples participate in label timing.
+fn calibration_song(
     link: &mut Link,
     capture: &mut Capture,
     manifest_paths: &[PathBuf],
-    chunk_samples: usize,
+    run: CalibrationRunKey,
+    schedule_revision: CalibrationScheduleRevision,
     finish_seconds: u64,
-    abort: Option<CalibrationAbort>,
 ) -> Result<()> {
-    // Both ends count from zero. The device's calibration sample space spans
-    // sessions but resets here, so the reset has to come before the run
-    // starts, not between the sessions.
-    link.send(&Frame::BenchReset {})?;
-    settle(link, capture, SETTLE);
-
-    // The first session is the thumb-up block, the rest are thumb-down: the
-    // state machine collects thumb-up first, so that is the order the
-    // manifests have to be given in.
-    const THUMB_UP_ROUNDS: u32 = 10;
-    const THUMB_DOWN_ROUNDS: u32 = 12;
-    let mut entries = Vec::new();
-    let mut offset = 0u64;
-    let mut per_block: Vec<(u8, [u32; 5])> = Vec::new();
-    for (index, path) in manifest_paths.iter().enumerate() {
-        let block = u8::from(index > 0);
-        let manifest = read_manifest(path)?;
-        let (bytes, per_gesture) = cue_schedule(path, offset, block)?;
-        entries.extend_from_slice(&bytes);
-        per_block.push((block, per_gesture));
-        offset += (manifest.records * manifest.samples_per_record) as u64;
+    let (entries, content_identity) = anchored_schedule(manifest_paths)?;
+    for frame in schedule_upload_frames(run, schedule_revision, &content_identity, &entries)? {
+        link.send(&frame)?;
     }
 
-    // Per gesture per block, not a total: a run ends when the gesture it is
-    // asking for has no cue left, so a schedule with plenty of prompts overall
-    // and none for ulnar deviation stops just as early. Worth knowing before a
-    // hardware slot is spent rather than after.
-    for (block, per_gesture) in &per_block {
-        let wanted = if *block == 0 {
-            THUMB_UP_ROUNDS
-        } else {
-            THUMB_DOWN_ROUNDS
-        };
-        let name = if *block == 0 {
-            "thumb-up"
-        } else {
-            "thumb-down"
-        };
-        let thinnest = per_gesture.iter().copied().min().unwrap_or(0);
-        if thinnest < wanted {
-            eprintln!(
-                "note: the {name} block has {thinnest} cues for its thinnest gesture against the \
-                 {wanted} rounds its floor wants; the run ends when that gesture runs out and \
-                 reports what it collected"
-            );
-        } else if thinnest == wanted {
-            eprintln!(
-                "note: the {name} block has exactly {wanted} cues for its thinnest gesture, so \
-                 there is no slack — the first rejected rep for it ends the block"
-            );
-        }
-    }
-
-    // Batched so no frame outgrows what the device decodes comfortably. The
-    // device refuses a schedule with a gap in its entry numbering, so a lost
-    // frame stops the run rather than shifting every later prompt.
-    const ENTRIES_PER_FRAME: usize = 64;
-    for (index, batch) in entries
-        .chunks(ENTRIES_PER_FRAME * CALIBRATION_SCHEDULE_ENTRY_BYTES)
-        .enumerate()
-    {
-        link.send(&Frame::CalibrationCueSchedule {
-            first_entry: (index * ENTRIES_PER_FRAME) as u32,
-            entries: batch.to_vec(),
-        })?;
-    }
-    link.send(&Frame::CalibrationStart {
-        scripted_wearer: true,
-    })?;
-    settle(link, capture, SETTLE);
-    if capture.failed() {
-        bail!("the device refused the calibration");
-    }
-
-    // No reset between sessions: that would restart the calibration's sample
-    // space in the middle of the run. Each `playback_begin` still builds a
-    // fresh filter pipeline, which is right — filters carry state across a
-    // session and must start from zero for the next one.
-    let mut abort_controller = abort.map(AbortController::new);
-    for path in manifest_paths {
-        stream(
-            link,
-            capture,
-            path,
-            None,
-            chunk_samples,
-            None,
-            abort_controller.as_mut(),
-        )?;
-        if capture.has_calibration_result() {
-            break;
-        }
-    }
-
-    // The last samples are not the end of the run: the polish passes and the
-    // slot commit happen after them, and how long that takes is the number
-    // this whole exercise exists to measure. So wait for the result frame
-    // rather than for a fixed settle.
-    eprintln!("streamed; waiting up to {finish_seconds}s for the run to finish");
     let deadline = Instant::now() + Duration::from_secs(finish_seconds);
-    while Instant::now() < deadline && !capture.has_calibration_result() {
-        let Some(frame) = link.receive(Duration::from_millis(500)) else {
+    let accepted = await_schedule_accepted(link, capture, deadline)?;
+    validate_schedule_acceptance(&accepted, run, schedule_revision, &content_identity)?;
+    eprintln!(
+        "schedule accepted: device anchor {} us, acquisition sample {}, content {}",
+        accepted.anchor_device_monotonic_microseconds,
+        accepted.acquisition_sample,
+        accepted.content_identity
+    );
+
+    let heartbeat = link.start_calibration_heartbeats(run, schedule_revision)?;
+    while Instant::now() < deadline {
+        let Some(frame) = link.receive(Duration::from_millis(250)) else {
             continue;
         };
         capture.accept(frame);
-        if let Some(controller) = abort_controller.as_mut() {
-            controller.request_if_due(link, capture)?;
+        if capture.has_calibration_song_terminal_event() {
+            return capture.assert_calibration_song_completed();
         }
     }
-    // Leave nothing running on the device for the next step to trip over.
-    // Before the verdict, so a device mid-run is stopped either way.
-    if abort_controller.is_none() {
-        link.send(&Frame::CalibrationAbort {})?;
-    }
-    settle(link, capture, SETTLE);
+    drop(heartbeat);
+    bail!("no calibration song result or interruption inside {finish_seconds}s")
+}
 
-    // The verdict. A run that aborted, failed its fit, lost its front end or
-    // ran out of storage reports that in its result rather than as a
-    // `bench_error` — so reading only the error list exits zero on every one
-    // of them, and an orchestration cannot tell a calibration that installed
-    // from one that gave up in round three.
-    if let Some(controller) = abort_controller {
-        if !controller.requested {
-            bail!("the calibration ended before the configured fit abort milestone was reached");
+/// Build the only legal transport sequence for one immutable schedule. Keeping
+/// this separate from serial I/O makes the 130-cue boundary auditable without
+/// pretending a host-side test can emulate device scheduling.
+fn schedule_upload_frames(
+    run: CalibrationRunKey,
+    schedule_revision: CalibrationScheduleRevision,
+    content_identity: &str,
+    entries: &[CalibrationScheduleEntry],
+) -> Result<Vec<Frame>> {
+    if entries.is_empty() {
+        bail!("a calibration song must contain at least one cue");
+    }
+    let total_count = u32::try_from(entries.len()).context("too many schedule entries")?;
+    let mut frames = Vec::with_capacity(
+        2 + entries
+            .len()
+            .div_ceil(CALIBRATION_SCHEDULE_CHUNK_MAX_ENTRIES),
+    );
+    frames.push(Frame::CalibrationScheduleBegin {
+        run,
+        schedule_revision,
+        content_identity: content_identity.into(),
+        total_count,
+    });
+    for (chunk_index, entries) in entries
+        .chunks(CALIBRATION_SCHEDULE_CHUNK_MAX_ENTRIES)
+        .enumerate()
+    {
+        frames.push(Frame::CalibrationScheduleChunk {
+            run,
+            schedule_revision,
+            content_identity: content_identity.into(),
+            total_count,
+            first_entry: u32::try_from(chunk_index * CALIBRATION_SCHEDULE_CHUNK_MAX_ENTRIES)
+                .expect("entry count already fits u32"),
+            entries: entries.to_vec(),
+        });
+    }
+    frames.push(Frame::CalibrationScheduleCommit {
+        run,
+        schedule_revision,
+        content_identity: content_identity.into(),
+        total_count,
+    });
+    Ok(frames)
+}
+
+fn validate_schedule_acceptance(
+    accepted: &protocol::CalibrationScheduleAccepted,
+    run: CalibrationRunKey,
+    schedule_revision: CalibrationScheduleRevision,
+    content_identity: &str,
+) -> Result<()> {
+    if accepted.run != run
+        || accepted.schedule_revision != schedule_revision
+        || accepted.content_identity != content_identity
+    {
+        bail!("device accepted a different calibration schedule identity");
+    }
+    if !accepted.is_exactly_three_seconds_ahead() {
+        bail!("device calibration anchor is not exactly three seconds after acknowledgement");
+    }
+    Ok(())
+}
+
+fn await_schedule_accepted(
+    link: &Link,
+    capture: &mut Capture,
+    deadline: Instant,
+) -> Result<protocol::CalibrationScheduleAccepted> {
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let Some(frame) = link.receive(remaining.min(Duration::from_millis(250))) else {
+            continue;
+        };
+        if let Frame::CalibrationScheduleAccepted { accepted } = &frame {
+            return Ok(accepted.clone());
         }
-        return capture.assert_aborted_calibration();
+        capture.accept(frame);
     }
-    match capture.calibration_outcome() {
-        Some(CalibrationOutcome::Installed) => Ok(()),
-        Some(outcome) => bail!("the calibration ended {outcome:?} without installing"),
-        // The states collected so far still carry the pass timing, and they
-        // are already written; the run is still a failure.
-        None => bail!("no result frame inside {finish_seconds}s"),
+    bail!("device did not acknowledge the complete calibration schedule")
+}
+
+fn await_resident_activation(link: &Link, capture: &mut Capture) -> Result<()> {
+    let deadline = Instant::now() + REPLY_TIMEOUT;
+    while Instant::now() < deadline {
+        let Some(frame) = link.receive(Duration::from_millis(250)) else {
+            continue;
+        };
+        capture.accept(frame);
+        if capture.has_valid_resident_activation() {
+            return Ok(());
+        }
     }
+    bail!("device did not acknowledge calibration resident activation")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{read_plan, Arguments, CalibrationAbort, Parser, Step};
+    use super::{
+        anchored_schedule, calibration_revision, calibration_run, read_plan,
+        schedule_upload_frames, validate_schedule_acceptance, Arguments, Parser, Step,
+    };
+    use crate::capture::Capture;
+    use protocol::{
+        CalibrationCueId, CalibrationGesture, CalibrationModifier, CalibrationScheduleAccepted,
+        CalibrationScheduleEntry, CalibrationSongInterruption, CalibrationSongInterruptionReason,
+        DurationMilliseconds, Frame, TrackMilliseconds,
+    };
     use std::path::PathBuf;
 
     fn write_plan(contents: &str) -> PathBuf {
@@ -1611,20 +1644,6 @@ mod tests {
     }
 
     #[test]
-    fn fit_started_waits_for_a_planned_checkpoint() {
-        assert!(!CalibrationAbort::FitStarted.reached(0, 0));
-        assert!(CalibrationAbort::FitStarted.reached(0, 16));
-    }
-
-    #[test]
-    fn fit_pass_abort_waits_for_the_threshold() {
-        let abort = CalibrationAbort::FitPasses(3);
-        assert!(!abort.reached(2, 16));
-        assert!(abort.reached(3, 16));
-        assert!(abort.reached(4, 16));
-    }
-
-    #[test]
     fn plan_rejects_more_than_one_fit_step() {
         let path = write_plan("fit --model first\nfit --model second\n");
         let error = read_plan(&path).err().expect("duplicate fit must fail");
@@ -1634,15 +1653,170 @@ mod tests {
     }
 
     #[test]
-    fn plan_rejects_more_than_one_calibrate_step() {
-        let path =
-            write_plan("calibrate --manifest first.json\ncalibrate --manifest second.json\n");
+    fn plan_rejects_more_than_one_calibration_song_step() {
+        let path = write_plan(
+            "calibration-song --manifest first.json\ncalibration-song --manifest second.json\n",
+        );
         let error = read_plan(&path)
             .err()
-            .expect("duplicate calibrate must fail");
+            .expect("duplicate calibration song must fail");
         std::fs::remove_file(path).unwrap();
 
-        assert!(format!("{error:#}").contains("more than one calibrate step"));
+        assert!(format!("{error:#}").contains("more than one calibration-song step"));
+    }
+
+    #[test]
+    fn anchored_schedule_has_fixed_holds_and_a_stable_content_identity() {
+        let manifest = std::env::temp_dir().join(format!(
+            "playback-host-anchored-schedule-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(
+            &manifest,
+            r#"{
+                "session":"fixture",
+                "raw_stream":{"path":"fixture.i16","samples_per_record":500,"records":20,"channels":16},
+                "scale_uv":1.0,
+                "reference":{"gain_bits":["0x00000000","0x00000000","0x00000000","0x00000000","0x00000000","0x00000000","0x00000000","0x00000000","0x00000000","0x00000000","0x00000000","0x00000000","0x00000000","0x00000000","0x00000000","0x00000000"]},
+                "cue_spans":[
+                    {"class_id":"thumb_up_pronation","start":100,"stop":200},
+                    {"class_id":"thumb_up_hold","start":1100,"stop":1200}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let (entries, identity) = anchored_schedule(&[manifest.clone()]).unwrap();
+        let (_, repeated_identity) = anchored_schedule(&[manifest.clone()]).unwrap();
+        std::fs::remove_file(manifest).unwrap();
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].track_offset.get(), 200);
+        assert_eq!(entries[1].track_offset.get(), 2_200);
+        assert!(entries.iter().all(|entry| entry.hold.get() == 1_500));
+        assert!(identity.starts_with("sha256:"));
+        assert_eq!(identity, repeated_identity);
+    }
+
+    fn entries(count: u32) -> Vec<CalibrationScheduleEntry> {
+        (1..=count)
+            .map(|cue_id| CalibrationScheduleEntry {
+                cue_id: CalibrationCueId::new(cue_id).unwrap(),
+                gesture: CalibrationGesture::WristPronation,
+                modifier: CalibrationModifier::ThumbUp,
+                track_offset: TrackMilliseconds::new(cue_id * 2_000),
+                hold: DurationMilliseconds::new(1_500),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_130_cue_song_uploads_as_32_32_32_32_2_with_one_content_identity() {
+        let run = calibration_run(1, 2);
+        let revision = calibration_revision(3);
+        let frames =
+            schedule_upload_frames(run, revision, "sha256:complete-song", &entries(130)).unwrap();
+        assert_eq!(frames.len(), 7);
+        assert!(matches!(
+            &frames[0],
+            Frame::CalibrationScheduleBegin { run: frame_run, schedule_revision, content_identity, total_count }
+                if *frame_run == run && *schedule_revision == revision
+                    && content_identity == "sha256:complete-song" && *total_count == 130
+        ));
+        let chunks: Vec<_> = frames[1..6]
+            .iter()
+            .map(|frame| match frame {
+                Frame::CalibrationScheduleChunk {
+                    run: frame_run,
+                    schedule_revision,
+                    content_identity,
+                    total_count,
+                    first_entry,
+                    entries,
+                } => {
+                    assert_eq!(*frame_run, run);
+                    assert_eq!(*schedule_revision, revision);
+                    assert_eq!(content_identity, "sha256:complete-song");
+                    assert_eq!(*total_count, 130);
+                    (*first_entry, entries.len())
+                }
+                _ => panic!("expected calibration schedule chunk"),
+            })
+            .collect();
+        assert_eq!(
+            chunks,
+            vec![(0, 32), (32, 32), (64, 32), (96, 32), (128, 2)]
+        );
+        assert!(matches!(
+            &frames[6],
+            Frame::CalibrationScheduleCommit { run: frame_run, schedule_revision, content_identity, total_count }
+                if *frame_run == run && *schedule_revision == revision
+                    && content_identity == "sha256:complete-song" && *total_count == 130
+        ));
+    }
+
+    #[test]
+    fn accepted_anchor_must_echo_the_complete_identity_and_be_exactly_three_seconds_ahead() {
+        let run = calibration_run(4, 5);
+        let revision = calibration_revision(6);
+        let accepted = CalibrationScheduleAccepted {
+            run,
+            schedule_revision: revision,
+            content_identity: "sha256:complete-song".into(),
+            acknowledged_device_monotonic_microseconds: 70,
+            anchor_device_monotonic_microseconds: 3_000_070,
+            acquisition_sample: 123,
+        };
+        assert!(
+            validate_schedule_acceptance(&accepted, run, revision, "sha256:complete-song").is_ok()
+        );
+        assert!(
+            validate_schedule_acceptance(&accepted, run, revision, "sha256:other-song").is_err()
+        );
+
+        let mut wrong_anchor = accepted;
+        wrong_anchor.anchor_device_monotonic_microseconds += 1;
+        assert!(
+            validate_schedule_acceptance(&wrong_anchor, run, revision, "sha256:complete-song")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn interruption_continues_with_a_new_revision_and_never_reuploads_the_old_one() {
+        let run = calibration_run(8, 9);
+        let interrupted_revision = calibration_revision(10);
+        let retry_revision = calibration_revision(11);
+        let mut capture = Capture::new("unused");
+        capture.accept(Frame::CalibrationSongInterrupted {
+            interruption: CalibrationSongInterruption {
+                run,
+                schedule_revision: interrupted_revision,
+                content_identity: "sha256:interrupted-song".into(),
+                reason: CalibrationSongInterruptionReason::HeartbeatTimeout,
+                open_cue: Some(CalibrationCueId::new(1).unwrap()),
+            },
+        });
+        assert!(capture.has_calibration_song_terminal_event());
+        assert!(capture.assert_calibration_song_completed().is_err());
+        let continue_frame = Frame::CalibrationContinue { run };
+        let retry =
+            schedule_upload_frames(run, retry_revision, "sha256:retry-song", &entries(2)).unwrap();
+
+        assert!(
+            matches!(continue_frame, Frame::CalibrationContinue { run: frame_run } if frame_run == run)
+        );
+        assert_ne!(retry_revision, interrupted_revision);
+        assert!(matches!(
+            &retry[0],
+            Frame::CalibrationScheduleBegin { schedule_revision, .. } if *schedule_revision == retry_revision
+        ));
+        assert!(retry.iter().all(|frame| !matches!(
+            frame,
+            Frame::CalibrationScheduleBegin { schedule_revision, .. }
+            | Frame::CalibrationScheduleChunk { schedule_revision, .. }
+            | Frame::CalibrationScheduleCommit { schedule_revision, .. }
+                if *schedule_revision == interrupted_revision
+        )));
     }
 
     #[test]

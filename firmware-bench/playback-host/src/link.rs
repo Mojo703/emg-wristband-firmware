@@ -10,21 +10,45 @@
 //! thread is left free to write bulk samples while credits arrive behind it.
 
 use anyhow::{anyhow, Context, Result};
-use protocol::{Frame, FrameScanner};
+use protocol::{
+    CalibrationHeartbeat, CalibrationRunKey, CalibrationScheduleRevision, Frame, FrameScanner,
+    CALIBRATION_HEARTBEAT_INTERVAL_MILLISECONDS,
+};
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
-use std::sync::{mpsc, Arc, Mutex};
-use std::time::Duration;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc, Arc, Mutex,
+};
+use std::time::{Duration, Instant};
 
 /// How often the claim is refreshed. The device releases after fifteen seconds
 /// of silence, so this has plenty of margin even when a fit occupies it.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+const PROBE_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 
 pub struct Link {
     writer: Arc<Mutex<File>>,
-    frames: mpsc::Receiver<Frame>,
+    frames: mpsc::Receiver<(Instant, Frame)>,
+}
+
+/// Owns the calibration-specific heartbeat worker. Dropping it stops future
+/// heartbeats and joins the worker, so a later schedule cannot accidentally
+/// inherit liveness from an earlier song.
+pub struct CalibrationHeartbeatWorker {
+    running: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for CalibrationHeartbeatWorker {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 impl Link {
@@ -63,21 +87,14 @@ impl Link {
                         scanner.extend(&buffer[..read]);
                     }
                 }
-                while let Some(payload) = scanner.next_frame() {
-                    // Frames this build does not know are not an error: the
-                    // device also sends logs, telemetry, and whatever a later
-                    // firmware adds, and none of it should stop a bench run.
-                    if let Ok(frame) = ciborium::from_reader::<Frame, _>(payload.as_slice()) {
-                        if decoded.send(frame).is_err() {
-                            return;
-                        }
-                    }
+                if decode_frames(&mut scanner, &decoded).is_err() {
+                    return;
                 }
             }
         });
 
         let writer = Arc::new(Mutex::new(port));
-        let mut link = Self { writer, frames };
+        let link = Self { writer, frames };
         link.send(&Frame::Probe {})?;
 
         let heartbeat_writer = Arc::clone(&link.writer);
@@ -92,19 +109,144 @@ impl Link {
         Ok(link)
     }
 
-    pub fn send(&mut self, frame: &Frame) -> Result<()> {
+    pub fn send(&self, frame: &Frame) -> Result<()> {
         let bytes = encode(frame)?;
         write_frame(&self.writer, &bytes)
     }
 
+    /// Start the host-to-device calibration heartbeat required while one
+    /// committed song is active. This is deliberately separate from the
+    /// generic serial lease heartbeat: the firmware uses its 500 ms cadence to
+    /// interrupt unattended songs after two seconds.
+    pub fn start_calibration_heartbeats(
+        &self,
+        run: CalibrationRunKey,
+        schedule_revision: CalibrationScheduleRevision,
+    ) -> Result<CalibrationHeartbeatWorker> {
+        start_calibration_heartbeat_worker(
+            Arc::clone(&self.writer),
+            run,
+            schedule_revision,
+            calibration_heartbeat_interval(),
+        )
+    }
+
     /// The next frame, or `None` if none arrived within `timeout`.
     pub fn receive(&self, timeout: Duration) -> Option<Frame> {
+        self.receive_timestamped(timeout).map(|(_, frame)| frame)
+    }
+
+    /// The next frame and the instant the reader decoded it, or `None` if none
+    /// arrived within `timeout`.
+    pub fn receive_timestamped(&self, timeout: Duration) -> Option<(Instant, Frame)> {
         self.frames.recv_timeout(timeout).ok()
     }
 
     /// Everything already decoded, without waiting.
     pub fn drain(&self) -> Vec<Frame> {
-        self.frames.try_iter().collect()
+        self.frames.try_iter().map(|(_, frame)| frame).collect()
+    }
+
+    /// Send probes until the device acknowledges this host with `DeviceHello`.
+    /// The heartbeat thread started by [`Self::open`] maintains the claim while
+    /// this waits.
+    pub fn claim(&self, timeout: Duration) -> Result<()> {
+        await_claim(
+            timeout,
+            PROBE_RETRY_INTERVAL,
+            || self.send(&Frame::Probe {}),
+            |timeout| self.receive_timestamped(timeout),
+        )
+    }
+}
+
+fn calibration_heartbeat_interval() -> Duration {
+    Duration::from_millis(u64::from(CALIBRATION_HEARTBEAT_INTERVAL_MILLISECONDS))
+}
+
+fn start_calibration_heartbeat_worker<W>(
+    writer: Arc<Mutex<W>>,
+    run: CalibrationRunKey,
+    schedule_revision: CalibrationScheduleRevision,
+    interval: Duration,
+) -> Result<CalibrationHeartbeatWorker>
+where
+    W: Write + Send + 'static,
+{
+    let running = Arc::new(AtomicBool::new(true));
+    let heartbeat = Arc::clone(&running);
+    let thread = std::thread::spawn(move || {
+        let mut sequence = 0u32;
+        while heartbeat.load(Ordering::Acquire) {
+            let frame = Frame::CalibrationHeartbeat {
+                heartbeat: CalibrationHeartbeat {
+                    run,
+                    schedule_revision,
+                    sequence,
+                },
+            };
+            let Ok(bytes) = encode(&frame) else {
+                return;
+            };
+            if write_frame(&writer, &bytes).is_err() {
+                return;
+            }
+            sequence = sequence.wrapping_add(1);
+            std::thread::sleep(interval);
+        }
+    });
+    Ok(CalibrationHeartbeatWorker {
+        running,
+        thread: Some(thread),
+    })
+}
+
+fn decode_frames(
+    scanner: &mut FrameScanner,
+    decoded: &mpsc::Sender<(Instant, Frame)>,
+) -> Result<(), ()> {
+    while let Some(payload) = scanner.next_frame() {
+        // Frames this build does not know are not an error: the device also
+        // sends logs, telemetry, and whatever a later firmware adds, and none
+        // of it should stop a bench run.
+        if let Ok(frame) = ciborium::from_reader::<Frame, _>(payload.as_slice()) {
+            if decoded.send((Instant::now(), frame)).is_err() {
+                return Err(());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn await_claim(
+    timeout: Duration,
+    retry_interval: Duration,
+    mut send_probe: impl FnMut() -> Result<()>,
+    mut receive: impl FnMut(Duration) -> Option<(Instant, Frame)>,
+) -> Result<()> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .context("link claim timeout deadline overflow")?;
+    loop {
+        send_probe()?;
+        let retry_deadline = Instant::now()
+            .checked_add(retry_interval)
+            .context("link probe retry deadline overflow")?;
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(anyhow!(
+                    "timed out waiting for DeviceHello after probing the link"
+                ));
+            }
+            let wait = (deadline - now).min(retry_deadline.saturating_duration_since(now));
+            if matches!(receive(wait), Some((_, Frame::DeviceHello { .. }))) {
+                return Ok(());
+            }
+            if Instant::now() >= retry_deadline {
+                break;
+            }
+        }
     }
 }
 
@@ -133,9 +275,17 @@ fn create_raw_tap(path: Option<&OsStr>) -> Result<Option<File>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{create_raw_tap, write_frame};
+    use super::{
+        await_claim, calibration_heartbeat_interval, create_raw_tap, decode_frames,
+        start_calibration_heartbeat_worker, write_frame,
+    };
+    use protocol::{
+        CalibrationRunId, CalibrationRunKey, CalibrationScheduleRevision, CalibrationSessionId,
+        DeviceConfig, DeviceProvenance, FirmwareBuild, Frame, FrameScanner,
+    };
     use std::io::{self, Write};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{mpsc, Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     #[derive(Default)]
     struct OneByteWriter(Vec<u8>);
@@ -149,6 +299,62 @@ mod tests {
 
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingWriter(Vec<u8>);
+
+    impl Write for RecordingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn calibration_run() -> CalibrationRunKey {
+        CalibrationRunKey {
+            session_id: CalibrationSessionId::new(7).unwrap(),
+            run_id: CalibrationRunId::new(9).unwrap(),
+        }
+    }
+
+    #[test]
+    fn calibration_heartbeats_are_500ms_and_stop_with_the_song_worker() {
+        assert_eq!(calibration_heartbeat_interval(), Duration::from_millis(500));
+
+        let writer = Arc::new(Mutex::new(RecordingWriter::default()));
+        let worker = start_calibration_heartbeat_worker(
+            Arc::clone(&writer),
+            calibration_run(),
+            CalibrationScheduleRevision::new(3).unwrap(),
+            Duration::from_millis(2),
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(12));
+        drop(worker);
+        let bytes_at_shutdown = writer.lock().unwrap().0.clone();
+        std::thread::sleep(Duration::from_millis(12));
+        assert_eq!(writer.lock().unwrap().0, bytes_at_shutdown);
+
+        let mut scanner = FrameScanner::new();
+        scanner.extend(&bytes_at_shutdown);
+        let heartbeats: Vec<_> = std::iter::from_fn(|| scanner.next_frame())
+            .map(|payload| ciborium::from_reader::<Frame, _>(payload.as_slice()).unwrap())
+            .collect();
+        assert!(heartbeats.len() >= 2);
+        for (sequence, frame) in heartbeats.into_iter().enumerate() {
+            assert!(matches!(
+                frame,
+                Frame::CalibrationHeartbeat { heartbeat }
+                    if heartbeat.run == calibration_run()
+                        && heartbeat.schedule_revision == CalibrationScheduleRevision::new(3).unwrap()
+                        && heartbeat.sequence == sequence as u32
+            ));
         }
     }
 
@@ -180,5 +386,66 @@ mod tests {
 
         assert!(message.contains("PLAYBACK_HOST_RAW_TAP"));
         assert!(message.contains(&path.display().to_string()));
+    }
+
+    #[test]
+    fn claim_retries_probe_until_device_hello() {
+        let mut probes = 0;
+        let hello = device_hello();
+        let mut replies = [None, Some((Instant::now(), hello))].into_iter();
+
+        await_claim(
+            Duration::from_secs(1),
+            Duration::ZERO,
+            || {
+                probes += 1;
+                Ok(())
+            },
+            |_| replies.next().flatten(),
+        )
+        .unwrap();
+
+        assert_eq!(probes, 2);
+    }
+
+    #[test]
+    fn decoded_frame_is_timestamped_in_reader() {
+        let frame = Frame::Probe {};
+        let mut payload = Vec::new();
+        ciborium::into_writer(&frame, &mut payload).unwrap();
+        let mut scanner = FrameScanner::new();
+        scanner.extend(&protocol::frame_bytes(&payload));
+        let (decoded, received) = mpsc::channel();
+        let before_decode = Instant::now();
+
+        decode_frames(&mut scanner, &decoded).unwrap();
+
+        let (decoded_at, frame) = received.recv().unwrap();
+        assert!(decoded_at >= before_decode);
+        assert!(matches!(frame, Frame::Probe {}));
+    }
+
+    fn device_hello() -> Frame {
+        Frame::DeviceHello {
+            device_id: "opal-test".into(),
+            config: DeviceConfig {
+                gestures: 0,
+                keymap: Vec::new(),
+                wifi_ssid: None,
+                sensitivity: "test".into(),
+                sensitivity_levels: Vec::new(),
+                tau: 0.0,
+                needed: 0,
+            },
+            provenance: DeviceProvenance {
+                firmware: FirmwareBuild {
+                    crate_version: "test".into(),
+                    git_commit: String::new(),
+                    working_tree_modified: false,
+                    built_at: "test".into(),
+                },
+                analog_front_ends: Vec::new(),
+            },
+        }
     }
 }

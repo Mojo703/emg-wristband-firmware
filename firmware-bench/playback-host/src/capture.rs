@@ -9,7 +9,7 @@
 //! because that is what a person reading the file needs.
 
 use anyhow::{Context, Result};
-use protocol::{CalibrationOutcome, CalibrationPhase, Frame, BENCH_FEATURE_COUNT};
+use protocol::{Frame, BENCH_FEATURE_COUNT};
 use serde::Serialize;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -84,13 +84,10 @@ pub struct Capture {
     errors: Vec<ErrorRecord>,
     fit: Option<FitRecord>,
     fitted_model: Option<Vec<u8>>,
-    /// Every calibration state frame in order, the probe, and the result. The
-    /// state sequence is the run report: it is the only place the per-round
-    /// pass timing appears, and that number decides the fit schedule's shape.
-    calibration_states: Vec<Frame>,
-    calibration_probe: Option<Frame>,
-    calibration_result: Option<Frame>,
-    calibration_result_count: usize,
+    /// Anchored-song terminal event. Unlike the removed scripted-wearer result,
+    /// an interruption keeps completed rows and checkpoints for Continue.
+    calibration_song_terminal: Option<Frame>,
+    resident_activation: Option<Frame>,
     /// The most recent credit grant, which the streaming loop reads.
     pub credit: Option<(u32, u32)>,
 }
@@ -106,10 +103,8 @@ impl Capture {
             errors: Vec::new(),
             fit: None,
             fitted_model: None,
-            calibration_states: Vec::new(),
-            calibration_probe: None,
-            calibration_result: None,
-            calibration_result_count: 0,
+            calibration_song_terminal: None,
+            resident_activation: None,
             credit: None,
         }
     }
@@ -142,69 +137,32 @@ impl Capture {
         self.fit.is_some()
     }
 
-    /// Whether the device has reported a calibration ending. The calibrate step
-    /// waits on this rather than on a timeout: the fit runs after the last
-    /// sample, and how long it takes is exactly what the run is measuring.
-    pub fn has_calibration_result(&self) -> bool {
-        self.calibration_result.is_some()
+    pub fn has_calibration_song_terminal_event(&self) -> bool {
+        self.calibration_song_terminal.is_some()
     }
 
-    /// The outcome a finished calibration reported, if one finished.
-    ///
-    /// A run that aborts, fails its fit, loses its front end or runs out of
-    /// storage is a failed run, and the device says so in the result rather
-    /// than in a `bench_error`. Reading only the error list called every one of
-    /// those a success and exited zero, which is exactly the shape of failure
-    /// an orchestration cannot see.
-    pub fn calibration_outcome(&self) -> Option<CalibrationOutcome> {
-        match self.calibration_result {
-            Some(Frame::CalibrationResult { outcome, .. }) => Some(outcome),
-            _ => None,
-        }
+    /// A resident acknowledgement is usable only when it carries the same
+    /// numerical and storage validity firmware requires for activation.
+    pub fn has_valid_resident_activation(&self) -> bool {
+        matches!(
+            self.resident_activation,
+            Some(Frame::CalibrationResidentActivated { activation })
+                if activation.validity.permits_activation()
+        )
     }
 
-    /// Fit progress reports received from the firmware adapter, in order.
-    pub fn calibration_fit_progress(
-        &self,
-    ) -> impl DoubleEndedIterator<Item = (CalibrationPhase, u32, u32)> + '_ {
-        self.calibration_states
-            .iter()
-            .filter_map(|frame| match frame {
-                Frame::CalibrationState {
-                    phase,
-                    fit_passes_done,
-                    fit_passes_planned,
-                    ..
-                } => Some((*phase, *fit_passes_done, *fit_passes_planned)),
-                _ => None,
-            })
-    }
-
-    /// Require the terminal report produced by the abort-validation path.
-    pub fn assert_aborted_calibration(&self) -> Result<()> {
-        if self.calibration_result_count != 1 {
-            anyhow::bail!(
-                "expected exactly one calibration result, received {}",
-                self.calibration_result_count
-            );
-        }
-        match self.calibration_result.as_ref() {
-            Some(Frame::CalibrationResult {
-                outcome: CalibrationOutcome::Aborted,
-                installed: None,
-                previous_retained: true,
-                ..
-            }) => Ok(()),
-            Some(Frame::CalibrationResult {
-                outcome,
-                installed,
-                previous_retained,
-                ..
-            }) => anyhow::bail!(
-                "abort validation reported outcome {outcome:?}, installed {installed:?}, \
-                 previous_retained {previous_retained}"
+    /// A completed song is a successful transport result even when its counts
+    /// are short: deficits are deliberately permissive and Continue owns the
+    /// next authored schedule. Interruption is distinct so callers cannot
+    /// mistake lost liveness for a usable terminal result.
+    pub fn assert_calibration_song_completed(&self) -> Result<()> {
+        match self.calibration_song_terminal.as_ref() {
+            Some(Frame::CalibrationSongResult { .. }) => Ok(()),
+            Some(Frame::CalibrationSongInterrupted { interruption }) => anyhow::bail!(
+                "calibration song interrupted {:?}; completed evidence is retained for Continue",
+                interruption.reason
             ),
-            _ => anyhow::bail!("abort validation received no calibration result"),
+            _ => anyhow::bail!("no calibration song terminal event"),
         }
     }
 
@@ -308,38 +266,12 @@ impl Capture {
                 eprintln!("device refused {stage}: {detail}");
                 self.errors.push(ErrorRecord { stage, detail });
             }
-            frame @ Frame::CalibrationState { .. } => {
-                if let Frame::CalibrationState {
-                    phase,
-                    round,
-                    rounds_planned,
-                    pass_milliseconds,
-                    accepted_reps,
-                    rejected_reps,
-                    ..
-                } = &frame
-                {
-                    eprintln!(
-                        "calibration {phase:?}: round {round}/{rounds_planned},                          {accepted_reps} reps kept, {rejected_reps} rejected,                          last pass {pass_milliseconds} ms"
-                    );
-                }
-                self.calibration_states.push(frame);
+            frame @ Frame::CalibrationSongResult { .. }
+            | frame @ Frame::CalibrationSongInterrupted { .. } => {
+                self.calibration_song_terminal = Some(frame);
             }
-            frame @ Frame::CalibrationProbe { .. } => self.calibration_probe = Some(frame),
-            frame @ Frame::CalibrationResult { .. } => {
-                if let Frame::CalibrationResult {
-                    outcome,
-                    installed,
-                    fit_wall_milliseconds,
-                    ..
-                } = &frame
-                {
-                    eprintln!(
-                        "calibration finished {outcome:?} (slot {installed:?},                          {fit_wall_milliseconds} ms of fitting)"
-                    );
-                }
-                self.calibration_result_count += 1;
-                self.calibration_result = Some(frame);
+            frame @ Frame::CalibrationResidentActivated { .. } => {
+                self.resident_activation = Some(frame);
             }
             Frame::Log { level, message, .. } => eprintln!("device {level:?}: {message}"),
             _ => {}
@@ -378,14 +310,12 @@ impl Capture {
         if !self.errors.is_empty() {
             self.write_json("errors.json", &self.errors)?;
         }
-        if !self.calibration_states.is_empty() || self.calibration_result.is_some() {
+        if self.calibration_song_terminal.is_some() || self.resident_activation.is_some() {
             self.write_json(
-                "calibration_run.json",
+                "calibration_song.json",
                 &serde_json::json!({
-                    "states": self.calibration_states,
-                    "probe": self.calibration_probe,
-                    "result": self.calibration_result,
-                    "result_count": self.calibration_result_count,
+                    "terminal": self.calibration_song_terminal,
+                    "resident_activation": self.resident_activation,
                 }),
             )?;
         }
@@ -415,62 +345,38 @@ fn write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::Capture;
-    use protocol::{CalibrationOutcome, Frame, InstalledSlot};
+    use protocol::{
+        CalibrationCandidateValidity, CalibrationResidentActivation, CalibrationRunId,
+        CalibrationRunKey, CalibrationScheduleRevision, CalibrationSessionId, Frame,
+    };
 
-    fn result(outcome: CalibrationOutcome, previous_retained: bool) -> Frame {
-        Frame::CalibrationResult {
-            outcome,
-            installed: None,
-            rounds_completed: 1,
-            rows_stored: 45,
-            accepted_reps: 5,
-            rejected_reps: 0,
-            quality: None,
-            weak_pair: None,
-            classes: Vec::new(),
-            fit_wall_milliseconds: 600,
-            previous_retained,
+    fn activation(validity: CalibrationCandidateValidity) -> Frame {
+        Frame::CalibrationResidentActivated {
+            activation: CalibrationResidentActivation {
+                run: CalibrationRunKey {
+                    session_id: CalibrationSessionId::new(1).unwrap(),
+                    run_id: CalibrationRunId::new(2).unwrap(),
+                },
+                schedule_revision: CalibrationScheduleRevision::new(3).unwrap(),
+                validity,
+                resident_sequence: 4,
+            },
         }
     }
 
     #[test]
-    fn abort_validation_requires_one_uninstalled_retained_result() {
+    fn save_waits_for_an_activation_with_numerical_and_crc_validity() {
         let mut capture = Capture::new("unused");
-        capture.accept(result(CalibrationOutcome::Aborted, true));
+        capture.accept(activation(CalibrationCandidateValidity {
+            model_numerically_valid: true,
+            record_crc_valid: false,
+        }));
+        assert!(!capture.has_valid_resident_activation());
 
-        assert!(capture.assert_aborted_calibration().is_ok());
-    }
-
-    #[test]
-    fn abort_validation_rejects_duplicate_results() {
-        let mut capture = Capture::new("unused");
-        capture.accept(result(CalibrationOutcome::Aborted, true));
-        capture.accept(result(CalibrationOutcome::Aborted, true));
-
-        assert!(capture.assert_aborted_calibration().is_err());
-    }
-
-    #[test]
-    fn abort_validation_requires_previous_calibration_retention() {
-        let mut capture = Capture::new("unused");
-        capture.accept(result(CalibrationOutcome::Aborted, false));
-
-        assert!(capture.assert_aborted_calibration().is_err());
-    }
-
-    #[test]
-    fn abort_validation_rejects_an_installed_slot() {
-        let mut frame = result(CalibrationOutcome::Aborted, true);
-        let Frame::CalibrationResult { installed, .. } = &mut frame else {
-            unreachable!()
-        };
-        *installed = Some(InstalledSlot {
-            slot: 1,
-            sequence: 2,
-        });
-        let mut capture = Capture::new("unused");
-        capture.accept(frame);
-
-        assert!(capture.assert_aborted_calibration().is_err());
+        capture.accept(activation(CalibrationCandidateValidity {
+            model_numerically_valid: true,
+            record_crc_valid: true,
+        }));
+        assert!(capture.has_valid_resident_activation());
     }
 }

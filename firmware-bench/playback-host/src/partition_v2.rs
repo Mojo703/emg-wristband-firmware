@@ -127,8 +127,9 @@ pub fn describe(image: &[u8]) -> Result<String> {
         let slot_bytes = &image[*offset..*offset + SLOT_BYTES];
         match parse_slot(index, slot_bytes, prior.hash()) {
             Ok(slot) => report.push_str(&format!(
-                "  slot {index}: sequence {}, prior {:08x}, {} rows, whole\n",
+                "  slot {index}: sequence {}, role {:?}, prior {:08x}, {} rows, whole\n",
                 slot.record.sequence,
+                slot.record.role,
                 slot.record.prior_hash,
                 slot.rows().len()
             )),
