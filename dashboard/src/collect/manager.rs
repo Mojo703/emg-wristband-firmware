@@ -59,11 +59,17 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::{broadcast, mpsc, watch};
 
 /// Fan-out capacity for collection frames toward browsers. State ticks are
 /// small and periodic; a browser that lags simply sees the next tick.
 const OUTBOUND_CAPACITY: usize = 64;
+
+/// Lifecycle commands are sparse. Reaching this bound means the session task is
+/// unhealthy; growing a stale backlog would make old Start/Pause/Finish intents
+/// execute after it recovers.
+const CONTROL_CAPACITY: usize = 8;
 
 /// How long arming waits for the device's first EMG window (which carries the
 /// hardware identity) before giving up.
@@ -126,10 +132,14 @@ enum SessionControl {
     ResumeTrack,
     /// End the session now and move to review, mid-track or not.
     Finish,
-    /// Turn the music up or down under the cues.
-    SetMusicGain(f32),
-    /// Move playback to another device without losing the track's place.
-    SetOutput(AudioOutput),
+}
+
+/// Latest-wins audio settings are state, not an event stream. A watch channel
+/// prevents a dragged volume slider from starving lifecycle commands.
+#[derive(Clone)]
+struct LiveAudioSettings {
+    output: AudioOutput,
+    gain: f32,
 }
 
 enum Phase {
@@ -140,7 +150,8 @@ enum Phase {
     },
     Running {
         session_id: dashboard::guided_session::GuidedSessionId,
-        control: mpsc::UnboundedSender<SessionControl>,
+        control: mpsc::Sender<SessionControl>,
+        audio: watch::Sender<LiveAudioSettings>,
     },
     /// The wire-facing session/summary data lives in the cached `latest_state`
     /// frame; the phase itself only needs what `StopCollection` acts on. A
@@ -609,6 +620,10 @@ impl CollectionManager {
             let settings = self.audio_settings.lock().unwrap();
             (settings.output.clone(), settings.gain())
         };
+        let playback_audio = LiveAudioSettings {
+            output: output.clone(),
+            gain,
+        };
         let playback = tokio::task::spawn_blocking(move || {
             Playback::open(&audio_path, &note_onsets, &click_beats, &output, gain)
         })
@@ -723,7 +738,15 @@ impl CollectionManager {
             }
         }
 
-        let (control, control_receiver) = mpsc::unbounded_channel();
+        let (control, control_receiver) = mpsc::channel(CONTROL_CAPACITY);
+        let current_audio = {
+            let settings = self.audio_settings.lock().unwrap();
+            LiveAudioSettings {
+                output: settings.output.clone(),
+                gain: settings.gain(),
+            }
+        };
+        let (audio, audio_receiver) = watch::channel(current_audio);
         let guided_session_id = lease
             .as_ref()
             .expect("arming owns the guided-session lease")
@@ -734,6 +757,7 @@ impl CollectionManager {
             state.phase = Phase::Running {
                 session_id: guided_session_id,
                 control,
+                audio,
             };
             // The photo now belongs to this session; a practice session leaves
             // it pending for the next real one.
@@ -754,6 +778,8 @@ impl CollectionManager {
             session_id,
             capture,
             control_receiver,
+            audio_receiver,
+            playback_audio,
             beatmap,
             track,
             rest_label,
@@ -786,20 +812,19 @@ impl CollectionManager {
 
     /// Browser → `SetAudioVolume`. A running session hears about it at once.
     pub fn set_audio_volume(&self, volume_permille: u32) {
-        let gain = {
+        {
             let mut settings = self.audio_settings.lock().unwrap();
             settings.volume_permille = volume_permille.min(1000);
-            settings.gain()
-        };
+        }
         self.remember_audio();
-        self.command(SessionControl::SetMusicGain(gain));
+        self.update_running_audio();
         self.publish(self.audio_settings_frame());
     }
 
     /// Browser → `SetAudioOutput`. A running session moves to the new device
     /// mid-track; anything else takes effect when the next one arms.
     pub fn set_audio_output(&self, output: Option<String>) {
-        let chosen = {
+        {
             let mut settings = self.audio_settings.lock().unwrap();
             if settings.forced_silent {
                 tracing::info!("ignoring an output-device change: this backend runs silent");
@@ -809,10 +834,9 @@ impl CollectionManager {
                 Some(name) if !name.is_empty() => AudioOutput::Named(name),
                 _ => AudioOutput::Default,
             };
-            settings.output.clone()
-        };
+        }
         self.remember_audio();
-        self.command(SessionControl::SetOutput(chosen));
+        self.update_running_audio();
         self.publish(self.audio_settings_frame());
     }
 
@@ -840,12 +864,40 @@ impl CollectionManager {
     }
 
     fn command(&self, control: SessionControl) {
-        let state = self.state.lock().unwrap();
-        if let Phase::Running {
-            control: sender, ..
-        } = &state.phase
-        {
-            let _ = sender.send(control);
+        let delivery = {
+            let state = self.state.lock().unwrap();
+            match &state.phase {
+                Phase::Running {
+                    control: sender, ..
+                } => sender.try_send(control).map_err(|error| match error {
+                    TrySendError::Full(_) => "collection control queue is full",
+                    TrySendError::Closed(_) => "collection control task has stopped",
+                }),
+                Phase::Idle | Phase::Starting { .. } | Phase::Reviewing { .. } => return,
+            }
+        };
+        if let Err(detail) = delivery {
+            self.publish_error(detail.into());
+        }
+    }
+
+    fn update_running_audio(&self) {
+        let latest = {
+            let settings = self.audio_settings.lock().unwrap();
+            LiveAudioSettings {
+                output: settings.output.clone(),
+                gain: settings.gain(),
+            }
+        };
+        let delivery = {
+            let state = self.state.lock().unwrap();
+            match &state.phase {
+                Phase::Running { audio, .. } => audio.send(latest),
+                Phase::Idle | Phase::Starting { .. } | Phase::Reviewing { .. } => return,
+            }
+        };
+        if delivery.is_err() {
+            self.publish_error("collection audio control task has stopped".into());
         }
     }
 
@@ -966,10 +1018,13 @@ impl GuidedModeAdapter for CollectionManager {
         if let Phase::Running {
             session_id,
             control,
+            ..
         } = &state.phase
         {
             if *session_id == session.session_id {
-                let _ = control.send(SessionControl::BrowserGone);
+                if let Err(error) = control.try_send(SessionControl::BrowserGone) {
+                    tracing::error!(?error, "failed to pause collection after browser departure");
+                }
             }
         }
     }
@@ -1142,7 +1197,9 @@ struct RunningSession {
     manager: Arc<CollectionManager>,
     session_id: SessionId,
     capture: CaptureResources,
-    control: mpsc::UnboundedReceiver<SessionControl>,
+    control: mpsc::Receiver<SessionControl>,
+    audio: watch::Receiver<LiveAudioSettings>,
+    applied_audio: LiveAudioSettings,
     cues: Vec<CueState>,
     track: TrackInfo,
     /// `Some` on a rest track; the finalizer logs the played stretch.
@@ -1170,7 +1227,9 @@ impl RunningSession {
         manager: Arc<CollectionManager>,
         session_id: SessionId,
         capture: CaptureResources,
-        control: mpsc::UnboundedReceiver<SessionControl>,
+        control: mpsc::Receiver<SessionControl>,
+        audio: watch::Receiver<LiveAudioSettings>,
+        applied_audio: LiveAudioSettings,
         beatmap: Beatmap,
         track: TrackInfo,
         rest_label: Option<String>,
@@ -1196,6 +1255,8 @@ impl RunningSession {
             session_id,
             capture,
             control,
+            audio,
+            applied_audio,
             cues,
             track,
             rest_label,
@@ -1220,6 +1281,10 @@ impl RunningSession {
     }
 
     async fn run(mut self) {
+        // Settings may have changed while track decoding or device acquisition was
+        // in flight. Reconcile the playback built above before accepting controls.
+        let desired_audio = self.audio.borrow_and_update().clone();
+        self.apply_audio_settings(desired_audio).await;
         let mut ticker = tokio::time::interval(TICK);
         let mut publish_health = false;
         let outcome = loop {
@@ -1228,11 +1293,18 @@ impl RunningSession {
                     Some(SessionControl::StartTrack) => self.start_track().await,
                     Some(SessionControl::PauseTrack) => self.pause_track().await,
                     Some(SessionControl::BrowserGone) => self.browser_gone().await,
-                    Some(SessionControl::SetMusicGain(gain)) => self.playback.set_music_gain(gain),
-                    Some(SessionControl::SetOutput(output)) => self.set_output(&output).await,
                     Some(SessionControl::ResumeTrack) => self.resume_track().await,
                     Some(SessionControl::Finish) => break SessionExit::OperatorStopped,
                     None => break SessionExit::TaskFailed("collection control channel closed".into()),
+                },
+                changed = self.audio.changed() => match changed {
+                    Ok(()) => {
+                        let settings = self.audio.borrow_and_update().clone();
+                        self.apply_audio_settings(settings).await;
+                    }
+                    Err(_) => break SessionExit::TaskFailed(
+                        "collection audio control channel closed".into(),
+                    ),
                 },
                 frame = next_emg(self.capture.emg_receiver_mut()) => match frame {
                     Ok(Frame::Emg { seq, t0_us, channels, samples, missing, .. }) => {
@@ -1261,6 +1333,16 @@ impl RunningSession {
             }
         };
         self.finalize(outcome).await;
+    }
+
+    async fn apply_audio_settings(&mut self, settings: LiveAudioSettings) {
+        if settings.gain != self.applied_audio.gain {
+            self.playback.set_music_gain(settings.gain);
+        }
+        if settings.output != self.applied_audio.output {
+            self.set_output(&settings.output).await;
+        }
+        self.applied_audio = settings;
     }
 
     /// The operator tapped Start: play the track, then take the anchor off the
@@ -1910,13 +1992,22 @@ mod tests {
     fn pretend_running(
         manager: &CollectionManager,
         session_id: dashboard::guided_session::GuidedSessionId,
-    ) -> mpsc::UnboundedReceiver<SessionControl> {
-        let (control, receiver) = mpsc::unbounded_channel();
+    ) -> (
+        mpsc::Receiver<SessionControl>,
+        watch::Receiver<LiveAudioSettings>,
+    ) {
+        let (control, receiver) = mpsc::channel(CONTROL_CAPACITY);
+        let settings = LiveAudioSettings {
+            output: AudioOutput::Silent,
+            gain: 0.0,
+        };
+        let (audio, audio_receiver) = watch::channel(settings);
         manager.state.lock().unwrap().phase = Phase::Running {
             session_id,
             control,
+            audio,
         };
-        receiver
+        (receiver, audio_receiver)
     }
 
     #[test]
@@ -1925,7 +2016,7 @@ mod tests {
         let lease = guided_sessions
             .acquire_current(GuidedMode::Collection, None)
             .unwrap();
-        let mut control = pretend_running(&manager, lease.binding().session_id);
+        let (mut control, _audio) = pretend_running(&manager, lease.binding().session_id);
         let generic = guided_sessions.connect_browser();
         let first = guided_sessions.connect_browser();
         let second = guided_sessions.connect_browser();
@@ -1957,7 +2048,7 @@ mod tests {
         let lease = guided_sessions
             .acquire_current(GuidedMode::Collection, None)
             .unwrap();
-        let mut control = pretend_running(&manager, lease.binding().session_id);
+        let (mut control, _audio) = pretend_running(&manager, lease.binding().session_id);
 
         for _ in 0..2 {
             let connection = guided_sessions.connect_browser();
@@ -1984,7 +2075,7 @@ mod tests {
         let replacement = guided_sessions
             .acquire_current(GuidedMode::Collection, None)
             .unwrap();
-        let mut control = pretend_running(&manager, replacement.binding().session_id);
+        let (mut control, _audio) = pretend_running(&manager, replacement.binding().session_id);
 
         manager.pause_for_no_visible_views(&old_binding);
         assert!(control.try_recv().is_err());
@@ -1994,6 +2085,47 @@ mod tests {
             Ok(SessionControl::BrowserGone)
         ));
         replacement.finish(SessionExit::Completed);
+    }
+
+    #[test]
+    fn rapid_audio_updates_coalesce_without_starving_lifecycle_control() {
+        let (manager, guided_sessions) = bare_manager("audio-coalescing");
+        let lease = guided_sessions
+            .acquire_current(GuidedMode::Collection, None)
+            .unwrap();
+        let (mut control, audio) = pretend_running(&manager, lease.binding().session_id);
+
+        for volume in 0..=1000 {
+            manager.audio_settings.lock().unwrap().volume_permille = volume;
+            manager.update_running_audio();
+        }
+        manager.finish_collection();
+
+        assert_eq!(audio.borrow().gain, 1.0);
+        assert!(matches!(control.try_recv(), Ok(SessionControl::Finish)));
+        assert!(control.try_recv().is_err());
+        lease.finish(SessionExit::Completed);
+    }
+
+    #[test]
+    fn closed_collection_control_task_is_reported() {
+        let (manager, guided_sessions) = bare_manager("closed-control");
+        let lease = guided_sessions
+            .acquire_current(GuidedMode::Collection, None)
+            .unwrap();
+        let (control, audio) = pretend_running(&manager, lease.binding().session_id);
+        drop(control);
+        drop(audio);
+        let mut outbound = manager.subscribe();
+
+        manager.finish_collection();
+
+        assert!(matches!(
+            outbound.try_recv(),
+            Ok(Frame::Log { message, .. })
+                if message.contains("collection control task has stopped")
+        ));
+        lease.finish(SessionExit::Completed);
     }
 
     #[tokio::test]
@@ -2009,7 +2141,7 @@ mod tests {
                 .unwrap();
             let session_id = lease.binding().session_id;
             if running {
-                let _control = pretend_running(&manager, session_id);
+                let (_control, _audio) = pretend_running(&manager, session_id);
             } else {
                 manager.state.lock().unwrap().phase = Phase::Starting { session_id };
             }
