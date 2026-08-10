@@ -37,9 +37,17 @@ pub struct RejectPipeline {
     num_commands: usize,
     pub tau: f32,
     needed: usize,
-    last_command: Option<u8>,
-    streak: usize,
-    latched: bool,
+    vote: VoteState,
+}
+
+/// The vote's command identity and progress move together. Keeping these as a
+/// command option, a count, and a latch flag allowed contradictory states such
+/// as "latched with no command" and made an active streak grow without bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VoteState {
+    Idle,
+    Arming { command: u8, streak: usize },
+    Active { command: u8 },
 }
 
 impl RejectPipeline {
@@ -51,9 +59,7 @@ impl RejectPipeline {
             num_commands,
             tau,
             needed: Self::NEEDED,
-            last_command: None,
-            streak: 0,
-            latched: false,
+            vote: VoteState::Idle,
         }
     }
 
@@ -71,31 +77,94 @@ impl RejectPipeline {
         );
         let above = reject_score >= self.tau;
 
-        if above && self.last_command == Some(argmax as u8) {
-            self.streak += 1;
-        } else if above {
-            self.last_command = Some(argmax as u8);
-            self.streak = 1;
+        let command = argmax as u8;
+        self.vote = if !above {
+            VoteState::Idle
         } else {
-            self.last_command = None;
-            self.streak = 0;
-        }
-        self.latched = self.streak >= self.needed;
+            match self.vote {
+                VoteState::Idle => VoteState::Arming { command, streak: 1 },
+                VoteState::Arming {
+                    command: previous,
+                    streak,
+                } if previous == command && streak + 1 >= self.needed => {
+                    VoteState::Active { command }
+                }
+                VoteState::Arming {
+                    command: previous,
+                    streak,
+                } if previous == command => VoteState::Arming {
+                    command,
+                    streak: streak + 1,
+                },
+                VoteState::Active { command: active } if active == command => {
+                    VoteState::Active { command }
+                }
+                VoteState::Arming { .. } | VoteState::Active { .. } => {
+                    VoteState::Arming { command, streak: 1 }
+                }
+            }
+        };
 
-        let wake_state = if self.streak == 0 {
-            WakeState::Idle
-        } else if self.latched {
-            WakeState::Active
-        } else {
-            WakeState::Arming
+        let (accepted, wake_state, streak) = match self.vote {
+            VoteState::Idle => (false, WakeState::Idle, 0),
+            VoteState::Arming { streak, .. } => (false, WakeState::Arming, streak),
+            VoteState::Active { .. } => (true, WakeState::Active, self.needed),
         };
 
         Decision {
-            argmax: argmax as u8,
+            argmax: command,
             reject_score,
-            accepted: self.latched,
+            accepted,
             wake_state,
-            streak: self.streak.min(u8::MAX as usize) as u8,
+            streak: streak.min(u8::MAX as usize) as u8,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn step(pipeline: &mut RejectPipeline, command: usize, score: f32) -> Decision {
+        let mut scores = [0.0; 3];
+        scores[command] = score;
+        pipeline.step(&scores)
+    }
+
+    #[test]
+    fn vote_lifecycle_is_closed_and_active_streak_is_bounded() {
+        let mut pipeline = RejectPipeline::new(3, 0.8);
+        let first = step(&mut pipeline, 1, 0.9);
+        assert_eq!((first.wake_state, first.streak), (WakeState::Arming, 1));
+        let second = step(&mut pipeline, 1, 0.9);
+        assert_eq!((second.wake_state, second.streak), (WakeState::Arming, 2));
+        let third = step(&mut pipeline, 1, 0.9);
+        assert_eq!((third.wake_state, third.streak), (WakeState::Active, 3));
+        assert!(third.accepted);
+
+        for _ in 0..1_000 {
+            let active = step(&mut pipeline, 1, 0.9);
+            assert_eq!((active.wake_state, active.streak), (WakeState::Active, 3));
+            assert!(active.accepted);
+        }
+    }
+
+    #[test]
+    fn command_change_and_rejection_each_leave_active_atomically() {
+        let mut pipeline = RejectPipeline::new(3, 0.8);
+        for _ in 0..3 {
+            step(&mut pipeline, 1, 0.9);
+        }
+
+        let changed = step(&mut pipeline, 2, 0.9);
+        assert_eq!(
+            (changed.argmax, changed.wake_state, changed.streak),
+            (2, WakeState::Arming, 1)
+        );
+        assert!(!changed.accepted);
+
+        let rejected = step(&mut pipeline, 2, 0.7);
+        assert_eq!((rejected.wake_state, rejected.streak), (WakeState::Idle, 0));
+        assert!(!rejected.accepted);
     }
 }
