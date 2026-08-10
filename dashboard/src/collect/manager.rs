@@ -1311,12 +1311,10 @@ impl RunningSession {
                         self.ingest_window(seq, t0_us, channels, &samples, &missing);
                     }
                     Ok(_) => {}
-                    Err(broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(broadcast::error::RecvError::Closed) => {
-                        self.manager.publish_error(
-                            "device stream ended mid-session; finalizing".into(),
-                        );
-                        break SessionExit::DependencyFailed("device stream ended mid-session".into());
+                    Err(error) => {
+                        let (report, exit) = recording_stream_failure(error);
+                        self.manager.publish_error(report);
+                        break exit;
                     }
                 },
                 _ = ticker.tick() => {
@@ -1946,6 +1944,22 @@ impl RunningSession {
     }
 }
 
+/// Once recording has begun, a broadcast lag is data loss, not a routine
+/// freshness event. Finalize the take immediately so its review state and
+/// guided-session outcome cannot claim a continuous recording. Before arming,
+/// `acquire_device` may still skip stale windows because no file exists yet.
+fn recording_stream_failure(error: broadcast::error::RecvError) -> (String, SessionExit) {
+    let detail = match error {
+        broadcast::error::RecvError::Lagged(skipped) => {
+            format!("device stream lost {skipped} frames mid-session; finalizing incomplete take")
+        }
+        broadcast::error::RecvError::Closed => {
+            "device stream ended mid-session; finalizing incomplete take".into()
+        }
+    };
+    (detail.clone(), SessionExit::DependencyFailed(detail))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2105,6 +2119,23 @@ mod tests {
         assert!(matches!(control.try_recv(), Ok(SessionControl::Finish)));
         assert!(control.try_recv().is_err());
         lease.finish(SessionExit::Completed);
+    }
+
+    #[tokio::test]
+    async fn lagged_recording_stream_is_an_explicit_integrity_failure() {
+        let (frames, mut receiver) = broadcast::channel(1);
+        frames.send(Frame::Probe {}).unwrap();
+        frames.send(Frame::Probe {}).unwrap();
+        let error = receiver.recv().await.unwrap_err();
+
+        let (report, exit) = recording_stream_failure(error);
+        assert!(report.contains("lost 1 frames"));
+        assert!(report.contains("incomplete take"));
+        assert!(matches!(
+            exit,
+            SessionExit::DependencyFailed(detail)
+                if detail.contains("lost 1 frames") && detail.contains("incomplete take")
+        ));
     }
 
     #[test]

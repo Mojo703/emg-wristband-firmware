@@ -14,11 +14,10 @@ use dashboard::guided_session::{
 use dashboard::signal_quality::SignalQualityMonitor;
 use futures_util::{SinkExt, StreamExt};
 use protocol::Frame;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{broadcast, mpsc};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
@@ -30,6 +29,9 @@ const POSE_QUEUE_MAX: usize = 100;
 /// Bound on frames queued toward one browser: slack for a momentary stall, not an
 /// unbounded backlog.
 const OUTBOUND_CAP: usize = 256;
+/// Telemetry sources are named by the device, so they cannot be allowed to
+/// grow a browser mailbox without bound. Real devices use only a handful.
+const LIVE_TELEMETRY_CAP: usize = 16;
 
 /// Which live stream a frame belongs to. Live frames are coalesced *per kind* when the
 /// browser falls behind: the device emits each EMG window immediately followed by its
@@ -45,7 +47,6 @@ enum LiveKind {
     /// one must not coalesce the other away — only a newer report from the
     /// same source may.
     Telemetry(String),
-    Other,
 }
 
 /// The latest live message of each kind, held while the browser catches up.
@@ -57,8 +58,7 @@ struct LatestLive {
     prediction: Option<Message>,
     pose: Option<Message>,
     signal_quality: Option<Message>,
-    telemetry: HashMap<String, Message>,
-    other: Option<Message>,
+    telemetry: VecDeque<(String, Message)>,
 }
 
 impl LatestLive {
@@ -69,32 +69,63 @@ impl LatestLive {
             LiveKind::Pose => self.pose = Some(message),
             LiveKind::SignalQuality => self.signal_quality = Some(message),
             LiveKind::Telemetry(source) => {
-                self.telemetry.insert(source, message);
+                if let Some(index) = self
+                    .telemetry
+                    .iter()
+                    .position(|(existing, _)| existing == &source)
+                {
+                    self.telemetry.remove(index);
+                } else if self.telemetry.len() == LIVE_TELEMETRY_CAP {
+                    self.telemetry.pop_front();
+                }
+                self.telemetry.push_back((source, message));
             }
-            LiveKind::Other => self.other = Some(message),
         }
     }
 
-    fn drain(self) -> impl Iterator<Item = Message> {
-        [
-            self.emg,
-            self.prediction,
-            self.pose,
-            self.signal_quality,
-            self.other,
-        ]
-        .into_iter()
-        .flatten()
-        .chain(self.telemetry.into_values())
+    fn drain(&mut self) -> impl Iterator<Item = Message> {
+        let fixed = [
+            self.emg.take(),
+            self.prediction.take(),
+            self.pose.take(),
+            self.signal_quality.take(),
+        ];
+        fixed.into_iter().flatten().chain(
+            std::mem::take(&mut self.telemetry)
+                .into_iter()
+                .map(|(_, message)| message),
+        )
     }
 }
 
-/// A message headed for the browser socket. `Reliable` frames (device list/config,
-/// discrete `Event`s) are delivered in order; `Live` frames (EMG, predictions, poses) are
-/// coalesced to the latest of their kind when the browser falls behind.
-enum Out {
-    Reliable(Message),
-    Live(LiveKind, Message),
+/// The loss-tolerant half of one browser's outbound path. Producers replace a
+/// pending frame of the same kind in place, so a full reliable queue can never
+/// make us retain stale live data or grow memory. `Notify` carries no count on
+/// purpose: one wake drains the current snapshot.
+#[derive(Default)]
+struct LiveMailbox {
+    latest: Mutex<LatestLive>,
+    notify: tokio::sync::Notify,
+}
+
+impl LiveMailbox {
+    fn put(&self, kind: LiveKind, message: Message) {
+        self.latest.lock().unwrap().set(kind, message);
+        self.notify.notify_one();
+    }
+
+    fn drain(&self) -> Vec<Message> {
+        self.latest.lock().unwrap().drain().collect()
+    }
+}
+
+/// Reliable transitions and coalesced live projections deliberately use
+/// different bounded storage. Filling one cannot discard or fossilize the
+/// other.
+#[derive(Clone)]
+struct BrowserSender {
+    reliable: mpsc::Sender<Message>,
+    live: Arc<LiveMailbox>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -122,7 +153,10 @@ fn delivery_for(frame: &Frame) -> Delivery {
         Frame::Emg { .. } => Delivery::Live(LiveKind::Emg),
         Frame::Prediction { .. } => Delivery::Live(LiveKind::Prediction),
         Frame::Telemetry { source, .. } => Delivery::Live(LiveKind::Telemetry(source.clone())),
-        _ => Delivery::Live(LiveKind::Other),
+        // Unclassified frames are protocol actions or state transitions. New
+        // variants default to lossless delivery until deliberately proven to
+        // be high-rate replaceable projections.
+        _ => Delivery::Reliable,
     }
 }
 
@@ -131,20 +165,19 @@ struct BrowserGone;
 
 /// Live frames stay loss-tolerant: a full bounded queue means a newer frame can
 /// supersede this one rather than growing browser memory without limit.
-fn send_live(tx: &mpsc::Sender<Out>, kind: LiveKind, message: Message) -> Result<(), BrowserGone> {
-    match tx.try_send(Out::Live(kind, message)) {
-        Ok(()) | Err(TrySendError::Full(_)) => Ok(()),
-        Err(TrySendError::Closed(_)) => Err(BrowserGone),
+fn send_live(tx: &BrowserSender, kind: LiveKind, message: Message) -> Result<(), BrowserGone> {
+    if tx.reliable.is_closed() {
+        return Err(BrowserGone);
     }
+    tx.live.put(kind, message);
+    Ok(())
 }
 
 /// Reliable frames apply bounded backpressure instead of treating a full queue
 /// as delivery. If this stalls device consumption enough to lag, `next_frame`
 /// restores the registry's retained current state before streaming resumes.
-async fn send_reliable(tx: &mpsc::Sender<Out>, message: Message) -> Result<(), BrowserGone> {
-    tx.send(Out::Reliable(message))
-        .await
-        .map_err(|_| BrowserGone)
+async fn send_reliable(tx: &BrowserSender, message: Message) -> Result<(), BrowserGone> {
+    tx.reliable.send(message).await.map_err(|_| BrowserGone)
 }
 
 /// The complete browser view: device list plus, when a device is selected, one
@@ -227,7 +260,7 @@ fn server_suggestions(port: u16) -> Vec<String> {
 async fn replay_retained(
     registry: &Registry,
     selected: Option<&str>,
-    tx: &mpsc::Sender<Out>,
+    tx: &BrowserSender,
 ) -> Result<(), BrowserGone> {
     if let Some(id) = selected {
         for frame in registry
@@ -358,34 +391,31 @@ pub async fn handle_browser(
     let mut guided_snapshots = guided_sessions.subscribe();
     let (browser_sink, mut browser_stream) = socket.split();
 
-    // All outbound browser traffic funnels through this channel so the pose proxy doesn't
-    // contend for the split sink.
-    let (browser_tx, mut browser_rx) = mpsc::channel::<Out>(OUTBOUND_CAP);
+    // Reliable transitions retain order and backpressure; high-rate projections
+    // occupy one latest-wins slot per kind. Both funnel through this sole sink owner.
+    let (reliable, mut browser_rx) = mpsc::channel::<Message>(OUTBOUND_CAP);
+    let live = Arc::new(LiveMailbox::default());
+    let browser_tx = BrowserSender {
+        reliable,
+        live: Arc::clone(&live),
+    };
     let forwarder = tokio::spawn(async move {
         let mut sink = browser_sink;
-        while let Some(first) = browser_rx.recv().await {
-            // Drain what's queued now: reliable frames in order, live frames coalesced to
-            // the most recent of each kind, so a browser that fell behind jumps to
-            // current data without losing one stream to another.
-            let mut latest_live = LatestLive::default();
-            let mut item = Some(first);
-            loop {
-                match item.take().expect("item present") {
-                    Out::Reliable(msg) => {
-                        if sink.send(msg).await.is_err() {
-                            return;
+        loop {
+            tokio::select! {
+                reliable = browser_rx.recv() => match reliable {
+                    Some(message) => if sink.send(message).await.is_err() { return; },
+                    None => {
+                        for message in live.drain() {
+                            if sink.send(message).await.is_err() { return; }
                         }
+                        return;
                     }
-                    Out::Live(kind, msg) => latest_live.set(kind, msg),
-                }
-                match browser_rx.try_recv() {
-                    Ok(next) => item = Some(next),
-                    Err(_) => break,
-                }
-            }
-            for msg in latest_live.drain() {
-                if sink.send(msg).await.is_err() {
-                    return;
+                },
+                () = live.notify.notified() => {
+                    for message in live.drain() {
+                        if sink.send(message).await.is_err() { return; }
+                    }
                 }
             }
         }
@@ -801,7 +831,7 @@ async fn run_pose_proxy(
     url: String,
     queue: PoseQueue,
     notify: PoseNotify,
-    browser_tx: mpsc::Sender<Out>,
+    browser_tx: BrowserSender,
 ) {
     let mut backoff = Duration::from_secs(1);
     loop {
@@ -856,7 +886,7 @@ async fn run_pose_proxy(
 mod tests {
     use super::{
         apply_guided_frame, delivery_for, next_frame, replay_retained, send_live, send_reliable,
-        Delivery, DeviceSelection, LiveKind, Out,
+        BrowserSender, Delivery, DeviceSelection, LiveKind, LiveMailbox, LIVE_TELEMETRY_CAP,
     };
     use crate::frame;
     use crate::registry::{ControlDeliveryError, DeviceHandle, Registry};
@@ -873,6 +903,8 @@ mod tests {
     use protocol::{
         DeviceConfig, DeviceProvenance, DeviceTransport, FirmwareBuild, Frame, PhoneStatus,
     };
+    use std::sync::Arc;
+    use std::time::Duration;
     use tokio::sync::{broadcast, mpsc};
     use tokio_tungstenite::tungstenite::Message as ClientMessage;
 
@@ -981,8 +1013,12 @@ mod tests {
     }
 
     fn emg() -> Frame {
+        emg_with_seq(1)
+    }
+
+    fn emg_with_seq(seq: u32) -> Frame {
         Frame::Emg {
-            seq: 1,
+            seq,
             t0_us: 0,
             channels: 1,
             sample_rate: 1,
@@ -1150,12 +1186,20 @@ mod tests {
 
     #[tokio::test]
     async fn full_queue_waits_then_delivers_reliable_state() {
-        let (tx, mut rx) = mpsc::channel(1);
+        let (reliable, mut rx) = mpsc::channel(1);
+        let tx = BrowserSender {
+            reliable,
+            live: Arc::new(LiveMailbox::default()),
+        };
+        assert!(send_reliable(&tx, Message::Text("first".into()))
+            .await
+            .is_ok());
         let live = Message::Binary(frame::encode(&emg()));
         assert!(send_live(&tx, LiveKind::Emg, live).is_ok());
+        let reliable_tx = tx.clone();
         let reliable = tokio::spawn(async move {
             send_reliable(
-                &tx,
+                &reliable_tx,
                 Message::Binary(frame::encode(&Frame::PhoneState {
                     status: PhoneStatus::Paired,
                 })),
@@ -1165,9 +1209,17 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(!reliable.is_finished());
 
-        assert!(matches!(rx.recv().await, Some(Out::Live(LiveKind::Emg, _))));
+        let pending_live = tx.live.drain();
+        let [Message::Binary(bytes)] = pending_live.as_slice() else {
+            panic!("expected coalesced live EMG");
+        };
+        assert!(matches!(
+            frame::decode(bytes).unwrap(),
+            Frame::Emg { seq: 1, .. }
+        ));
+        assert!(matches!(rx.recv().await, Some(Message::Text(value)) if value == "first"));
         assert!(reliable.await.unwrap().is_ok());
-        let Some(Out::Reliable(Message::Binary(bytes))) = rx.recv().await else {
+        let Some(Message::Binary(bytes)) = rx.recv().await else {
             panic!("expected reliable phone state");
         };
         assert!(matches!(
@@ -1176,6 +1228,59 @@ mod tests {
                 status: PhoneStatus::Paired
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn racing_live_producer_eventually_delivers_newest_with_constant_storage() {
+        const LAST: u32 = 9_999;
+        let (reliable, _receiver) = mpsc::channel(1);
+        let tx = BrowserSender {
+            reliable,
+            live: Arc::new(LiveMailbox::default()),
+        };
+        let consumer_mailbox = Arc::clone(&tx.live);
+        let consumer = tokio::spawn(async move {
+            loop {
+                consumer_mailbox.notify.notified().await;
+                for message in consumer_mailbox.drain() {
+                    let Message::Binary(bytes) = message else {
+                        continue;
+                    };
+                    if matches!(frame::decode(&bytes), Ok(Frame::Emg { seq: LAST, .. })) {
+                        return;
+                    }
+                }
+            }
+        });
+
+        for seq in 0..=LAST {
+            assert!(send_live(
+                &tx,
+                LiveKind::Emg,
+                Message::Binary(frame::encode(&emg_with_seq(seq))),
+            )
+            .is_ok());
+            if seq % 31 == 0 {
+                tokio::task::yield_now().await;
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(1), consumer)
+            .await
+            .expect("newest frame remained observable")
+            .unwrap();
+        assert!(tx.live.latest.lock().unwrap().drain().count() <= 1);
+    }
+
+    #[test]
+    fn device_named_telemetry_sources_cannot_make_live_storage_unbounded() {
+        let mailbox = LiveMailbox::default();
+        for source in 0..(LIVE_TELEMETRY_CAP * 4) {
+            mailbox.put(
+                LiveKind::Telemetry(format!("source-{source}")),
+                Message::Text(source.to_string()),
+            );
+        }
+        assert_eq!(mailbox.drain().len(), LIVE_TELEMETRY_CAP);
     }
 
     #[tokio::test]
@@ -1212,13 +1317,17 @@ mod tests {
         let registry = Registry::new();
         let token = register_device(&registry);
         registry.push_phone_state("opal-test", token, PhoneStatus::Advertising);
-        let (tx, mut rx) = mpsc::channel(1);
+        let (reliable, mut rx) = mpsc::channel(1);
+        let tx = BrowserSender {
+            reliable,
+            live: Arc::new(LiveMailbox::default()),
+        };
 
         assert!(replay_retained(&registry, Some("opal-test"), &tx)
             .await
             .is_ok());
 
-        let Out::Reliable(Message::Binary(bytes)) = rx.recv().await.unwrap() else {
+        let Message::Binary(bytes) = rx.recv().await.unwrap() else {
             panic!("expected retained phone state");
         };
         assert!(matches!(
