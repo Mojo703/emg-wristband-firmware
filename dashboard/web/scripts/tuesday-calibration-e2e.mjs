@@ -7,6 +7,13 @@ import { mkdir, writeFile } from 'node:fs/promises';
 
 const endpoint = process.env.EMG_DASHBOARD_WS ?? 'ws://127.0.0.1:8090/ws';
 const traceDirectory = process.env.EMG_E2E_TRACE_DIR ?? '/tmp/opal-recovery-20260810';
+const playbackObservationMilliseconds = Number.parseInt(
+  process.env.EMG_E2E_PLAYBACK_OBSERVATION_MS ?? '10000',
+  10,
+);
+if (!Number.isSafeInteger(playbackObservationMilliseconds) || playbackObservationMilliseconds < 0) {
+  throw new Error('EMG_E2E_PLAYBACK_OBSERVATION_MS must be a non-negative integer');
+}
 const encoder = new Encoder({ useRecords: false, mapsAsObjects: true, tagUint8Array: false });
 const decoder = new Decoder({ mapsAsObjects: true });
 const trace = [];
@@ -132,14 +139,22 @@ async function main() {
   const tracks = setup.tracks.filter(track => track.cue_count > 0);
   if (tracks.length === 0) fail('no nonempty calibration track');
   const track = tracks.sort((left, right) => left.duration_ms - right.duration_ms)[0];
+  const beforeSelectionRevision = snapshot.revision;
   guided({ name: 'select_calibration_track', track_id: track.id });
-  await waitFor('selected calibration track', frame => frame.type === 'guided_session_snapshot' && calibration(frame.snapshot)?.phase === 'setup' && calibration(frame.snapshot).selected_track_id === track.id);
+  await waitFor('selected calibration track', frame =>
+    frame.type === 'guided_session_snapshot' &&
+    frame.snapshot.revision > beforeSelectionRevision &&
+    calibration(frame.snapshot)?.phase === 'setup' &&
+    calibration(frame.snapshot).selected_track_id === track.id);
   guided({ name: 'start_calibration' });
   await waitFor('immediate Preparing snapshot', frame => frame.type === 'guided_session_snapshot' && calibration(frame.snapshot)?.phase === 'preparing', 5_000);
+  const startedSessionId = snapshot.lifecycle.session_id;
 
   const preparation = [];
   while (!preparation.some(value => value.status.phase.phase === 'ready_for_schedule')) {
-    const frame = await waitFor('device preparation progress', value => value.type === 'calibration_preparation_status', 45_000);
+    const frame = await waitFor('device preparation progress', value =>
+      value.type === 'calibration_preparation_status' &&
+      value.status.run.session_id === startedSessionId, 45_000);
     preparation.push(frame);
     if (frame.status.phase.phase === 'failed') fail(`firmware preparation failed: ${frame.status.phase.detail}`);
   }
@@ -153,7 +168,9 @@ async function main() {
   const acknowledgements = [];
   const operationalChunkEntries = 8;
   while (acknowledgements.length < Math.ceil(track.cue_count / operationalChunkEntries) + 1) {
-    const frame = await waitFor('schedule transaction acknowledgement', value => value.type === 'calibration_schedule_upload_acknowledged', 15_000);
+    const frame = await waitFor('schedule transaction acknowledgement', value =>
+      value.type === 'calibration_schedule_upload_acknowledged' &&
+      value.acknowledgement.run.session_id === startedSessionId, 15_000);
     acknowledgements.push(frame.acknowledgement);
   }
   if (acknowledgements[0].operation.kind !== 'begin') fail('first upload acknowledgement was not Begin');
@@ -162,7 +179,9 @@ async function main() {
   const firstEntries = chunkOperations.map(value => value.first_entry);
   const expectedEntries = Array.from({ length: Math.ceil(track.cue_count / operationalChunkEntries) }, (_, index) => index * operationalChunkEntries);
   if (JSON.stringify(firstEntries) !== JSON.stringify(expectedEntries)) fail(`wrong chunk acknowledgements: ${firstEntries}`);
-  const accepted = await waitFor('ScheduleAccepted', value => value.type === 'calibration_schedule_accepted', 15_000);
+  const accepted = await waitFor('ScheduleAccepted', value =>
+    value.type === 'calibration_schedule_accepted' &&
+    value.accepted.run.session_id === startedSessionId, 15_000);
   const schedule = accepted.accepted;
   if (schedule.content_identity !== track.content_identity || schedule.anchor_device_monotonic_microseconds - schedule.acknowledged_device_monotonic_microseconds !== 3_000_000) {
     fail('ScheduleAccepted did not echo content identity and exact 3-second anchor');
@@ -171,11 +190,18 @@ async function main() {
 
   // Let the first authored cue become eligible, then use the UI pause intent
   // to withhold the backend heartbeat.  The device must authoritatively interrupt.
-  await new Promise(resolve => setTimeout(resolve, 10_000));
+  await new Promise(resolve => setTimeout(resolve, playbackObservationMilliseconds));
   guided({ name: 'pause_calibration' });
-  const interruption = await waitFor('heartbeat-timeout interruption', value => value.type === 'calibration_song_interrupted', 8_000);
+  const interruption = await waitFor('heartbeat-timeout interruption', value =>
+    value.type === 'calibration_song_interrupted' &&
+    value.interruption.run.session_id === schedule.run.session_id &&
+    value.interruption.run.run_id === schedule.run.run_id, 8_000);
   if (interruption.interruption.reason !== 'heartbeat_timeout') fail(`unexpected interruption ${interruption.interruption.reason}`);
-  await waitFor('between-songs snapshot', value => value.type === 'guided_session_snapshot' && calibration(value.snapshot)?.phase === 'between_songs', 8_000);
+  await waitFor('between-songs snapshot', value =>
+    value.type === 'guided_session_snapshot' &&
+    value.snapshot.lifecycle.state === 'calibration' &&
+    value.snapshot.lifecycle.session_id === startedSessionId &&
+    calibration(value.snapshot)?.phase === 'between_songs', 8_000);
   // Initial Idle snapshots remain in the asynchronous inbox for the whole run;
   // do not let one make Discard appear complete before the device's exact ACK.
   inbox.length = 0;
