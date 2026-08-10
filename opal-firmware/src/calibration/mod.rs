@@ -281,6 +281,85 @@ enum AnchoredFitLifecycle {
     CandidateReady(CandidateOwnership),
 }
 
+impl AnchoredFitLifecycle {
+    fn request_checkpoint(self) -> Self {
+        match self {
+            Self::Idle | Self::CheckpointRequested => Self::CheckpointRequested,
+            Self::Running(pending) | Self::RunningThenCheckpoint(pending) => {
+                Self::RunningThenCheckpoint(pending)
+            }
+            // Final polish is terminal. A cue reaching this transition would
+            // be an executor bug, not permission to orphan the candidate.
+            Self::CandidateReady(owner) => {
+                warn!("anchored checkpoint requested after candidate became ready");
+                Self::CandidateReady(owner)
+            }
+        }
+    }
+}
+
+/// The one flash slot erased before acquisition starts.
+///
+/// `Erased` is a capability, not a cached observation.  The first operation
+/// that can program any byte consumes it.  A failed/torn write therefore
+/// cannot make the slot available to a later run in the same boot, while an
+/// interrupted run that never wrote anything may safely retry.  Only boot can
+/// mint a new `Erased` value.
+#[derive(Debug, PartialEq, Eq)]
+enum BootScratchCapability {
+    Unavailable,
+    Erased(PhysicalSlot),
+    Programmed(PhysicalSlot),
+    Poisoned(PhysicalSlot),
+}
+
+impl BootScratchCapability {
+    fn erased(slot: Option<PhysicalSlot>) -> Self {
+        match slot {
+            Some(slot) => Self::Erased(slot),
+            None => Self::Unavailable,
+        }
+    }
+
+    const fn erased_slot(&self) -> Option<PhysicalSlot> {
+        match self {
+            Self::Erased(slot) => Some(*slot),
+            Self::Unavailable | Self::Programmed(_) | Self::Poisoned(_) => None,
+        }
+    }
+
+    /// Authorize a write to this boot's scratch slot, consuming erasedness
+    /// before the fallible flash call begins.  Further writes by the same run
+    /// remain authorized, but `erased_slot` can never advertise it to a new
+    /// run again.
+    fn authorize_programming(&mut self, expected: PhysicalSlot) -> bool {
+        match core::mem::replace(self, Self::Unavailable) {
+            Self::Erased(slot) if slot == expected => {
+                *self = Self::Programmed(slot);
+                true
+            }
+            Self::Programmed(slot) if slot == expected => {
+                *self = Self::Programmed(slot);
+                true
+            }
+            state => {
+                *self = state;
+                false
+            }
+        }
+    }
+
+    /// A failed write may have programmed an arbitrary prefix. It is no
+    /// longer safe even for the owning run to retry at the same offset.
+    fn poison_after_write_failure(&mut self, expected: PhysicalSlot) {
+        let state = core::mem::replace(self, Self::Unavailable);
+        *self = match state {
+            Self::Programmed(slot) if slot == expected => Self::Poisoned(slot),
+            state => state,
+        };
+    }
+}
+
 /// A candidate is not merely "the exportable slot". It is the durable record
 /// produced by one exact schedule transaction. Keeping both identities in the
 /// ready variant prevents a later run from adopting a slot left by an older
@@ -639,9 +718,9 @@ pub(crate) enum ResidentRuntimeUpdate {
 pub(crate) struct Calibration {
     constants: Constants,
     partition: Option<CalibrationPartition>,
-    /// The slot erased at boot, which is the only slot a run may write this
-    /// boot. `None` when there was no partition or the erase failed.
-    boot_erased_slot: Option<usize>,
+    /// Affine authority to program the slot erased before acquisition.  The
+    /// first possible write consumes `Erased`; it is never recreated in RAM.
+    boot_scratch: BootScratchCapability,
     run: Option<Run>,
     anchored: AnchoredRunLifecycle,
     /// The device-owned settling/gain lifecycle.  Its variants make an
@@ -796,7 +875,7 @@ impl Calibration {
         Self {
             constants,
             partition,
-            boot_erased_slot,
+            boot_scratch: BootScratchCapability::erased(boot_erased_slot),
             run: None,
             anchored: AnchoredRunLifecycle::Idle,
             anchored_preparation: AnchoredPreparation::Idle,
@@ -831,17 +910,18 @@ impl Calibration {
     fn erase_scratch_slot(
         partition: Option<&mut CalibrationPartition>,
         scratch: Option<PhysicalSlot>,
-    ) -> Option<usize> {
+    ) -> Option<PhysicalSlot> {
         let partition = partition?;
-        let slot = scratch?.index();
+        let physical = scratch?;
+        let slot = physical.index();
         if partition.slot_is_erased(slot) {
             info!("scratch slot {slot} is already erased and ready");
-            return Some(slot);
+            return Some(physical);
         }
         match partition.erase_slot_region(slot) {
             Ok(microseconds) => {
                 info!("scratch slot {slot} erased at boot ({microseconds} us)");
-                Some(slot)
+                Some(physical)
             }
             Err(error) => {
                 warn!("scratch slot {slot} could not be erased ({error:#}); no run can start");
@@ -893,7 +973,7 @@ impl Calibration {
             );
             return false;
         }
-        let Some(slot) = self.boot_erased_slot else {
+        let Some(slot) = self.boot_scratch.erased_slot() else {
             self.fail_anchored_preparation(
                 run,
                 schedule_revision,
@@ -931,7 +1011,7 @@ impl Calibration {
             self.fail_anchored_preparation(run, schedule_revision, &detail);
             return false;
         }
-        self.slot = slot;
+        self.slot = slot.index();
         self.sequence = sequence;
         self.rows.clear();
         self.rep_rows.clear();
@@ -1614,6 +1694,12 @@ impl Calibration {
         }
         let slot = self.slot;
         let pending = self.rows.len();
+        if !self.authorize_active_slot_programming() {
+            self.refuse(
+                "anchored calibration has no erased-slot capability; reboot before calibrating again",
+            );
+            return false;
+        }
         let result = self
             .partition
             .as_mut()
@@ -1626,6 +1712,7 @@ impl Calibration {
                 true
             }
             Some(Err(error)) => {
+                self.poison_active_slot_after_write_failure();
                 self.refuse(&format!("anchored calibration row flush failed: {error}"));
                 false
             }
@@ -1670,17 +1757,7 @@ impl Calibration {
             .anchored
             .fit_mut()
             .expect("a checkpoint request belongs to an active run");
-        *fit = match core::mem::replace(fit, AnchoredFitLifecycle::Idle) {
-            AnchoredFitLifecycle::Idle => AnchoredFitLifecycle::CheckpointRequested,
-            AnchoredFitLifecycle::CheckpointRequested => AnchoredFitLifecycle::CheckpointRequested,
-            AnchoredFitLifecycle::Running(pending) => {
-                AnchoredFitLifecycle::RunningThenCheckpoint(pending)
-            }
-            AnchoredFitLifecycle::RunningThenCheckpoint(pending) => {
-                AnchoredFitLifecycle::RunningThenCheckpoint(pending)
-            }
-            AnchoredFitLifecycle::CandidateReady(_) => AnchoredFitLifecycle::CheckpointRequested,
-        };
+        *fit = core::mem::replace(fit, AnchoredFitLifecycle::Idle).request_checkpoint();
     }
 
     fn advance_anchored_fit(&mut self) {
@@ -1847,6 +1924,12 @@ impl Calibration {
         }
         let slot = self.slot;
         let rows = self.rows_flushed();
+        if !self.authorize_active_slot_programming() {
+            self.refuse(
+                "candidate commit has no erased-slot capability; reboot before calibrating again",
+            );
+            return;
+        }
         let committed = self
             .partition
             .as_mut()
@@ -1878,7 +1961,10 @@ impl Calibration {
                 let _ = model;
                 self.emit_anchored_candidate_status(identity.run, identity.revision);
             }
-            Some(Err(error)) => self.refuse(&format!("candidate record commit failed: {error}")),
+            Some(Err(error)) => {
+                self.poison_active_slot_after_write_failure();
+                self.refuse(&format!("candidate record commit failed: {error}"));
+            }
             None => self.refuse("candidate record commit has no partition"),
         }
     }
@@ -2361,10 +2447,13 @@ impl Calibration {
     /// which is what killed the first wearer attempt.
     fn erase(&mut self) {
         let slot = self.slot;
-        let erased = self
-            .partition
-            .as_ref()
-            .is_some_and(|partition| partition.slot_is_erased(slot));
+        let erased = self.boot_scratch.erased_slot().is_some_and(|capability| {
+            capability.index() == slot
+                && self
+                    .partition
+                    .as_ref()
+                    .is_some_and(|partition| partition.slot_is_erased(slot))
+        });
         if erased {
             self.completed(Step::Erase);
             return;
@@ -2456,6 +2545,13 @@ impl Calibration {
             self.completed(Step::Flush);
             return;
         }
+        if !self.authorize_active_slot_programming() {
+            self.fail(
+                CalibrationOutcome::StorageFailed,
+                "no erased-slot capability; reboot before calibrating again",
+            );
+            return;
+        }
         // The buffer holds only this round, so its whole contents go out at the
         // cumulative offset. No copy: `as_bytes` is exactly the rows to write.
         let result = self
@@ -2471,7 +2567,10 @@ impl Calibration {
                 );
                 self.completed(Step::Flush);
             }
-            Some(Err(error)) => self.fail(CalibrationOutcome::StorageFailed, &error.to_string()),
+            Some(Err(error)) => {
+                self.poison_active_slot_after_write_failure();
+                self.fail(CalibrationOutcome::StorageFailed, &error.to_string());
+            }
             None => self.fail(CalibrationOutcome::StorageFailed, "no partition"),
         }
     }
@@ -2647,6 +2746,13 @@ impl Calibration {
                 return;
             }
         };
+        if !self.authorize_active_slot_programming() {
+            self.fail(
+                CalibrationOutcome::StorageFailed,
+                "install has no erased-slot capability; reboot before calibrating again",
+            );
+            return;
+        }
         match self
             .partition
             .as_mut()
@@ -2660,7 +2766,6 @@ impl Calibration {
                     .expect("partition exists after committing")
                     .stored_identities();
                 self.active_selector = StoreSelector::recover(stored);
-                self.boot_erased_slot = None;
                 let Some(identity) = self.active_selector.resident() else {
                     self.fail(
                         CalibrationOutcome::StorageFailed,
@@ -2683,7 +2788,10 @@ impl Calibration {
                     }));
                 self.completed(Step::Install);
             }
-            Some(Err(error)) => self.fail(CalibrationOutcome::StorageFailed, &error.to_string()),
+            Some(Err(error)) => {
+                self.poison_active_slot_after_write_failure();
+                self.fail(CalibrationOutcome::StorageFailed, &error.to_string());
+            }
             None => self.fail(CalibrationOutcome::StorageFailed, "no partition"),
         }
     }
@@ -2841,6 +2949,32 @@ impl Calibration {
         self.partition
             .as_ref()
             .map_or(0, |partition| partition.flushed_row_count(self.slot))
+    }
+
+    /// Consume boot-time erasedness before the first fallible flash write.
+    /// Once consumed, later writes belonging to this already-active run are
+    /// allowed, but no later run can acquire the slot as erased.
+    fn authorize_active_slot_programming(&mut self) -> bool {
+        let Some(physical) = self.active_slot_physical() else {
+            return false;
+        };
+        self.boot_scratch.authorize_programming(physical)
+    }
+
+    fn poison_active_slot_after_write_failure(&mut self) {
+        let Some(physical) = self.active_slot_physical() else {
+            return;
+        };
+        self.boot_scratch.poison_after_write_failure(physical);
+    }
+
+    fn active_slot_physical(&self) -> Option<PhysicalSlot> {
+        match self.slot {
+            0 => PhysicalSlot::First,
+            1 => PhysicalSlot::Second,
+            _ => return None,
+        }
+        .into()
     }
 
     /// The clock the flow sees: how far the acquisition source has got.
@@ -3038,6 +3172,85 @@ mod anchored_lifecycle_tests {
         replaced_record.generation += 1;
         assert!(!owner.matches(&owner.schedule, Some(replaced_record)));
         assert!(!owner.matches(&owner.schedule, None));
+    }
+
+    #[test]
+    fn erased_slot_capability_is_consumed_by_the_first_possible_write() {
+        let mut capability = BootScratchCapability::erased(Some(PhysicalSlot::Second));
+        assert_eq!(capability.erased_slot(), Some(PhysicalSlot::Second));
+
+        // Beginning and then interrupting before a flash write does not spend
+        // the capability, so a safe retry can still acquire the erased slot.
+        assert_eq!(capability.erased_slot(), Some(PhysicalSlot::Second));
+
+        // Authorization happens before the fallible write. Even if that write
+        // fails or tears, the programmed slot can never be advertised as
+        // erased to a second run in this boot.
+        assert!(capability.authorize_programming(PhysicalSlot::Second));
+        assert_eq!(capability.erased_slot(), None);
+        assert_eq!(
+            capability,
+            BootScratchCapability::Programmed(PhysicalSlot::Second)
+        );
+
+        // Further flush/commit/Save writes of the owning run remain legal,
+        // while an attempt to use the other physical slot is rejected.
+        assert!(capability.authorize_programming(PhysicalSlot::Second));
+        assert!(!capability.authorize_programming(PhysicalSlot::First));
+        assert_eq!(capability.erased_slot(), None);
+    }
+
+    #[test]
+    fn failed_flash_attempt_poisoned_slot_cannot_be_retried() {
+        let mut capability = BootScratchCapability::erased(Some(PhysicalSlot::Second));
+        assert!(capability.authorize_programming(PhysicalSlot::Second));
+        capability.poison_after_write_failure(PhysicalSlot::Second);
+        assert_eq!(
+            capability,
+            BootScratchCapability::Poisoned(PhysicalSlot::Second)
+        );
+        assert_eq!(capability.erased_slot(), None);
+        assert!(!capability.authorize_programming(PhysicalSlot::Second));
+    }
+
+    #[test]
+    fn candidate_save_and_discard_cannot_remint_erasedness() {
+        for _decision in ["Save", "Discard"] {
+            let mut capability = BootScratchCapability::erased(Some(PhysicalSlot::First));
+            assert!(capability.authorize_programming(PhysicalSlot::First));
+
+            // Save promotes metadata and Discard invalidates the CRC. Neither
+            // operation erases rows/metadata, so neither may transition the
+            // boot capability back to Erased.
+            assert_eq!(capability.erased_slot(), None);
+            assert_eq!(
+                capability,
+                BootScratchCapability::Programmed(PhysicalSlot::First)
+            );
+        }
+    }
+
+    #[test]
+    fn only_reboot_erase_can_mint_the_next_slot_capability() {
+        let mut first_boot = BootScratchCapability::erased(Some(PhysicalSlot::Second));
+        assert!(first_boot.authorize_programming(PhysicalSlot::Second));
+        assert_eq!(first_boot.erased_slot(), None);
+
+        // Boot recovery preserves the resident and chooses/erases scratch;
+        // construction from that erase result is the sole minting boundary.
+        let next_boot = BootScratchCapability::erased(Some(PhysicalSlot::First));
+        assert_eq!(next_boot.erased_slot(), Some(PhysicalSlot::First));
+        assert_eq!(BootScratchCapability::erased(None).erased_slot(), None);
+    }
+
+    #[test]
+    fn ready_candidate_rejects_checkpoint_without_dropping_ownership() {
+        let owner = candidate_owner(run(12, 4));
+        let lifecycle = AnchoredFitLifecycle::CandidateReady(owner.clone()).request_checkpoint();
+        match lifecycle {
+            AnchoredFitLifecycle::CandidateReady(retained) => assert_eq!(retained, owner),
+            _ => panic!("candidate ownership was dropped by an impossible checkpoint"),
+        }
     }
 
     #[test]
