@@ -44,6 +44,12 @@ pub const SLOT_ROWS_OFFSET: usize = 0x3000;
 /// The CRC word sits at the very end of the slot, not after the last row, so
 /// the write that makes a slot live is 4-byte aligned whatever the row count.
 pub const SLOT_CRC_OFFSET: usize = SLOT_BYTES - 4;
+/// CRC for the candidate → resident promotion image. Legacy residents and all
+/// candidates keep using [`SLOT_CRC_OFFSET`]. This word was erased tail space
+/// in every v2 slot already deployed, so adding it moves no partition boundary
+/// and changes no existing metadata or row offset.
+pub const SLOT_PROMOTION_CRC_OFFSET: usize = SLOT_BYTES - 8;
+pub const SLOT_ROLE_OFFSET: usize = 36;
 
 /// Sequence numbers that erased or zeroed flash could produce, and which a live
 /// slot therefore may not use.
@@ -311,6 +317,28 @@ impl ImageError {
 /// nibble at a time: 16 words of table against 1 KB, and the whole slot is a
 /// few hundred kilobytes checked once per boot.
 pub fn crc32(bytes: &[u8]) -> u32 {
+    crc32_segments([bytes])
+}
+
+/// CRC of the same committed slot after the one NOR-monotonic role transition
+/// from ExportableCandidate (`1`) to Resident (`0`). No large temporary image
+/// is needed on firmware: only the four-byte role word differs.
+pub fn resident_promotion_crc(bytes: &[u8], live_row_count: usize) -> Option<u32> {
+    let covered = covered_bytes(live_row_count);
+    if covered > bytes.len()
+        || SLOT_ROLE_OFFSET + 4 > covered
+        || read_u32(bytes, SLOT_ROLE_OFFSET) != SlotRole::ExportableCandidate.value()
+    {
+        return None;
+    }
+    Some(crc32_segments([
+        &bytes[..SLOT_ROLE_OFFSET],
+        &SlotRole::Resident.value().to_le_bytes(),
+        &bytes[SLOT_ROLE_OFFSET + 4..covered],
+    ]))
+}
+
+fn crc32_segments<const COUNT: usize>(segments: [&[u8]; COUNT]) -> u32 {
     const NIBBLE: [u32; 16] = [
         0x0000_0000,
         0x1DB7_1064,
@@ -330,9 +358,11 @@ pub fn crc32(bytes: &[u8]) -> u32 {
         0xBDBD_F21C,
     ];
     let mut crc = 0xFFFF_FFFFu32;
-    for &byte in bytes {
-        crc = NIBBLE[((crc ^ byte as u32) & 0x0F) as usize] ^ (crc >> 4);
-        crc = NIBBLE[((crc ^ (byte as u32 >> 4)) & 0x0F) as usize] ^ (crc >> 4);
+    for bytes in segments {
+        for &byte in bytes {
+            crc = NIBBLE[((crc ^ u32::from(byte)) & 0x0F) as usize] ^ (crc >> 4);
+            crc = NIBBLE[((crc ^ (u32::from(byte) >> 4)) & 0x0F) as usize] ^ (crc >> 4);
+        }
     }
     !crc
 }
@@ -549,7 +579,7 @@ pub enum SlotRole {
 }
 
 impl SlotRole {
-    const fn value(self) -> u32 {
+    pub const fn value(self) -> u32 {
         match self {
             Self::Resident => 0,
             Self::ExportableCandidate => 1,
@@ -726,6 +756,10 @@ pub fn covered_bytes(live_row_count: usize) -> usize {
 pub struct LiveSlot<'a> {
     pub index: usize,
     pub record: SlotRecord,
+    /// The CRC word that validated this exact logical record. Promoted
+    /// residents use [`SLOT_PROMOTION_CRC_OFFSET`]; deployed legacy residents
+    /// and candidates use [`SLOT_CRC_OFFSET`].
+    pub crc: u32,
     rows: RowSource<'a>,
 }
 
@@ -791,10 +825,26 @@ fn parse_slot_layout<'a>(
     if read_u32(bytes, 32) as usize != covered {
         return Err(ImageError::Torn);
     }
-    if crc32(&bytes[..covered]) != read_u32(bytes, crc_offset) {
-        return Err(ImageError::Torn);
-    }
-    let role = SlotRole::from_value(read_u32(bytes, 36))?;
+    let computed_crc = crc32(&bytes[..covered]);
+    let legacy_crc = read_u32(bytes, crc_offset);
+    let raw_role = read_u32(bytes, SLOT_ROLE_OFFSET);
+    let crc = match raw_role {
+        // A promoted resident is valid through the new tail word. A deployed
+        // resident has that word erased and remains valid through its original
+        // CRC, preserving the v2 generation-3 layout byte for byte.
+        0 if computed_crc == read_u32(bytes, SLOT_PROMOTION_CRC_OFFSET) => computed_crc,
+        0 if computed_crc == legacy_crc => computed_crc,
+        // Candidate and inactive records have no in-place transition and keep
+        // the original commit word.
+        1 | 2 if computed_crc == legacy_crc => computed_crc,
+        // Preserve the previous diagnostic ordering: an unknown role whose
+        // image is otherwise whole is named as such, not called torn.
+        other if computed_crc == legacy_crc => {
+            return Err(ImageError::BadSlotRole(other));
+        }
+        _ => return Err(ImageError::Torn),
+    };
+    let role = SlotRole::from_value(raw_role)?;
     // Only now, with the bytes proven whole, does the pairing matter.
     if stored_prior_hash != prior_hash {
         return Err(ImageError::PriorMismatch {
@@ -836,6 +886,7 @@ fn parse_slot_layout<'a>(
             deviation,
             weights,
         },
+        crc,
         rows: RowSource::new(&bytes[SLOT_ROWS_OFFSET..covered]).expect("whole rows"),
     })
 }
@@ -934,6 +985,11 @@ mod tests {
         assert_eq!(PRIOR_ROWS_OFFSET % 4096, 0);
         assert_eq!(SLOT_ROWS_OFFSET % 4096, 0);
         assert_eq!(SLOT_CRC_OFFSET % 4, 0);
+        assert_eq!(SLOT_PROMOTION_CRC_OFFSET % 4, 0);
+        assert!(
+            covered_bytes(slot_row_capacity()) <= SLOT_PROMOTION_CRC_OFFSET,
+            "the promotion word must stay in existing erased tail space"
+        );
         // The capacities FLASH-FORMATS.md quotes, against the golden shapes.
         assert_eq!(prior_row_capacity(), 8078);
         assert!(
@@ -981,6 +1037,111 @@ mod tests {
         assert_eq!(
             parse_slot(0, &image, 0x1234).unwrap_err(),
             ImageError::BadSlotRole(3)
+        );
+    }
+
+    fn nor_program(destination: &mut [u8], source: &[u8]) {
+        assert_eq!(destination.len(), source.len());
+        for (stored, desired) in destination.iter_mut().zip(source) {
+            *stored &= *desired;
+        }
+    }
+
+    #[test]
+    fn candidate_promotion_is_nor_monotonic_and_keeps_legacy_slots_readable() {
+        let prior_hash = 0x1234_5678;
+        let mut candidate = SlotRecord::empty(12);
+        candidate.sequence = 8;
+        candidate.role = SlotRole::ExportableCandidate;
+        candidate.prior_hash = prior_hash;
+        let rows = some_rows(17);
+        let mut image = slot_bytes(&candidate, &rows);
+        let legacy_candidate_crc = read_u32(&image, SLOT_CRC_OFFSET);
+        assert_eq!(
+            read_u32(&image, SLOT_PROMOTION_CRC_OFFSET),
+            u32::MAX,
+            "deployed v2 layout leaves the promotion word erased"
+        );
+
+        let promotion_crc = resident_promotion_crc(&image, 17).unwrap();
+        assert_ne!(
+            promotion_crc & !legacy_candidate_crc,
+            0,
+            "this fixture proves replacing the original CRC requires forbidden 0→1 bits"
+        );
+        let mut old_in_place_algorithm = image.clone();
+        nor_program(
+            &mut old_in_place_algorithm[SLOT_ROLE_OFFSET..SLOT_ROLE_OFFSET + 4],
+            &SlotRole::Resident.value().to_le_bytes(),
+        );
+        nor_program(
+            &mut old_in_place_algorithm[SLOT_CRC_OFFSET..SLOT_CRC_OFFSET + 4],
+            &promotion_crc.to_le_bytes(),
+        );
+        assert_eq!(
+            parse_slot(0, &old_in_place_algorithm, prior_hash).unwrap_err(),
+            ImageError::Torn,
+            "rewriting the original CRC reproduces the physical Save failure"
+        );
+
+        nor_program(
+            &mut image[SLOT_PROMOTION_CRC_OFFSET..SLOT_PROMOTION_CRC_OFFSET + 4],
+            &promotion_crc.to_le_bytes(),
+        );
+        // A power loss before the final role bit still boots as the exact
+        // candidate through its original CRC.
+        let still_candidate = parse_slot(0, &image, prior_hash).unwrap();
+        assert_eq!(still_candidate.record.role, SlotRole::ExportableCandidate);
+        assert_eq!(still_candidate.crc, legacy_candidate_crc);
+
+        nor_program(
+            &mut image[SLOT_ROLE_OFFSET..SLOT_ROLE_OFFSET + 4],
+            &SlotRole::Resident.value().to_le_bytes(),
+        );
+        let promoted = parse_slot(0, &image, prior_hash).unwrap();
+        assert_eq!(promoted.record.role, SlotRole::Resident);
+        assert_eq!(promoted.crc, promotion_crc);
+
+        // The original resident layout has no promotion word and continues to
+        // validate against the legacy word at the end of the slot.
+        let mut resident = candidate.clone();
+        resident.role = SlotRole::Resident;
+        let legacy = slot_bytes(&resident, &rows);
+        assert_eq!(read_u32(&legacy, SLOT_PROMOTION_CRC_OFFSET), u32::MAX);
+        assert_eq!(
+            parse_slot(0, &legacy, prior_hash).unwrap().record.role,
+            SlotRole::Resident
+        );
+    }
+
+    #[test]
+    fn torn_promotion_crc_cannot_activate_a_candidate() {
+        let prior_hash = 0x89AB_CDEF;
+        let mut candidate = SlotRecord::empty(12);
+        candidate.sequence = 9;
+        candidate.role = SlotRole::ExportableCandidate;
+        candidate.prior_hash = prior_hash;
+        let rows = some_rows(9);
+        let mut image = slot_bytes(&candidate, &rows);
+        let intended = resident_promotion_crc(&image, 9).unwrap();
+        assert_ne!(intended, 0);
+        let torn = intended & !(1u32 << intended.trailing_zeros());
+        nor_program(
+            &mut image[SLOT_PROMOTION_CRC_OFFSET..SLOT_PROMOTION_CRC_OFFSET + 4],
+            &torn.to_le_bytes(),
+        );
+        assert_eq!(
+            parse_slot(0, &image, prior_hash).unwrap().record.role,
+            SlotRole::ExportableCandidate,
+            "the promotion CRC is not authority while the role bit remains candidate"
+        );
+        nor_program(
+            &mut image[SLOT_ROLE_OFFSET..SLOT_ROLE_OFFSET + 4],
+            &SlotRole::Resident.value().to_le_bytes(),
+        );
+        assert_eq!(
+            parse_slot(0, &image, prior_hash).unwrap_err(),
+            ImageError::Torn
         );
     }
 

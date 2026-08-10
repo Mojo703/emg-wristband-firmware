@@ -2213,16 +2213,7 @@ impl Calibration {
             self.refuse("Save has no calibration partition");
             return;
         };
-        let Ok(mut record) = partition
-            .slot(candidate.physical.index())
-            .map(|slot| slot.record)
-        else {
-            self.refuse("Save candidate failed CRC revalidation");
-            return;
-        };
-        record.role = flash_image::SlotRole::Resident;
-        let rows = partition.flushed_row_count(candidate.physical.index());
-        match partition.commit_record(candidate.physical.index(), &record, rows) {
+        match partition.promote_candidate(candidate.physical) {
             Ok(microseconds) => {
                 self.flash_microseconds += microseconds;
                 self.active_selector = StoreSelector::recover(partition.stored_identities());

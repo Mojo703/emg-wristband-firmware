@@ -194,18 +194,29 @@ uses committed sequence numbers and slot roles rather than a separate selector.
 | … | 256 | fitted model `deviation[64]` |
 | … | `260 * class_count` | fitted model weights, `(64 + 1) * class_count` f32 |
 | 12288 | `72 * live_row_count` | the live rows, standardized int8 |
-| 196604 | 4 | CRC-32, written last |
+| 196600 | 4 | candidate→resident promotion CRC; erased for legacy residents and candidates |
+| 196604 | 4 | original v2 CRC-32, written last when the candidate/resident is first committed |
 
 Rows start at a fixed `0x3000` — sector-aligned, and past the 9,904 B the
 metadata occupies at 12 classes — so appending rows never writes a sector the
 metadata lives in. The row area holds 2,559 rows. The firmware's fixed recipe
 budget is 1,170 rows.
 
-The CRC sits at a fixed offset at the end of the slot rather than
+The original CRC sits at a fixed offset at the end of the slot rather than
 immediately after the last row. That keeps the final write 4-byte aligned
-regardless of row count, and it is the write that makes the slot live.
+regardless of row count, and it is the write that first makes the slot live.
 Covered bytes is `12288 + 72 * live_row_count`; the CRC is taken over
 `[0, covered_bytes)` and the gap between there and the CRC word is not covered.
+
+Saving an exportable candidate cannot replace that original CRC in place:
+NOR flash cannot turn any of its programmed zero bits back into ones. The word
+immediately before it was erased tail space in every deployed v2 slot. Save
+first writes there the CRC of the same bytes with role `0`, verifies it, then
+clears the candidate role word from `1` to `0` as the commit edge. A power loss
+before that last bit leaves the original candidate CRC authoritative. Recovery
+accepts deployed residents through the original CRC and promoted residents
+through the promotion CRC, so neither slot offsets nor the generation-3 layout
+move and the 2,559-row capacity is unchanged.
 
 CRC-32 is the reflected IEEE-802.3 polynomial (`0xEDB88320`), the one zlib and
 PNG use; both sides pin it against the standard check value
@@ -233,9 +244,10 @@ At boot, firmware identifies at most one resident and one scratch region. It
 erases scratch before acquisition starts. A calibration writes rows and
 metadata there while the CRC remains erased.
 
-Saving to resident writes a role `0` CRC last. Until that write completes, the
-old resident remains the highest valid record. Once it completes, the candidate
-becomes resident and the old resident becomes future scratch.
+Saving to resident writes and verifies the separate role-`0` promotion CRC,
+then clears the role bit last. Until that bit clears, the old resident remains
+the highest valid record. Once it clears, the candidate becomes resident and
+the old resident becomes future scratch.
 
 Discard leaves the candidate CRC invalid and preserves the resident. Saving to
 host commits role `1`, leaving the resident active until transfer completes.
@@ -263,9 +275,12 @@ documents their cost, it does not decide when they run.
    A write invalidates the cache under it, so the mapping is dropped before a
    flush and `remap` is called after — at the same inter-round points, so no
    borrow spans a write.
-4. **Commit the role last.** `commit_record` writes metadata and then the CRC
-   word. A crash before the CRC leaves the candidate invalid. Recovery therefore
-   keeps the prior resident or tombstone.
+4. **Commit the role last.** `commit_record` writes initial metadata and then
+   the original CRC word. Promotion writes and verifies its second CRC before
+   clearing the candidate→resident role bit. A crash before an initial CRC
+   leaves the candidate invalid; a crash during promotion leaves either the
+   original candidate or the promoted resident valid. Recovery therefore keeps
+   the prior resident until the promotion commit edge.
 
 A slot is **live** only if all of: magic matches, version is 2, sequence is
 neither `0` nor `0xFFFFFFFF`, the row count and covered bytes fit the slot, the

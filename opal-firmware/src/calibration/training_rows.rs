@@ -19,7 +19,8 @@ use anyhow::{bail, Context, Result};
 use emg_runtime::calibration::{FeaturePrecision, Int8Quantization};
 use emg_runtime::flash_image::{
     self, ImageError, LiveSlot, PriorImage, SlotRecord, StandardizationVariant, PARTITION_BYTES,
-    SLOT_BYTES, SLOT_COUNT, SLOT_CRC_OFFSET, SLOT_OFFSETS, SLOT_ROWS_OFFSET,
+    SLOT_BYTES, SLOT_COUNT, SLOT_CRC_OFFSET, SLOT_OFFSETS, SLOT_PROMOTION_CRC_OFFSET,
+    SLOT_ROLE_OFFSET, SLOT_ROWS_OFFSET,
 };
 use emg_runtime::streaming_fit::{RowSource, ROW_STRIDE};
 use esp_idf_svc::sys::EspError;
@@ -378,7 +379,7 @@ impl CalibrationPartition {
         Some(StoredIdentity {
             physical,
             generation: live.record.sequence,
-            crc: read_u32(self.slot_bytes(physical.index()), SLOT_CRC_OFFSET),
+            crc: live.crc,
             role: match live.record.role {
                 flash_image::SlotRole::Resident => StoredRole::Resident,
                 flash_image::SlotRole::ExportableCandidate => StoredRole::ExportableCandidate,
@@ -443,6 +444,61 @@ impl CalibrationPartition {
             &0u32.to_le_bytes(),
         )
         .with_context(|| format!("invalidate calibration slot {}", physical.index()))
+    }
+
+    /// Atomically promote a validated candidate without asking NOR flash to
+    /// turn any programmed zero back into one. The separate promotion CRC is
+    /// written and read back first; while the role is still Candidate a power
+    /// loss leaves the original CRC authoritative. Clearing the role's single
+    /// low bit is the final commit edge.
+    pub(super) fn promote_candidate(&mut self, physical: PhysicalSlot) -> Result<u32> {
+        let index = physical.index();
+        let (live_rows, promotion_crc) = {
+            let live = self.slot(index).map_err(|error| {
+                anyhow::anyhow!("candidate slot is not live: {}", error.as_str())
+            })?;
+            if live.record.role != flash_image::SlotRole::ExportableCandidate {
+                bail!("slot {index} is not an exportable candidate");
+            }
+            let live_rows = live.rows().len();
+            let promotion_crc =
+                flash_image::resident_promotion_crc(self.slot_bytes(index), live_rows)
+                    .ok_or_else(|| anyhow::anyhow!("candidate promotion CRC shape is invalid"))?;
+            (live_rows, promotion_crc)
+        };
+
+        let existing = read_u32(self.slot_bytes(index), SLOT_PROMOTION_CRC_OFFSET);
+        if existing & promotion_crc != promotion_crc {
+            bail!(
+                "slot {index} promotion CRC word {existing:08x} cannot reach {promotion_crc:08x} with NOR writes"
+            );
+        }
+        let mut elapsed = self
+            .write(
+                SLOT_OFFSETS[index] + SLOT_PROMOTION_CRC_OFFSET,
+                &promotion_crc.to_le_bytes(),
+            )
+            .context("write candidate promotion CRC")?;
+        if read_u32(self.slot_bytes(index), SLOT_PROMOTION_CRC_OFFSET) != promotion_crc {
+            bail!("slot {index} promotion CRC did not verify before role commit");
+        }
+
+        elapsed += self
+            .write(
+                SLOT_OFFSETS[index] + SLOT_ROLE_OFFSET,
+                &flash_image::SlotRole::Resident.value().to_le_bytes(),
+            )
+            .context("commit candidate resident role")?;
+        let promoted = self.slot(index).map_err(|error| {
+            anyhow::anyhow!("promoted resident did not validate: {}", error.as_str())
+        })?;
+        if promoted.record.role != flash_image::SlotRole::Resident
+            || promoted.rows().len() != live_rows
+            || promoted.crc != promotion_crc
+        {
+            bail!("slot {index} promotion readback disagrees with the committed candidate");
+        }
+        Ok(elapsed)
     }
 
     /// Flush buffered rows into a pre-erased slot, starting at row
