@@ -34,7 +34,8 @@ fn serial_frame_bytes(frame: &Frame) -> Vec<u8> {
 }
 
 fn write_serial_frame(writer: &mut impl std::io::Write, frame: &Frame) -> std::io::Result<()> {
-    writer.write_all(&serial_frame_bytes(frame))
+    writer.write_all(&serial_frame_bytes(frame))?;
+    writer.flush()
 }
 
 /// Whether device log lines are echoed onto the backend's own tty (`tracing`).
@@ -100,6 +101,9 @@ async fn device_session(
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         let mut interval = tokio::time::interval(Duration::from_secs(5));
+        // Tokio's first tick is immediate; consume it so the connect burst is
+        // exactly five probes, followed by one maintenance probe per 5 s.
+        interval.tick().await;
         loop {
             interval.tick().await;
             if probe_outgoing
@@ -629,6 +633,79 @@ mod tests {
         ));
         assert!(scanner.next_frame().is_none());
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn production_control_frame_fixtures_are_deterministic() {
+        fn hex(bytes: &[u8]) -> String {
+            bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+        }
+
+        let frames = [
+            (
+                "probe",
+                Frame::Probe {},
+                "a55a0c000000a164747970656570726f6265",
+            ),
+            (
+                "clock_probe_request",
+                Frame::ClockProbeRequest {
+                    sequence: 7,
+                    host_send_nanoseconds: 123_456_789,
+                },
+                "a55a3f000000a3647479706573636c6f636b5f70726f62655f726571756573746873657175656e63650775686f73745f73656e645f6e616e6f7365636f6e64731a075bcd15",
+            ),
+            (
+                "timing_start",
+                Frame::CalibrationTimingLoopStart {},
+                "a55a25000000a16474797065781d63616c6962726174696f6e5f74696d696e675f6c6f6f705f7374617274",
+            ),
+            (
+                "timing_stop",
+                Frame::CalibrationTimingLoopStop {},
+                "a55a24000000a16474797065781c63616c6962726174696f6e5f74696d696e675f6c6f6f705f73746f70",
+            ),
+        ];
+        for (name, frame, expected_hex) in frames {
+            let bytes = serial_frame_bytes(&frame);
+            assert_eq!(hex(&bytes), expected_hex, "{name} fixture");
+            let payload_len = u32::from_le_bytes(bytes[2..6].try_into().unwrap()) as usize;
+            assert_eq!(bytes[..2], protocol::FRAME_MAGIC, "{name} magic");
+            assert_eq!(bytes.len(), 6 + payload_len, "{name} length");
+            let mut scanner = FrameScanner::new();
+            scanner.extend(&bytes);
+            let decoded = frame::decode(&scanner.next_frame().unwrap()).unwrap();
+            assert_eq!(
+                format!("{decoded:?}"),
+                format!("{frame:?}"),
+                "{name} payload"
+            );
+            println!("{name}: {}", hex(&bytes));
+        }
+    }
+
+    #[test]
+    fn serial_frame_writer_flushes_each_complete_frame() {
+        #[derive(Default)]
+        struct FlushRecorder {
+            bytes: Vec<u8>,
+            flushes: usize,
+        }
+        impl std::io::Write for FlushRecorder {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.flushes += 1;
+                Ok(())
+            }
+        }
+
+        let mut writer = FlushRecorder::default();
+        write_serial_frame(&mut writer, &Frame::Probe {}).unwrap();
+        assert_eq!(writer.bytes, serial_frame_bytes(&Frame::Probe {}));
+        assert_eq!(writer.flushes, 1);
     }
 
     #[cfg(unix)]

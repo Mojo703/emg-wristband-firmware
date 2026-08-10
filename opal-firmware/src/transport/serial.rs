@@ -56,7 +56,7 @@ const SERIAL_WRITE_CHUNK_BYTES: usize = 2048;
 
 /// Inbound controls are bounded by the 16 KiB playback receive contract. The
 /// largest control is one full playback sample chunk; ordinary controls are tiny.
-const SERIAL_CONTROL_MAX_LEN: usize = 16 * 1024;
+pub(super) const SERIAL_CONTROL_MAX_LEN: usize = 16 * 1024;
 
 /// Reads/writes framed CBOR over the USB-Serial-JTAG CDC channel — the same USB port
 /// used for flashing and JTAG debugging (the CDC and JTAG are independent interfaces

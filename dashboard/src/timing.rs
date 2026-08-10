@@ -303,4 +303,19 @@ mod tests {
             Some(1003)
         );
     }
+
+    #[test]
+    fn browser_start_and_stop_intents_return_device_controls() {
+        let service = TimingService::new();
+        let (_, start_control) = service.intent("opal", CalibrationTimingIntent::Start);
+        assert!(matches!(
+            start_control,
+            Some(Frame::CalibrationTimingLoopStart {})
+        ));
+        let (_, stop_control) = service.intent("opal", CalibrationTimingIntent::Stop);
+        assert!(matches!(
+            stop_control,
+            Some(Frame::CalibrationTimingLoopStop {})
+        ));
+    }
 }

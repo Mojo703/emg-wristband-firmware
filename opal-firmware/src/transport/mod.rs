@@ -82,6 +82,57 @@ mod tests {
     }
 
     #[test]
+    fn production_probe_clock_and_timing_frames_survive_cdc_framing() {
+        let frames = [
+            Frame::Probe {},
+            Frame::ClockProbeRequest {
+                sequence: 17,
+                host_send_nanoseconds: 9_876_543_210,
+            },
+            Frame::CalibrationTimingLoopStart {},
+            Frame::CalibrationTimingLoopStop {},
+        ];
+        let mut wire = Vec::new();
+        for frame in &frames {
+            wire.extend_from_slice(&frame_header(frame).unwrap());
+            encode_to(frame, &mut wire).unwrap();
+        }
+        assert_eq!(
+            &wire[..18],
+            &[
+                0xa5, 0x5a, 0x0c, 0, 0, 0, 0xa1, 0x64, b't', b'y', b'p', b'e', 0x65, b'p', b'r',
+                b'o', b'b', b'e',
+            ],
+            "dashboard's production Probe fixture is accepted verbatim"
+        );
+
+        let mut scanner =
+            protocol::FrameScanner::with_max_len(super::serial::SERIAL_CONTROL_MAX_LEN);
+        // The dashboard's CDC writes may split anywhere, including inside a
+        // header or a CBOR string; neither session claim nor timing controls
+        // may depend on a whole frame arriving in one driver read.
+        for chunk in wire.chunks(7) {
+            scanner.extend(chunk);
+        }
+        let controls: Vec<_> = std::iter::from_fn(|| scanner.next_frame())
+            .map(|payload| decode(&payload).expect("production control frame decodes"))
+            .collect();
+        assert!(matches!(controls[0], Control::Probe {}));
+        assert!(matches!(
+            controls[1],
+            Control::ClockProbeRequest {
+                sequence: 17,
+                host_send_nanoseconds: 9_876_543_210,
+            }
+        ));
+        assert!(matches!(
+            controls[2],
+            Control::CalibrationTimingLoopStart {}
+        ));
+        assert!(matches!(controls[3], Control::CalibrationTimingLoopStop {}));
+    }
+
+    #[test]
     fn anchored_song_controls_accept_the_complete_130_cue_upload_shape() {
         let run = CalibrationRunKey {
             session_id: CalibrationSessionId::new(7).unwrap(),
