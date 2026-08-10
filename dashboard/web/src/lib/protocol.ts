@@ -1244,7 +1244,7 @@ export interface BenchFitResultFrame {
 /** Where the playback engine stands. `mode` is idle/streaming/replaying/fitting. */
 export interface BenchStatusFrame {
   readonly type: 'bench_status';
-  readonly mode: string;
+  readonly mode: BenchMode;
   readonly session: string;
   readonly samples_received: number;
   readonly windows_processed: number;
@@ -1260,6 +1260,8 @@ export interface BenchStatusFrame {
   /** Rows the flash training partition offers, zero when none is mapped. */
   readonly flash_rows: number;
 }
+
+export type BenchMode = 'idle' | 'streaming' | 'replaying' | 'fitting';
 
 /** A bench request the device refused, or a run it abandoned. */
 export interface BenchErrorFrame {
@@ -2464,7 +2466,10 @@ export function isBenchStatusFrame(value: unknown): value is BenchStatusFrame {
   return (
     hasType(value, 'bench_status') &&
     isObject(value) &&
-    isString(value['mode']) &&
+    (value['mode'] === 'idle' ||
+      value['mode'] === 'streaming' ||
+      value['mode'] === 'replaying' ||
+      value['mode'] === 'fitting') &&
     isString(value['session']) &&
     isNumber(value['samples_received']) &&
     isNumber(value['windows_processed']) &&

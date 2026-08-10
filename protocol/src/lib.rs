@@ -796,8 +796,7 @@ pub enum Frame {
     /// Device → host: where the playback engine stands. Sent periodically while
     /// streaming, at the end of a session, and on request.
     BenchStatus {
-        /// "idle", "streaming", "replaying", or "fitting".
-        mode: String,
+        mode: BenchMode,
         session: String,
         samples_received: u64,
         windows_processed: u32,
@@ -1478,6 +1477,27 @@ pub struct BenchDecision {
     /// The reject score as little-endian `f32` bits, so the comparison against
     /// the host simulation is exact rather than within a printed precision.
     pub reject_score_bits: u32,
+}
+
+/// The finite execution phase of the firmware playback/fit bench.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BenchMode {
+    Idle,
+    Streaming,
+    Replaying,
+    Fitting,
+}
+
+impl core::fmt::Display for BenchMode {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str(match self {
+            Self::Idle => "idle",
+            Self::Streaming => "streaming",
+            Self::Replaying => "replaying",
+            Self::Fitting => "fitting",
+        })
+    }
 }
 
 /// Channels one playback sample instant carries. Fixed by the recording format
@@ -4596,7 +4616,7 @@ mod tests {
     #[test]
     fn bench_status_roundtrips() {
         let frame = Frame::BenchStatus {
-            mode: "streaming".into(),
+            mode: BenchMode::Streaming,
             session: "2026-08-07T16-38-35_Matthew".into(),
             samples_received: 120_000,
             windows_processed: 240,
@@ -4618,7 +4638,7 @@ mod tests {
                 largest_free_block_bytes,
                 ..
             } => {
-                assert_eq!(mode, "streaming");
+                assert_eq!(mode, BenchMode::Streaming);
                 assert_eq!(windows_processed, 240);
                 assert_eq!(feature_mean_microseconds, 4_400);
                 assert_eq!(largest_free_block_bytes, 31_000);

@@ -9,7 +9,7 @@
 //! because that is what a person reading the file needs.
 
 use anyhow::{Context, Result};
-use protocol::{Frame, BENCH_FEATURE_COUNT};
+use protocol::{BenchMode, Frame, BENCH_FEATURE_COUNT};
 use serde::Serialize;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -25,7 +25,7 @@ struct DecisionRecord {
 
 #[derive(Serialize)]
 struct StatusRecord {
-    mode: String,
+    mode: BenchMode,
     session: String,
     samples_received: u64,
     windows_processed: u32,

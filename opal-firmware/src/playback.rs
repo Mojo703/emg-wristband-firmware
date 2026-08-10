@@ -33,7 +33,7 @@ use emg_runtime::calibration::{
 };
 use emg_runtime::pipeline::RejectPipeline;
 use log::{info, warn};
-use protocol::{BenchDecision, Frame, PLAYBACK_MAX_CHUNK_SAMPLES};
+use protocol::{BenchDecision, BenchMode, Frame, PLAYBACK_MAX_CHUNK_SAMPLES};
 
 use crate::calibration::training_rows::TrainingRows;
 use crate::transport::Control;
@@ -290,7 +290,7 @@ struct Bench {
     /// Set at each `playback_begin` from what the previous sessions
     /// contributed, which is what splices them.
     published_base: u64,
-    mode: &'static str,
+    mode: BenchMode,
 }
 
 impl Bench {
@@ -316,7 +316,7 @@ impl Bench {
             probabilities: Vec::new(),
             published_samples: 0,
             published_base: 0,
-            mode: "idle",
+            mode: BenchMode::Idle,
         }
     }
 
@@ -418,7 +418,7 @@ impl Bench {
         // A new session's windows number from zero again, so the run's own
         // space carries on from where the last one stopped.
         self.published_base = self.published_samples;
-        self.mode = "streaming";
+        self.mode = BenchMode::Streaming;
         info!("playback session begins: {sample_count} samples in chunks of {chunk_samples}");
         self.grant_credit(0);
     }
@@ -615,7 +615,7 @@ impl Bench {
     fn handle_end(&mut self) {
         self.flush_features();
         self.flush_decisions();
-        self.mode = "idle";
+        self.mode = BenchMode::Idle;
         self.send_status();
         if let Some(session) = self.session.as_ref() {
             info!(
@@ -663,14 +663,14 @@ impl Bench {
             );
             return;
         }
-        self.mode = "replaying";
+        self.mode = BenchMode::Replaying;
         for (index, row) in rows.chunks_exact(ROW_BYTES).enumerate() {
             let features: [f32; FEATURE_COUNT] =
                 std::array::from_fn(|feature| float_at(row, feature));
             self.score_row(first_window + index as u32, &features);
         }
         self.flush_decisions();
-        self.mode = "idle";
+        self.mode = BenchMode::Idle;
     }
 
     fn handle_fit_begin(
@@ -781,7 +781,7 @@ impl Bench {
             Some(_) => {}
         }
         let store = self.store.as_ref().expect("checked above");
-        self.mode = "fitting";
+        self.mode = BenchMode::Fitting;
 
         // Which experiment this is. Live-only measures how many rows RAM can
         // hold; live-plus-flash measures the split the full training matrix
@@ -795,7 +795,7 @@ impl Bench {
                     "bench_fit_run",
                     "asked for flash rows, none are mapped".into(),
                 );
-                self.mode = "idle";
+                self.mode = BenchMode::Idle;
                 return;
             }
             (true, Some(flash)) => Some(flash),
@@ -823,7 +823,7 @@ impl Bench {
                 "bench_fit_run",
                 "flash rows are not a whole number of rows at their own precision".into(),
             );
-            self.mode = "idle";
+            self.mode = BenchMode::Idle;
             return;
         }
         let flash_row_count = static_rows
@@ -846,7 +846,7 @@ impl Bench {
         let class_count = model.class_count as u32;
         self.model = Some(model);
         self.reject = RejectPipeline::new(COMMAND_CLASSES, REJECT_TAU);
-        self.mode = "idle";
+        self.mode = BenchMode::Idle;
         self.send(Frame::BenchFitResult {
             wall_milliseconds,
             rows: self.stored_rows,
@@ -873,7 +873,7 @@ impl Bench {
         self.published_base = 0;
         self.reject = RejectPipeline::new(COMMAND_CLASSES, REJECT_TAU);
         self.refused.store(0, Ordering::Relaxed);
-        self.mode = "idle";
+        self.mode = BenchMode::Idle;
         self.send_status();
     }
 
@@ -934,7 +934,7 @@ impl Bench {
         };
         let heap = crate::allocation::heap_snapshot();
         self.send(Frame::BenchStatus {
-            mode: self.mode.into(),
+            mode: self.mode,
             session: identifier,
             samples_received,
             windows_processed: windows,
