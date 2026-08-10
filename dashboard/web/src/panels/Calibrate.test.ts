@@ -97,8 +97,8 @@ test('authoritative save projection disables the persistent exit action until pr
   assert.match(body, /Finalizing on the wristband/);
 });
 
-test('calibration shell wires both required playback controls to typed intents', async () => {
+test('Stop song is the only playback interruption control', async () => {
   const source = await readFile(new URL('./Calibrate.svelte', import.meta.url), 'utf8');
-  assert.match(source, /onPause=\{\(\) => sendGuided\(\{ name: 'pause_calibration' \}\)\}/);
-  assert.match(source, /onResume=\{\(\) => sendGuided\(\{ name: 'resume_calibration' \}\)\}/);
+  assert.match(source, /onStop=\{\(\) => sendGuided\(\{ name: 'pause_calibration' \}\)\}/);
+  assert.doesNotMatch(source, /resume_calibration/);
 });

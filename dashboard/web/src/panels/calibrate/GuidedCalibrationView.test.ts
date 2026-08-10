@@ -124,6 +124,17 @@ test('playing renders a persistent cue-variant legend and accessible cue narrati
   assert.doesNotMatch(body, /WristPronation|WristSupination|Lift thumb/);
 });
 
+test('playing offers Stop song without promising resumable playback', async () => {
+  const { fixtures } = await modules();
+  const playing = fixtures['calibrationPlayingFixture'];
+  assert.ok(playing?.phase === 'playing');
+  const body = await render(playing);
+
+  assert.doesNotMatch(button(body, 'Stop song'), DISABLED_ATTRIBUTE);
+  assert.doesNotMatch(body, />Pause</);
+  assert.doesNotMatch(body, />Resume</);
+});
+
 test('song end keeps unavailable actions visible and disabled', async () => {
   const { fixtures } = await modules();
   const songEnd = fixtures['calibrationSongEndFixture'];

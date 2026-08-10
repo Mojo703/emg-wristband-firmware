@@ -191,8 +191,8 @@ async function main() {
   const playing = await waitFor('device-anchored playback snapshot', value => value.type === 'guided_session_snapshot' && calibration(value.snapshot)?.phase === 'playing', 8_000);
   const playingAuthority = playing.snapshot.action_authority;
 
-  // Let the first authored cue become eligible, then use the UI pause intent
-  // to request an explicit device interruption. Exercise an authority captured
+  // Let the first authored cue become eligible, then use the UI Stop song
+  // intent to request an explicit device interruption. Exercise an authority captured
   // before many projection-only updates: telemetry revisions must not
   // invalidate the control for the still-current actionable phase.
   let samePhaseUpdates = 0;
@@ -244,10 +244,15 @@ try {
   await writeFile(path, `${trace.map(json).join('\n')}\n`);
   record('trace_written', { path });
   socket.close();
+  // Node's built-in WebSocket can keep its underlying client alive after a
+  // successful close request when the backend has already begun tearing down
+  // the guided browser stream. All evidence is durably written at this point;
+  // make the diagnostic command itself exact and automation-friendly.
+  process.exit(0);
 } catch (error) {
   record('failure', { message: String(error?.stack ?? error) });
   await mkdir(traceDirectory, { recursive: true });
   await writeFile(`${traceDirectory}/tuesday-calibration-e2e-failure.jsonl`, `${trace.map(json).join('\n')}\n`);
   socket.close();
-  process.exitCode = 1;
+  process.exit(1);
 }

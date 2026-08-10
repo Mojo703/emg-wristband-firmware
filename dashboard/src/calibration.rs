@@ -1450,11 +1450,16 @@ impl CalibrationModeAdapter {
         if !self.tracks.iter().any(|track| track.id.0 == track_id) {
             return Err(CoordinatorError::UnknownCalibrationTrack);
         }
-        *self.selected_track_id.lock().unwrap() = Some(track_id.clone());
+        // The coordinator revalidates authority inside `publish_calibration`.
+        // Hold selection ownership across that check so a request which became
+        // stale after the outer intent check cannot silently change the track
+        // a later Start consumes while its browser projection was rejected.
+        let mut selected_track_id = self.selected_track_id.lock().unwrap();
         self.coordinator.publish_calibration(
             request.authority,
-            setup_snapshot(&self.tracks, Some(track_id)),
+            setup_snapshot(&self.tracks, Some(track_id.clone())),
         )?;
+        *selected_track_id = Some(track_id);
         Ok(())
     }
 
@@ -2423,6 +2428,157 @@ mod tests {
             .expect("calibration control channel closed")
     }
 
+    fn attach_test_timing(adapter: &CalibrationModeAdapter, identity: &DeviceConnectionIdentity) {
+        let timing = Arc::new(crate::timing::TimingService::new());
+        let epoch = timing.begin_epoch(&identity.device_id, identity.connection_token);
+        let host_send_nanoseconds = crate::timing::host_monotonic_nanoseconds();
+        let device_receive_microseconds = host_send_nanoseconds / 1_000;
+        timing.record_clock_probe(
+            &epoch,
+            host_send_nanoseconds,
+            device_receive_microseconds,
+            device_receive_microseconds.saturating_add(100),
+            host_send_nanoseconds.saturating_add(100_000),
+        );
+        adapter.attach_timing(timing);
+    }
+
+    async fn acknowledge_test_schedule(
+        device: &mut crate::registry::DeviceHandle,
+        run: CalibrationRunKey,
+        revision: CalibrationScheduleRevision,
+        track: &crate::collect::beatmap::CalibrationTrack,
+    ) {
+        loop {
+            if let Frame::CalibrationScheduleBegin {
+                run: received_run,
+                schedule_revision,
+                content_identity,
+                total_count,
+            } = receive_control(device).await
+            {
+                if received_run == run && schedule_revision == revision {
+                    assert_eq!(content_identity, track.content_identity);
+                    assert_eq!(total_count, track.entries.len() as u32);
+                    break;
+                }
+            }
+        }
+        device
+            .frames
+            .send(Frame::CalibrationScheduleUploadAcknowledged {
+                acknowledgement: protocol::CalibrationScheduleUploadAcknowledgement {
+                    run,
+                    schedule_revision: revision,
+                    content_identity: track.content_identity.clone(),
+                    total_count: track.entries.len() as u32,
+                    operation: protocol::CalibrationScheduleUploadOperationAcknowledgement::Begin {
+                        operation_fingerprint: protocol::calibration_schedule_begin_fingerprint(
+                            run,
+                            revision,
+                            &track.content_identity,
+                            track.entries.len() as u32,
+                        ),
+                    },
+                },
+            })
+            .unwrap();
+
+        let mut acknowledged_entries = 0usize;
+        while acknowledged_entries < track.entries.len() {
+            let Frame::CalibrationScheduleChunk {
+                run: received_run,
+                schedule_revision,
+                content_identity,
+                total_count,
+                first_entry,
+                entries,
+            } = receive_control(device).await
+            else {
+                continue;
+            };
+            if received_run != run || schedule_revision != revision {
+                continue;
+            }
+            assert_eq!(content_identity, track.content_identity);
+            assert_eq!(total_count, track.entries.len() as u32);
+            assert_eq!(first_entry as usize, acknowledged_entries);
+            assert_eq!(
+                entries,
+                track.entries[acknowledged_entries..][..entries.len()]
+            );
+            device
+                .frames
+                .send(Frame::CalibrationScheduleUploadAcknowledged {
+                    acknowledgement: protocol::CalibrationScheduleUploadAcknowledgement {
+                        run,
+                        schedule_revision: revision,
+                        content_identity: track.content_identity.clone(),
+                        total_count: track.entries.len() as u32,
+                        operation:
+                            protocol::CalibrationScheduleUploadOperationAcknowledgement::Chunk {
+                                first_entry,
+                                operation_fingerprint:
+                                    protocol::calibration_schedule_chunk_fingerprint(
+                                        run,
+                                        revision,
+                                        &track.content_identity,
+                                        track.entries.len() as u32,
+                                        first_entry,
+                                        &entries,
+                                    ),
+                            },
+                    },
+                })
+                .unwrap();
+            acknowledged_entries += entries.len();
+        }
+
+        device
+            .frames
+            .send(Frame::CalibrationPreparationStatus {
+                status: protocol::CalibrationPreparationStatus {
+                    run,
+                    schedule_revision: revision,
+                    phase: protocol::CalibrationPreparationPhase::ReadyForSchedule,
+                },
+            })
+            .unwrap();
+        loop {
+            if matches!(
+                receive_control(device).await,
+                Frame::CalibrationScheduleCommit {
+                    run: committed_run,
+                    schedule_revision,
+                    ref content_identity,
+                    total_count,
+                } if committed_run == run
+                    && schedule_revision == revision
+                    && content_identity == &track.content_identity
+                    && total_count == track.entries.len() as u32
+            ) {
+                break;
+            }
+        }
+
+        let acknowledged_device_monotonic_microseconds =
+            crate::timing::host_monotonic_nanoseconds() / 1_000;
+        device
+            .frames
+            .send(Frame::CalibrationScheduleAccepted {
+                accepted: protocol::CalibrationScheduleAccepted {
+                    run,
+                    schedule_revision: revision,
+                    content_identity: track.content_identity.clone(),
+                    acknowledged_device_monotonic_microseconds,
+                    anchor_device_monotonic_microseconds: acknowledged_device_monotonic_microseconds
+                        + 3_000_000,
+                    acquisition_sample: 10_000,
+                },
+            })
+            .unwrap();
+    }
+
     #[test]
     fn exit_route_covers_every_actor_owned_schedule_boundary() {
         let fresh = EvidenceState::Fresh;
@@ -2696,6 +2852,455 @@ mod tests {
                         record_crc_valid: true,
                     },
                     resident_sequence: 1,
+                },
+            })
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(matches!(
+            coordinator.snapshot().calibration(),
+            Some(GuidedCalibrationSnapshot::Setup { .. })
+        ));
+        assert!(coordinator.snapshot().active().is_none());
+    }
+
+    #[tokio::test]
+    async fn two_song_actor_lifecycle_continues_then_saves_exact_revision_two() {
+        let registry = Arc::new(Registry::new());
+        let coordinator = GuidedSessionCoordinator::new();
+        let first_track = track();
+        let mut second_track = first_track.clone();
+        second_track.id = protocol::TrackId("second-calibration-track".into());
+        second_track.title = "Second Calibration Track".into();
+        second_track.cue_count = 2;
+        second_track.cue_shortfall = 128;
+        second_track
+            .entries
+            .push(protocol::CalibrationScheduleEntry {
+                cue_id: protocol::CalibrationCueId::new(2).unwrap(),
+                gesture: protocol::CalibrationGesture::WristSupination,
+                modifier: protocol::CalibrationModifier::ThumbDown,
+                track_offset: protocol::TrackMilliseconds::new(2_000),
+                hold: protocol::DurationMilliseconds::new(1_500),
+            });
+        let adapter = CalibrationModeAdapter::new(
+            registry.clone(),
+            coordinator.clone(),
+            vec![first_track.clone(), second_track.clone()],
+        );
+        attach_test_collection(&adapter, registry.clone(), coordinator.clone());
+        coordinator.set_mode_adapter(GuidedMode::Calibration, adapter.clone());
+        let mut device = register_device(&registry);
+        let identity = registry.connection_identity("opal-test").unwrap();
+        attach_test_timing(&adapter, &identity);
+
+        let setup = coordinator.snapshot();
+        coordinator
+            .handle_intent_for_device(
+                GuidedIntentRequest {
+                    authority: setup.action_authority,
+                    action: GuidedSessionAction::SelectCalibrationTrack {
+                        track_id: first_track.id.0.clone(),
+                    },
+                },
+                None,
+            )
+            .unwrap();
+        let selected = coordinator.snapshot();
+        coordinator
+            .handle_intent_for_device(
+                GuidedIntentRequest {
+                    authority: selected.action_authority,
+                    action: GuidedSessionAction::StartCalibration,
+                },
+                Some(identity),
+            )
+            .unwrap();
+
+        let run = CalibrationRunKey {
+            session_id: CalibrationSessionId::new(1).unwrap(),
+            run_id: CalibrationRunId::new(1).unwrap(),
+        };
+        let first_revision = CalibrationScheduleRevision::new(1).unwrap();
+        acknowledge_test_schedule(&mut device, run, first_revision, &first_track).await;
+
+        let first_counts = vec![protocol::CalibrationClassCounts {
+            gesture: protocol::CalibrationGesture::WristPronation,
+            modifier: protocol::CalibrationModifier::ThumbUp,
+            accepted_count: 9,
+            rejected_count: 1,
+            target_count: 10,
+            deficit_count: 1,
+        }];
+        device
+            .frames
+            .send(Frame::CalibrationSongResult {
+                result: protocol::CalibrationSongResult {
+                    run,
+                    schedule_revision: first_revision,
+                    content_identity: first_track.content_identity.clone(),
+                    counts: first_counts,
+                    validity: protocol::CalibrationCandidateValidity {
+                        model_numerically_valid: false,
+                        record_crc_valid: false,
+                    },
+                },
+            })
+            .unwrap();
+        device
+            .frames
+            .send(Frame::CalibrationCandidateStatus {
+                candidate: protocol::CalibrationCandidateStatus {
+                    run,
+                    schedule_revision: first_revision,
+                    presence: protocol::CalibrationCandidatePresence::Absent,
+                },
+            })
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(matches!(
+            coordinator.snapshot().calibration(),
+            Some(GuidedCalibrationSnapshot::BetweenSongs {
+                track_title,
+                candidate_available: true,
+                continue_available: true,
+                valid_reps: 9,
+                invalid_reps: 1,
+                ..
+            }) if track_title == &first_track.title
+        ));
+
+        // Select the replacement track through the same public intent path a
+        // browser uses. A delayed status for song one must neither relabel its
+        // evidence nor withdraw Save before Continue consumes the selection.
+        let between_songs = coordinator.snapshot();
+        coordinator
+            .handle_intent_for_device(
+                GuidedIntentRequest {
+                    authority: between_songs.action_authority,
+                    action: GuidedSessionAction::SelectCalibrationTrack {
+                        track_id: second_track.id.0.clone(),
+                    },
+                },
+                None,
+            )
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        device
+            .frames
+            .send(Frame::CalibrationCandidateStatus {
+                candidate: protocol::CalibrationCandidateStatus {
+                    run,
+                    schedule_revision: first_revision,
+                    presence: protocol::CalibrationCandidatePresence::Present {
+                        content_identity: first_track.content_identity.clone(),
+                        total_count: first_track.entries.len() as u32,
+                        validity: protocol::CalibrationCandidateValidity {
+                            model_numerically_valid: false,
+                            record_crc_valid: false,
+                        },
+                    },
+                },
+            })
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(matches!(
+            coordinator.snapshot().calibration(),
+            Some(GuidedCalibrationSnapshot::BetweenSongs {
+                track_title,
+                selected_track_id: Some(selected),
+                candidate_available: true,
+                continue_available: true,
+                ..
+            }) if track_title == &first_track.title && selected == &second_track.id.0
+        ));
+
+        let continue_snapshot = coordinator.snapshot();
+        coordinator
+            .handle_intent_for_device(
+                GuidedIntentRequest {
+                    authority: continue_snapshot.action_authority,
+                    action: GuidedSessionAction::ContinueCalibration,
+                },
+                None,
+            )
+            .unwrap();
+        let second_revision = CalibrationScheduleRevision::new(2).unwrap();
+        let mut saw_continue = false;
+        loop {
+            match receive_control(&mut device).await {
+                Frame::CalibrationContinue { run: continued } if continued == run => {
+                    saw_continue = true;
+                }
+                Frame::CalibrationScheduleBegin {
+                    run: begun,
+                    schedule_revision,
+                    content_identity,
+                    total_count,
+                } if begun == run && schedule_revision == second_revision => {
+                    assert!(saw_continue, "Continue must precede revision-2 Begin");
+                    assert_eq!(content_identity, second_track.content_identity);
+                    assert_eq!(total_count, second_track.entries.len() as u32);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        device
+            .frames
+            .send(Frame::CalibrationScheduleUploadAcknowledged {
+                acknowledgement: protocol::CalibrationScheduleUploadAcknowledgement {
+                    run,
+                    schedule_revision: second_revision,
+                    content_identity: second_track.content_identity.clone(),
+                    total_count: second_track.entries.len() as u32,
+                    operation: protocol::CalibrationScheduleUploadOperationAcknowledgement::Begin {
+                        operation_fingerprint: protocol::calibration_schedule_begin_fingerprint(
+                            run,
+                            second_revision,
+                            &second_track.content_identity,
+                            second_track.entries.len() as u32,
+                        ),
+                    },
+                },
+            })
+            .unwrap();
+        let chunk = loop {
+            let frame = receive_control(&mut device).await;
+            if matches!(
+                frame,
+                Frame::CalibrationScheduleChunk {
+                    run: chunk_run,
+                    schedule_revision,
+                    ..
+                } if chunk_run == run && schedule_revision == second_revision
+            ) {
+                break frame;
+            }
+        };
+        let Frame::CalibrationScheduleChunk {
+            first_entry,
+            entries,
+            ..
+        } = chunk
+        else {
+            unreachable!("matched revision-2 chunk")
+        };
+        device
+            .frames
+            .send(Frame::CalibrationScheduleUploadAcknowledged {
+                acknowledgement: protocol::CalibrationScheduleUploadAcknowledgement {
+                    run,
+                    schedule_revision: second_revision,
+                    content_identity: second_track.content_identity.clone(),
+                    total_count: second_track.entries.len() as u32,
+                    operation: protocol::CalibrationScheduleUploadOperationAcknowledgement::Chunk {
+                        first_entry,
+                        operation_fingerprint: protocol::calibration_schedule_chunk_fingerprint(
+                            run,
+                            second_revision,
+                            &second_track.content_identity,
+                            second_track.entries.len() as u32,
+                            first_entry,
+                            &entries,
+                        ),
+                    },
+                },
+            })
+            .unwrap();
+        device
+            .frames
+            .send(Frame::CalibrationPreparationStatus {
+                status: protocol::CalibrationPreparationStatus {
+                    run,
+                    schedule_revision: second_revision,
+                    phase: protocol::CalibrationPreparationPhase::ReadyForSchedule,
+                },
+            })
+            .unwrap();
+        loop {
+            if matches!(
+                receive_control(&mut device).await,
+                Frame::CalibrationScheduleCommit {
+                    run: committed_run,
+                    schedule_revision,
+                    ref content_identity,
+                    ..
+                } if committed_run == run
+                    && schedule_revision == second_revision
+                    && content_identity == &second_track.content_identity
+            ) {
+                break;
+            }
+        }
+        let acknowledged_device_monotonic_microseconds =
+            crate::timing::host_monotonic_nanoseconds() / 1_000;
+        device
+            .frames
+            .send(Frame::CalibrationScheduleAccepted {
+                accepted: protocol::CalibrationScheduleAccepted {
+                    run,
+                    schedule_revision: second_revision,
+                    content_identity: second_track.content_identity.clone(),
+                    acknowledged_device_monotonic_microseconds,
+                    anchor_device_monotonic_microseconds: acknowledged_device_monotonic_microseconds
+                        + 3_000_000,
+                    acquisition_sample: 20_000,
+                },
+            })
+            .unwrap();
+
+        let second_counts = protocol::CalibrationGesture::ALL
+            .into_iter()
+            .flat_map(|gesture| {
+                [
+                    protocol::CalibrationModifier::ThumbUp,
+                    protocol::CalibrationModifier::ThumbDown,
+                ]
+                .into_iter()
+                .map(move |modifier| (gesture, modifier))
+            })
+            .enumerate()
+            .map(|(index, (gesture, modifier))| {
+                let (accepted_count, target_count) = match modifier {
+                    protocol::CalibrationModifier::ThumbUp => (12, 10),
+                    protocol::CalibrationModifier::ThumbDown if index == 9 => (16, 16),
+                    protocol::CalibrationModifier::ThumbDown => (17, 16),
+                };
+                protocol::CalibrationClassCounts {
+                    gesture,
+                    modifier,
+                    accepted_count,
+                    rejected_count: if index == 9 { 0 } else { 4 },
+                    target_count,
+                    deficit_count: 0,
+                }
+            })
+            .collect();
+        device
+            .frames
+            .send(Frame::CalibrationSongResult {
+                result: protocol::CalibrationSongResult {
+                    run,
+                    schedule_revision: second_revision,
+                    content_identity: second_track.content_identity.clone(),
+                    counts: second_counts,
+                    validity: protocol::CalibrationCandidateValidity {
+                        model_numerically_valid: false,
+                        record_crc_valid: false,
+                    },
+                },
+            })
+            .unwrap();
+        device
+            .frames
+            .send(Frame::CalibrationCandidateStatus {
+                candidate: protocol::CalibrationCandidateStatus {
+                    run,
+                    schedule_revision: second_revision,
+                    presence: protocol::CalibrationCandidatePresence::Absent,
+                },
+            })
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(matches!(
+            coordinator.snapshot().calibration(),
+            Some(GuidedCalibrationSnapshot::BetweenSongs {
+                track_title,
+                candidate_available: true,
+                continue_available: false,
+                valid_reps: 144,
+                invalid_reps: 36,
+                ref deficits,
+                ..
+            }) if track_title == &second_track.title && deficits.is_empty()
+        ));
+
+        // Neither a prior revision's terminal nor the current pre-Save Absent
+        // status may revoke the exact song result's Save authority.
+        device
+            .frames
+            .send(Frame::CalibrationCandidateStatus {
+                candidate: protocol::CalibrationCandidateStatus {
+                    run,
+                    schedule_revision: first_revision,
+                    presence: protocol::CalibrationCandidatePresence::Absent,
+                },
+            })
+            .unwrap();
+        device
+            .frames
+            .send(Frame::CalibrationCandidateStatus {
+                candidate: protocol::CalibrationCandidateStatus {
+                    run,
+                    schedule_revision: second_revision,
+                    presence: protocol::CalibrationCandidatePresence::Absent,
+                },
+            })
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(matches!(
+            coordinator.snapshot().calibration(),
+            Some(GuidedCalibrationSnapshot::BetweenSongs {
+                candidate_available: true,
+                continue_available: false,
+                ..
+            })
+        ));
+
+        let save_snapshot = coordinator.snapshot();
+        coordinator
+            .handle_intent_for_device(
+                GuidedIntentRequest {
+                    authority: save_snapshot.action_authority,
+                    action: GuidedSessionAction::SaveCalibration,
+                },
+                None,
+            )
+            .unwrap();
+        loop {
+            if matches!(
+                receive_control(&mut device).await,
+                Frame::CalibrationSave { run: saved_run } if saved_run == run
+            ) {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(matches!(
+            coordinator.snapshot().calibration(),
+            Some(GuidedCalibrationSnapshot::Finalizing { .. })
+        ));
+
+        device
+            .frames
+            .send(Frame::CalibrationResidentActivated {
+                activation: protocol::CalibrationResidentActivation {
+                    run,
+                    schedule_revision: first_revision,
+                    validity: protocol::CalibrationCandidateValidity {
+                        model_numerically_valid: true,
+                        record_crc_valid: true,
+                    },
+                    resident_sequence: 8,
+                },
+            })
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(matches!(
+            coordinator.snapshot().calibration(),
+            Some(GuidedCalibrationSnapshot::Finalizing { .. })
+        ));
+        device
+            .frames
+            .send(Frame::CalibrationResidentActivated {
+                activation: protocol::CalibrationResidentActivation {
+                    run,
+                    schedule_revision: second_revision,
+                    validity: protocol::CalibrationCandidateValidity {
+                        model_numerically_valid: true,
+                        record_crc_valid: true,
+                    },
+                    resident_sequence: 9,
                 },
             })
             .unwrap();
@@ -3428,6 +4033,54 @@ mod tests {
                 selected_track_id: Some(selected),
                 tracks,
             } if selected == track.id.0 && tracks.len() == 1
+        ));
+    }
+
+    #[test]
+    fn stale_setup_selection_cannot_change_the_track_a_later_start_consumes() {
+        let registry = Arc::new(Registry::new());
+        let coordinator = GuidedSessionCoordinator::new();
+        let first = track();
+        let mut second = first.clone();
+        second.id = protocol::TrackId("second-track".into());
+        second.title = "Second Track".into();
+        let adapter = CalibrationModeAdapter::new(
+            registry,
+            coordinator.clone(),
+            vec![first.clone(), second.clone()],
+        );
+
+        let setup = coordinator.snapshot();
+        let first_request = GuidedIntentRequest {
+            authority: setup.action_authority,
+            action: GuidedSessionAction::SelectCalibrationTrack {
+                track_id: first.id.0.clone(),
+            },
+        };
+        adapter
+            .select_track(first.id.0.clone(), &first_request)
+            .unwrap();
+
+        let stale_request = GuidedIntentRequest {
+            authority: setup.action_authority,
+            action: GuidedSessionAction::SelectCalibrationTrack {
+                track_id: second.id.0.clone(),
+            },
+        };
+        assert!(matches!(
+            adapter.select_track(second.id.0.clone(), &stale_request),
+            Err(CoordinatorError::StaleActionPhase { .. })
+        ));
+        assert_eq!(
+            adapter.selected_track_id.lock().unwrap().as_deref(),
+            Some(first.id.0.as_str())
+        );
+        assert!(matches!(
+            coordinator.snapshot().calibration(),
+            Some(GuidedCalibrationSnapshot::Setup {
+                selected_track_id: Some(selected),
+                ..
+            }) if selected == &first.id.0
         ));
     }
 }

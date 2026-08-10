@@ -23,8 +23,7 @@
     snapshot: GuidedCalibrationSnapshot;
     onSelectTrack?: (trackId: string) => void;
     onStart?: () => void;
-    onPause: () => void;
-    onResume: () => void;
+    onStop: () => void;
     onSongEndAction?: (action: CalibrationSongEndAction) => void;
   }
 
@@ -32,8 +31,7 @@
     snapshot,
     onSelectTrack,
     onStart,
-    onPause,
-    onResume,
+    onStop,
     onSongEndAction,
   }: Props = $props();
 
@@ -148,9 +146,9 @@
       <Button
         variant="secondary"
         size="sm"
-        onclick={() => snapshot.paused_reason === null ? onPause() : onResume()}
+        onclick={() => onStop()}
       >
-        {snapshot.paused_reason === null ? 'Pause' : 'Resume'}
+        Stop song
       </Button>
     </div>
     <div class="thumb-legend" aria-label="Cue variant legend">
@@ -173,13 +171,6 @@
         {laneMisses}
         canvasDuplicate={true}
       />
-      {#if snapshot.paused_reason !== null}
-        <div class="gate">
-          <strong>Paused</strong>
-          <p>{snapshot.paused_reason}</p>
-          <Button onclick={() => onResume()}>Resume</Button>
-        </div>
-      {/if}
     </div>
     <div class="counts card">
       {#each snapshot.counts as count (count.class_id)}
@@ -306,7 +297,6 @@
   }
   .cue-text { justify-content: space-between; min-height: 2.5rem; padding: 8px 10px; background: var(--muted); border-radius: var(--radius); }
   .field { position: relative; }
-  .gate { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; background: var(--canvas-dim-overlay); text-align: center; }
   .counts { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 8px 16px; font-size: 12px; }
   .song-end { display: grid; gap: 18px; }
   .song-end h3 { margin: 3px 0; font-size: 1.6rem; }
