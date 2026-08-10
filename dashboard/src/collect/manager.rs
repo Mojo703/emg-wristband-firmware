@@ -60,7 +60,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 /// Fan-out capacity for collection frames toward browsers. State ticks are
 /// small and periodic; a browser that lags simply sees the next tick.
@@ -1080,12 +1080,170 @@ struct CueState {
     class_id: ClassId,
     at_track: TrackMilliseconds,
     hold: protocol::DurationMilliseconds,
-    /// Wall-clock hold transitions; known once the beat grid is anchored.
-    at_wall: Option<UnixMilliseconds>,
-    release_wall: Option<UnixMilliseconds>,
-    logged: bool,
-    resolved: bool,
-    peak_activity: f32,
+    lifecycle: CueLifecycle,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CuePlacement {
+    at: UnixMilliseconds,
+    release: UnixMilliseconds,
+}
+
+/// The legal states of one cue. In particular, a cue cannot be logged without
+/// placement instants or resolved while still retaining mutable activity.
+enum CueLifecycle {
+    Unplaced,
+    Placed {
+        placement: CuePlacement,
+        peak_activity: f32,
+    },
+    Logged {
+        placement: CuePlacement,
+        peak_activity: f32,
+    },
+    Resolved {
+        placement: CuePlacement,
+    },
+    /// The playhead passed this cue while paused, so it was never presented.
+    Skipped,
+}
+
+impl CueLifecycle {
+    fn placement(&self) -> Option<CuePlacement> {
+        match self {
+            Self::Placed { placement, .. }
+            | Self::Logged { placement, .. }
+            | Self::Resolved { placement } => Some(*placement),
+            Self::Unplaced | Self::Skipped => None,
+        }
+    }
+
+    fn place(&mut self, placement: CuePlacement) {
+        match self {
+            Self::Unplaced => {
+                *self = Self::Placed {
+                    placement,
+                    peak_activity: 0.0,
+                };
+            }
+            Self::Placed { peak_activity, .. } => {
+                *self = Self::Placed {
+                    placement,
+                    peak_activity: *peak_activity,
+                };
+            }
+            Self::Logged { .. } | Self::Resolved { .. } | Self::Skipped => {}
+        }
+    }
+
+    fn peak_activity_mut(&mut self) -> Option<&mut f32> {
+        match self {
+            Self::Placed { peak_activity, .. } | Self::Logged { peak_activity, .. } => {
+                Some(peak_activity)
+            }
+            Self::Unplaced | Self::Resolved { .. } | Self::Skipped => None,
+        }
+    }
+
+    fn log_if_due(&mut self, current: UnixMilliseconds) -> Option<CuePlacement> {
+        match self {
+            Self::Placed {
+                placement,
+                peak_activity,
+            } if current >= placement.at => {
+                let (placement, peak_activity) = (*placement, *peak_activity);
+                *self = Self::Logged {
+                    placement,
+                    peak_activity,
+                };
+                Some(placement)
+            }
+            Self::Unplaced
+            | Self::Placed { .. }
+            | Self::Logged { .. }
+            | Self::Resolved { .. }
+            | Self::Skipped => None,
+        }
+    }
+
+    fn resolve_if_due(&mut self, current: UnixMilliseconds) -> Option<(CuePlacement, f32)> {
+        match self {
+            Self::Logged {
+                placement,
+                peak_activity,
+            } if current.get() > placement.release.get() + ACTIVITY_WINDOW_AFTER_MILLISECONDS => {
+                let result = (*placement, *peak_activity);
+                *self = Self::Resolved {
+                    placement: result.0,
+                };
+                Some(result)
+            }
+            Self::Unplaced
+            | Self::Placed { .. }
+            | Self::Logged { .. }
+            | Self::Resolved { .. }
+            | Self::Skipped => None,
+        }
+    }
+
+    fn interrupt(&mut self) -> Option<(CuePlacement, f32)> {
+        match self {
+            Self::Logged {
+                placement,
+                peak_activity,
+            } => {
+                let result = (*placement, *peak_activity);
+                *self = Self::Resolved {
+                    placement: result.0,
+                };
+                Some(result)
+            }
+            Self::Unplaced | Self::Placed { .. } | Self::Resolved { .. } | Self::Skipped => None,
+        }
+    }
+
+    fn skip_unpresented(&mut self) {
+        match self {
+            Self::Unplaced | Self::Placed { .. } => *self = Self::Skipped,
+            Self::Logged { .. } | Self::Resolved { .. } | Self::Skipped => {}
+        }
+    }
+}
+
+type OutputSwitchResult = anyhow::Result<audio::PreparedOutput>;
+
+/// Audio output reconciliation with exactly one possible preparation worker.
+/// The oneshot receiver is owned by `Preparing`, so neither duplicate workers
+/// nor a completion without a corresponding target can be represented.
+enum OutputSwitchState {
+    Stable {
+        applied: LiveAudioSettings,
+    },
+    Preparing {
+        applied: LiveAudioSettings,
+        desired: LiveAudioSettings,
+        target: AudioOutput,
+        completion: oneshot::Receiver<OutputSwitchResult>,
+    },
+}
+
+impl OutputSwitchState {
+    fn applied(&self) -> &LiveAudioSettings {
+        match self {
+            Self::Stable { applied } | Self::Preparing { applied, .. } => applied,
+        }
+    }
+}
+
+async fn wait_for_output_switch(state: &mut OutputSwitchState) -> OutputSwitchResult {
+    match state {
+        OutputSwitchState::Stable { .. } => std::future::pending().await,
+        OutputSwitchState::Preparing { completion, .. } => completion.await.unwrap_or_else(|_| {
+            Err(anyhow::anyhow!(
+                "audio output worker stopped without a result"
+            ))
+        }),
+    }
 }
 
 /// Rolling baseline of [`mean_absolute_deviation`] for the activity detector. Only
@@ -1212,11 +1370,7 @@ struct RunningSession {
     control: mpsc::Receiver<SessionControl>,
     browser_departure: watch::Receiver<BrowserDeparture>,
     audio: watch::Receiver<LiveAudioSettings>,
-    applied_audio: LiveAudioSettings,
-    desired_audio: LiveAudioSettings,
-    output_switch_tx: mpsc::UnboundedSender<(AudioOutput, anyhow::Result<audio::PreparedOutput>)>,
-    output_switch_rx: mpsc::UnboundedReceiver<(AudioOutput, anyhow::Result<audio::PreparedOutput>)>,
-    output_switch_in_flight: bool,
+    output_switch: OutputSwitchState,
     cues: Vec<CueState>,
     track: TrackInfo,
     /// `Some` on a rest track; the finalizer logs the played stretch.
@@ -1254,7 +1408,6 @@ impl RunningSession {
         playback: Playback,
         lease: SessionLease,
     ) -> Self {
-        let (output_switch_tx, output_switch_rx) = mpsc::unbounded_channel();
         let cues = beatmap
             .iter()
             .map(|(index, note)| CueState {
@@ -1262,11 +1415,7 @@ impl RunningSession {
                 class_id: note.class_id.clone(),
                 at_track: note.at,
                 hold: note.hold,
-                at_wall: None,
-                release_wall: None,
-                logged: false,
-                resolved: false,
-                peak_activity: 0.0,
+                lifecycle: CueLifecycle::Unplaced,
             })
             .collect();
         Self {
@@ -1276,11 +1425,9 @@ impl RunningSession {
             control,
             browser_departure,
             audio,
-            desired_audio: applied_audio.clone(),
-            applied_audio,
-            output_switch_tx,
-            output_switch_rx,
-            output_switch_in_flight: false,
+            output_switch: OutputSwitchState::Stable {
+                applied: applied_audio,
+            },
             cues,
             track,
             rest_label,
@@ -1339,11 +1486,8 @@ impl RunningSession {
                         "collection audio control channel closed".into(),
                     ),
                 },
-                switched = self.output_switch_rx.recv() => match switched {
-                    Some((output, result)) => self.finish_output_switch(output, result),
-                    None => break SessionExit::TaskFailed(
-                        "collection audio switch channel closed".into(),
-                    ),
+                switched = wait_for_output_switch(&mut self.output_switch) => {
+                    self.finish_output_switch(switched)
                 },
                 frame = next_emg(self.capture.emg_receiver_mut()) => match frame {
                     Ok(Frame::Emg { seq, t0_us, channels, samples, missing, .. }) => {
@@ -1373,26 +1517,42 @@ impl RunningSession {
     }
 
     fn apply_audio_settings(&mut self, settings: LiveAudioSettings) {
-        self.desired_audio = settings.clone();
-        if settings.gain != self.applied_audio.gain {
+        if settings.gain != self.output_switch.applied().gain {
             self.playback.set_music_gain(settings.gain);
-            self.applied_audio.gain = settings.gain;
         }
-        if settings.output != self.applied_audio.output && !self.output_switch_in_flight {
-            self.begin_output_switch(settings.output);
+        match &mut self.output_switch {
+            OutputSwitchState::Stable { applied } => {
+                applied.gain = settings.gain;
+                if settings.output != applied.output {
+                    self.begin_output_switch(settings);
+                }
+            }
+            OutputSwitchState::Preparing {
+                applied, desired, ..
+            } => {
+                applied.gain = settings.gain;
+                *desired = settings;
+            }
         }
     }
 
-    fn begin_output_switch(&mut self, output: AudioOutput) {
-        self.output_switch_in_flight = true;
-        let request = self.playback.output_switch_request(output.clone());
-        let sender = self.output_switch_tx.clone();
+    fn begin_output_switch(&mut self, desired: LiveAudioSettings) {
+        let applied = self.output_switch.applied().clone();
+        let target = desired.output.clone();
+        let request = self.playback.output_switch_request(target.clone());
+        let (sender, completion) = oneshot::channel();
+        self.output_switch = OutputSwitchState::Preparing {
+            applied,
+            desired,
+            target,
+            completion,
+        };
         tokio::spawn(async move {
             let result = tokio::task::spawn_blocking(move || request.prepare())
                 .await
                 .map_err(|error| anyhow::anyhow!("audio output worker failed: {error}"))
                 .and_then(|result| result);
-            let _ = sender.send((output, result));
+            let _ = sender.send(result);
         });
     }
 
@@ -1451,9 +1611,11 @@ impl RunningSession {
     /// from this anchor. Logged cues keep the times they were logged with: those
     /// are what the subject was actually shown.
     fn place_unlogged_cues(&mut self, anchor: UnixMilliseconds) {
-        for cue in self.cues.iter_mut().filter(|cue| !cue.logged) {
-            cue.at_wall = Some(anchor.at_track_position(cue.at_track));
-            cue.release_wall = Some(anchor.at_track_position(cue.at_track.plus(cue.hold)));
+        for cue in &mut self.cues {
+            cue.lifecycle.place(CuePlacement {
+                at: anchor.at_track_position(cue.at_track),
+                release: anchor.at_track_position(cue.at_track.plus(cue.hold)),
+            });
         }
     }
 
@@ -1471,18 +1633,25 @@ impl RunningSession {
     /// re-placed against a fresh anchor — the same re-derivation a resume does,
     /// for the same reason. Cues already logged keep the instants they were
     /// logged with: those are when the subject actually heard them.
-    fn finish_output_switch(
-        &mut self,
-        output: AudioOutput,
-        result: anyhow::Result<audio::PreparedOutput>,
-    ) {
-        self.output_switch_in_flight = false;
-        if output != self.desired_audio.output {
+    fn finish_output_switch(&mut self, result: OutputSwitchResult) {
+        let (applied, desired, target) = match &self.output_switch {
+            OutputSwitchState::Preparing {
+                applied,
+                desired,
+                target,
+                ..
+            } => (applied.clone(), desired.clone(), target.clone()),
+            OutputSwitchState::Stable { .. } => {
+                unreachable!("a stable output switch never produces a completion")
+            }
+        };
+        if target != desired.output {
             // Latest wins. Dropping a successfully prepared stale sink stops
             // its private thread without ever making it audible.
             drop(result);
-            if self.applied_audio.output != self.desired_audio.output {
-                self.begin_output_switch(self.desired_audio.output.clone());
+            self.output_switch = OutputSwitchState::Stable { applied };
+            if self.output_switch.applied().output != desired.output {
+                self.begin_output_switch(desired);
             }
             return;
         }
@@ -1493,12 +1662,13 @@ impl RunningSession {
                     "could not switch audio output: {error:#}; still on {}",
                     self.playback.output_name()
                 ));
+                self.output_switch = OutputSwitchState::Stable { applied };
                 return;
             }
         };
         self.playback.install_prepared_output(prepared);
-        self.playback.set_music_gain(self.desired_audio.gain);
-        self.applied_audio = self.desired_audio.clone();
+        self.playback.set_music_gain(desired.gain);
+        self.output_switch = OutputSwitchState::Stable { applied: desired };
         tracing::info!(
             "collection audio moved to '{}' at {} Hz",
             self.playback.output_name(),
@@ -1584,16 +1754,14 @@ impl RunningSession {
     /// rest of the hold would label rest as a gesture.
     fn interrupt_cues_in_progress(&mut self, at: UnixMilliseconds) {
         for position in 0..self.cues.len() {
-            let cue = &self.cues[position];
-            if !cue.logged || cue.resolved {
+            let Some((placement, peak_activity)) = self.cues[position].lifecycle.interrupt() else {
                 continue;
-            }
+            };
             // A cue whose hold already ran out was shown in full; it is only
             // waiting on its activity window, so it resolves as usual.
-            let held_through = cue.release_wall.is_some_and(|release| release > at);
-            let index = cue.index;
-            self.cues[position].resolved = true;
-            let hit = self.cue_hit(position);
+            let held_through = placement.release > at;
+            let index = self.cues[position].index;
+            let hit = self.activity_is_hit(peak_activity);
             if hit {
                 self.activity_hits += 1;
             }
@@ -1638,10 +1806,14 @@ impl RunningSession {
         // A cue whose onset is already behind the resumed playhead was never
         // shown — the pause froze the timeline just short of it. Retire it
         // silently rather than logging a gesture nobody was asked for.
-        for cue in self.cues.iter_mut().filter(|cue| !cue.logged) {
-            if cue.at_track < position {
-                cue.logged = true;
-                cue.resolved = true;
+        for cue in &mut self.cues {
+            if cue.at_track < position
+                && matches!(
+                    cue.lifecycle,
+                    CueLifecycle::Unplaced | CueLifecycle::Placed { .. }
+                )
+            {
+                cue.lifecycle.skip_unpresented();
             }
         }
         self.place_unlogged_cues(anchor);
@@ -1715,18 +1887,19 @@ impl RunningSession {
         let arrival = arrival.get();
         let mut near_cue = false;
         for cue in &mut self.cues {
-            let (Some(at_wall), Some(release_wall)) = (cue.at_wall, cue.release_wall) else {
+            let Some(placement) = cue.lifecycle.placement() else {
                 continue;
             };
             // The activity window spans the whole hold, with slop either side.
-            let window_start = at_wall
+            let window_start = placement
+                .at
                 .get()
                 .saturating_sub(ACTIVITY_WINDOW_BEFORE_MILLISECONDS);
-            let window_end = release_wall.get() + ACTIVITY_WINDOW_AFTER_MILLISECONDS;
+            let window_end = placement.release.get() + ACTIVITY_WINDOW_AFTER_MILLISECONDS;
             if arrival >= window_start && arrival <= window_end {
                 near_cue = true;
-                if !cue.resolved {
-                    cue.peak_activity = cue.peak_activity.max(mean_absolute);
+                if let Some(peak_activity) = cue.lifecycle.peak_activity_mut() {
+                    *peak_activity = peak_activity.max(mean_absolute);
                 }
             }
         }
@@ -1781,28 +1954,22 @@ impl RunningSession {
     }
 
     /// Whether a cue's peak activity beat the rolling baseline.
-    fn cue_hit(&self, position: usize) -> bool {
+    fn activity_is_hit(&self, peak_activity: f32) -> bool {
         match self.baseline.value {
-            Some(baseline) if baseline > 0.0 => {
-                self.cues[position].peak_activity > baseline * ACTIVITY_HIT_FACTOR
-            }
+            Some(baseline) if baseline > 0.0 => peak_activity > baseline * ACTIVITY_HIT_FACTOR,
             _ => false,
         }
     }
 
     fn resolve_cues(&mut self, current: UnixMilliseconds) {
         for position in 0..self.cues.len() {
-            let cue = &mut self.cues[position];
-            let (Some(at_wall), Some(release_wall)) = (cue.at_wall, cue.release_wall) else {
-                continue;
-            };
-            if !cue.logged && current >= at_wall {
-                cue.logged = true;
+            if let Some(placement) = self.cues[position].lifecycle.log_if_due(current) {
+                let cue = &self.cues[position];
                 let event = SessionEvent::Cue {
                     note_index: cue.index,
                     class_id: cue.class_id.clone(),
-                    at: at_wall,
-                    release: release_wall,
+                    at: placement.at,
+                    release: placement.release,
                 };
                 *self.cues_per_class.entry(cue.class_id.clone()).or_insert(0) += 1;
                 if let Some(recorder) = self.capture.recorder_mut() {
@@ -1811,13 +1978,11 @@ impl RunningSession {
                     }
                 }
             }
-            let index = cue.index;
-            if cue.logged
-                && !cue.resolved
-                && current.get() > release_wall.get() + ACTIVITY_WINDOW_AFTER_MILLISECONDS
+            if let Some((_placement, peak_activity)) =
+                self.cues[position].lifecycle.resolve_if_due(current)
             {
-                cue.resolved = true;
-                let hit = self.cue_hit(position);
+                let index = self.cues[position].index;
+                let hit = self.activity_is_hit(peak_activity);
                 if hit {
                     self.activity_hits += 1;
                     let event = SessionEvent::ActivityHit {
@@ -2332,5 +2497,119 @@ mod tests {
     fn an_empty_or_channel_less_window_has_no_measure() {
         assert_eq!(mean_absolute_deviation(16, &[]), None);
         assert_eq!(mean_absolute_deviation(0, &blob(&[&[1i16, 2]])), None);
+    }
+
+    fn cue_placement() -> CuePlacement {
+        CuePlacement {
+            at: UnixMilliseconds::new(1_000),
+            release: UnixMilliseconds::new(1_250),
+        }
+    }
+
+    #[test]
+    fn cue_lifecycle_preserves_the_logged_instants_until_resolution() {
+        let placement = cue_placement();
+        let mut cue = CueLifecycle::Unplaced;
+        cue.place(placement);
+        assert!(cue.log_if_due(UnixMilliseconds::new(999)).is_none());
+        assert_eq!(cue.log_if_due(placement.at), Some(placement));
+
+        // Re-anchoring cannot rewrite an event that has already been logged.
+        cue.place(CuePlacement {
+            at: UnixMilliseconds::new(9_000),
+            release: UnixMilliseconds::new(9_250),
+        });
+        assert_eq!(cue.placement(), Some(placement));
+        assert!(cue
+            .resolve_if_due(UnixMilliseconds::new(
+                placement.release.get() + ACTIVITY_WINDOW_AFTER_MILLISECONDS
+            ))
+            .is_none());
+        assert_eq!(
+            cue.resolve_if_due(UnixMilliseconds::new(
+                placement.release.get() + ACTIVITY_WINDOW_AFTER_MILLISECONDS + 1
+            )),
+            Some((placement, 0.0))
+        );
+        assert!(matches!(cue, CueLifecycle::Resolved { .. }));
+    }
+
+    #[test]
+    fn cue_transition_serializes_the_original_placed_interval() {
+        let placement = cue_placement();
+        let mut cue = CueLifecycle::Unplaced;
+        cue.place(placement);
+        let logged = cue
+            .log_if_due(placement.at)
+            .expect("a due placed cue becomes logged exactly once");
+        let json = serde_json::to_value(SessionEvent::Cue {
+            note_index: NoteIndex(7),
+            class_id: ClassId("fist".into()),
+            at: logged.at,
+            release: logged.release,
+        })
+        .unwrap();
+
+        assert_eq!(json["type"], "cue");
+        assert_eq!(json["at"], placement.at.get());
+        assert_eq!(json["release"], placement.release.get());
+        assert!(cue.log_if_due(UnixMilliseconds::new(9_000)).is_none());
+    }
+
+    #[test]
+    fn skipped_and_resolved_cues_cannot_be_presented_again() {
+        let placement = cue_placement();
+        let mut skipped = CueLifecycle::Unplaced;
+        skipped.place(placement);
+        skipped.skip_unpresented();
+        skipped.place(placement);
+        assert!(skipped.log_if_due(placement.at).is_none());
+        assert!(matches!(skipped, CueLifecycle::Skipped));
+
+        let mut interrupted = CueLifecycle::Unplaced;
+        interrupted.place(placement);
+        assert_eq!(interrupted.log_if_due(placement.at), Some(placement));
+        assert_eq!(interrupted.interrupt(), Some((placement, 0.0)));
+        assert!(interrupted.interrupt().is_none());
+        interrupted.place(placement);
+        assert!(matches!(interrupted, CueLifecycle::Resolved { .. }));
+    }
+
+    #[tokio::test]
+    async fn output_switch_state_owns_exactly_one_completion_and_target() {
+        let applied = LiveAudioSettings {
+            output: AudioOutput::Default,
+            gain: 0.5,
+        };
+        let desired = LiveAudioSettings {
+            output: AudioOutput::Named("headphones".into()),
+            gain: 0.75,
+        };
+        let (sender, completion) = oneshot::channel();
+        let mut state = OutputSwitchState::Preparing {
+            applied,
+            desired,
+            target: AudioOutput::Named("headphones".into()),
+            completion,
+        };
+        assert!(
+            sender
+                .send(Err(anyhow::anyhow!("injected preparation failure")))
+                .is_ok(),
+            "the sole completion receiver is live"
+        );
+
+        let error = match wait_for_output_switch(&mut state).await {
+            Ok(_) => panic!("the injected preparation unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("injected preparation failure"));
+        assert!(matches!(
+            state,
+            OutputSwitchState::Preparing {
+                target: AudioOutput::Named(ref name),
+                ..
+            } if name == "headphones"
+        ));
     }
 }
