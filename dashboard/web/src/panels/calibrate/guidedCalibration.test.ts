@@ -12,6 +12,7 @@ import {
   calibrationSongEndFixture,
   calibrationTechnicalFailureFixture,
 } from './guidedCalibrationFixtures.ts';
+import { isGuidedCalibrationSnapshot } from '../../lib/protocol.ts';
 
 function songEnd(
   candidateAvailable: boolean,
@@ -76,4 +77,44 @@ test('fixtures cover every guided calibration presentation phase', () => {
     new Set(calibrationPlayingFixture.cues.map((cue) => cue.thumbVariant)),
     new Set(['up', 'down']),
   );
+});
+
+test('calibration lanes carry the same user-facing Collect presentation', () => {
+  assert.deepEqual(
+    calibrationPlayingFixture.lanes.map(({ id, label, colorName, motion }) => ({
+      id,
+      label,
+      colorName,
+      arrow: motion?.arrow ?? null,
+    })),
+    [
+      { id: 'wrist_pronation', label: 'Tip out', colorName: 'blue', arrow: 'right' },
+      { id: 'wrist_supination', label: 'Tip in', colorName: 'amber', arrow: 'left' },
+      { id: 'wrist_radial_deviation', label: 'Tip forward', colorName: 'green', arrow: 'up' },
+      { id: 'wrist_ulnar_deviation', label: 'Tip back', colorName: 'purple', arrow: 'down' },
+      { id: 'thumb_extension', label: 'Lift thumb', colorName: 'pink', arrow: null },
+    ],
+  );
+});
+
+test('playing wire snapshots require the source-time playhead pair', () => {
+  const wire = {
+    ...calibrationPlayingFixture,
+    lanes: calibrationPlayingFixture.lanes.map((lane) => ({
+      visual_lane: lane.visualLane,
+      id: lane.id,
+      label: lane.label,
+      color_name: lane.colorName,
+      motion: lane.motion,
+    })),
+    cues: calibrationPlayingFixture.cues.map((cue) => ({
+      visual_lane: cue.visualLane,
+      at: cue.at,
+      hold: cue.hold,
+      thumb_variant: cue.thumbVariant,
+    })),
+  };
+  assert.equal(isGuidedCalibrationSnapshot(wire), true);
+  const { position_observed_at_unix_ms: _omitted, ...untimestamped } = wire;
+  assert.equal(isGuidedCalibrationSnapshot(untimestamped), false);
 });

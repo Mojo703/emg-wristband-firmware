@@ -705,6 +705,7 @@ enum CalibrationActionPhase {
     PlayingPaused,
     BetweenSongs,
     TechnicalFailure,
+    Exiting,
 }
 
 fn calibration_action_phase(
@@ -728,6 +729,7 @@ fn calibration_action_phase(
         protocol::GuidedCalibrationSnapshot::TechnicalFailure { .. } => {
             CalibrationActionPhase::TechnicalFailure
         }
+        protocol::GuidedCalibrationSnapshot::Exiting { .. } => CalibrationActionPhase::Exiting,
     }
 }
 
@@ -737,6 +739,7 @@ fn is_terminal_action(action: &protocol::GuidedSessionAction) -> bool {
         protocol::GuidedSessionAction::SaveCalibration
             | protocol::GuidedSessionAction::ContinueCalibration
             | protocol::GuidedSessionAction::DiscardCalibration
+            | protocol::GuidedSessionAction::ExitCalibration
     )
 }
 

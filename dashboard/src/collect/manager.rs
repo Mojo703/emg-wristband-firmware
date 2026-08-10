@@ -337,6 +337,13 @@ impl CollectionManager {
         }
     }
 
+    /// The presentation descriptors for the five gesture lanes. Calibration
+    /// deliberately reads this same catalog instead of maintaining a second
+    /// set of labels, colours, or motion hints that can drift from Collect.
+    pub fn collection_classes(&self) -> Vec<protocol::CollectionClass> {
+        self.catalog.read().unwrap().collection_classes().to_vec()
+    }
+
     /// The track library's root, for the import and delete routes.
     pub fn tracks_root(&self) -> &std::path::Path {
         &self.catalog_paths.tracks_root

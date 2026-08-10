@@ -899,6 +899,7 @@ pub enum GuidedSessionAction {
     SaveCalibration,
     ContinueCalibration,
     DiscardCalibration,
+    ExitCalibration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -965,6 +966,10 @@ pub enum GuidedCalibrationSnapshot {
         lanes: Vec<GuidedCalibrationLane>,
         cues: Vec<GuidedCalibrationCue>,
         position_ms: u64,
+        /// Wall-clock instant when `position_ms` reaches the listener, from the
+        /// audio sink's measured timeline. Browsers extrapolate this sparse
+        /// authoritative pair instead of advancing from WebSocket receipt.
+        position_observed_at_unix_ms: UnixMilliseconds,
         valid_reps: u32,
         invalid_reps: u32,
         paused_reason: Option<String>,
@@ -981,6 +986,12 @@ pub enum GuidedCalibrationSnapshot {
         valid_reps: u32,
         invalid_reps: u32,
         deficits: Vec<String>,
+    },
+    /// A single-use operator exit is in progress. The backend keeps this
+    /// projection authoritative until the exact device-side Discard result is
+    /// observed; browsers must not infer completion from sending the intent.
+    Exiting {
+        detail: String,
     },
     TechnicalFailure {
         detail: String,
@@ -5136,6 +5147,34 @@ mod tests {
                     phase_generation: 7,
                 },
                 action: GuidedSessionAction::StartCalibration,
+            },
+            Frame::GuidedSessionIntent {
+                authority: GuidedActionAuthority {
+                    run_revision: 4,
+                    session_id: Some(9),
+                    phase_generation: 8,
+                },
+                action: GuidedSessionAction::ExitCalibration,
+            },
+            Frame::GuidedSessionSnapshot {
+                snapshot: GuidedSessionSnapshot {
+                    revision: 13,
+                    run_revision: 4,
+                    action_authority: GuidedActionAuthority {
+                        run_revision: 4,
+                        session_id: Some(9),
+                        phase_generation: 8,
+                    },
+                    visible_collection_views: 0,
+                    visible_calibration_views: 1,
+                    lifecycle: GuidedSessionState::Calibration {
+                        session_id: 9,
+                        device_id: Some("opal-test".into()),
+                        calibration: Some(GuidedCalibrationSnapshot::Exiting {
+                            detail: "waiting for exact Discard acknowledgement".into(),
+                        }),
+                    },
+                },
             },
         ];
 

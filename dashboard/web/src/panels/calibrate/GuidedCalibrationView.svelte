@@ -2,7 +2,9 @@
   // Authoritative-snapshot renderer only. This component remains deliberately
   // unmounted until the guided coordinator publishes browser snapshots.
   import { Button } from '$lib/components/ui/button/index.js';
-  import { asTrackMilliseconds } from '../../lib/protocol';
+  import { onMount } from 'svelte';
+  import { asTrackMilliseconds, nowUnixMilliseconds } from '../../lib/protocol';
+  import { PresentationPlayhead } from '../../lib/collect/presentationPlayhead';
   import { theme } from '../../lib/theme.svelte';
   import PlayfieldView from '../../lib/collect/PlayfieldView.svelte';
   import {
@@ -34,6 +36,35 @@
     onResume,
     onSongEndAction,
   }: Props = $props();
+
+  const presentationPlayhead = new PresentationPlayhead();
+  let forcePlayheadSnap = true;
+
+  $effect(() => {
+    if (snapshot.phase !== 'playing') return;
+    presentationPlayhead.observe(
+      snapshot.position_ms,
+      snapshot.position_observed_at_unix_ms,
+      snapshot.paused_reason === null,
+      nowUnixMilliseconds(),
+      forcePlayheadSnap,
+    );
+    forcePlayheadSnap = false;
+  });
+
+  onMount(() => {
+    const visibilityChanged = (): void => {
+      if (!document.hidden) forcePlayheadSnap = true;
+    };
+    document.addEventListener('visibilitychange', visibilityChanged);
+    return () => document.removeEventListener('visibilitychange', visibilityChanged);
+  });
+
+  function currentPosition() {
+    const position = presentationPlayhead.value(nowUnixMilliseconds());
+    const duration = snapshot.phase === 'playing' ? snapshot.track.duration_ms : 0;
+    return asTrackMilliseconds(Math.min(position, duration));
+  }
 
   const playfield = $derived.by(() => {
     if (snapshot.phase !== 'playing') return null;
@@ -136,7 +167,7 @@
         {playfield}
         lanes={snapshot.lanes}
         {laneColors}
-        currentPosition={() => asTrackMilliseconds(snapshot.position_ms)}
+        {currentPosition}
         {laneHits}
         {laneMisses}
         canvasDuplicate={true}

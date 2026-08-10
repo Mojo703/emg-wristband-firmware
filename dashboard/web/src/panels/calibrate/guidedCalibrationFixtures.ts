@@ -6,6 +6,7 @@ import type {
   CalibrationTechnicalFailureSnapshot,
   FiveCalibrationLanes,
 } from './guidedCalibration';
+import { asUnixMilliseconds } from '../../lib/protocol.ts';
 
 const contentIdentity = 'a'.repeat(64);
 
@@ -84,6 +85,7 @@ export const calibrationPlayingFixture: CalibrationPlayingSnapshot = {
     thumbVariant: semanticColumn < 5 ? ThumbVariant.Up : ThumbVariant.Down,
   })),
   position_ms: 18_000,
+  position_observed_at_unix_ms: asUnixMilliseconds(1_800_000_018_000),
   valid_reps: 37,
   invalid_reps: 2,
   paused_reason: null,

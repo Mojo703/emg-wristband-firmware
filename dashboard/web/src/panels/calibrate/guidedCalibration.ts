@@ -1,6 +1,7 @@
 import type {
   GestureMotion,
   GuidedCalibrationSnapshot as WireGuidedCalibrationSnapshot,
+  UnixMilliseconds,
 } from '../../lib/protocol';
 import type { CuePresentation, VisualLane } from '../../lib/collect/field';
 import type { CalibrationTrack } from './calibrationTracks';
@@ -41,6 +42,7 @@ export interface CalibrationPlayingSnapshot {
   readonly lanes: FiveCalibrationLanes;
   readonly cues: readonly CuePresentation[];
   readonly position_ms: number;
+  readonly position_observed_at_unix_ms: UnixMilliseconds;
   readonly valid_reps: number;
   readonly invalid_reps: number;
   readonly paused_reason: string | null;
@@ -72,11 +74,17 @@ export interface CalibrationTechnicalFailureSnapshot {
   readonly detail: string;
 }
 
+export interface CalibrationExitingSnapshot {
+  readonly phase: 'exiting';
+  readonly detail: string;
+}
+
 export type GuidedCalibrationSnapshot =
   | CalibrationSetupSnapshot
   | CalibrationPreparingSnapshot
   | CalibrationPlayingSnapshot
   | CalibrationSongEndSnapshot
+  | CalibrationExitingSnapshot
   | CalibrationTechnicalFailureSnapshot;
 
 export type CalibrationSongEndAction = 'save' | 'continue' | 'discard';

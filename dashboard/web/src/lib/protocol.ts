@@ -1089,6 +1089,7 @@ export type GuidedCalibrationSnapshot =
       ];
       readonly cues: readonly GuidedCalibrationCue[];
       readonly position_ms: number;
+      readonly position_observed_at_unix_ms: UnixMilliseconds;
       readonly valid_reps: number;
       readonly invalid_reps: number;
       readonly paused_reason: string | null;
@@ -1104,6 +1105,10 @@ export type GuidedCalibrationSnapshot =
       readonly valid_reps: number;
       readonly invalid_reps: number;
       readonly deficits: readonly string[];
+    }
+  | {
+      readonly phase: 'exiting';
+      readonly detail: string;
     }
   | {
       readonly phase: 'technical_failure';
@@ -1168,7 +1173,8 @@ export type GuidedSessionAction =
   | { readonly name: 'resume_calibration' }
   | { readonly name: 'save_calibration' }
   | { readonly name: 'continue_calibration' }
-  | { readonly name: 'discard_calibration' };
+  | { readonly name: 'discard_calibration' }
+  | { readonly name: 'exit_calibration' };
 
 export interface GuidedSessionIntentFrame {
   readonly type: 'guided_session_intent';
@@ -1825,6 +1831,7 @@ export function isGuidedCalibrationSnapshot(
         Array.isArray(value['cues']) &&
         value['cues'].every(isGuidedCalibrationCue) &&
         isNonnegativeInteger(value['position_ms']) &&
+        isNonnegativeInteger(value['position_observed_at_unix_ms']) &&
         isNonnegativeInteger(value['valid_reps']) &&
         isNonnegativeInteger(value['invalid_reps']) &&
         (value['paused_reason'] === null || isString(value['paused_reason'])) &&
@@ -1853,6 +1860,7 @@ export function isGuidedCalibrationSnapshot(
         isNonnegativeInteger(value['invalid_reps']) &&
         isStringArray(value['deficits'])
       );
+    case 'exiting':
     case 'technical_failure':
       return isString(value['detail']);
     default:
@@ -1959,6 +1967,7 @@ function isGuidedSessionAction(value: unknown): value is GuidedSessionAction {
     case 'save_calibration':
     case 'continue_calibration':
     case 'discard_calibration':
+    case 'exit_calibration':
       return true;
     default:
       return false;

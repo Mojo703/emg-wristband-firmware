@@ -64,6 +64,10 @@ enum RunAction {
     Save,
     /// Drop the candidate while retaining the previous resident model.
     Discard,
+    /// End the run from any phase. Unlike the between-songs Discard decision,
+    /// a committed schedule must first reach its device-owned interruption
+    /// boundary before its candidate can be discarded.
+    Exit,
 }
 
 /// Latest requested heartbeat/playback gate. Before Commit, pause and resume
@@ -221,6 +225,7 @@ enum PlaybackState {
     Dormant,
     Armed {
         playback: crate::collect::audio::Playback,
+        audible_anchor: protocol::UnixMilliseconds,
     },
     Playing(crate::collect::audio::Playback),
 }
@@ -378,15 +383,32 @@ enum CandidateState {
 /// arrives, while making a duplicate/racing terminal action unrepresentable.
 enum TerminalDecision {
     Open,
+    AwaitingInterruption { deadline: tokio::time::Instant },
     AwaitingSave { deadline: tokio::time::Instant },
     AwaitingDiscard { deadline: tokio::time::Instant },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExitRoute {
+    DiscardNow,
+    InterruptThenDiscard,
+}
+
+fn exit_route(commit: &ScheduleCommitPhase, evidence: &EvidenceState) -> ExitRoute {
+    if matches!(commit, ScheduleCommitPhase::AwaitingDeviceReadiness) || evidence.is_retained() {
+        ExitRoute::DiscardNow
+    } else {
+        ExitRoute::InterruptThenDiscard
+    }
 }
 
 impl TerminalDecision {
     fn deadline(&self) -> Option<tokio::time::Instant> {
         match self {
             Self::Open => None,
-            Self::AwaitingSave { deadline } | Self::AwaitingDiscard { deadline } => Some(*deadline),
+            Self::AwaitingInterruption { deadline }
+            | Self::AwaitingSave { deadline }
+            | Self::AwaitingDiscard { deadline } => Some(*deadline),
         }
     }
 
@@ -425,7 +447,8 @@ fn run_action_is_authorized(
     match action {
         RunAction::Continue | RunAction::SelectNextTrack(_) => evidence.is_retained(),
         RunAction::Save => evidence.is_retained() && candidate.permits_activation(),
-        RunAction::Discard => true,
+        RunAction::Discard => evidence.is_retained(),
+        RunAction::Exit => true,
     }
 }
 
@@ -596,6 +619,7 @@ impl CalibrationModeAdapter {
             ));
             return;
         };
+        let collection_classes = playback_collection.collection_classes();
         let mut prepared_playback = prepare_playback(playback_collection.clone(), &track);
         let binding = lease.binding().clone();
         let mut heartbeat = tokio::time::interval(std::time::Duration::from_millis(u64::from(
@@ -719,10 +743,17 @@ impl CalibrationModeAdapter {
                                 break delivery_failure(error);
                             }
                             if let PlaybackState::Playing(playback) = &playback {
-                                let position = playback.timeline().position.get() as u64;
+                                let timeline = playback.timeline();
                                 let _ = self.coordinator.update_calibration(
                                     &binding,
-                                    playing_snapshot(&track, position),
+                                    playing_snapshot(
+                                        &track,
+                                        CalibrationPlayhead {
+                                            position_ms: u64::from(timeline.position.get()),
+                                            observed_at: timeline.heard_at,
+                                        },
+                                        &collection_classes,
+                                    ),
                                 );
                             }
                     }
@@ -764,6 +795,14 @@ impl CalibrationModeAdapter {
                                 next_sequence: 0,
                             }
                         };
+                        // Exit after Commit deliberately never opens or arms
+                        // audio. The device owns the accepted anchor, so the
+                        // actor waits for its heartbeat-timeout interruption
+                        // before issuing the durable Discard.
+                        if matches!(terminal, TerminalDecision::AwaitingInterruption { .. }) {
+                            heartbeat_mode = HeartbeatMode::Withheld;
+                            continue;
+                        }
                         let host_anchor = self
                             .timing
                             .lock()
@@ -773,10 +812,6 @@ impl CalibrationModeAdapter {
                                 &device.device_id,
                                 accepted.anchor_device_monotonic_microseconds,
                             ));
-                        let deadline = match playback_deadline(host_anchor, unix_milliseconds(), tokio::time::Instant::now()) {
-                            Ok(deadline) => deadline,
-                            Err(detail) => break SessionExit::DependencyFailed(detail.into()),
-                        };
                         let opened = match consume_playback_preparation(
                             &mut prepared_playback,
                             &track.content_identity,
@@ -784,7 +819,41 @@ impl CalibrationModeAdapter {
                             Ok(opened) => opened,
                             Err(detail) => break SessionExit::TaskFailed(detail),
                         };
-                        playback = PlaybackState::Armed { playback: opened };
+                        // The accepted anchor is when the subject/device must
+                        // hear track position zero, not when the host begins
+                        // filling the output queue. Collection derives this
+                        // boundary from Timeline::heard_at. Calibration has an
+                        // independently fixed device anchor, so start the
+                        // already-warmed sink one measured output latency
+                        // earlier to make its audible cursor meet that anchor.
+                        let output_latency = opened.output_latency();
+                        let deadline = match playback_deadline(
+                            host_anchor,
+                            output_latency,
+                            unix_milliseconds(),
+                            tokio::time::Instant::now(),
+                        ) {
+                            Ok(deadline) => deadline,
+                            Err(detail) => break SessionExit::DependencyFailed(detail.into()),
+                        };
+                        tracing::info!(
+                            device_id = %device.device_id,
+                            device_anchor_microseconds = accepted.anchor_device_monotonic_microseconds,
+                            host_audible_anchor_milliseconds = host_anchor.expect("a deadline requires a mapped host anchor"),
+                            output_latency_milliseconds = output_latency.get(),
+                            "calibration audio armed against the device's audible anchor"
+                        );
+                        let Ok(audible_anchor) = u64::try_from(
+                            host_anchor.expect("a deadline requires a mapped host anchor"),
+                        ) else {
+                            break SessionExit::DependencyFailed(
+                                "the mapped calibration anchor precedes the Unix epoch".into(),
+                            );
+                        };
+                        playback = PlaybackState::Armed {
+                            playback: opened,
+                            audible_anchor: protocol::UnixMilliseconds::new(audible_anchor),
+                        };
                         playback_alarm.as_mut().reset(deadline);
                     }
                     Ok(Frame::CalibrationScheduleUploadAcknowledged { acknowledgement })
@@ -876,12 +945,19 @@ impl CalibrationModeAdapter {
                         if interruption.run == run
                             && interruption.schedule_revision == schedule_revision
                             && interruption.content_identity == track.content_identity => {
-                        enter_between_songs(
-                            &mut evidence,
-                            &track.title,
-                            &mut heartbeat_mode,
-                            &mut playback,
-                        );
+                        if matches!(terminal, TerminalDecision::AwaitingInterruption { .. }) {
+                            if let Err(error) = self.registry.send_bound_control(
+                                &device,
+                                Frame::CalibrationDiscard { run },
+                            ) {
+                                break delivery_failure(error);
+                            }
+                            terminal = TerminalDecision::AwaitingDiscard {
+                                deadline: tokio::time::Instant::now() + TERMINAL_DECISION_TIMEOUT,
+                            };
+                            continue;
+                        }
+                        enter_between_songs(&mut evidence, &track.title, &mut heartbeat_mode, &mut playback);
                         let _ = self.coordinator.update_calibration(
                             &binding,
                             between_songs_snapshot(
@@ -899,6 +975,20 @@ impl CalibrationModeAdapter {
                             && result.content_identity == track.content_identity => {
                         song_counts = result.counts;
                         candidate = candidate.with_validity(result.validity);
+                        if matches!(terminal, TerminalDecision::AwaitingInterruption { .. }) {
+                            heartbeat_mode = HeartbeatMode::Withheld;
+                            playback = PlaybackState::Dormant;
+                            if let Err(error) = self.registry.send_bound_control(
+                                &device,
+                                Frame::CalibrationDiscard { run },
+                            ) {
+                                break delivery_failure(error);
+                            }
+                            terminal = TerminalDecision::AwaitingDiscard {
+                                deadline: tokio::time::Instant::now() + TERMINAL_DECISION_TIMEOUT,
+                            };
+                            continue;
+                        }
                         // A normal song result is the same transport/output
                         // boundary as an explicit interruption.  Previously
                         // the UI entered BetweenSongs while the actor kept
@@ -968,7 +1058,9 @@ impl CalibrationModeAdapter {
                         );
                     }
                 },
-                _ = upload_ack_timeout.tick(), if !matches!(upload, UploadPhase::Complete) => {
+                _ = upload_ack_timeout.tick(),
+                    if !matches!(upload, UploadPhase::Complete)
+                        && matches!(terminal, TerminalDecision::Open) => {
                     match upload_timeout_action(&upload, chunk_ack_retries) {
                         UploadTimeoutAction::FailBegin => {
                             // Begin is not idempotent on the device: retrying it
@@ -997,7 +1089,8 @@ impl CalibrationModeAdapter {
                     }
                 }
                 _ = tokio::time::sleep_until(schedule_acceptance_deadline),
-                    if matches!(commit_phase, ScheduleCommitPhase::Sent { .. }) => {
+                    if matches!(commit_phase, ScheduleCommitPhase::Sent { .. })
+                        && matches!(terminal, TerminalDecision::Open) => {
                     debug_assert!(commit_phase.acceptance_timed_out(tokio::time::Instant::now()));
                     // Commit is terminal and not idempotent. A lost acceptance
                     // cannot safely be reconstructed by the host, especially
@@ -1009,6 +1102,7 @@ impl CalibrationModeAdapter {
                 _ = tokio::time::sleep_until(terminal_deadline),
                     if !matches!(terminal, TerminalDecision::Open) => {
                     let operation = match terminal {
+                        TerminalDecision::AwaitingInterruption { .. } => "Exit interruption",
                         TerminalDecision::AwaitingSave { .. } => "Save",
                         TerminalDecision::AwaitingDiscard { .. } => "Discard",
                         TerminalDecision::Open => unreachable!(),
@@ -1026,6 +1120,40 @@ impl CalibrationModeAdapter {
                     // Continue cannot replace an upload that is still being
                     // prepared, acknowledged, or played.
                     if !run_action_is_authorized(&command, &evidence, candidate, &terminal) {
+                        continue;
+                    }
+                    if matches!(&command, RunAction::Exit) {
+                        let _ = self.coordinator.update_calibration(
+                            &binding,
+                            GuidedCalibrationSnapshot::Exiting {
+                                detail: if matches!(exit_route(&commit_phase, &evidence), ExitRoute::DiscardNow) {
+                                    "Discarding calibration on the device…".into()
+                                } else {
+                                    "Stopping the accepted song before discarding calibration…".into()
+                                },
+                            },
+                        );
+                        gate_state = RunGate::Interrupted;
+                        heartbeat_mode = HeartbeatMode::Withheld;
+                        if let PlaybackState::Playing(opened) = &playback {
+                            opened.pause();
+                        }
+                        if matches!(exit_route(&commit_phase, &evidence), ExitRoute::DiscardNow) {
+                            playback = PlaybackState::Dormant;
+                            if let Err(error) = self.registry.send_bound_control(
+                                &device,
+                                Frame::CalibrationDiscard { run },
+                            ) {
+                                break delivery_failure(error);
+                            }
+                            terminal = TerminalDecision::AwaitingDiscard {
+                                deadline: tokio::time::Instant::now() + TERMINAL_DECISION_TIMEOUT,
+                            };
+                        } else {
+                            terminal = TerminalDecision::AwaitingInterruption {
+                                deadline: tokio::time::Instant::now() + TERMINAL_DECISION_TIMEOUT,
+                            };
+                        }
                         continue;
                     }
                     let save_requested = matches!(&command, RunAction::Save);
@@ -1092,6 +1220,7 @@ impl CalibrationModeAdapter {
                         }
                         RunAction::Save => Frame::CalibrationSave { run },
                         RunAction::Discard => Frame::CalibrationDiscard { run },
+                        RunAction::Exit => unreachable!("Exit is handled before song-end decisions"),
                     };
                     if let Err(error) = self.registry.send_bound_control(&device, frame) {
                         break delivery_failure(error);
@@ -1109,14 +1238,21 @@ impl CalibrationModeAdapter {
                 _ = &mut playback_alarm,
                     if matches!(gate_state, RunGate::Running)
                         && matches!(playback, PlaybackState::Armed { .. }) => {
-                    let PlaybackState::Armed { playback: opened, .. } = core::mem::replace(&mut playback, PlaybackState::Dormant) else {
+                    let PlaybackState::Armed { playback: opened, audible_anchor } = core::mem::replace(&mut playback, PlaybackState::Dormant) else {
                         break SessionExit::TaskFailed("calibration playback deadline had no armed output".into());
                     };
                     opened.play();
                     playback = PlaybackState::Playing(opened);
                     let _ = self.coordinator.update_calibration(
                         &binding,
-                        playing_snapshot(&track, 0),
+                        playing_snapshot(
+                            &track,
+                            CalibrationPlayhead {
+                                position_ms: 0,
+                                observed_at: audible_anchor,
+                            },
+                            &collection_classes,
+                        ),
                     );
                 }
             }
@@ -1239,6 +1375,13 @@ impl CalibrationModeAdapter {
         self.require_between_songs(binding)?;
         self.send_action(binding, action)
     }
+
+    fn exit_inactive(&self) -> Result<(), CoordinatorError> {
+        let selected_track_id = self.selected_track_id.lock().unwrap().clone();
+        self.coordinator
+            .update_idle_calibration(setup_snapshot(&self.tracks, selected_track_id))?;
+        Ok(())
+    }
 }
 
 impl GuidedModeAdapter for CalibrationModeAdapter {
@@ -1282,10 +1425,17 @@ impl GuidedModeAdapter for CalibrationModeAdapter {
                 session.ok_or(CoordinatorError::LeaseMismatch)?,
                 RunGate::Running,
             ),
-            GuidedSessionAction::DiscardCalibration => self.send_action(
+            GuidedSessionAction::DiscardCalibration => self.send_between_songs_action(
                 session.ok_or(CoordinatorError::LeaseMismatch)?,
                 RunAction::Discard,
             ),
+            GuidedSessionAction::ExitCalibration => match session {
+                Some(binding) if binding.mode == GuidedMode::Calibration => {
+                    self.send_action(binding, RunAction::Exit)
+                }
+                Some(_) => Err(CoordinatorError::LeaseMismatch),
+                None => self.exit_inactive(),
+            },
             GuidedSessionAction::SaveCalibration => self.send_between_songs_action(
                 session.ok_or(CoordinatorError::LeaseMismatch)?,
                 RunAction::Save,
@@ -1368,19 +1518,23 @@ fn delivery_failure(error: ControlDeliveryError) -> SessionExit {
 
 fn playback_deadline(
     host_anchor_milliseconds: Option<i64>,
+    output_latency: protocol::DurationMilliseconds,
     now_wall_milliseconds: i64,
     now: tokio::time::Instant,
 ) -> Result<tokio::time::Instant, &'static str> {
     let host_anchor_milliseconds = host_anchor_milliseconds.ok_or(
         "calibration playback is withheld until production clock probes map the device anchor",
     )?;
-    let delay_milliseconds = host_anchor_milliseconds
+    let playback_start_milliseconds = host_anchor_milliseconds
+        .checked_sub(i64::from(output_latency.get()))
+        .ok_or("the output-latency-compensated calibration anchor is already in the past")?;
+    let delay_milliseconds = playback_start_milliseconds
         .checked_sub(now_wall_milliseconds)
-        .ok_or("the accepted calibration anchor is already in the past")?;
+        .ok_or("the output-latency-compensated calibration anchor is already in the past")?;
     let delay_milliseconds = u64::try_from(delay_milliseconds)
-        .map_err(|_| "the accepted calibration anchor is already in the past")?;
+        .map_err(|_| "the output-latency-compensated calibration anchor is already in the past")?;
     if delay_milliseconds == 0 {
-        return Err("the accepted calibration anchor is already in the past");
+        return Err("the output-latency-compensated calibration anchor is already in the past");
     }
     Ok(now + std::time::Duration::from_millis(delay_milliseconds))
 }
@@ -1544,20 +1698,18 @@ fn send_schedule_commit(
     )
 }
 
+#[derive(Clone, Copy)]
+struct CalibrationPlayhead {
+    position_ms: u64,
+    observed_at: protocol::UnixMilliseconds,
+}
+
 fn playing_snapshot(
     track: &crate::collect::beatmap::CalibrationTrack,
-    position_ms: u64,
+    playhead: CalibrationPlayhead,
+    collection_classes: &[protocol::CollectionClass],
 ) -> GuidedCalibrationSnapshot {
-    let lanes = protocol::CalibrationGesture::ALL
-        .into_iter()
-        .map(|gesture| protocol::GuidedCalibrationLane {
-            visual_lane: gesture.index(),
-            id: format!("{gesture:?}"),
-            label: format!("{gesture:?}"),
-            color_name: "brand".into(),
-            motion: None,
-        })
-        .collect();
+    let lanes = calibration_lanes(collection_classes);
     let cues = track
         .entries
         .iter()
@@ -1583,12 +1735,40 @@ fn playing_snapshot(
         },
         lanes,
         cues,
-        position_ms,
+        position_ms: playhead.position_ms,
+        position_observed_at_unix_ms: playhead.observed_at,
         valid_reps: 0,
         invalid_reps: 0,
         paused_reason: None,
         counts: Vec::new(),
     }
+}
+
+fn calibration_lanes(
+    collection_classes: &[protocol::CollectionClass],
+) -> Vec<protocol::GuidedCalibrationLane> {
+    protocol::CalibrationGesture::ALL
+        .into_iter()
+        .map(|gesture| {
+            let id = match gesture {
+                protocol::CalibrationGesture::WristPronation => "wrist_pronation",
+                protocol::CalibrationGesture::WristSupination => "wrist_supination",
+                protocol::CalibrationGesture::WristRadialDeviation => "wrist_radial_deviation",
+                protocol::CalibrationGesture::WristUlnarDeviation => "wrist_ulnar_deviation",
+                protocol::CalibrationGesture::ThumbExtension => "thumb_extension",
+            };
+            let descriptor = collection_classes
+                .iter()
+                .find(|descriptor| descriptor.id.0 == id);
+            protocol::GuidedCalibrationLane {
+                visual_lane: gesture.index(),
+                id: id.into(),
+                label: descriptor.map_or_else(|| id.replace('_', " "), |value| value.label.clone()),
+                color_name: descriptor.map_or_else(|| "gray".into(), |value| value.color.clone()),
+                motion: descriptor.and_then(|value| value.motion.clone()),
+            }
+        })
+        .collect()
 }
 
 fn preparing_snapshot_from_device(
@@ -1704,6 +1884,18 @@ mod tests {
             valid,
             &TerminalDecision::Open,
         ));
+        assert!(!run_action_is_authorized(
+            &RunAction::Discard,
+            &evidence,
+            absent,
+            &TerminalDecision::Open,
+        ));
+        assert!(run_action_is_authorized(
+            &RunAction::Exit,
+            &evidence,
+            absent,
+            &TerminalDecision::Open,
+        ));
 
         enter_between_songs(
             &mut evidence,
@@ -1726,6 +1918,12 @@ mod tests {
             &RunAction::Save,
             &evidence,
             valid,
+            &TerminalDecision::Open,
+        ));
+        assert!(run_action_is_authorized(
+            &RunAction::Discard,
+            &evidence,
+            absent,
             &TerminalDecision::Open,
         ));
         assert!(!run_action_is_authorized(
@@ -1995,6 +2193,115 @@ mod tests {
             .await
             .expect("calibration control delivery timed out")
             .expect("calibration control channel closed")
+    }
+
+    #[test]
+    fn exit_route_covers_every_actor_owned_schedule_boundary() {
+        let fresh = EvidenceState::Fresh;
+        let retained = EvidenceState::Retained {
+            completed_track_title: "finished".into(),
+        };
+        assert_eq!(
+            exit_route(&ScheduleCommitPhase::AwaitingDeviceReadiness, &fresh),
+            ExitRoute::DiscardNow
+        );
+        assert_eq!(
+            exit_route(
+                &ScheduleCommitPhase::sent_at(tokio::time::Instant::now()),
+                &fresh
+            ),
+            ExitRoute::InterruptThenDiscard
+        );
+        assert_eq!(
+            exit_route(&ScheduleCommitPhase::Accepted, &fresh),
+            ExitRoute::InterruptThenDiscard
+        );
+        assert_eq!(
+            exit_route(&ScheduleCommitPhase::Accepted, &retained),
+            ExitRoute::DiscardNow,
+            "a song boundary is already a safe discard boundary"
+        );
+    }
+
+    #[tokio::test]
+    async fn exit_during_preparation_waits_for_exact_absent_ack_and_is_single_use() {
+        let registry = Arc::new(Registry::new());
+        let coordinator = GuidedSessionCoordinator::new();
+        let adapter =
+            CalibrationModeAdapter::new(registry.clone(), coordinator.clone(), vec![track()]);
+        attach_test_collection(&adapter, registry.clone(), coordinator.clone());
+        coordinator.set_mode_adapter(GuidedMode::Calibration, adapter.clone());
+        let mut device = register_device(&registry);
+        let identity = registry.connection_identity("opal-test").unwrap();
+
+        let setup = coordinator.snapshot();
+        coordinator
+            .handle_intent_for_device(
+                GuidedIntentRequest {
+                    authority: setup.action_authority,
+                    action: GuidedSessionAction::SelectCalibrationTrack {
+                        track_id: "calibration-track".into(),
+                    },
+                },
+                None,
+            )
+            .unwrap();
+        let selected = coordinator.snapshot();
+        coordinator
+            .handle_intent_for_device(
+                GuidedIntentRequest {
+                    authority: selected.action_authority,
+                    action: GuidedSessionAction::StartCalibration,
+                },
+                Some(identity),
+            )
+            .unwrap();
+        let exit_snapshot = coordinator.snapshot();
+        let exit_request = GuidedIntentRequest {
+            authority: exit_snapshot.action_authority,
+            action: GuidedSessionAction::ExitCalibration,
+        };
+        coordinator
+            .handle_intent_for_device(exit_request.clone(), None)
+            .unwrap();
+        assert!(matches!(
+            coordinator.handle_intent_for_device(exit_request, None),
+            Err(CoordinatorError::StaleActionPhase { .. })
+        ));
+
+        let discard = loop {
+            let frame = receive_control(&mut device).await;
+            if matches!(frame, Frame::CalibrationDiscard { .. }) {
+                break frame;
+            }
+        };
+        assert!(matches!(discard, Frame::CalibrationDiscard { .. }));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(matches!(
+            coordinator.snapshot().calibration(),
+            Some(GuidedCalibrationSnapshot::Exiting { .. })
+        ));
+
+        let run = CalibrationRunKey {
+            session_id: CalibrationSessionId::new(1).unwrap(),
+            run_id: CalibrationRunId::new(1).unwrap(),
+        };
+        device
+            .frames
+            .send(Frame::CalibrationCandidateStatus {
+                candidate: protocol::CalibrationCandidateStatus {
+                    run,
+                    schedule_revision: CalibrationScheduleRevision::new(1).unwrap(),
+                    presence: protocol::CalibrationCandidatePresence::Absent,
+                },
+            })
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(matches!(
+            coordinator.snapshot().calibration(),
+            Some(GuidedCalibrationSnapshot::Setup { .. })
+        ));
+        assert!(coordinator.snapshot().active().is_none());
     }
 
     #[tokio::test]
@@ -2522,18 +2829,67 @@ mod tests {
     #[test]
     fn playback_deadline_requires_a_future_production_clock_map() {
         let now = tokio::time::Instant::now();
+        let output_latency = protocol::DurationMilliseconds::new(20);
         assert_eq!(
-            playback_deadline(None, 1_000, now),
+            playback_deadline(None, output_latency, 1_000, now),
             Err("calibration playback is withheld until production clock probes map the device anchor")
         );
         assert_eq!(
-            playback_deadline(Some(1_000), 1_000, now),
-            Err("the accepted calibration anchor is already in the past")
+            playback_deadline(Some(1_000), output_latency, 1_000, now),
+            Err("the output-latency-compensated calibration anchor is already in the past")
         );
         assert_eq!(
-            playback_deadline(Some(1_050), 1_000, now).unwrap(),
-            now + std::time::Duration::from_millis(50)
+            playback_deadline(Some(1_050), output_latency, 1_000, now).unwrap(),
+            now + std::time::Duration::from_millis(30)
         );
+    }
+
+    #[test]
+    fn calibration_lanes_reuse_collect_presentation_descriptors() {
+        let classes = [
+            ("wrist_pronation", "Tilt Out", "blue"),
+            ("wrist_supination", "Tilt In", "amber"),
+            ("wrist_radial_deviation", "Tilt Forward", "green"),
+            ("wrist_ulnar_deviation", "Tilt Back", "purple"),
+            ("thumb_extension", "Lift Thumb", "pink"),
+        ]
+        .map(|(id, label, color)| protocol::CollectionClass {
+            id: protocol::ClassId(id.into()),
+            label: label.into(),
+            color: color.into(),
+            motion: Some(protocol::GestureMotion {
+                arrow: protocol::MotionArrow::Left,
+                hint: format!("{label} hint"),
+            }),
+        });
+
+        let lanes = calibration_lanes(&classes);
+        assert_eq!(lanes.len(), 5);
+        for (lane, class) in lanes.iter().zip(&classes) {
+            assert_eq!(lane.id, class.id.0);
+            assert_eq!(lane.label, class.label);
+            assert_eq!(lane.color_name, class.color);
+            assert_eq!(lane.motion, class.motion);
+        }
+        assert!(lanes.iter().all(|lane| !lane.label.starts_with("Wrist")));
+
+        let observed_at = protocol::UnixMilliseconds::new(1_800_000_012_345);
+        let snapshot = playing_snapshot(
+            &track(),
+            CalibrationPlayhead {
+                position_ms: 12_345,
+                observed_at,
+            },
+            &classes,
+        );
+        assert!(matches!(
+            snapshot,
+            GuidedCalibrationSnapshot::Playing {
+                position_ms: 12_345,
+                position_observed_at_unix_ms,
+                ..
+            } if position_observed_at_unix_ms == observed_at
+        ));
     }
 
     #[test]

@@ -40,6 +40,14 @@ test('guided callbacks carry stable action authority rather than telemetry revis
   );
 });
 
+test('calibration exit carries the current single-use typed authority', () => {
+  assert.deepEqual(guidedIntent(snapshot(12), { name: 'exit_calibration' }), {
+    type: 'guided_session_intent',
+    authority: { run_revision: 4, session_id: 9, phase_generation: 6 },
+    action: { name: 'exit_calibration' },
+  });
+});
+
 test('guided wire guard requires one complete tagged lifecycle', () => {
   const valid = { type: 'guided_session_snapshot', snapshot: snapshot(12) } as const;
   assert.equal(asIncomingFrame(valid), valid);

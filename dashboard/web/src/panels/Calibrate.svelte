@@ -7,6 +7,7 @@
   // controls and a request for a stored slot's rows — so a wearer whose page
   // closed mid-run loses the display and nothing else.
   import { api, live } from '../lib/socket.svelte';
+  import { Button } from '$lib/components/ui/button/index.js';
   import type { GuidedSessionAction } from '../lib/protocol';
   import GuidedCalibrationView from './calibrate/GuidedCalibrationView.svelte';
   import {
@@ -22,9 +23,10 @@
   const guidedCalibration = $derived(
     calibrationSnapshot === null ? null : presentGuidedCalibration(calibrationSnapshot),
   );
+  const exitPending = $derived(calibrationSnapshot?.phase === 'exiting');
   function sendGuided(action: GuidedSessionAction): void {
     const snapshot = live.guidedSession;
-    if (snapshot === null || guidedCalibrationSnapshot(snapshot) === null) return;
+    if (snapshot === null) return;
     api.guidedSessionIntent(snapshot, action);
   }
 
@@ -40,9 +42,24 @@
   }
 </script>
 
-<h2>Calibrate</h2>
+<div class="calibration-heading">
+  <h2>Calibrate</h2>
+  <Button
+    variant="secondary"
+    disabled={guidedSnapshot === null || exitPending}
+    onclick={() => sendGuided({ name: 'exit_calibration' })}
+  >
+    {exitPending ? 'Exiting…' : 'Exit calibration'}
+  </Button>
+</div>
 
-{#if guidedCalibration !== null}
+{#if calibrationSnapshot?.phase === 'exiting'}
+  <section class="exit-status card" role="status" aria-live="polite">
+    <strong>Exiting calibration</strong>
+    <p>{calibrationSnapshot.detail}</p>
+    <p class="muted">Waiting for the wristband to confirm that no candidate remains.</p>
+  </section>
+{:else if guidedCalibration !== null}
   <GuidedCalibrationView
     snapshot={guidedCalibration}
     onSelectTrack={(trackId) => sendGuided({ name: 'select_calibration_track', track_id: trackId })}
@@ -56,3 +73,16 @@
 {:else}
   <p class="muted">The guided calibration session is unavailable. Select a device and reconnect.</p>
 {/if}
+
+<style>
+  .calibration-heading {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+  }
+
+  .exit-status {
+    max-width: 760px;
+  }
+</style>
