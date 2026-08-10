@@ -216,6 +216,7 @@ fn anchored_preparation_matches_run(
         AnchoredPreparation::Settling { run: active, .. }
             | AnchoredPreparation::EstimatingGains { run: active, .. }
             | AnchoredPreparation::ReadyForSchedule { run: active, .. }
+            | AnchoredPreparation::Failed { run: active, .. }
             if *active == run
     )
 }
@@ -325,6 +326,173 @@ struct AnchoredCapture {
     flash_microseconds_at_open: u32,
 }
 
+/// Capture and feedback delivery are one cue lifecycle.  The old pair of
+/// `Option` fields admitted a stale prompt after interruption and a capture
+/// without a prompt-producing cue; neither is a meaningful device state.
+#[derive(Debug)]
+enum AnchoredCueLifecycle {
+    Idle,
+    Open {
+        capture: AnchoredCapture,
+        prompt: PromptDelivery,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptDelivery {
+    Pending,
+    Delivered,
+}
+
+impl AnchoredCueLifecycle {
+    fn open(capture: AnchoredCapture) -> Self {
+        Self::Open {
+            capture,
+            prompt: PromptDelivery::Pending,
+        }
+    }
+
+    fn capture_mut(&mut self) -> Option<&mut AnchoredCapture> {
+        match self {
+            Self::Open { capture, .. } => Some(capture),
+            Self::Idle => None,
+        }
+    }
+
+    fn take_capture(&mut self) -> Option<AnchoredCapture> {
+        match core::mem::replace(self, Self::Idle) {
+            Self::Open { capture, .. } => Some(capture),
+            Self::Idle => None,
+        }
+    }
+
+    fn take_prompt(&mut self) -> Option<CalibrationGesture> {
+        match self {
+            Self::Open { capture, prompt } if *prompt == PromptDelivery::Pending => {
+                *prompt = PromptDelivery::Delivered;
+                Some(capture.entry.gesture)
+            }
+            Self::Open { .. } | Self::Idle => None,
+        }
+    }
+
+    fn is_open(&self) -> bool {
+        matches!(self, Self::Open { .. })
+    }
+
+    fn clear(&mut self) {
+        *self = Self::Idle;
+    }
+}
+
+/// Gain changes are effects with provenance, not an unlabelled optional array.
+/// In particular, an interrupted/discarded run restores resident gains while
+/// preparation publishes newly frozen gains; callers apply both identically,
+/// but the producer cannot confuse their rollback semantics.
+#[derive(Debug, Clone, Copy)]
+enum FeatureGainUpdate {
+    Prepared([f32; CHANNEL_COUNT]),
+    RestoreResident([f32; CHANNEL_COUNT]),
+}
+
+impl FeatureGainUpdate {
+    fn gains(self) -> [f32; CHANNEL_COUNT] {
+        match self {
+            Self::Prepared(gains) | Self::RestoreResident(gains) => gains,
+        }
+    }
+}
+
+/// Everything that is meaningful only after a validated schedule Begin lives
+/// under one variant.  Consequently cue capture, fit work, retained counts,
+/// and candidate readiness cannot outlive (or exist without) their song.
+///
+/// Indirection would save stack space only in the `Idle` variant while adding
+/// a fallible heap allocation at calibration Begin, the exact OOM-sensitive
+/// boundary this state owns. Keep the bounded storage inline on the device.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
+enum AnchoredRunLifecycle {
+    Idle,
+    Active {
+        song: AnchoredSong,
+        cue: AnchoredCueLifecycle,
+        counts: [AnchoredClassCount; CALIBRATION_CLASS_CAPACITY],
+        fit: AnchoredFitLifecycle,
+    },
+}
+
+impl AnchoredRunLifecycle {
+    fn start(run: CalibrationRunKey) -> Self {
+        Self::Active {
+            song: AnchoredSong::new(run),
+            cue: AnchoredCueLifecycle::Idle,
+            counts: [AnchoredClassCount::default(); CALIBRATION_CLASS_CAPACITY],
+            fit: AnchoredFitLifecycle::Idle,
+        }
+    }
+
+    fn song(&self) -> Option<&AnchoredSong> {
+        match self {
+            Self::Active { song, .. } => Some(song),
+            Self::Idle => None,
+        }
+    }
+
+    fn song_mut(&mut self) -> Option<&mut AnchoredSong> {
+        match self {
+            Self::Active { song, .. } => Some(song),
+            Self::Idle => None,
+        }
+    }
+
+    fn cue(&self) -> Option<&AnchoredCueLifecycle> {
+        match self {
+            Self::Active { cue, .. } => Some(cue),
+            Self::Idle => None,
+        }
+    }
+
+    fn cue_mut(&mut self) -> Option<&mut AnchoredCueLifecycle> {
+        match self {
+            Self::Active { cue, .. } => Some(cue),
+            Self::Idle => None,
+        }
+    }
+
+    fn fit(&self) -> Option<&AnchoredFitLifecycle> {
+        match self {
+            Self::Active { fit, .. } => Some(fit),
+            Self::Idle => None,
+        }
+    }
+
+    fn fit_mut(&mut self) -> Option<&mut AnchoredFitLifecycle> {
+        match self {
+            Self::Active { fit, .. } => Some(fit),
+            Self::Idle => None,
+        }
+    }
+
+    fn count_mut(&mut self, index: usize) -> Option<&mut AnchoredClassCount> {
+        match self {
+            Self::Active { counts, .. } => counts.get_mut(index),
+            Self::Idle => None,
+        }
+    }
+
+    fn counts(&self) -> Option<&[AnchoredClassCount; CALIBRATION_CLASS_CAPACITY]> {
+        match self {
+            Self::Active { counts, .. } => Some(counts),
+            Self::Idle => None,
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::Idle;
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct AnchoredClassCount {
     accepted: u32,
@@ -369,7 +537,10 @@ enum PreparationStatusReport {
 
 impl AnchoredPreparation {
     fn is_live(&self) -> bool {
-        !matches!(self, Self::Idle)
+        matches!(
+            self,
+            Self::Settling { .. } | Self::EstimatingGains { .. } | Self::ReadyForSchedule { .. }
+        )
     }
 
     fn is_ready(&self) -> bool {
@@ -433,16 +604,12 @@ pub(crate) struct Calibration {
     /// boot. `None` when there was no partition or the erase failed.
     boot_erased_slot: Option<usize>,
     run: Option<Run>,
-    anchored_song: Option<AnchoredSong>,
-    anchored_capture: Option<AnchoredCapture>,
-    anchored_counts: [AnchoredClassCount; CALIBRATION_CLASS_CAPACITY],
-    anchored_prompt: Option<CalibrationGesture>,
+    anchored: AnchoredRunLifecycle,
     /// The device-owned settling/gain lifecycle.  Its variants make an
     /// uploaded-but-not-ready schedule impossible to treat as runnable.
     anchored_preparation: AnchoredPreparation,
     preparation_status_report: PreparationStatusReport,
-    pending_feature_gains: Option<[f32; CHANNEL_COUNT]>,
-    anchored_fit: AnchoredFitLifecycle,
+    pending_gain_update: Option<FeatureGainUpdate>,
 
     gains: GainEstimator,
     open: Option<OpenRep>,
@@ -565,14 +732,10 @@ impl Calibration {
             partition,
             boot_erased_slot,
             run: None,
-            anchored_song: None,
-            anchored_capture: None,
-            anchored_counts: [AnchoredClassCount::default(); CALIBRATION_CLASS_CAPACITY],
-            anchored_prompt: None,
+            anchored: AnchoredRunLifecycle::Idle,
             anchored_preparation: AnchoredPreparation::Idle,
             preparation_status_report: PreparationStatusReport::Never,
-            pending_feature_gains: None,
-            anchored_fit: AnchoredFitLifecycle::Idle,
+            pending_gain_update: None,
             gains: GainEstimator::new(),
             open: None,
             rows: buffers.rows,
@@ -713,9 +876,6 @@ impl Calibration {
         self.gains_latched = false;
         self.adopted_gains = None;
         self.checkpoint = self.warm_start();
-        self.anchored_counts = [AnchoredClassCount::default(); CALIBRATION_CLASS_CAPACITY];
-        self.anchored_fit = AnchoredFitLifecycle::Idle;
-        self.pending_feature_gains = None;
         self.anchored_preparation = AnchoredPreparation::Settling {
             run,
             schedule_revision,
@@ -761,7 +921,7 @@ impl Calibration {
             {
                 let gains = self.gains.freeze();
                 self.gains_latched = true;
-                self.pending_feature_gains = Some(gains);
+                self.pending_gain_update = Some(FeatureGainUpdate::Prepared(gains));
                 info!(
                     "anchored calibration gains frozen over {} instants",
                     self.gains.instants()
@@ -877,56 +1037,69 @@ impl Calibration {
                 content_identity,
                 total_count,
             } => {
-                if !self.begin_anchored_lifecycle(run, schedule_revision) {
-                    return None;
-                }
-                let identity = AnchoredSongIdentity::new(
+                // Validate the complete upload identity before preparation has
+                // any side effects.  Previously a malformed Begin started the
+                // 30 s acquisition lifecycle and commit suppression, but left
+                // `anchored_song` empty: no later control could complete it.
+                let identity = match AnchoredSongIdentity::new(
                     run,
                     schedule_revision,
                     content_identity,
                     total_count,
-                );
-                match identity {
-                    Ok(identity) => {
-                        // Continue is a newer revision of the same run.  Keep
-                        // the pure song's retained progress and the adapter's
-                        // already-flushed rows/checkpoints across a completed
-                        // short song; `begin_upload` enforces the revision.
-                        if self.anchored_song.is_none() {
-                            self.anchored_song = Some(AnchoredSong::new(run));
-                        }
-                        match self
-                            .anchored_song
-                            .as_mut()
-                            .expect("an anchored song was installed")
-                            .begin_upload(identity.clone())
-                        {
-                            Ok(()) => {
-                                self.anchored_capture = None;
-                                self.anchored_prompt = None;
-                                // A Continue mints a new schedule revision but
-                                // does not repeat the acquisition preparation.
-                                self.anchored_preparation
-                                    .set_schedule_revision(run, schedule_revision);
-                                self.outbound
-                                    .push(Frame::CalibrationScheduleUploadAcknowledged {
-                                        acknowledgement: CalibrationScheduleUploadAcknowledgement {
-                                            run,
-                                            schedule_revision,
-                                            content_identity: identity.content_identity.clone(),
-                                            total_count: identity.total_count,
-                                            first_entry: None,
-                                        },
-                                    });
-                                self.emit_anchored_preparation_status();
-                            }
-                            Err(error) => {
-                                self.refuse(&format!("anchored schedule begin rejected: {error}"))
-                            }
-                        }
+                ) {
+                    Ok(identity) => identity,
+                    Err(error) => {
+                        self.refuse(&format!("anchored schedule identity rejected: {error}"));
+                        return None;
+                    }
+                };
+                if !self.begin_anchored_lifecycle(run, schedule_revision) {
+                    return None;
+                }
+                // Continue is a newer revision of the same run.  Keep the
+                // pure song's retained progress and the adapter's already-
+                // flushed rows/checkpoints across a completed short song;
+                // `begin_upload` enforces the revision.
+                let starts_new_run = self.anchored.song().is_none();
+                if starts_new_run {
+                    self.anchored = AnchoredRunLifecycle::start(run);
+                }
+                match self
+                    .anchored
+                    .song_mut()
+                    .expect("a validated Begin installs an anchored song")
+                    .begin_upload(identity.clone())
+                {
+                    Ok(()) => {
+                        self.anchored
+                            .cue_mut()
+                            .expect("an active run owns its cue lifecycle")
+                            .clear();
+                        // A Continue mints a new schedule revision but does not
+                        // repeat the acquisition preparation.
+                        self.anchored_preparation
+                            .set_schedule_revision(run, schedule_revision);
+                        self.outbound
+                            .push(Frame::CalibrationScheduleUploadAcknowledged {
+                                acknowledgement: CalibrationScheduleUploadAcknowledgement {
+                                    run,
+                                    schedule_revision,
+                                    content_identity: identity.content_identity.clone(),
+                                    total_count: identity.total_count,
+                                    first_entry: None,
+                                },
+                            });
+                        self.emit_anchored_preparation_status();
                     }
                     Err(error) => {
-                        self.refuse(&format!("anchored schedule identity rejected: {error}"))
+                        self.refuse(&format!("anchored schedule begin rejected: {error}"));
+                        // Allocation/identity failure on the first upload must
+                        // not leave a suppressing preparation that has no
+                        // schedule transaction.  A failed Continue retains the
+                        // completed prior song and its collected rows.
+                        if starts_new_run {
+                            self.reset_anchored_lifecycle();
+                        }
                     }
                 }
             }
@@ -951,7 +1124,7 @@ impl Calibration {
                     content_identity,
                     total_count,
                 );
-                match (self.anchored_song.as_mut(), identity) {
+                match (self.anchored.song_mut(), identity) {
                     (Some(song), Ok(identity)) => {
                         match song.upload_chunk(&identity, first_entry, &entries) {
                             Ok(effect) => {
@@ -1000,7 +1173,7 @@ impl Calibration {
                     total_count,
                 );
                 let acknowledged = crate::device_now_us();
-                match (self.anchored_song.as_mut(), identity) {
+                match (self.anchored.song_mut(), identity) {
                     (Some(song), Ok(identity)) => {
                         match song.commit(&identity, acknowledged, self.acquisition_sample) {
                             Ok(anchor) => self.outbound.push(Frame::CalibrationScheduleAccepted {
@@ -1027,7 +1200,7 @@ impl Calibration {
                 }
             }
             Control::CalibrationHeartbeat { heartbeat } => {
-                let Some(song) = self.anchored_song.as_mut() else {
+                let Some(song) = self.anchored.song_mut() else {
                     self.refuse("calibration heartbeat arrived without an anchored song");
                     return None;
                 };
@@ -1061,7 +1234,7 @@ impl Calibration {
             }
             Control::CalibrationContinue { run }
                 if !matches!(
-                    self.anchored_song.as_ref().and_then(AnchoredSong::identity),
+                    self.anchored.song().and_then(AnchoredSong::identity),
                     Some(identity) if identity.run == run
                 ) =>
             {
@@ -1096,7 +1269,11 @@ impl Calibration {
         let window_start = window
             .end_sample
             .saturating_sub(self.constants.window_samples as u64);
-        if let Some(capture) = self.anchored_capture.as_mut() {
+        if let Some(capture) = self
+            .anchored
+            .cue_mut()
+            .and_then(AnchoredCueLifecycle::capture_mut)
+        {
             // The close handler runs before the next acquisition window. This
             // admits exactly the fully-contained windows seen while device time
             // held the cue open, never a window that began before its trigger.
@@ -1258,7 +1435,7 @@ impl Calibration {
     }
 
     fn poll_anchored_song(&mut self) {
-        let action = match self.anchored_song.as_mut() {
+        let action = match self.anchored.song_mut() {
             // Upload and preparation are deliberately non-runnable states.
             // Polling them asks the pure executor for an anchor that cannot
             // exist yet and used to turn the normal 10 s + 20 s preparation
@@ -1270,15 +1447,16 @@ impl Calibration {
         match action {
             Ok(Some(AnchoredSongAction::OpenCue { entry, .. })) => {
                 self.rep_rows.clear();
-                self.anchored_capture = Some(AnchoredCapture {
-                    entry,
-                    opened_acquisition_sample: self.acquisition_sample,
-                    evidence: RepEvidence::default(),
-                    flash_microseconds_at_open: self.flash_microseconds,
-                });
-                // Main consumes this edge in the same serve-loop pass and
-                // dispatches LED and haptic together from the feedback owner.
-                self.anchored_prompt = Some(entry.gesture);
+                *self
+                    .anchored
+                    .cue_mut()
+                    .expect("a song action belongs to an active run") =
+                    AnchoredCueLifecycle::open(AnchoredCapture {
+                        entry,
+                        opened_acquisition_sample: self.acquisition_sample,
+                        evidence: RepEvidence::default(),
+                        flash_microseconds_at_open: self.flash_microseconds,
+                    });
             }
             Ok(Some(AnchoredSongAction::CloseCue { entry, .. })) => {
                 self.finish_anchored_capture(entry);
@@ -1287,7 +1465,10 @@ impl Calibration {
                 reason,
                 rejected_open_cue,
             })) => {
-                self.anchored_capture = None;
+                self.anchored
+                    .cue_mut()
+                    .expect("a song interruption belongs to an active run")
+                    .clear();
                 self.rep_rows.clear();
                 if let Some(entry) = rejected_open_cue {
                     self.anchored_count_mut(entry).rejected += 1;
@@ -1301,7 +1482,11 @@ impl Calibration {
     }
 
     fn finish_anchored_capture(&mut self, entry: protocol::CalibrationScheduleEntry) {
-        let Some(mut capture) = self.anchored_capture.take() else {
+        let Some(mut capture) = self
+            .anchored
+            .cue_mut()
+            .and_then(AnchoredCueLifecycle::take_capture)
+        else {
             self.refuse("anchored cue closed without an open capture");
             return;
         };
@@ -1322,8 +1507,8 @@ impl Calibration {
         let evidence = capture.evidence;
         let accepted_rows = self.rep_rows.len() as u32;
         let result = self
-            .anchored_song
-            .as_mut()
+            .anchored
+            .song_mut()
             .expect("an anchored capture requires a song")
             .record_closed_evidence(evidence, accepted_rows);
         match result {
@@ -1382,8 +1567,8 @@ impl Calibration {
 
     fn begin_anchored_fit(&mut self, stage: AnchoredFitStage) {
         if !matches!(
-            self.anchored_fit,
-            AnchoredFitLifecycle::Idle | AnchoredFitLifecycle::CheckpointRequested
+            self.anchored.fit(),
+            Some(AnchoredFitLifecycle::Idle | AnchoredFitLifecycle::CheckpointRequested)
         ) || self.checkpoint.is_none()
             || self.rows_flushed() == 0
         {
@@ -1393,12 +1578,16 @@ impl Calibration {
             AnchoredFitStage::Checkpoint => self.constants.passes_per_round,
             AnchoredFitStage::Polish => self.constants.final_passes,
         };
-        self.anchored_fit = AnchoredFitLifecycle::Running(AnchoredPendingFit {
-            stage,
-            schedule: FitPassSchedule::new(passes),
-            pass: None,
-            pass_work_microseconds: 0,
-        });
+        *self
+            .anchored
+            .fit_mut()
+            .expect("anchored fit work belongs to an active run") =
+            AnchoredFitLifecycle::Running(AnchoredPendingFit {
+                stage,
+                schedule: FitPassSchedule::new(passes),
+                pass: None,
+                pass_work_microseconds: 0,
+            });
     }
 
     /// A newly accepted cue always needs a checkpoint.  If a fit is already
@@ -1406,40 +1595,57 @@ impl Calibration {
     /// one further checkpoint rather than representing the queue with an
     /// unrelated flag.
     fn request_anchored_checkpoint(&mut self) {
-        self.anchored_fit =
-            match core::mem::replace(&mut self.anchored_fit, AnchoredFitLifecycle::Idle) {
-                AnchoredFitLifecycle::Idle => AnchoredFitLifecycle::CheckpointRequested,
-                AnchoredFitLifecycle::CheckpointRequested => {
-                    AnchoredFitLifecycle::CheckpointRequested
-                }
-                AnchoredFitLifecycle::Running(pending) => {
-                    AnchoredFitLifecycle::RunningThenCheckpoint(pending)
-                }
-                AnchoredFitLifecycle::RunningThenCheckpoint(pending) => {
-                    AnchoredFitLifecycle::RunningThenCheckpoint(pending)
-                }
-                AnchoredFitLifecycle::CandidateReady => AnchoredFitLifecycle::CheckpointRequested,
-            };
+        let fit = self
+            .anchored
+            .fit_mut()
+            .expect("a checkpoint request belongs to an active run");
+        *fit = match core::mem::replace(fit, AnchoredFitLifecycle::Idle) {
+            AnchoredFitLifecycle::Idle => AnchoredFitLifecycle::CheckpointRequested,
+            AnchoredFitLifecycle::CheckpointRequested => AnchoredFitLifecycle::CheckpointRequested,
+            AnchoredFitLifecycle::Running(pending) => {
+                AnchoredFitLifecycle::RunningThenCheckpoint(pending)
+            }
+            AnchoredFitLifecycle::RunningThenCheckpoint(pending) => {
+                AnchoredFitLifecycle::RunningThenCheckpoint(pending)
+            }
+            AnchoredFitLifecycle::CandidateReady => AnchoredFitLifecycle::CheckpointRequested,
+        };
     }
 
     fn advance_anchored_fit(&mut self) {
-        if self.anchored_capture.is_some() {
+        if self
+            .anchored
+            .cue()
+            .is_some_and(AnchoredCueLifecycle::is_open)
+        {
             return;
         }
-        if matches!(self.anchored_fit, AnchoredFitLifecycle::CheckpointRequested) {
+        if matches!(
+            self.anchored.fit(),
+            Some(AnchoredFitLifecycle::CheckpointRequested)
+        ) {
             self.begin_anchored_fit(AnchoredFitStage::Checkpoint);
         }
+        let Some(fit) = self.anchored.fit_mut() else {
+            return;
+        };
         let (mut pending, queued_checkpoint) =
-            match core::mem::replace(&mut self.anchored_fit, AnchoredFitLifecycle::Idle) {
+            match core::mem::replace(fit, AnchoredFitLifecycle::Idle) {
                 AnchoredFitLifecycle::Running(pending) => (pending, false),
                 AnchoredFitLifecycle::RunningThenCheckpoint(pending) => (pending, true),
                 lifecycle => {
-                    self.anchored_fit = lifecycle;
+                    *self
+                        .anchored
+                        .fit_mut()
+                        .expect("the active run retains its fit lifecycle") = lifecycle;
                     return;
                 }
             };
         let Some((progress, microseconds)) = self.run_fit_chunk_for_anchored(&mut pending) else {
-            self.anchored_fit = if queued_checkpoint {
+            *self
+                .anchored
+                .fit_mut()
+                .expect("the active run retains its fit lifecycle") = if queued_checkpoint {
                 AnchoredFitLifecycle::RunningThenCheckpoint(pending)
             } else {
                 AnchoredFitLifecycle::Running(pending)
@@ -1450,14 +1656,17 @@ impl Calibration {
         pending.pass_work_microseconds += microseconds;
         match pending.schedule.note_chunk(progress) {
             FitScheduleProgress::PassInProgress | FitScheduleProgress::PassComplete => {
-                self.anchored_fit = if queued_checkpoint {
+                *self
+                    .anchored
+                    .fit_mut()
+                    .expect("the active run retains its fit lifecycle") = if queued_checkpoint {
                     AnchoredFitLifecycle::RunningThenCheckpoint(pending)
                 } else {
                     AnchoredFitLifecycle::Running(pending)
                 };
             }
             FitScheduleProgress::CheckpointComplete => {
-                if let Some(song) = self.anchored_song.as_mut() {
+                if let Some(song) = self.anchored.song_mut() {
                     song.fit_checkpoint_completed();
                 }
                 info!(
@@ -1467,11 +1676,15 @@ impl Calibration {
                 );
                 match pending.stage {
                     AnchoredFitStage::Checkpoint => {
-                        self.anchored_fit = if queued_checkpoint {
-                            AnchoredFitLifecycle::CheckpointRequested
-                        } else {
-                            AnchoredFitLifecycle::Idle
-                        };
+                        *self
+                            .anchored
+                            .fit_mut()
+                            .expect("the active run retains its fit lifecycle") =
+                            if queued_checkpoint {
+                                AnchoredFitLifecycle::CheckpointRequested
+                            } else {
+                                AnchoredFitLifecycle::Idle
+                            };
                     }
                     AnchoredFitStage::Polish => self.finalize_anchored_candidate(),
                 }
@@ -1515,21 +1728,24 @@ impl Calibration {
 
     fn maybe_begin_anchored_polish(&mut self) {
         let song_completed = self
-            .anchored_song
-            .as_ref()
+            .anchored
+            .song()
             .is_some_and(|song| song.state() == SongState::Completed);
-        if song_completed && matches!(self.anchored_fit, AnchoredFitLifecycle::Idle) {
+        if song_completed && matches!(self.anchored.fit(), Some(AnchoredFitLifecycle::Idle)) {
             self.begin_anchored_fit(AnchoredFitStage::Polish);
         }
     }
 
     fn finalize_anchored_candidate(&mut self) {
-        if matches!(self.anchored_fit, AnchoredFitLifecycle::CandidateReady) {
+        if matches!(
+            self.anchored.fit(),
+            Some(AnchoredFitLifecycle::CandidateReady)
+        ) {
             return;
         }
         let Some(identity) = self
-            .anchored_song
-            .as_ref()
+            .anchored
+            .song()
             .and_then(|song| song.identity())
             .cloned()
         else {
@@ -1578,7 +1794,11 @@ impl Calibration {
                     self.emit_anchored_candidate_status(identity.run, identity.revision);
                     return;
                 }
-                self.anchored_fit = AnchoredFitLifecycle::CandidateReady;
+                *self
+                    .anchored
+                    .fit_mut()
+                    .expect("candidate readiness belongs to an active run") =
+                    AnchoredFitLifecycle::CandidateReady;
                 // Keep `model` alive only long enough to prove its shape was
                 // constructible; Save reloads the CRC-validated flash record.
                 let _ = model;
@@ -1602,7 +1822,9 @@ impl Calibration {
                 CalibrationModifier::ThumbUp => 0,
                 CalibrationModifier::ThumbDown => CalibrationGesture::ALL.len(),
             };
-        &mut self.anchored_counts[index]
+        self.anchored
+            .count_mut(index)
+            .expect("anchored class counts belong to an active run")
     }
 
     fn emit_anchored_interruption(
@@ -1611,8 +1833,8 @@ impl Calibration {
         rejected_open_cue: Option<protocol::CalibrationScheduleEntry>,
     ) {
         let Some(identity) = self
-            .anchored_song
-            .as_ref()
+            .anchored
+            .song()
             .and_then(|song| song.identity())
             .cloned()
         else {
@@ -1637,17 +1859,22 @@ impl Calibration {
         // The candidate gains were adopted for collection. An interrupted run
         // resumes the previous resident immediately, so restore the resident's
         // reference before its command model sees another feature window.
+        self.queue_resident_gain_restore();
+    }
+
+    fn queue_resident_gain_restore(&mut self) {
         if let Some(resident) = self.active_selector.resident() {
             if let Some(activation) = self.resident_activation(resident) {
-                self.pending_feature_gains = Some(activation.gains);
+                self.pending_gain_update =
+                    Some(FeatureGainUpdate::RestoreResident(activation.gains));
             }
         }
     }
 
     fn emit_anchored_song_result(&mut self) {
         let Some(identity) = self
-            .anchored_song
-            .as_ref()
+            .anchored
+            .song()
             .and_then(|song| song.identity())
             .cloned()
         else {
@@ -1661,7 +1888,10 @@ impl Calibration {
                         CalibrationModifier::ThumbUp => 0,
                         CalibrationModifier::ThumbDown => CalibrationGesture::ALL.len(),
                     };
-                let count = self.anchored_counts[index];
+                let count = self
+                    .anchored
+                    .counts()
+                    .expect("a song result belongs to an active run")[index];
                 let target_count = match modifier {
                     CalibrationModifier::ThumbUp => 10,
                     CalibrationModifier::ThumbDown => 16,
@@ -1735,8 +1965,8 @@ impl Calibration {
 
     fn save_anchored_candidate(&mut self, run: protocol::CalibrationRunKey) {
         let identity = self
-            .anchored_song
-            .as_ref()
+            .anchored
+            .song()
             .and_then(|song| song.identity())
             .cloned();
         let Some(identity) = identity.filter(|identity| identity.run == run) else {
@@ -1797,8 +2027,8 @@ impl Calibration {
 
     fn discard_anchored_candidate(&mut self, run: protocol::CalibrationRunKey) {
         let schedule_matches_run = self
-            .anchored_song
-            .as_ref()
+            .anchored
+            .song()
             .and_then(|song| song.identity())
             .is_some_and(|identity| identity.run == run);
         let preparation_matches_run =
@@ -1811,6 +2041,7 @@ impl Calibration {
         // Resetting this matching preparation is deliberately write-free, so a
         // diagnostic/operator Discard cannot touch the resident slot.
         if !schedule_matches_run {
+            self.queue_resident_gain_restore();
             self.reset_anchored_lifecycle();
             return;
         }
@@ -1827,11 +2058,7 @@ impl Calibration {
                             .expect("partition remains mapped after discard")
                             .stored_identities(),
                     );
-                    if let Some(resident) = self.active_selector.resident() {
-                        if let Some(activation) = self.resident_activation(resident) {
-                            self.pending_feature_gains = Some(activation.gains);
-                        }
-                    }
+                    self.queue_resident_gain_restore();
                 }
                 Some(Err(error)) => {
                     self.refuse(&format!("Discard candidate invalidation failed: {error}"));
@@ -1847,21 +2074,22 @@ impl Calibration {
     }
 
     fn reset_anchored_lifecycle(&mut self) {
-        self.anchored_song = None;
-        self.anchored_capture = None;
-        self.anchored_prompt = None;
+        self.anchored.reset();
         self.anchored_preparation = AnchoredPreparation::Idle;
         self.preparation_status_report = PreparationStatusReport::Never;
-        self.anchored_fit = AnchoredFitLifecycle::Idle;
         self.rep_rows.clear();
     }
 
     pub(crate) fn take_anchored_prompt(&mut self) -> Option<CalibrationGesture> {
-        self.anchored_prompt.take()
+        self.anchored
+            .cue_mut()
+            .and_then(AnchoredCueLifecycle::take_prompt)
     }
 
     pub(crate) fn take_pending_feature_gains(&mut self) -> Option<[f32; CHANNEL_COUNT]> {
-        self.pending_feature_gains.take()
+        self.pending_gain_update
+            .take()
+            .map(FeatureGainUpdate::gains)
     }
 
     /// Do whatever the state machine asks for next. Called once per serve-loop
@@ -2443,7 +2671,7 @@ impl Calibration {
     /// a wearer performing a gesture on request must not also fire the command
     /// it is bound to.
     pub fn suppresses_commits(&self) -> bool {
-        let anchored = match self.anchored_song.as_ref().map(AnchoredSong::state) {
+        let anchored = match self.anchored.song().map(AnchoredSong::state) {
             Some(SongState::Interrupted) => false,
             // A completed song stays suppressed while its candidate awaits the
             // explicit Save/Discard decision; an interrupted song immediately
@@ -2567,7 +2795,99 @@ fn row_at(source: &RowSource<'_>, index: usize) -> Option<([u8; FEATURE_COUNT], 
 #[cfg(test)]
 mod anchored_lifecycle_tests {
     use super::*;
-    use protocol::{CalibrationRunId, CalibrationSessionId};
+    use protocol::{
+        CalibrationCueId, CalibrationRunId, CalibrationScheduleEntry, CalibrationSessionId,
+        DurationMilliseconds, TrackMilliseconds,
+    };
+
+    fn cue_entry(cue_id: u32) -> CalibrationScheduleEntry {
+        CalibrationScheduleEntry {
+            cue_id: CalibrationCueId::new(cue_id).unwrap(),
+            gesture: CalibrationGesture::ALL[0],
+            modifier: CalibrationModifier::ThumbUp,
+            track_offset: TrackMilliseconds::new(1_000),
+            hold: DurationMilliseconds::new(1_500),
+        }
+    }
+
+    fn capture(cue_id: u32) -> AnchoredCapture {
+        AnchoredCapture {
+            entry: cue_entry(cue_id),
+            opened_acquisition_sample: 10_000,
+            evidence: RepEvidence::default(),
+            flash_microseconds_at_open: 0,
+        }
+    }
+
+    #[test]
+    fn anchored_cue_owns_capture_and_exactly_once_prompt_delivery() {
+        let mut cue = AnchoredCueLifecycle::open(capture(1));
+        assert!(cue.is_open());
+        assert_eq!(cue.take_prompt(), Some(CalibrationGesture::ALL[0]));
+        assert_eq!(cue.take_prompt(), None);
+
+        let closed = cue.take_capture().expect("the open cue owns its capture");
+        assert_eq!(closed.entry, cue_entry(1));
+        assert!(!cue.is_open());
+        assert_eq!(cue.take_prompt(), None);
+        assert!(cue.take_capture().is_none());
+    }
+
+    #[test]
+    fn interruption_clears_both_capture_and_prompt_in_every_delivery_phase() {
+        let mut before_feedback = AnchoredCueLifecycle::open(capture(1));
+        before_feedback.clear();
+        assert!(!before_feedback.is_open());
+        assert_eq!(before_feedback.take_prompt(), None);
+        assert!(before_feedback.take_capture().is_none());
+
+        let mut after_feedback = AnchoredCueLifecycle::open(capture(2));
+        assert!(after_feedback.take_prompt().is_some());
+        after_feedback.clear();
+        assert!(!after_feedback.is_open());
+        assert_eq!(after_feedback.take_prompt(), None);
+        assert!(after_feedback.take_capture().is_none());
+
+        let mut idle = AnchoredCueLifecycle::Idle;
+        idle.clear();
+        assert_eq!(idle.take_prompt(), None);
+        assert!(idle.take_capture().is_none());
+    }
+
+    #[test]
+    fn gain_update_variants_preserve_preparation_and_rollback_payloads() {
+        let prepared = [2.0; CHANNEL_COUNT];
+        let resident = [3.0; CHANNEL_COUNT];
+        assert_eq!(FeatureGainUpdate::Prepared(prepared).gains(), prepared);
+        assert_eq!(
+            FeatureGainUpdate::RestoreResident(resident).gains(),
+            resident
+        );
+    }
+
+    #[test]
+    fn anchored_run_reset_atomically_drops_song_cue_fit_and_counts() {
+        let run = CalibrationRunKey {
+            session_id: CalibrationSessionId::new(9).unwrap(),
+            run_id: CalibrationRunId::new(3).unwrap(),
+        };
+        let mut lifecycle = AnchoredRunLifecycle::start(run);
+        *lifecycle.cue_mut().expect("active run owns cue state") =
+            AnchoredCueLifecycle::open(capture(4));
+        *lifecycle.fit_mut().expect("active run owns fit state") =
+            AnchoredFitLifecycle::CandidateReady;
+        lifecycle
+            .count_mut(0)
+            .expect("active run owns counts")
+            .accepted = 7;
+
+        lifecycle.reset();
+
+        assert!(lifecycle.song().is_none());
+        assert!(lifecycle.cue().is_none());
+        assert!(lifecycle.fit().is_none());
+        assert!(lifecycle.counts().is_none());
+    }
 
     #[test]
     fn anchored_preparation_is_exactly_ten_seconds_of_settle_then_twenty_of_gains() {
@@ -2621,6 +2941,11 @@ mod anchored_lifecycle_tests {
                 run,
                 schedule_revision: revision,
             },
+            AnchoredPreparation::Failed {
+                run,
+                schedule_revision: revision,
+                detail: "test failure".into(),
+            },
         ];
         for phase in phases {
             assert!(anchored_preparation_matches_run(&phase, run));
@@ -2630,6 +2955,21 @@ mod anchored_lifecycle_tests {
             &AnchoredPreparation::Idle,
             run
         ));
+    }
+
+    #[test]
+    fn terminal_preparation_failure_is_discardable_but_does_not_suppress_commands() {
+        let run = CalibrationRunKey {
+            session_id: CalibrationSessionId::new(4).unwrap(),
+            run_id: CalibrationRunId::new(7).unwrap(),
+        };
+        let failed = AnchoredPreparation::Failed {
+            run,
+            schedule_revision: CalibrationScheduleRevision::new(1).unwrap(),
+            detail: "front end unavailable".into(),
+        };
+        assert!(anchored_preparation_matches_run(&failed, run));
+        assert!(!failed.is_live());
     }
 
     #[test]
