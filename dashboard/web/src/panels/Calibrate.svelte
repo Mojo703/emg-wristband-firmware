@@ -13,16 +13,18 @@
     presentGuidedCalibration,
     type CalibrationSongEndAction,
   } from './calibrate/guidedCalibration';
+  import { activeGuidedSession, guidedCalibrationSnapshot } from '../lib/guidedSession';
   const selection = $derived(live.hello?.selection ?? null);
   const guidedSnapshot = $derived(live.guidedSession);
+  const calibrationSnapshot = $derived(
+    guidedSnapshot === null ? null : guidedCalibrationSnapshot(guidedSnapshot),
+  );
   const guidedCalibration = $derived(
-    guidedSnapshot?.calibration === null || guidedSnapshot?.calibration === undefined
-      ? null
-      : presentGuidedCalibration(guidedSnapshot.calibration),
+    calibrationSnapshot === null ? null : presentGuidedCalibration(calibrationSnapshot),
   );
   function sendGuided(action: GuidedSessionAction): void {
     const snapshot = live.guidedSession;
-    if (snapshot === null || snapshot.calibration === null) return;
+    if (snapshot === null || guidedCalibrationSnapshot(snapshot) === null) return;
     api.guidedSessionIntent(snapshot, action);
   }
 
@@ -47,7 +49,7 @@
     onStart={() => sendGuided({ name: 'start_calibration' })}
     onSongEndAction={guidedSongEnd}
   />
-{:else if guidedSnapshot?.active?.mode === 'calibration'}
+{:else if guidedSnapshot !== null && activeGuidedSession(guidedSnapshot)?.mode === 'calibration'}
   <p class="muted" role="status">Calibration is starting. Waiting for the backend projection…</p>
 {:else if selection === null}
   <p class="muted">No device selected.</p>

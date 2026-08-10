@@ -85,16 +85,17 @@ test('strict authoritative wire snapshot reaches the real guided component', asy
     snapshot: {
       revision: 7,
       run_revision: 0,
-      active: null,
       visible_collection_views: 0,
       visible_calibration_views: 1,
-      failure: null,
-      calibration: setup,
+      lifecycle: { state: 'idle', calibration: setup },
     },
   });
   assert.ok(frame?.type === 'guided_session_snapshot');
-  assert.notEqual(frame.snapshot.calibration, null);
-  const body = await render(presentGuidedCalibration(frame.snapshot.calibration!));
+  assert.equal(frame.snapshot.lifecycle.state, 'idle');
+  const calibration =
+    frame.snapshot.lifecycle.state === 'idle' ? frame.snapshot.lifecycle.calibration : null;
+  assert.notEqual(calibration, null);
+  const body = await render(presentGuidedCalibration(calibration!));
 
   assert.match(body, /Choose a Calibration track/);
   assert.match(body, /Fixture Track/);

@@ -841,14 +841,6 @@ pub enum GuidedMode {
     Calibration,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GuidedSessionBinding {
-    pub session_id: u64,
-    pub run_revision: u64,
-    pub mode: GuidedMode,
-    pub device_id: Option<String>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GuidedFailureKind {
@@ -857,22 +849,44 @@ pub enum GuidedFailureKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GuidedSessionFailure {
-    pub run_revision: u64,
-    pub mode: GuidedMode,
-    pub kind: GuidedFailureKind,
-    pub detail: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GuidedSessionSnapshot {
     pub revision: u64,
     pub run_revision: u64,
-    pub active: Option<GuidedSessionBinding>,
     pub visible_collection_views: u64,
     pub visible_calibration_views: u64,
-    pub failure: Option<GuidedSessionFailure>,
-    pub calibration: Option<GuidedCalibrationSnapshot>,
+    pub lifecycle: GuidedSessionState,
+}
+
+/// Complete guided-mode ownership and projection.
+///
+/// The variant owns the mode, active session, failure, and calibration fields
+/// that exist together. This prevents active-and-failed snapshots, a
+/// collection carrying calibration state, and nested run revisions that
+/// disagree with [`GuidedSessionSnapshot::run_revision`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum GuidedSessionState {
+    Idle {
+        calibration: Option<GuidedCalibrationSnapshot>,
+    },
+    Collection {
+        session_id: u64,
+        device_id: Option<String>,
+    },
+    Calibration {
+        session_id: u64,
+        device_id: Option<String>,
+        calibration: Option<GuidedCalibrationSnapshot>,
+    },
+    CollectionFailed {
+        kind: GuidedFailureKind,
+        detail: String,
+    },
+    CalibrationFailed {
+        kind: GuidedFailureKind,
+        detail: String,
+        calibration: Option<GuidedCalibrationSnapshot>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -4685,12 +4699,6 @@ mod tests {
 
     #[test]
     fn guided_presence_and_full_snapshot_roundtrip() {
-        let binding = GuidedSessionBinding {
-            session_id: 9,
-            run_revision: 4,
-            mode: GuidedMode::Collection,
-            device_id: Some("opal-1".into()),
-        };
         let calibration = GuidedCalibrationSnapshot::Setup {
             tracks: vec![GuidedCalibrationTrack {
                 id: "track-1".into(),
@@ -4712,16 +4720,13 @@ mod tests {
                 snapshot: GuidedSessionSnapshot {
                     revision: 12,
                     run_revision: 4,
-                    active: Some(binding),
                     visible_collection_views: 2,
                     visible_calibration_views: 1,
-                    failure: Some(GuidedSessionFailure {
-                        run_revision: 3,
-                        mode: GuidedMode::Calibration,
+                    lifecycle: GuidedSessionState::CalibrationFailed {
                         kind: GuidedFailureKind::DependencyFailed,
                         detail: "device link ended".into(),
-                    }),
-                    calibration: Some(calibration),
+                        calibration: Some(calibration),
+                    },
                 },
             },
             Frame::GuidedSessionIntent {

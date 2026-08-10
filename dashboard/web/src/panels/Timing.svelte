@@ -1,6 +1,7 @@
 <script lang="ts">
   import { Button } from '$lib/components/ui/button/index.js';
   import { api, live } from '../lib/socket.svelte';
+  import { activeGuidedSession } from '../lib/guidedSession';
   import { asOffsetMilliseconds } from '../lib/protocol';
   import { timingAvailable, timingDisplayProjection, timingQualityWarning } from './timing';
 
@@ -9,7 +10,9 @@
     live.hello?.devices.find((device) => device.id === selection?.device_id) ?? null,
   );
   const status = $derived(live.timingStatus?.status ?? null);
-  const activeGuidedMode = $derived(live.guidedSession?.active?.mode ?? null);
+  const activeGuidedMode = $derived(
+    live.guidedSession === null ? null : activeGuidedSession(live.guidedSession)?.mode ?? null,
+  );
   const available = $derived(
     timingAvailable({ selectedDeviceConnected: selectedDevice?.connected === true, guidedMode: activeGuidedMode }),
   );

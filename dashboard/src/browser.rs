@@ -543,7 +543,7 @@ pub async fn handle_browser(
                         }
                         Frame::CalibrationTimingIntent { intent } => {
                             let Some(device_id) = selection.device_id() else { continue };
-                            if guided_sessions.snapshot().active.is_some() {
+                            if guided_sessions.snapshot().active().is_some() {
                                 let refusal = Frame::BenchError {
                                     stage: "timing".into(),
                                     detail: "Timing is available only while collection and calibration are idle.".into(),

@@ -8,16 +8,14 @@ function snapshot(revision: number, runRevision = 4): GuidedSessionSnapshot {
   return {
     revision,
     run_revision: runRevision,
-    active: {
-      session_id: 9,
-      run_revision: runRevision,
-      mode: 'calibration',
-      device_id: 'opal-1',
-    },
     visible_collection_views: 0,
     visible_calibration_views: 2,
-    failure: null,
-    calibration: null,
+    lifecycle: {
+      state: 'calibration',
+      session_id: 9,
+      device_id: 'opal-1',
+      calibration: null,
+    },
   };
 }
 
@@ -39,7 +37,7 @@ test('guided callbacks carry the exact snapshot run identity', () => {
   });
 });
 
-test('guided wire guard requires a complete consistent run identity', () => {
+test('guided wire guard requires one complete tagged lifecycle', () => {
   const valid = { type: 'guided_session_snapshot', snapshot: snapshot(12) } as const;
   assert.equal(asIncomingFrame(valid), valid);
   assert.equal(
@@ -47,7 +45,22 @@ test('guided wire guard requires a complete consistent run identity', () => {
       ...valid,
       snapshot: {
         ...valid.snapshot,
-        active: { ...valid.snapshot.active!, run_revision: 3 },
+        lifecycle: { state: 'collection', session_id: 0, device_id: null },
+      },
+    }),
+    null,
+  );
+  assert.equal(
+    asIncomingFrame({
+      ...valid,
+      snapshot: {
+        ...valid.snapshot,
+        lifecycle: {
+          state: 'collection',
+          session_id: 9,
+          device_id: null,
+          calibration: null,
+        },
       },
     }),
     null,

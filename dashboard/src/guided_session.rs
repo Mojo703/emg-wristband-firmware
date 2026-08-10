@@ -89,11 +89,30 @@ pub struct GuidedFailure {
 pub struct GuidedSessionSnapshot {
     pub revision: SnapshotRevision,
     pub run_revision: RunRevision,
-    pub active: Option<GuidedSessionBinding>,
     pub visible_collection_views: usize,
     pub visible_calibration_views: usize,
-    pub failure: Option<GuidedFailure>,
-    pub calibration: Option<protocol::GuidedCalibrationSnapshot>,
+    pub lifecycle: GuidedSessionLifecycle,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GuidedSessionLifecycle {
+    Idle {
+        calibration: Option<protocol::GuidedCalibrationSnapshot>,
+    },
+    Collection {
+        binding: GuidedSessionBinding,
+    },
+    Calibration {
+        binding: GuidedSessionBinding,
+        calibration: Option<protocol::GuidedCalibrationSnapshot>,
+    },
+    CollectionFailed {
+        failure: GuidedFailure,
+    },
+    CalibrationFailed {
+        failure: GuidedFailure,
+        calibration: Option<protocol::GuidedCalibrationSnapshot>,
+    },
 }
 
 impl GuidedSessionSnapshot {
@@ -104,39 +123,91 @@ impl GuidedSessionSnapshot {
         }
     }
 
+    pub const fn active(&self) -> Option<&GuidedSessionBinding> {
+        match &self.lifecycle {
+            GuidedSessionLifecycle::Collection { binding }
+            | GuidedSessionLifecycle::Calibration { binding, .. } => Some(binding),
+            GuidedSessionLifecycle::Idle { .. }
+            | GuidedSessionLifecycle::CollectionFailed { .. }
+            | GuidedSessionLifecycle::CalibrationFailed { .. } => None,
+        }
+    }
+
+    pub const fn failure(&self) -> Option<&GuidedFailure> {
+        match &self.lifecycle {
+            GuidedSessionLifecycle::CollectionFailed { failure }
+            | GuidedSessionLifecycle::CalibrationFailed { failure, .. } => Some(failure),
+            GuidedSessionLifecycle::Idle { .. }
+            | GuidedSessionLifecycle::Collection { .. }
+            | GuidedSessionLifecycle::Calibration { .. } => None,
+        }
+    }
+
+    pub const fn calibration(&self) -> Option<&protocol::GuidedCalibrationSnapshot> {
+        match &self.lifecycle {
+            GuidedSessionLifecycle::Idle { calibration }
+            | GuidedSessionLifecycle::Calibration { calibration, .. }
+            | GuidedSessionLifecycle::CalibrationFailed { calibration, .. } => calibration.as_ref(),
+            GuidedSessionLifecycle::Collection { .. }
+            | GuidedSessionLifecycle::CollectionFailed { .. } => None,
+        }
+    }
+
     pub fn to_wire(&self) -> protocol::GuidedSessionSnapshot {
-        protocol::GuidedSessionSnapshot {
-            revision: self.revision.get(),
-            run_revision: self.run_revision.get(),
-            active: self
-                .active
-                .as_ref()
-                .map(|active| protocol::GuidedSessionBinding {
-                    session_id: active.session_id.get(),
-                    run_revision: active.run_revision.get(),
-                    mode: active.mode.into(),
-                    device_id: active
+        let lifecycle = match &self.lifecycle {
+            GuidedSessionLifecycle::Idle { calibration } => protocol::GuidedSessionState::Idle {
+                calibration: calibration.clone(),
+            },
+            GuidedSessionLifecycle::Collection { binding } => {
+                protocol::GuidedSessionState::Collection {
+                    session_id: binding.session_id.get(),
+                    device_id: binding
                         .device
                         .as_ref()
                         .map(|device| device.device_id.clone()),
-                }),
+                }
+            }
+            GuidedSessionLifecycle::Calibration {
+                binding,
+                calibration,
+            } => protocol::GuidedSessionState::Calibration {
+                session_id: binding.session_id.get(),
+                device_id: binding
+                    .device
+                    .as_ref()
+                    .map(|device| device.device_id.clone()),
+                calibration: calibration.clone(),
+            },
+            GuidedSessionLifecycle::CollectionFailed { failure } => {
+                protocol::GuidedSessionState::CollectionFailed {
+                    kind: failure.kind.into(),
+                    detail: failure.detail.clone(),
+                }
+            }
+            GuidedSessionLifecycle::CalibrationFailed {
+                failure,
+                calibration,
+            } => protocol::GuidedSessionState::CalibrationFailed {
+                kind: failure.kind.into(),
+                detail: failure.detail.clone(),
+                calibration: calibration.clone(),
+            },
+        };
+        protocol::GuidedSessionSnapshot {
+            revision: self.revision.get(),
+            run_revision: self.run_revision.get(),
             visible_collection_views: self.visible_collection_views as u64,
             visible_calibration_views: self.visible_calibration_views as u64,
-            failure: self
-                .failure
-                .as_ref()
-                .map(|failure| protocol::GuidedSessionFailure {
-                    run_revision: failure.run_revision.get(),
-                    mode: failure.mode.into(),
-                    kind: match failure.kind {
-                        GuidedFailureKind::DependencyFailed => {
-                            protocol::GuidedFailureKind::DependencyFailed
-                        }
-                        GuidedFailureKind::TaskFailed => protocol::GuidedFailureKind::TaskFailed,
-                    },
-                    detail: failure.detail.clone(),
-                }),
-            calibration: self.calibration.clone(),
+            lifecycle,
+        }
+    }
+}
+
+impl From<GuidedFailureKind> for protocol::GuidedFailureKind {
+    fn from(value: GuidedFailureKind) -> Self {
+        match value {
+            GuidedFailureKind::DependencyFailed => Self::DependencyFailed,
+            GuidedFailureKind::TaskFailed => Self::TaskFailed,
         }
     }
 }
@@ -213,6 +284,7 @@ pub enum CoordinatorError {
     LeaseMismatch,
     DeviceRequired,
     AdapterTaskUnavailable,
+    AdapterTaskBusy,
     CalibrationTrackRequired,
     UnknownCalibrationTrack,
 }
@@ -261,11 +333,9 @@ impl GuidedSessionCoordinator {
         let snapshot = GuidedSessionSnapshot {
             revision: SnapshotRevision(0),
             run_revision: RunRevision(0),
-            active: None,
             visible_collection_views: 0,
             visible_calibration_views: 0,
-            failure: None,
-            calibration: None,
+            lifecycle: GuidedSessionLifecycle::Idle { calibration: None },
         };
         let (snapshots, _) = watch::channel(snapshot.clone());
         Self {
@@ -314,7 +384,7 @@ impl GuidedSessionCoordinator {
         mode: GuidedMode,
         device: Option<DeviceConnectionIdentity>,
     ) -> Result<SessionLease, CoordinatorError> {
-        if let Some(active) = &state.snapshot.active {
+        if let Some(active) = state.snapshot.active() {
             return Err(CoordinatorError::LeaseHeld { mode: active.mode });
         }
         let adapter_available = state
@@ -339,9 +409,15 @@ impl GuidedSessionCoordinator {
             device,
         };
         state.snapshot.run_revision = binding.run_revision;
-        state.snapshot.active = Some(binding.clone());
-        state.snapshot.failure = None;
-        state.snapshot.calibration = None;
+        state.snapshot.lifecycle = match mode {
+            GuidedMode::Collection => GuidedSessionLifecycle::Collection {
+                binding: binding.clone(),
+            },
+            GuidedMode::Calibration => GuidedSessionLifecycle::Calibration {
+                binding: binding.clone(),
+                calibration: None,
+            },
+        };
         publish_locked(&self.inner, state, next_snapshot_revision);
         Ok(SessionLease {
             coordinator: Arc::downgrade(&self.inner),
@@ -365,11 +441,14 @@ impl GuidedSessionCoordinator {
         calibration: protocol::GuidedCalibrationSnapshot,
     ) -> Result<GuidedSessionSnapshot, CoordinatorError> {
         let mut state = self.inner.state.lock().unwrap();
-        if state.snapshot.active.as_ref() != Some(binding) {
-            return Err(CoordinatorError::LeaseMismatch);
-        }
         let next_revision = next_snapshot_revision(&state.snapshot)?;
-        state.snapshot.calibration = Some(calibration);
+        match &mut state.snapshot.lifecycle {
+            GuidedSessionLifecycle::Calibration {
+                binding: active,
+                calibration: current,
+            } if active == binding => *current = Some(calibration),
+            _ => return Err(CoordinatorError::LeaseMismatch),
+        }
         publish_locked(&self.inner, &mut state, next_revision);
         Ok(state.snapshot.clone())
     }
@@ -379,11 +458,20 @@ impl GuidedSessionCoordinator {
         calibration: protocol::GuidedCalibrationSnapshot,
     ) -> Result<GuidedSessionSnapshot, CoordinatorError> {
         let mut state = self.inner.state.lock().unwrap();
-        if state.snapshot.active.is_some() {
-            return Err(CoordinatorError::LeaseMismatch);
-        }
         let next_revision = next_snapshot_revision(&state.snapshot)?;
-        state.snapshot.calibration = Some(calibration);
+        match state.snapshot.lifecycle {
+            GuidedSessionLifecycle::Idle { .. }
+            | GuidedSessionLifecycle::CollectionFailed { .. }
+            | GuidedSessionLifecycle::CalibrationFailed { .. } => {
+                state.snapshot.lifecycle = GuidedSessionLifecycle::Idle {
+                    calibration: Some(calibration),
+                };
+            }
+            GuidedSessionLifecycle::Collection { .. }
+            | GuidedSessionLifecycle::Calibration { .. } => {
+                return Err(CoordinatorError::LeaseMismatch);
+            }
+        }
         publish_locked(&self.inner, &mut state, next_revision);
         Ok(state.snapshot.clone())
     }
@@ -406,7 +494,7 @@ impl GuidedSessionCoordinator {
                 .and_then(Weak::upgrade)
                 .filter(|adapter| adapter.available())
                 .ok_or(CoordinatorError::ModeUnavailable(GuidedMode::Calibration))?;
-            (adapter, state.snapshot.active.clone())
+            (adapter, state.snapshot.active().cloned())
         };
         adapter.handle_intent(active.as_ref(), device, request)
     }
@@ -437,7 +525,23 @@ impl GuidedSessionCoordinator {
             expected_session_id,
         )?;
         let next_revision = next_snapshot_revision(&state.snapshot)?;
-        state.snapshot.calibration = Some(calibration);
+        match &mut state.snapshot.lifecycle {
+            GuidedSessionLifecycle::Idle {
+                calibration: current,
+            }
+            | GuidedSessionLifecycle::Calibration {
+                calibration: current,
+                ..
+            }
+            | GuidedSessionLifecycle::CalibrationFailed {
+                calibration: current,
+                ..
+            } => *current = Some(calibration),
+            GuidedSessionLifecycle::Collection { .. }
+            | GuidedSessionLifecycle::CollectionFailed { .. } => {
+                return Err(CoordinatorError::LeaseMismatch);
+            }
+        }
         publish_locked(&self.inner, &mut state, next_revision);
         Ok(state.snapshot.clone())
     }
@@ -505,7 +609,7 @@ fn check_identity(
             received: expected_run_revision,
         });
     }
-    let expected_session = snapshot.active.as_ref().map(|active| active.session_id);
+    let expected_session = snapshot.active().map(|active| active.session_id);
     if expected_session != expected_session_id {
         return Err(CoordinatorError::StaleSession {
             expected: expected_session,
@@ -589,29 +693,52 @@ fn release(
         return;
     };
     let mut state = inner.state.lock().unwrap();
-    if state.snapshot.active.as_ref() != Some(binding) {
+    if state.snapshot.active() != Some(binding) {
         return;
     }
     let Ok(next_revision) = next_snapshot_revision(&state.snapshot) else {
         return;
     };
-    state.snapshot.active = None;
-    state.snapshot.failure = match outcome {
-        SessionExit::Completed | SessionExit::OperatorStopped => None,
-        SessionExit::DependencyFailed(detail) => Some(GuidedFailure {
-            run_revision: binding.run_revision,
-            mode: binding.mode,
-            kind: GuidedFailureKind::DependencyFailed,
+    let calibration = match &mut state.snapshot.lifecycle {
+        GuidedSessionLifecycle::Calibration { calibration, .. } => calibration.take(),
+        _ => None,
+    };
+    state.snapshot.lifecycle = match outcome {
+        SessionExit::Completed | SessionExit::OperatorStopped => {
+            GuidedSessionLifecycle::Idle { calibration }
+        }
+        SessionExit::DependencyFailed(detail) => failed_lifecycle(
+            binding,
+            GuidedFailureKind::DependencyFailed,
             detail,
-        }),
-        SessionExit::TaskFailed(detail) => Some(GuidedFailure {
-            run_revision: binding.run_revision,
-            mode: binding.mode,
-            kind: GuidedFailureKind::TaskFailed,
-            detail,
-        }),
+            calibration,
+        ),
+        SessionExit::TaskFailed(detail) => {
+            failed_lifecycle(binding, GuidedFailureKind::TaskFailed, detail, calibration)
+        }
     };
     publish_locked(&inner, &mut state, next_revision);
+}
+
+fn failed_lifecycle(
+    binding: &GuidedSessionBinding,
+    kind: GuidedFailureKind,
+    detail: String,
+    calibration: Option<protocol::GuidedCalibrationSnapshot>,
+) -> GuidedSessionLifecycle {
+    let failure = GuidedFailure {
+        run_revision: binding.run_revision,
+        mode: binding.mode,
+        kind,
+        detail,
+    };
+    match binding.mode {
+        GuidedMode::Collection => GuidedSessionLifecycle::CollectionFailed { failure },
+        GuidedMode::Calibration => GuidedSessionLifecycle::CalibrationFailed {
+            failure,
+            calibration,
+        },
+    }
 }
 
 pub struct GuidedBrowserConnection {
@@ -718,7 +845,7 @@ fn pause_target(state: &CoordinatorState, departed_mode: GuidedMode) -> PauseTar
     if state.snapshot.visible_views(departed_mode) != 0 {
         return None;
     }
-    let active = state.snapshot.active.clone()?;
+    let active = state.snapshot.active().cloned()?;
     if active.mode != departed_mode {
         return None;
     }
@@ -843,7 +970,7 @@ mod tests {
         let request = GuidedIntentRequest {
             expected_revision: snapshot.revision,
             expected_run_revision: snapshot.run_revision,
-            expected_session_id: snapshot.active.as_ref().map(|active| active.session_id),
+            expected_session_id: snapshot.active().map(|active| active.session_id),
             action: protocol::GuidedSessionAction::PauseCalibration,
         };
 
@@ -889,7 +1016,7 @@ mod tests {
             coordinator.acquire_for_intent(&request, GuidedMode::Calibration, Some(device())),
             Err(CoordinatorError::StaleRevision { .. })
         ));
-        assert!(coordinator.snapshot().active.is_none());
+        assert!(coordinator.snapshot().active().is_none());
     }
 
     #[test]
@@ -940,7 +1067,7 @@ mod tests {
         let resynchronized = snapshots.borrow_and_update().clone();
         assert_eq!(resynchronized, coordinator.snapshot());
         assert_eq!(resynchronized.visible_views(GuidedMode::Calibration), 0);
-        assert_eq!(resynchronized.active.as_ref(), Some(lease.binding()));
+        assert_eq!(resynchronized.active(), Some(lease.binding()));
         lease.finish(SessionExit::Completed);
     }
 
@@ -956,10 +1083,10 @@ mod tests {
             .unwrap();
 
         let snapshot = coordinator.snapshot();
-        assert_eq!(snapshot.active.as_ref(), Some(lease.binding()));
+        assert_eq!(snapshot.active(), Some(lease.binding()));
         assert_eq!(snapshot.run_revision, lease.binding().run_revision);
         assert_eq!(snapshot.visible_views(GuidedMode::Collection), 1);
-        assert_eq!(snapshot.failure, None);
+        assert_eq!(snapshot.failure(), None);
         lease.finish(SessionExit::Completed);
     }
 
@@ -973,10 +1100,10 @@ mod tests {
         drop(lease);
 
         let snapshot = coordinator.snapshot();
-        assert_eq!(snapshot.active, None);
+        assert_eq!(snapshot.active(), None);
         assert_eq!(
-            snapshot.failure,
-            Some(GuidedFailure {
+            snapshot.failure(),
+            Some(&GuidedFailure {
                 run_revision,
                 mode: GuidedMode::Calibration,
                 kind: GuidedFailureKind::TaskFailed,
@@ -998,15 +1125,41 @@ mod tests {
         lease.finish(SessionExit::DependencyFailed("device link ended".into()));
 
         assert_eq!(
-            coordinator.snapshot().failure,
-            Some(GuidedFailure {
+            coordinator.snapshot().failure(),
+            Some(&GuidedFailure {
                 run_revision,
                 mode: GuidedMode::Collection,
                 kind: GuidedFailureKind::DependencyFailed,
                 detail: "device link ended".into(),
             })
         );
-        assert!(coordinator.snapshot().active.is_none());
+        assert!(coordinator.snapshot().active().is_none());
+    }
+
+    #[test]
+    fn publishing_a_new_idle_calibration_clears_the_previous_run_failure() {
+        let (coordinator, _adapter) = coordinator();
+        let lease = coordinator
+            .acquire_current(GuidedMode::Calibration, Some(device()))
+            .unwrap();
+        lease.finish(SessionExit::TaskFailed("old run failed".into()));
+        assert!(coordinator.snapshot().failure().is_some());
+
+        coordinator
+            .update_idle_calibration(protocol::GuidedCalibrationSnapshot::Setup {
+                tracks: Vec::new(),
+                selected_track_id: None,
+            })
+            .unwrap();
+
+        let snapshot = coordinator.snapshot();
+        assert!(matches!(
+            snapshot.lifecycle,
+            GuidedSessionLifecycle::Idle {
+                calibration: Some(protocol::GuidedCalibrationSnapshot::Setup { .. })
+            }
+        ));
+        assert!(snapshot.failure().is_none());
     }
 
     #[test]

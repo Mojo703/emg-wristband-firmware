@@ -998,19 +998,7 @@ export interface GuidedViewPresenceFrame {
   readonly mode: GuidedMode | null;
 }
 
-export interface GuidedSessionBinding {
-  readonly session_id: number;
-  readonly run_revision: number;
-  readonly mode: GuidedMode;
-  readonly device_id: string | null;
-}
-
-export interface GuidedSessionFailure {
-  readonly run_revision: number;
-  readonly mode: GuidedMode;
-  readonly kind: 'dependency_failed' | 'task_failed';
-  readonly detail: string;
-}
+export type GuidedFailureKind = 'dependency_failed' | 'task_failed';
 
 export interface GuidedCalibrationTrack {
   readonly id: string;
@@ -1094,12 +1082,41 @@ export type GuidedCalibrationSnapshot =
 export interface GuidedSessionSnapshot {
   readonly revision: number;
   readonly run_revision: number;
-  readonly active: GuidedSessionBinding | null;
   readonly visible_collection_views: number;
   readonly visible_calibration_views: number;
-  readonly failure: GuidedSessionFailure | null;
-  readonly calibration: GuidedCalibrationSnapshot | null;
+  readonly lifecycle: GuidedSessionState;
 }
+
+/** A tagged lifecycle prevents active/failed and collection/calibration fields
+ * from appearing in impossible combinations. The enclosing run revision is
+ * the sole run identity rather than being repeated in nullable children. */
+export type GuidedSessionState =
+  | {
+      readonly state: 'idle';
+      readonly calibration: GuidedCalibrationSnapshot | null;
+    }
+  | {
+      readonly state: 'collection';
+      readonly session_id: number;
+      readonly device_id: string | null;
+    }
+  | {
+      readonly state: 'calibration';
+      readonly session_id: number;
+      readonly device_id: string | null;
+      readonly calibration: GuidedCalibrationSnapshot | null;
+    }
+  | {
+      readonly state: 'collection_failed';
+      readonly kind: GuidedFailureKind;
+      readonly detail: string;
+    }
+  | {
+      readonly state: 'calibration_failed';
+      readonly kind: GuidedFailureKind;
+      readonly detail: string;
+      readonly calibration: GuidedCalibrationSnapshot | null;
+    };
 
 export interface GuidedSessionSnapshotFrame {
   readonly type: 'guided_session_snapshot';
@@ -1779,24 +1796,60 @@ export function isGuidedCalibrationSnapshot(
   }
 }
 
-function isGuidedSessionBinding(value: unknown): value is GuidedSessionBinding {
-  return (
-    isObject(value) &&
-    isPositiveInteger(value['session_id']) &&
-    isPositiveInteger(value['run_revision']) &&
-    isGuidedMode(value['mode']) &&
-    (value['device_id'] === null || isString(value['device_id']))
-  );
+function isGuidedFailureKind(value: unknown): value is GuidedFailureKind {
+  return value === 'dependency_failed' || value === 'task_failed';
 }
 
-function isGuidedSessionFailure(value: unknown): value is GuidedSessionFailure {
-  return (
-    isObject(value) &&
-    isPositiveInteger(value['run_revision']) &&
-    isGuidedMode(value['mode']) &&
-    (value['kind'] === 'dependency_failed' || value['kind'] === 'task_failed') &&
-    isString(value['detail'])
-  );
+function isNullableGuidedCalibration(value: unknown): boolean {
+  return value === null || isGuidedCalibrationSnapshot(value);
+}
+
+function isGuidedSessionState(value: unknown): value is GuidedSessionState {
+  if (!isObject(value)) return false;
+  switch (value['state']) {
+    case 'idle':
+      return (
+        isNullableGuidedCalibration(value['calibration']) &&
+        value['session_id'] === undefined &&
+        value['device_id'] === undefined &&
+        value['kind'] === undefined &&
+        value['detail'] === undefined
+      );
+    case 'collection':
+      return (
+        isPositiveInteger(value['session_id']) &&
+        (value['device_id'] === null || isString(value['device_id'])) &&
+        value['calibration'] === undefined &&
+        value['kind'] === undefined &&
+        value['detail'] === undefined
+      );
+    case 'calibration':
+      return (
+        isPositiveInteger(value['session_id']) &&
+        (value['device_id'] === null || isString(value['device_id'])) &&
+        isNullableGuidedCalibration(value['calibration']) &&
+        value['kind'] === undefined &&
+        value['detail'] === undefined
+      );
+    case 'collection_failed':
+      return (
+        isGuidedFailureKind(value['kind']) &&
+        isString(value['detail']) &&
+        value['session_id'] === undefined &&
+        value['device_id'] === undefined &&
+        value['calibration'] === undefined
+      );
+    case 'calibration_failed':
+      return (
+        isGuidedFailureKind(value['kind']) &&
+        isString(value['detail']) &&
+        isNullableGuidedCalibration(value['calibration']) &&
+        value['session_id'] === undefined &&
+        value['device_id'] === undefined
+      );
+    default:
+      return false;
+  }
 }
 
 export function isGuidedSessionSnapshotFrame(
@@ -1805,18 +1858,12 @@ export function isGuidedSessionSnapshotFrame(
   if (!hasType(value, 'guided_session_snapshot') || !isObject(value)) return false;
   const snapshot = value['snapshot'];
   if (!isObject(snapshot)) return false;
-  const active = snapshot['active'];
-  const failure = snapshot['failure'];
   return (
     isNonnegativeInteger(snapshot['revision']) &&
     isNonnegativeInteger(snapshot['run_revision']) &&
-    (active === null || isGuidedSessionBinding(active)) &&
-    (active === null || active.run_revision === snapshot['run_revision']) &&
     isNonnegativeInteger(snapshot['visible_collection_views']) &&
     isNonnegativeInteger(snapshot['visible_calibration_views']) &&
-    (failure === null || isGuidedSessionFailure(failure)) &&
-    (snapshot['calibration'] === null ||
-      isGuidedCalibrationSnapshot(snapshot['calibration']))
+    isGuidedSessionState(snapshot['lifecycle'])
   );
 }
 

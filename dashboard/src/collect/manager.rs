@@ -2240,10 +2240,10 @@ mod tests {
             manager.restore_idle_after_task(session_id);
 
             assert!(matches!(manager.state.lock().unwrap().phase, Phase::Idle));
-            assert!(guided_sessions.snapshot().active.is_none());
+            assert!(guided_sessions.snapshot().active().is_none());
             assert!(matches!(
-                guided_sessions.snapshot().failure,
-                Some(dashboard::guided_session::GuidedFailure {
+                guided_sessions.snapshot().failure(),
+                Some(&dashboard::guided_session::GuidedFailure {
                     kind: dashboard::guided_session::GuidedFailureKind::TaskFailed,
                     ..
                 })

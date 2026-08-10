@@ -20,6 +20,7 @@ use tokio::sync::{broadcast, mpsc};
 const OPERATIONAL_SCHEDULE_UPLOAD_ENTRIES: usize = 8;
 const CHUNK_ACK_RETRY_AFTER: Duration = Duration::from_secs(2);
 const MAX_CHUNK_ACK_RETRIES: u8 = 3;
+const RUN_ACTION_CAPACITY: usize = 8;
 
 pub struct CalibrationModeAdapter {
     registry: Arc<Registry>,
@@ -34,7 +35,8 @@ pub struct CalibrationModeAdapter {
 
 struct ActiveRun {
     binding: GuidedSessionBinding,
-    commands: mpsc::UnboundedSender<RunCommand>,
+    actions: mpsc::Sender<RunAction>,
+    gate: tokio::sync::watch::Sender<RunGate>,
 }
 
 struct CalibrationRunContext {
@@ -46,11 +48,7 @@ struct CalibrationRunContext {
     track: crate::collect::beatmap::CalibrationTrack,
 }
 
-enum RunCommand {
-    /// Stop host heartbeats when the guided view disappears.  The device's
-    /// two-second watchdog then emits the interruption while retaining rows.
-    Interrupt,
-    Resume,
+enum RunAction {
     /// Continue retains the completed evidence on the device and asks it to
     /// wait for a newly authored schedule.  The adapter owns the revision
     /// minting; the browser never talks to the device directly.
@@ -64,6 +62,25 @@ enum RunCommand {
     Save,
     /// Drop the candidate while retaining the previous resident model.
     Discard,
+}
+
+/// Latest requested heartbeat/playback gate. Pause and resume are idempotent
+/// state, not an event backlog. A watch channel bounds storage at one value and
+/// makes the browser-departure interrupt impossible to reject under load.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RunGate {
+    Interrupted,
+    Running,
+}
+
+fn enqueue_run_action(
+    actions: &mpsc::Sender<RunAction>,
+    action: RunAction,
+) -> Result<(), CoordinatorError> {
+    actions.try_send(action).map_err(|error| match error {
+        mpsc::error::TrySendError::Full(_) => CoordinatorError::AdapterTaskBusy,
+        mpsc::error::TrySendError::Closed(_) => CoordinatorError::AdapterTaskUnavailable,
+    })
 }
 
 /// The host actor's phase-local state.  These are deliberately not booleans:
@@ -213,10 +230,12 @@ impl CalibrationModeAdapter {
             .find(|track| track.id.0 == track_id)
             .cloned()
             .ok_or(CoordinatorError::UnknownCalibrationTrack)?;
-        let (commands, command_rx) = mpsc::unbounded_channel();
+        let (actions, action_rx) = mpsc::channel(RUN_ACTION_CAPACITY);
+        let (gate, gate_rx) = tokio::sync::watch::channel(RunGate::Running);
         *active = Some(ActiveRun {
             binding: binding.clone(),
-            commands,
+            actions,
+            gate,
         });
         let Some(adapter) = self.this.upgrade() else {
             *active = None;
@@ -236,7 +255,8 @@ impl CalibrationModeAdapter {
                         schedule_revision,
                         track,
                     },
-                    command_rx,
+                    action_rx,
+                    gate_rx,
                 )
                 .await;
         });
@@ -246,7 +266,8 @@ impl CalibrationModeAdapter {
     async fn run(
         self: Arc<Self>,
         context: CalibrationRunContext,
-        mut commands: mpsc::UnboundedReceiver<RunCommand>,
+        mut actions: mpsc::Receiver<RunAction>,
+        mut gate: tokio::sync::watch::Receiver<RunGate>,
     ) {
         let CalibrationRunContext {
             lease,
@@ -311,6 +332,25 @@ impl CalibrationModeAdapter {
         let mut chunk_ack_retries = 0u8;
         let outcome = loop {
             tokio::select! {
+                biased;
+                changed = gate.changed() => match changed {
+                    Ok(()) => match *gate.borrow_and_update() {
+                        RunGate::Interrupted => heartbeat_mode = HeartbeatMode::Withheld,
+                        RunGate::Running => {
+                            if matches!(heartbeat_mode, HeartbeatMode::Withheld)
+                                && matches!(playback, PlaybackState::Playing(_) | PlaybackState::Armed { .. })
+                            {
+                                heartbeat_mode = HeartbeatMode::Sending {
+                                    schedule_revision,
+                                    next_sequence: 0,
+                                };
+                            }
+                        }
+                    },
+                    Err(_) => break SessionExit::TaskFailed(
+                        "calibration lifecycle gate closed".into(),
+                    ),
+                },
                 _ = heartbeat.tick() => {
                     if let HeartbeatMode::Sending { schedule_revision: committed_revision, next_sequence } = &mut heartbeat_mode {
                         let frame = Frame::CalibrationHeartbeat {
@@ -547,34 +587,17 @@ impl CalibrationModeAdapter {
                     }
                     chunk_ack_retries = chunk_ack_retries.saturating_add(1);
                 }
-                command = commands.recv() => {
+                command = actions.recv() => {
                     let Some(command) = command else {
-                        break SessionExit::TaskFailed("calibration actor command channel closed".into());
+                        break SessionExit::TaskFailed("calibration actor action channel closed".into());
                     };
-                    let terminal_discard = matches!(&command, RunCommand::Discard);
-                    if matches!(&command, RunCommand::Save) && !candidate.permits_activation()
+                    let terminal_discard = matches!(&command, RunAction::Discard);
+                    if matches!(&command, RunAction::Save) && !candidate.permits_activation()
                     {
                         continue;
                     }
                     let frame = match command {
-                        RunCommand::Interrupt => {
-                            heartbeat_mode = HeartbeatMode::Withheld;
-                            continue;
-                        }
-                        RunCommand::Resume => {
-                            if let HeartbeatMode::Withheld = heartbeat_mode {
-                                // Only an accepted schedule carries the exact
-                                // revision required for a heartbeat.
-                                if matches!(playback, PlaybackState::Playing(_) | PlaybackState::Armed { .. }) {
-                                    heartbeat_mode = HeartbeatMode::Sending {
-                                        schedule_revision,
-                                        next_sequence: 0,
-                                    };
-                                }
-                            }
-                            continue;
-                        }
-                        RunCommand::Continue => {
+                        RunAction::Continue => {
                             let Some(next_revision) = next_schedule_revision(schedule_revision) else {
                                 break SessionExit::TaskFailed("calibration schedule revision exhausted".into());
                             };
@@ -601,7 +624,7 @@ impl CalibrationModeAdapter {
                             playback = PlaybackState::Dormant;
                             continue;
                         }
-                        RunCommand::SelectNextTrack(next_track) => {
+                        RunAction::SelectNextTrack(next_track) => {
                             // A live song owns its authored identity until its
                             // result/interruption is projected. Retargeting is
                             // deliberately restricted to that boundary.
@@ -623,8 +646,8 @@ impl CalibrationModeAdapter {
                             );
                             continue;
                         }
-                        RunCommand::Save => Frame::CalibrationSave { run },
-                        RunCommand::Discard => Frame::CalibrationDiscard { run },
+                        RunAction::Save => Frame::CalibrationSave { run },
+                        RunAction::Discard => Frame::CalibrationDiscard { run },
                     };
                     if let Err(error) = self.registry.send_bound_control(&device, frame) {
                         break delivery_failure(error);
@@ -673,18 +696,32 @@ impl CalibrationModeAdapter {
         lease.finish(outcome);
     }
 
-    fn send(
+    fn send_action(
         &self,
         binding: &GuidedSessionBinding,
-        command: RunCommand,
+        action: RunAction,
     ) -> Result<(), CoordinatorError> {
         let active = self.active.lock().unwrap();
-        active
+        let actions = &active
             .as_ref()
             .filter(|active| &active.binding == binding)
             .ok_or(CoordinatorError::LeaseMismatch)?
-            .commands
-            .send(command)
+            .actions;
+        enqueue_run_action(actions, action)
+    }
+
+    fn set_gate(
+        &self,
+        binding: &GuidedSessionBinding,
+        requested: RunGate,
+    ) -> Result<(), CoordinatorError> {
+        let active = self.active.lock().unwrap();
+        let gate = &active
+            .as_ref()
+            .filter(|active| &active.binding == binding)
+            .ok_or(CoordinatorError::LeaseMismatch)?
+            .gate;
+        gate.send(requested)
             .map_err(|_| CoordinatorError::AdapterTaskUnavailable)
     }
 
@@ -721,15 +758,15 @@ impl CalibrationModeAdapter {
             .cloned()
             .ok_or(CoordinatorError::UnknownCalibrationTrack)?;
         let snapshot = self.coordinator.snapshot();
-        if snapshot.active.as_ref() != Some(binding)
+        if snapshot.active() != Some(binding)
             || !matches!(
-                snapshot.calibration,
+                snapshot.calibration(),
                 Some(GuidedCalibrationSnapshot::BetweenSongs { .. })
             )
         {
             return Ok(());
         }
-        self.send(binding, RunCommand::SelectNextTrack(track))
+        self.send_action(binding, RunAction::SelectNextTrack(track))
     }
 }
 
@@ -737,7 +774,7 @@ impl GuidedModeAdapter for CalibrationModeAdapter {
     fn pause_for_no_visible_views(&self, session: &GuidedSessionBinding) {
         let active = self.active.lock().unwrap();
         if let Some(active) = active.as_ref().filter(|active| &active.binding == session) {
-            let _ = active.commands.send(RunCommand::Interrupt);
+            let _ = active.gate.send(RunGate::Interrupted);
         }
     }
 
@@ -759,25 +796,25 @@ impl GuidedModeAdapter for CalibrationModeAdapter {
             GuidedSessionAction::StartCalibration if session.is_none() => {
                 self.start(device.ok_or(CoordinatorError::DeviceRequired)?, &request)
             }
-            GuidedSessionAction::PauseCalibration => self.send(
+            GuidedSessionAction::PauseCalibration => self.set_gate(
                 session.ok_or(CoordinatorError::LeaseMismatch)?,
-                RunCommand::Interrupt,
+                RunGate::Interrupted,
             ),
-            GuidedSessionAction::ResumeCalibration => self.send(
+            GuidedSessionAction::ResumeCalibration => self.set_gate(
                 session.ok_or(CoordinatorError::LeaseMismatch)?,
-                RunCommand::Resume,
+                RunGate::Running,
             ),
-            GuidedSessionAction::DiscardCalibration => self.send(
+            GuidedSessionAction::DiscardCalibration => self.send_action(
                 session.ok_or(CoordinatorError::LeaseMismatch)?,
-                RunCommand::Discard,
+                RunAction::Discard,
             ),
-            GuidedSessionAction::SaveCalibration => self.send(
+            GuidedSessionAction::SaveCalibration => self.send_action(
                 session.ok_or(CoordinatorError::LeaseMismatch)?,
-                RunCommand::Save,
+                RunAction::Save,
             ),
-            GuidedSessionAction::ContinueCalibration => self.send(
+            GuidedSessionAction::ContinueCalibration => self.send_action(
                 session.ok_or(CoordinatorError::LeaseMismatch)?,
-                RunCommand::Continue,
+                RunAction::Continue,
             ),
             GuidedSessionAction::SelectCalibrationTrack { .. }
             | GuidedSessionAction::StartCalibration => Ok(()),
@@ -1124,6 +1161,50 @@ mod tests {
     use protocol::{DeviceConfig, DeviceProvenance, DeviceTransport, FirmwareBuild};
     use std::path::PathBuf;
 
+    #[test]
+    fn run_action_queue_is_bounded_and_distinguishes_full_from_closed() {
+        let (actions, mut receiver) = mpsc::channel(2);
+        enqueue_run_action(&actions, RunAction::Continue).unwrap();
+        enqueue_run_action(&actions, RunAction::Save).unwrap();
+        assert_eq!(
+            enqueue_run_action(&actions, RunAction::Discard),
+            Err(CoordinatorError::AdapterTaskBusy)
+        );
+
+        assert!(matches!(receiver.try_recv(), Ok(RunAction::Continue)));
+        drop(receiver);
+        assert_eq!(
+            enqueue_run_action(&actions, RunAction::Discard),
+            Err(CoordinatorError::AdapterTaskUnavailable)
+        );
+    }
+
+    #[test]
+    fn interrupt_supersedes_a_stale_resume_even_when_actions_are_saturated() {
+        let (actions, receiver) = mpsc::channel(1);
+        enqueue_run_action(&actions, RunAction::Continue).unwrap();
+        let (gate, mut gate_receiver) = tokio::sync::watch::channel(RunGate::Interrupted);
+
+        gate.send(RunGate::Running).unwrap();
+        gate.send(RunGate::Interrupted).unwrap();
+
+        assert_eq!(*gate_receiver.borrow_and_update(), RunGate::Interrupted);
+        assert_eq!(receiver.len(), 1);
+    }
+
+    #[test]
+    fn browser_interrupt_delivery_survives_action_queue_saturation() {
+        let (actions, receiver) = mpsc::channel(1);
+        enqueue_run_action(&actions, RunAction::Continue).unwrap();
+        let (gate, mut gate_receiver) = tokio::sync::watch::channel(RunGate::Running);
+
+        gate.send(RunGate::Interrupted).unwrap();
+
+        assert!(gate_receiver.has_changed().unwrap());
+        assert_eq!(*gate_receiver.borrow_and_update(), RunGate::Interrupted);
+        assert_eq!(receiver.len(), 1);
+    }
+
     fn register_device(registry: &Registry) -> crate::registry::DeviceHandle {
         registry.register(
             "opal-test".into(),
@@ -1281,7 +1362,7 @@ mod tests {
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         assert!(matches!(
-            coordinator.snapshot().calibration,
+            coordinator.snapshot().calibration(),
             Some(GuidedCalibrationSnapshot::Preparing {
                 stage: protocol::GuidedCalibrationPreparationStage::Stillness,
                 elapsed_milliseconds: 750,
@@ -1327,7 +1408,7 @@ mod tests {
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         assert!(matches!(
-            coordinator.snapshot().calibration,
+            coordinator.snapshot().calibration(),
             Some(GuidedCalibrationSnapshot::BetweenSongs {
                 continue_available: true,
                 valid_reps: 3,
@@ -1352,7 +1433,7 @@ mod tests {
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         assert!(matches!(
-            coordinator.snapshot().calibration,
+            coordinator.snapshot().calibration(),
             Some(GuidedCalibrationSnapshot::BetweenSongs { .. })
         ));
         // A new DeviceHello is a link epoch, even when the underlying serial
@@ -1384,7 +1465,7 @@ mod tests {
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         assert!(matches!(
-            coordinator.snapshot().calibration,
+            coordinator.snapshot().calibration(),
             Some(GuidedCalibrationSnapshot::TechnicalFailure { .. })
         ));
     }
