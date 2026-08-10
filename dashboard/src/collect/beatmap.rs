@@ -465,20 +465,27 @@ fn load_track(directory: &Path) -> anyhow::Result<CatalogTrack> {
         let availability = (|| -> anyhow::Result<CalibrationAvailability> {
             let source = entry
                 .levels
-                .get(super::calibration_level::CALIBRATION_SOURCE_LEVEL)
-                .ok_or_else(|| anyhow!("calibration product has no retained hard source level"))?;
-            let regenerated = (product.generator_version
-                == super::calibration_level::INCOMPATIBLE_CALIBRATION_LEVEL_GENERATOR_VERSION)
-                .then(|| {
-                    tracing::warn!(
-                        track = %entry.id,
-                        generator_version = product.generator_version,
-                        "regenerating incompatible calibration schedule in memory with the mandatory recovery interval"
-                    );
-                    CalibrationLevelProduct::generate(&source.map_notes, entry.duration_ms)
-                });
-            let product = regenerated.as_ref().unwrap_or(product);
-            product.validate_against_source(&source.map_notes, entry.duration_ms)?;
+                .get(&product.source_level)
+                .ok_or_else(|| anyhow!("calibration product names a missing retained source level"))?;
+            if product.generator_version
+                != super::calibration_level::INCOMPATIBLE_CALIBRATION_LEVEL_GENERATOR_VERSION
+            {
+                product.validate_against_source(&source.map_notes, entry.duration_ms)?;
+            }
+            let canonical = CalibrationLevelProduct::generate_best(&entry.levels, entry.duration_ms)?;
+            let product = if product != &canonical {
+                tracing::warn!(
+                    track = %entry.id,
+                    old_source = %product.source_level,
+                    old_cues = product.cue_count(),
+                    new_source = %canonical.source_level,
+                    new_cues = canonical.cue_count(),
+                    "regenerating calibration schedule in memory from the best retained source level"
+                );
+                &canonical
+            } else {
+                product
+            };
             Ok(CalibrationAvailability {
                 cue_count: product.cue_count(),
                 content_identity: product.content_identity.clone(),
@@ -976,6 +983,58 @@ mod tests {
                     + pair[0].hold.get()
                     + crate::collect::calibration_level::MINIMUM_RECOVERY_MILLISECONDS
         }));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn valid_stored_product_is_regenerated_from_a_more_productive_retained_level() {
+        let duration_ms = 410_000;
+        let hard = (0..196)
+            .map(|index| MapNote {
+                time_ms: 1_000 + index * 1_714,
+                cell: (index % 12) as u8,
+                hold_ms: 200,
+            })
+            .collect::<Vec<_>>();
+        let medium = (0..156)
+            .map(|index| MapNote {
+                time_ms: 1_000 + index * 2_000,
+                cell: (index % 12) as u8,
+                hold_ms: 200,
+            })
+            .collect::<Vec<_>>();
+        let mut entry = track_entry("best-retained-level", hard.clone(), duration_ms);
+        let medium_level = entry.levels.get_mut("medium").unwrap();
+        medium_level.column_assignments = every_column_count(&medium);
+        medium_level.map_notes = medium;
+        entry.calibration = Some(
+            crate::collect::calibration_level::CalibrationLevelProduct::generate(
+                &hard,
+                duration_ms,
+            ),
+        );
+        let expected = CalibrationLevelProduct::generate_best(&entry.levels, duration_ms).unwrap();
+        assert_eq!(expected.source_level, "medium");
+        assert_eq!(expected.cue_count(), 130);
+
+        let directory = std::env::temp_dir().join(format!(
+            "dashboard-calibration-best-source-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join(TRACK_FILE_NAME),
+            serde_json::to_vec(&entry).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = load_track(&directory).unwrap();
+        let calibration = loaded.calibration.unwrap();
+        assert_eq!(calibration.cue_count, 130);
+        assert_eq!(calibration.content_identity, expected.content_identity);
         let _ = std::fs::remove_dir_all(directory);
     }
 

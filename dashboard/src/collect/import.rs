@@ -24,7 +24,7 @@ use serde::Serialize;
 
 use super::beatmap::{LevelEntry, TrackEntry, TRACK_AUDIO_NAME, TRACK_FILE_NAME};
 use super::beatsaber::{self, LevelSummary};
-use super::calibration_level::{CalibrationLevelProduct, CALIBRATION_SOURCE_LEVEL};
+use super::calibration_level::CalibrationLevelProduct;
 
 /// The largest map archive accepted. Beat Saber maps run a few megabytes of Ogg
 /// plus a cover image; ten times the largest map in the library is room enough
@@ -188,13 +188,10 @@ fn build_imported_track_entry(
     duration_ms: u32,
     levels: std::collections::BTreeMap<String, LevelEntry>,
 ) -> TrackEntry {
-    let calibration_source = levels
-        .get(CALIBRATION_SOURCE_LEVEL)
-        .expect("the converter always produces the hard source level");
-    let calibration = Some(CalibrationLevelProduct::generate(
-        &calibration_source.map_notes,
-        duration_ms,
-    ));
+    let calibration = Some(
+        CalibrationLevelProduct::generate_best(&levels, duration_ms)
+            .expect("the converter always produces calibration source levels"),
+    );
     TrackEntry {
         id,
         title,
@@ -499,6 +496,7 @@ pub async fn download_map(key: &BeatSaverKey) -> anyhow::Result<Vec<u8>> {
 mod tests {
     use super::*;
     use crate::collect::beatmap::{assign_columns, LevelEntry, MapNote, MAXIMUM_COLUMNS};
+    use crate::collect::calibration_level::CALIBRATION_SOURCE_LEVEL;
 
     fn test_track_entry(id: &str) -> TrackEntry {
         let map_notes = (0..12)

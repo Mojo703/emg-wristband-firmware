@@ -1,7 +1,9 @@
 //! Pure generation of the imported calibration product from an existing
 //! source-derived collection schedule.
 
-use super::beatmap::MapNote;
+use std::collections::BTreeMap;
+
+use super::beatmap::{LevelEntry, MapNote};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -20,7 +22,11 @@ const LEGACY_CALIBRATION_LEVEL_GENERATOR_VERSION: u32 = 2;
 /// regenerates this version in memory from the retained source schedule.
 pub(crate) const INCOMPATIBLE_CALIBRATION_LEVEL_GENERATOR_VERSION: u32 = 3;
 pub const CALIBRATION_LEVEL_GENERATOR_VERSION: u32 = 4;
+#[cfg(test)]
 pub const CALIBRATION_SOURCE_LEVEL: &str = "hard";
+/// Prefer the established hard schedule when counts tie, but allow a more
+/// suitably spaced retained level to supply more valid calibration cues.
+pub const CALIBRATION_SOURCE_LEVEL_PREFERENCE: [&str; 3] = ["hard", "medium", "easy"];
 
 /// Fixed measured order, beginning at command zero. No implicit song/session
 /// rotation participates in the imported product.
@@ -44,15 +50,59 @@ pub struct CalibrationLevelProductNote {
 }
 
 impl CalibrationLevelProduct {
+    #[cfg(test)]
     pub fn generate(source_notes: &[MapNote], source_duration_ms: u32) -> Self {
-        Self::generate_with_version(
+        Self::generate_for_source_with_version(
+            CALIBRATION_SOURCE_LEVEL,
             source_notes,
             source_duration_ms,
             CALIBRATION_LEVEL_GENERATOR_VERSION,
         )
     }
 
+    /// Generate from whichever retained collection level yields the most cues
+    /// under the device's fixed hold-and-recovery contract.
+    pub fn generate_best(
+        levels: &BTreeMap<String, LevelEntry>,
+        source_duration_ms: u32,
+    ) -> anyhow::Result<Self> {
+        let mut best = None;
+        for source_level in CALIBRATION_SOURCE_LEVEL_PREFERENCE {
+            let Some(level) = levels.get(source_level) else {
+                continue;
+            };
+            let candidate = Self::generate_for_source_with_version(
+                source_level,
+                &level.map_notes,
+                source_duration_ms,
+                CALIBRATION_LEVEL_GENERATOR_VERSION,
+            );
+            if best
+                .as_ref()
+                .is_none_or(|current: &Self| candidate.cue_count() > current.cue_count())
+            {
+                best = Some(candidate);
+            }
+        }
+        best.ok_or_else(|| anyhow::anyhow!("track has no retained calibration source level"))
+    }
+
+    #[cfg(test)]
     pub(crate) fn generate_with_version(
+        source_notes: &[MapNote],
+        source_duration_ms: u32,
+        generator_version: u32,
+    ) -> Self {
+        Self::generate_for_source_with_version(
+            CALIBRATION_SOURCE_LEVEL,
+            source_notes,
+            source_duration_ms,
+            generator_version,
+        )
+    }
+
+    fn generate_for_source_with_version(
+        source_level: &str,
         source_notes: &[MapNote],
         source_duration_ms: u32,
         generator_version: u32,
@@ -64,7 +114,7 @@ impl CalibrationLevelProduct {
         let mut product = Self {
             schema_version: CALIBRATION_LEVEL_SCHEMA_VERSION,
             generator_version,
-            source_level: CALIBRATION_SOURCE_LEVEL.to_string(),
+            source_level: source_level.to_string(),
             content_identity: String::new(),
             duration_ms,
             notes,
@@ -93,7 +143,7 @@ impl CalibrationLevelProduct {
                 self.generator_version
             );
         }
-        if self.source_level != CALIBRATION_SOURCE_LEVEL {
+        if !CALIBRATION_SOURCE_LEVEL_PREFERENCE.contains(&self.source_level.as_str()) {
             anyhow::bail!("calibration level names source level {}", self.source_level);
         }
         if self.notes.len() > MAXIMUM_CUES {
@@ -158,7 +208,8 @@ impl CalibrationLevelProduct {
     ) -> anyhow::Result<()> {
         self.validate()?;
         if self
-            != &Self::generate_with_version(
+            != &Self::generate_for_source_with_version(
+                &self.source_level,
                 source_notes,
                 source_duration_ms,
                 self.generator_version,
@@ -304,6 +355,13 @@ mod tests {
 
     fn source_duration(notes: &[MapNote]) -> u32 {
         notes.last().map_or(10_000, |note| note.time_ms + 10_000)
+    }
+
+    fn retained_level(map_notes: Vec<MapNote>) -> LevelEntry {
+        LevelEntry {
+            map_notes,
+            column_assignments: BTreeMap::new(),
+        }
     }
 
     const VISUAL_LANE_COUNT: usize = 5;
@@ -538,6 +596,35 @@ mod tests {
         assert_eq!(level.summary().visual_lane_counts, [26; VISUAL_LANE_COUNT]);
         assert_eq!(level.summary().thumb_variant_counts, [50, 80]);
         assert!(!level.summary().shorter_than_maximum);
+    }
+
+    #[test]
+    fn best_retained_level_wins_by_valid_calibration_count_not_source_density() {
+        let duration = 410_000;
+        let levels = [
+            (
+                "easy".to_string(),
+                retained_level(regular_source(126, 2_500)),
+            ),
+            (
+                "medium".to_string(),
+                retained_level(regular_source(156, 2_000)),
+            ),
+            (
+                "hard".to_string(),
+                retained_level(regular_source(196, 1_714)),
+            ),
+        ]
+        .into_iter()
+        .collect();
+
+        let product = CalibrationLevelProduct::generate_best(&levels, duration).unwrap();
+
+        assert_eq!(product.source_level, "medium");
+        assert_eq!(product.cue_count(), MAXIMUM_CUES);
+        product
+            .validate_against_source(&levels["medium"].map_notes, duration)
+            .unwrap();
     }
 
     #[test]
