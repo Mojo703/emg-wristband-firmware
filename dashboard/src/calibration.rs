@@ -74,6 +74,26 @@ enum RunGate {
     Running,
 }
 
+fn gate_withholds_heartbeat(gate: RunGate, commit: &ScheduleCommitPhase) -> bool {
+    matches!(gate, RunGate::Interrupted)
+        && matches!(
+            commit,
+            ScheduleCommitPhase::Sent { .. } | ScheduleCommitPhase::Accepted
+        )
+}
+
+fn schedule_commit_is_authorized(
+    gate: RunGate,
+    upload: &UploadPhase,
+    device_ready: bool,
+    commit: &ScheduleCommitPhase,
+) -> bool {
+    matches!(gate, RunGate::Running)
+        && matches!(upload, UploadPhase::Complete)
+        && device_ready
+        && matches!(commit, ScheduleCommitPhase::AwaitingDeviceReadiness)
+}
+
 fn enqueue_run_action(
     actions: &mpsc::Sender<RunAction>,
     action: RunAction,
@@ -413,6 +433,7 @@ impl CalibrationModeAdapter {
             schedule_revision,
             next_sequence: 0,
         };
+        let mut gate_state = *gate.borrow_and_update();
         let mut song_counts = Vec::new();
         let mut evidence = EvidenceState::Fresh;
         let mut candidate = CandidateState::Absent;
@@ -446,8 +467,24 @@ impl CalibrationModeAdapter {
                 biased;
                 changed = gate.changed() => match changed {
                     Ok(()) => match *gate.borrow_and_update() {
-                        RunGate::Interrupted => heartbeat_mode = HeartbeatMode::Withheld,
+                        RunGate::Interrupted => {
+                            gate_state = RunGate::Interrupted;
+                            // Before Commit, heartbeats keep the device-owned
+                            // 30-second preparation transaction alive.  They
+                            // do not authorize playback, so a hidden view can
+                            // safely finish preparation while Commit remains
+                            // gated.  Once Commit has crossed the wire,
+                            // withholding heartbeat is the device's bounded
+                            // interruption mechanism.
+                            if gate_withholds_heartbeat(gate_state, &commit_phase) {
+                                heartbeat_mode = HeartbeatMode::Withheld;
+                                if let PlaybackState::Playing(opened) = &playback {
+                                    opened.pause();
+                                }
+                            }
+                        }
                         RunGate::Running => {
+                            gate_state = RunGate::Running;
                             if matches!(heartbeat_mode, HeartbeatMode::Withheld)
                                 && matches!(playback, PlaybackState::Playing(_) | PlaybackState::Armed { .. })
                             {
@@ -455,6 +492,22 @@ impl CalibrationModeAdapter {
                                     schedule_revision,
                                     next_sequence: 0,
                                 };
+                                if let PlaybackState::Playing(opened) = &playback {
+                                    opened.play();
+                                }
+                            }
+                            if schedule_commit_is_authorized(
+                                gate_state,
+                                &upload,
+                                device_ready_for_commit,
+                                &commit_phase,
+                            ) {
+                                if let Err(error) = send_schedule_commit(
+                                    &self.registry, &device, run, schedule_revision, &track,
+                                ) {
+                                    break delivery_failure(error);
+                                }
+                                commit_phase = ScheduleCommitPhase::sent_at(tokio::time::Instant::now());
                             }
                         }
                     },
@@ -515,9 +568,13 @@ impl CalibrationModeAdapter {
                             );
                         }
                         commit_phase = ScheduleCommitPhase::Accepted;
-                        heartbeat_mode = HeartbeatMode::Sending {
-                            schedule_revision,
-                            next_sequence: 0,
+                        heartbeat_mode = if gate_withholds_heartbeat(gate_state, &commit_phase) {
+                            HeartbeatMode::Withheld
+                        } else {
+                            HeartbeatMode::Sending {
+                                schedule_revision,
+                                next_sequence: 0,
+                            }
                         };
                         let host_anchor = self
                             .timing
@@ -569,10 +626,12 @@ impl CalibrationModeAdapter {
                         // it also refreshes the deadline for that chunk.
                         chunk_ack_retries = 0;
                         upload_ack_timeout.reset();
-                        if matches!(upload, UploadPhase::Complete)
-                            && device_ready_for_commit
-                            && matches!(commit_phase, ScheduleCommitPhase::AwaitingDeviceReadiness)
-                        {
+                        if schedule_commit_is_authorized(
+                            gate_state,
+                            &upload,
+                            device_ready_for_commit,
+                            &commit_phase,
+                        ) {
                             if let Err(error) = send_schedule_commit(
                                 &self.registry, &device, run, schedule_revision, &track,
                             ) {
@@ -605,10 +664,12 @@ impl CalibrationModeAdapter {
                             }
                         }
                         device_ready_for_commit = ready_for_schedule;
-                        if ready_for_schedule
-                            && matches!(upload, UploadPhase::Complete)
-                            && matches!(commit_phase, ScheduleCommitPhase::AwaitingDeviceReadiness)
-                        {
+                        if schedule_commit_is_authorized(
+                            gate_state,
+                            &upload,
+                            ready_for_schedule,
+                            &commit_phase,
+                        ) {
                             if let Err(error) = send_schedule_commit(
                                 &self.registry, &device, run, schedule_revision, &track,
                             ) {
@@ -680,6 +741,10 @@ impl CalibrationModeAdapter {
                         // retryable refusal returns to its explicit ready
                         // phase; no backend stopwatch recreates that phase.
                         commit_phase = ScheduleCommitPhase::AwaitingDeviceReadiness;
+                        heartbeat_mode = HeartbeatMode::Sending {
+                            schedule_revision,
+                            next_sequence: 0,
+                        };
                     }
                     Ok(_) => {}
                     Err(broadcast::error::RecvError::Lagged(_)) => {
@@ -805,7 +870,9 @@ impl CalibrationModeAdapter {
                         break SessionExit::Completed;
                     }
                 }
-                _ = &mut playback_alarm, if matches!(playback, PlaybackState::Armed { .. }) => {
+                _ = &mut playback_alarm,
+                    if matches!(gate_state, RunGate::Running)
+                        && matches!(playback, PlaybackState::Armed { .. }) => {
                     let PlaybackState::Armed { playback: opened, .. } = core::mem::replace(&mut playback, PlaybackState::Dormant) else {
                         break SessionExit::TaskFailed("calibration playback deadline had no armed output".into());
                     };
@@ -927,6 +994,13 @@ impl GuidedModeAdapter for CalibrationModeAdapter {
         let active = self.active.lock().unwrap();
         if let Some(active) = active.as_ref().filter(|active| &active.binding == session) {
             let _ = active.gate.send(RunGate::Interrupted);
+        }
+    }
+
+    fn resume_for_visible_views(&self, session: &GuidedSessionBinding) {
+        let active = self.active.lock().unwrap();
+        if let Some(active) = active.as_ref().filter(|active| &active.binding == session) {
+            let _ = active.gate.send(RunGate::Running);
         }
     }
 
@@ -1390,6 +1464,35 @@ mod tests {
         assert!(gate_receiver.has_changed().unwrap());
         assert_eq!(*gate_receiver.borrow_and_update(), RunGate::Interrupted);
         assert_eq!(receiver.len(), 1);
+    }
+
+    #[test]
+    fn hidden_preparation_keeps_its_lease_but_cannot_commit() {
+        let awaiting = ScheduleCommitPhase::AwaitingDeviceReadiness;
+        assert!(!gate_withholds_heartbeat(RunGate::Interrupted, &awaiting));
+        assert!(!schedule_commit_is_authorized(
+            RunGate::Interrupted,
+            &UploadPhase::Complete,
+            true,
+            &awaiting,
+        ));
+        assert!(schedule_commit_is_authorized(
+            RunGate::Running,
+            &UploadPhase::Complete,
+            true,
+            &awaiting,
+        ));
+    }
+
+    #[test]
+    fn interruption_after_commit_withholds_playback_lease() {
+        let sent = ScheduleCommitPhase::sent_at(tokio::time::Instant::now());
+        assert!(gate_withholds_heartbeat(RunGate::Interrupted, &sent));
+        assert!(gate_withholds_heartbeat(
+            RunGate::Interrupted,
+            &ScheduleCommitPhase::Accepted,
+        ));
+        assert!(!gate_withholds_heartbeat(RunGate::Running, &sent));
     }
 
     fn register_device(registry: &Registry) -> crate::registry::DeviceHandle {

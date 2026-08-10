@@ -237,6 +237,12 @@ pub trait GuidedModeAdapter: Send + Sync + 'static {
 
     fn pause_for_no_visible_views(&self, session: &GuidedSessionBinding);
 
+    /// A browser view returned after this mode's visible count reached zero.
+    /// Modes whose pause is terminal may keep the default no-op; calibration
+    /// uses this edge to reopen its host-side gate while preparation is still
+    /// safely waiting before Commit.
+    fn resume_for_visible_views(&self, _session: &GuidedSessionBinding) {}
+
     fn handle_intent(
         &self,
         _session: Option<&GuidedSessionBinding>,
@@ -761,7 +767,7 @@ impl GuidedBrowserConnection {
         let Some(inner) = self.coordinator.upgrade() else {
             return Err(CoordinatorError::RevisionExhausted);
         };
-        let (snapshot, pause) = {
+        let (snapshot, pause, resume) = {
             let mut state = inner.state.lock().unwrap();
             let Some(previous) = state.connections.get(&self.id).copied() else {
                 return Ok(state.snapshot.clone());
@@ -773,15 +779,19 @@ impl GuidedBrowserConnection {
             if let Some(mode) = previous {
                 decrement_visible(&mut state.snapshot, mode);
             }
+            let resume = visible_mode
+                .and_then(|mode| (state.snapshot.visible_views(mode) == 0).then_some(mode));
             if let Some(mode) = visible_mode {
                 increment_visible(&mut state.snapshot, mode);
             }
             state.connections.insert(self.id, visible_mode);
             let pause = previous.and_then(|mode| pause_target(&state, mode));
+            let resume = resume.and_then(|mode| resume_target(&state, mode));
             publish_locked(&inner, &mut state, next_revision);
-            (state.snapshot.clone(), pause)
+            (state.snapshot.clone(), pause, resume)
         };
         invoke_pause(pause);
+        invoke_resume(resume);
         Ok(snapshot)
     }
 
@@ -826,6 +836,7 @@ impl Drop for GuidedBrowserConnection {
 }
 
 type PauseTarget = Option<(Arc<dyn GuidedModeAdapter>, GuidedSessionBinding)>;
+type ResumeTarget = Option<(Arc<dyn GuidedModeAdapter>, GuidedSessionBinding)>;
 
 fn increment_visible(snapshot: &mut GuidedSessionSnapshot, mode: GuidedMode) {
     match mode {
@@ -853,9 +864,24 @@ fn pause_target(state: &CoordinatorState, departed_mode: GuidedMode) -> PauseTar
     Some((adapter, active))
 }
 
+fn resume_target(state: &CoordinatorState, arrived_mode: GuidedMode) -> ResumeTarget {
+    let active = state.snapshot.active().cloned()?;
+    if active.mode != arrived_mode {
+        return None;
+    }
+    let adapter = state.adapters.get(&active.mode)?.upgrade()?;
+    Some((adapter, active))
+}
+
 fn invoke_pause(target: PauseTarget) {
     if let Some((adapter, session)) = target {
         adapter.pause_for_no_visible_views(&session);
+    }
+}
+
+fn invoke_resume(target: ResumeTarget) {
+    if let Some((adapter, session)) = target {
+        adapter.resume_for_visible_views(&session);
     }
 }
 
@@ -867,12 +893,17 @@ mod tests {
     #[derive(Default)]
     struct FakeModeAdapter {
         paused: Mutex<Vec<GuidedSessionId>>,
+        resumed: Mutex<Vec<GuidedSessionId>>,
         actions: Mutex<Vec<protocol::GuidedSessionAction>>,
     }
 
     impl GuidedModeAdapter for FakeModeAdapter {
         fn pause_for_no_visible_views(&self, session: &GuidedSessionBinding) {
             self.paused.lock().unwrap().push(session.session_id);
+        }
+
+        fn resume_for_visible_views(&self, session: &GuidedSessionBinding) {
+            self.resumed.lock().unwrap().push(session.session_id);
         }
 
         fn handle_intent(
@@ -1044,6 +1075,33 @@ mod tests {
 
         assert_eq!(
             adapter.paused.lock().unwrap().as_slice(),
+            &[lease.binding().session_id]
+        );
+        lease.finish(SessionExit::Completed);
+    }
+
+    #[test]
+    fn first_returning_view_resumes_an_active_mode_after_zero_visibility() {
+        let (coordinator, adapter) = coordinator();
+        let lease = coordinator
+            .acquire_current(GuidedMode::Calibration, Some(device()))
+            .unwrap();
+        let connection = coordinator.connect_browser();
+        connection
+            .set_visible_mode(Some(GuidedMode::Calibration))
+            .unwrap();
+        adapter.resumed.lock().unwrap().clear();
+
+        connection.set_visible_mode(None).unwrap();
+        assert_eq!(
+            adapter.paused.lock().unwrap().as_slice(),
+            &[lease.binding().session_id]
+        );
+        connection
+            .set_visible_mode(Some(GuidedMode::Calibration))
+            .unwrap();
+        assert_eq!(
+            adapter.resumed.lock().unwrap().as_slice(),
             &[lease.binding().session_id]
         );
         lease.finish(SessionExit::Completed);
