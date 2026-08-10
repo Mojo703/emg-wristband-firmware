@@ -171,13 +171,6 @@ impl BleSession {
         }
     }
 
-    /// Stop and join the worker, recovering its phone for a consuming transition.
-    #[allow(dead_code)]
-    pub(crate) fn stop(mut self) -> anyhow::Result<Phone<NimbleRadio>> {
-        let _ = self.stop.try_send(());
-        self.join()
-    }
-
     fn join(&mut self) -> anyhow::Result<Phone<NimbleRadio>> {
         self.worker
             .take()

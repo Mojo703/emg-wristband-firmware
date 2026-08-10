@@ -74,6 +74,7 @@ impl Channel {
     ];
 
     /// `None` for an index outside `0..CHANNELS_PER_DEVICE`.
+    #[cfg(test)]
     pub(crate) const fn new(index: u8) -> Option<Channel> {
         if (index as usize) < CHANNELS_PER_DEVICE {
             Some(Channel(index))
@@ -82,13 +83,9 @@ impl Channel {
         }
     }
 
-    /// [`Channel::new`] for `const` contexts, where an out-of-range index should stop
-    /// the build. `new` would turn it into `None`, and in the one place this matters --
-    /// the test-signal channel in `main` -- `None` already means "read the electrodes",
-    /// so a typo would silently disable the bring-up check rather than fail.
-    #[allow(dead_code)] // Only reachable when the test signal is switched on in `main`.
+    #[cfg(test)]
     pub(crate) const fn checked(index: u8) -> Channel {
-        match Channel::new(index) {
+        match Self::new(index) {
             Some(channel) => channel,
             None => panic!("channel index must be within 0..CHANNELS_PER_DEVICE"),
         }

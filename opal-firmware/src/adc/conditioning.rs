@@ -242,7 +242,7 @@ impl<const CHANNELS: usize> SignalConditioner<CHANNELS> {
     /// fixed scale: nothing outside this module needs the estimate, but it is the one
     /// window onto whether the normalisation is tracking, so the tests assert on it
     /// rather than inferring it from quantised output.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(super) fn amplitude_microvolts(&self, channel: usize) -> Option<f32> {
         self.channels.get(channel)?.amplitude.amplitude()
     }

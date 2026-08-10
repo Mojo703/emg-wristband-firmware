@@ -60,7 +60,7 @@ use pipeline::ChipEvent;
 /// going missing. It wants to be deeper than this; heap is what stops it. Every unit
 /// of depth is ~24 KB of standing allocation (a window's model-input buffer plus its
 /// packed payload, and the recycle pool holds a buffer set per slot to match),
-/// against a steady state that must leave room for a live TCP session's lwIP
+/// against a steady state that must leave room for serial transport and BLE
 /// buffers on top. Depth one still covers a main-loop absence of a full window
 /// period — the loop polls every 5 ms — and overflow past it is counted
 /// ([`HealthCounters::dropped`]), not absorbed.
@@ -76,7 +76,7 @@ const EVENT_QUEUE_DEPTH: usize = 64;
 /// enough for the steady cycle — the main loop returns a set as each window ships,
 /// and the combiner takes it back for the next — so in steady state every window
 /// reuses pooled buffers and the window path performs no recurring multi-kilobyte
-/// allocation. Each pooled set parks ~24 KB of capacity, and heap headroom (TCP's
+/// allocation. Each pooled set parks ~24 KB of capacity, and heap headroom (the
 /// link threads need two 8 KB contiguous stacks at dial time) outranks covering the
 /// rare cold-start pool miss, which falls back to a fresh allocation. A window
 /// rejected by the output queue is reclaimed directly by the combiner instead
@@ -312,31 +312,6 @@ impl AdcSource {
     pub(crate) fn lead_off_channels(&self) -> Option<u16> {
         ads1298::LEAD_OFF_ENABLED
             .then(|| self.counters.lead_off_channels.load(Ordering::Relaxed) as u16)
-    }
-
-    /// Every window waiting, oldest first, or empty if none is. Never blocks.
-    ///
-    /// The whole backlog comes out because the stream is recorded: the caller sends
-    /// each window on the wire in order and classifies only the last, so a link stall
-    /// costs latency on the decision rather than a gap in the data. Nothing is
-    /// discarded here — [`HealthCounters::dropped`] only counts what the producer
-    /// could not hand over at all.
-    pub(crate) fn drain_windows(&self) -> Vec<AcquiredWindow> {
-        let mut drained = Vec::new();
-        while let Ok(window) = self.windows.try_recv() {
-            // The model-input copy in `main` asserts on a length mismatch, and an
-            // assert there is a reboot with no console, so check it here first.
-            let expected = self.window_length * INPUT_CH;
-            if window.samples.len() != expected {
-                warn!(
-                    "discarding malformed window: {} model samples, expected {expected}",
-                    window.samples.len(),
-                );
-                continue;
-            }
-            drained.push(window);
-        }
-        drained
     }
 
     /// The next complete window without allocating a temporary backlog vector.

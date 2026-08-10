@@ -28,9 +28,6 @@ use super::registers::{
     TestSignalFrequency, WilsonCenterTerminalOneOff, WilsonCenterTerminalTwoOff,
 };
 
-const COMMAND_WAKEUP: u8 = 0x02;
-const COMMAND_STANDBY: u8 = 0x04;
-const COMMAND_RESET: u8 = 0x06;
 const COMMAND_RDATAC: u8 = 0x10;
 const COMMAND_SDATAC: u8 = 0x11;
 const COMMAND_RREG_BASE: u8 = 0x20;
@@ -132,9 +129,6 @@ pub(super) enum RightLegDriveMode {
     /// grounded, which is mid-supply on this board's bipolar rails, so this mode is
     /// correct here.
     ExternalReference,
-    /// Amplifier powered, reference generated internally at mid-supply (`0xCE`).
-    #[allow(dead_code)]
-    InternalReference,
     /// Amplifier powered down entirely (`0xC0`).
     Disabled,
 }
@@ -150,7 +144,7 @@ impl RightLegDriveMode {
             // The 2.4 V reference is what `preprocess` converts codes against.
             four_volt_reference: false,
             right_leg_drive_measurement: false,
-            right_leg_drive_reference_internal: matches!(self, Self::InternalReference),
+            right_leg_drive_reference_internal: false,
             right_leg_drive_enabled: drive_enabled,
             // Lead-off sense rides on the same amplifier.
             right_leg_drive_lead_off_sense: drive_enabled,
@@ -415,21 +409,6 @@ impl Ads1298Device {
             device.command_spi.write(&[command])?;
             Ok(())
         })
-    }
-
-    #[allow(dead_code)] // Datasheet command set, kept whole for bring-up.
-    pub(super) fn software_reset(&mut self) -> Result<()> {
-        self.send_command(COMMAND_RESET)
-    }
-
-    #[allow(dead_code)] // Datasheet command set, kept whole for bring-up.
-    pub(super) fn wakeup(&mut self) -> Result<()> {
-        self.send_command(COMMAND_WAKEUP)
-    }
-
-    #[allow(dead_code)] // Datasheet command set, kept whole for bring-up.
-    pub(super) fn standby(&mut self) -> Result<()> {
-        self.send_command(COMMAND_STANDBY)
     }
 
     /// Disables read data continuous mode so that registers can be configured
@@ -733,10 +712,9 @@ mod tests {
     /// silently change anything else.
     #[test]
     fn each_right_leg_drive_mode_emits_its_datasheet_byte() {
-        use RightLegDriveMode::{Disabled, ExternalReference, InternalReference};
+        use RightLegDriveMode::{Disabled, ExternalReference};
 
         assert_eq!(ExternalReference.config3().to_byte(), 0xC6);
-        assert_eq!(InternalReference.config3().to_byte(), 0xCE);
         assert_eq!(Disabled.config3().to_byte(), 0xC0);
     }
 

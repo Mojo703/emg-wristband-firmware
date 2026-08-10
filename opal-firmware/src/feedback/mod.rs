@@ -606,7 +606,7 @@ mod tests {
         let mut feedback = detached();
         feedback.observe(running());
         let linked = DeviceState {
-            link: ActiveLink::Wifi,
+            link: ActiveLink::Serial,
             ..running()
         };
         feedback.observe(linked);

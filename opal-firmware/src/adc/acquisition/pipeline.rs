@@ -45,7 +45,7 @@ const CHIP_LEAD_OFF_BITS: usize = 8;
 
 /// Stack for a pipeline thread. It holds no large locals, but esp-idf's default is
 /// tight, and a stack overflow here presents as an unexplained reboot rather than an
-/// error. The TCP thread in `links` hit exactly that.
+/// error. The production link path must never rely on that timing.
 const THREAD_STACK_BYTES: usize = 8192;
 
 /// Above the combiner and the main loop, below esp-idf's wifi and timer tasks.

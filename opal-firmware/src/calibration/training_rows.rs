@@ -15,6 +15,7 @@
 //! at a precision the caller can name.
 
 use anyhow::{bail, Context, Result};
+#[cfg(feature = "playback")]
 use emg_runtime::calibration::{FeaturePrecision, Int8Quantization};
 use emg_runtime::flash_image::{
     self, ImageError, LiveSlot, PriorImage, SlotRecord, StandardizationVariant, PARTITION_BYTES,
@@ -22,7 +23,9 @@ use emg_runtime::flash_image::{
 };
 use emg_runtime::streaming_fit::{RowSource, ROW_STRIDE};
 use esp_idf_svc::sys::EspError;
-use log::{info, warn};
+use log::info;
+#[cfg(feature = "playback")]
+use log::warn;
 
 use super::resident_selector::{PhysicalSlot, StoredIdentity, StoredRole};
 
@@ -30,21 +33,27 @@ use super::resident_selector::{PhysicalSlot, StoredIdentity, StoredRole};
 /// never written reads as erased flash (`0xFF`), and a fit that took that for
 /// rows would train on 14000 rows of garbage and report a plausible wall time
 /// for it.
+#[cfg(feature = "playback")]
 const MAGIC: [u8; 8] = *b"OPALROWS";
 
 /// The layout this build understands.
+#[cfg(feature = "playback")]
 const VERSION: u32 = 1;
 
 /// Fixed header, then the int8 constants, then the rows. The constants sit in
 /// the image rather than arriving with the fit command because they are a
 /// property of how these particular rows were quantized: an image and the
 /// affine that decodes it cannot be allowed to travel separately.
+#[cfg(feature = "playback")]
 const HEADER_BYTES: usize = 32;
+#[cfg(feature = "playback")]
 const QUANTIZATION_BYTES: usize = 64 * 2 * 4;
+#[cfg(feature = "playback")]
 const ROWS_OFFSET: usize = HEADER_BYTES + QUANTIZATION_BYTES;
 
 /// A mapped training-row image. The mapping is released when this is dropped,
 /// so the borrow of [`Self::rows`] cannot outlive it.
+#[cfg(feature = "playback")]
 pub(crate) struct TrainingRows {
     handle: esp_idf_svc::sys::esp_partition_mmap_handle_t,
     /// The mapped window, starting at the image's first byte.
@@ -55,6 +64,7 @@ pub(crate) struct TrainingRows {
     quantization: Int8Quantization,
 }
 
+#[cfg(feature = "playback")]
 impl TrainingRows {
     /// Map the `training` partition's rows, or explain why not. A missing or
     /// unwritten partition is a plain absence, not a fault: a device with no
@@ -193,6 +203,7 @@ impl TrainingRows {
     }
 }
 
+#[cfg(feature = "playback")]
 impl Drop for TrainingRows {
     fn drop(&mut self) {
         unsafe { esp_idf_svc::sys::esp_partition_munmap(self.handle) };
@@ -581,6 +592,7 @@ impl Drop for CalibrationPartition {
 /// A failure to map is not a reason to refuse to boot: report it and fit on
 /// live rows. Returning the absence rather than the error keeps the one
 /// decision — join flash or not — in one place.
+#[cfg(feature = "playback")]
 pub(crate) fn map_or_warn() -> Option<TrainingRows> {
     match TrainingRows::map() {
         Ok(rows) => rows,

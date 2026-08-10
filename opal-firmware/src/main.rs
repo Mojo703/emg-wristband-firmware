@@ -40,12 +40,11 @@ use adc::acquisition::AdcSource;
 use adc::Channel;
 use calibration::{Calibration, CalibrationBuffers, WearerFeatureBuffers, WearerFeatures};
 use config::{Sensitivity, Settings, Store};
-use emg_runtime::band_features::{CHANNEL_COUNT, FEATURE_COUNT};
+use emg_runtime::band_features::FEATURE_COUNT;
 use emg_runtime::calibration::CalibrationModel;
 use emg_runtime::model::{Model, ModelBuffers, INPUT_CH, NUM_CLASSES};
 use emg_runtime::tensor::I8Activation;
 use emg_runtime::{softmax, Decision, ForwardResult, RejectPipeline};
-use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::delay::FreeRtos;
 use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::hal::usb_serial::{UsbSerialConfig, UsbSerialDriver};
@@ -116,6 +115,9 @@ const CALIBRATION_COMMAND_CLASSES: usize = 5;
 /// short sleep instead polls the links at 200 Hz and costs at most 5 ms of the 250 ms
 /// pipeline.
 const IDLE_POLL_MS: u32 = 5;
+/// The browser renders device-reported RGB state, so publish well inside each
+/// 500 ms colour phase rather than relying on Start/Stop acknowledgements.
+const TIMING_STATUS_CADENCE_MICROSECONDS: u64 = 100_000;
 
 /// How long the front end may stay silent before the loop says so. Long enough that
 /// normal jitter never trips it, short enough to notice a stalled ADC quickly.
@@ -376,6 +378,12 @@ fn device_now_us() -> u64 {
     unsafe { esp_idf_svc::sys::esp_timer_get_time() as u64 }
 }
 
+fn timing_status_due(anchor: Option<u64>, last_reported_at: Option<u64>, observed: u64) -> bool {
+    anchor.is_some()
+        && last_reported_at
+            .is_none_or(|last| observed.saturating_sub(last) >= TIMING_STATUS_CADENCE_MICROSECONDS)
+}
+
 struct App {
     device_id: String,
     store: Store,
@@ -405,6 +413,8 @@ struct App {
     /// Anchor of the feedback-thread-owned RGB timing loop, on the ESP
     /// monotonic clock. `None` means ordinary indicator rendering owns the LED.
     timing_loop_anchor: Option<u64>,
+    /// Device-clock instant of the most recent timing-state publication.
+    timing_status_reported_at: Option<u64>,
     clock_probe: clock_probe::ClockProbeAdapter,
 }
 
@@ -494,7 +504,6 @@ impl App {
         } = memory;
 
         let peripherals = Peripherals::take()?;
-        let sysloop = EspSystemEventLoop::take()?;
         let nvs_partition = EspDefaultNvsPartition::take()?;
 
         let store = Store::open(nvs_partition.clone())?;
@@ -513,7 +522,7 @@ impl App {
                 .rx_buffer_size(SERIAL_RX_BUFFER_BYTES),
         )?);
 
-        let links = Links::serial_only(serial, peripherals.modem, sysloop, nvs_partition);
+        let links = Links::serial_only(serial);
 
         let clock_probe = clock_probe::ClockProbeAdapter::new(peripherals.pins.gpio3.into());
 
@@ -726,6 +735,7 @@ impl App {
         let config_generation: u32 = 0;
         let committed: Option<MediaKey> = None;
         let timing_loop_anchor = None;
+        let timing_status_reported_at = None;
 
         Ok(Box::new(Self {
             device_id,
@@ -754,6 +764,7 @@ impl App {
             config_generation,
             committed,
             timing_loop_anchor,
+            timing_status_reported_at,
             clock_probe,
         }))
     }
@@ -770,6 +781,7 @@ impl App {
             self.replay_phone_state();
             self.service_playback();
             self.advance_calibration();
+            self.report_timing_status_if_due();
 
             match self.take_window() {
                 Some(window) => self.process_window(window, config_changed),
@@ -855,17 +867,34 @@ impl App {
                 self.feedback.stop_timing_loop();
                 self.timing_loop_anchor = None;
                 self.report_timing_status();
+                self.timing_status_reported_at = None;
             }
             _ => unreachable!("only timing controls reach timing routing"),
         }
     }
 
     fn report_timing_status(&mut self) {
-        let status = feedback::timing_loop_status(self.timing_loop_anchor, device_now_us());
+        let observed = device_now_us();
+        let status = feedback::timing_loop_status(self.timing_loop_anchor, observed);
         self.links.send_window(
             None,
             std::slice::from_ref(&Frame::CalibrationTimingLoopStatus { status }),
         );
+        // This records an attempted publication too: when no host currently
+        // holds CDC, retrying every 5 ms would turn a disconnected timing loop
+        // into needless transport work. A new claim sees the next update within
+        // the same bounded cadence.
+        self.timing_status_reported_at = Some(observed);
+    }
+
+    fn report_timing_status_if_due(&mut self) {
+        let Some(anchor) = self.timing_loop_anchor else {
+            return;
+        };
+        let observed = device_now_us();
+        if timing_status_due(Some(anchor), self.timing_status_reported_at, observed) {
+            self.report_timing_status();
+        }
     }
 
     fn replay_phone_state(&mut self) {
@@ -917,16 +946,6 @@ impl App {
         if !frames.is_empty() {
             self.links.send_window(None, &frames);
         }
-        if self.links.active_link().is_connected() {
-            let generation = self.links.generation();
-            if let Some(narration) = self.calibration.pending_narration(generation) {
-                let revision = narration.revision();
-                if self.links.send_window(None, narration.frames()) {
-                    self.calibration
-                        .mark_narration_delivered(generation, revision);
-                }
-            }
-        }
         if let Some(update) = self.calibration.take_resident_runtime_update() {
             self.apply_resident_runtime_update(update);
         }
@@ -948,11 +967,6 @@ impl App {
                     activation.identity.generation,
                     activation.identity.crc
                 );
-            }
-            calibration::ResidentRuntimeUpdate::Inactive => {
-                self.band_features.adopt_gains([1.0; CHANNEL_COUNT]);
-                self.calibrated = None;
-                info!("resident selection cleared; classification disabled");
             }
         }
     }
@@ -1333,6 +1347,45 @@ mod decision_pipeline_tests {
         // reset, so activation cannot silently change control sensitivity.
         assert_eq!(pipelines.shipped.tau, 0.5);
         assert_eq!(pipelines.wearer.tau, 0.5);
+    }
+
+    #[test]
+    fn running_timing_status_is_published_inside_every_rgb_phase() {
+        let anchor = 10_000_000;
+        assert!(timing_status_due(Some(anchor), None, anchor));
+        assert!(!timing_status_due(
+            Some(anchor),
+            Some(anchor),
+            anchor + 99_999
+        ));
+        assert!(timing_status_due(
+            Some(anchor),
+            Some(anchor),
+            anchor + 100_000
+        ));
+        assert!(!timing_status_due(None, None, anchor));
+
+        for (elapsed_milliseconds, expected_color) in [
+            (0, protocol::CalibrationTimingColor::Red),
+            (500, protocol::CalibrationTimingColor::Green),
+            (1_000, protocol::CalibrationTimingColor::Blue),
+        ] {
+            let observed = anchor + elapsed_milliseconds * 1_000;
+            let status = feedback::timing_loop_status(Some(anchor), observed);
+            assert_eq!(status.state, protocol::CalibrationTimingState::Running);
+            assert_eq!(status.color, expected_color);
+            assert_eq!(status.anchor_device_monotonic_microseconds, anchor);
+            assert_eq!(status.observed_device_monotonic_microseconds, observed);
+            assert!(status.color_elapsed_milliseconds < 500);
+        }
+
+        let stopped = feedback::timing_loop_status(None, anchor + 1_500_000);
+        assert_eq!(stopped.state, protocol::CalibrationTimingState::Stopped);
+        assert_eq!(stopped.color_elapsed_milliseconds, 0);
+        assert_eq!(
+            stopped.observed_device_monotonic_microseconds,
+            anchor + 1_500_000
+        );
     }
 
     #[test]

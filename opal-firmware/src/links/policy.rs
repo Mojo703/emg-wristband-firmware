@@ -6,10 +6,8 @@
 //! The rules (mirrored in the parent module's docs): a dashboard probing the serial
 //! port claims it as the data link; heartbeats keep the claim alive; silence,
 //! unplug, or a stalled write releases it. After a stall, plain heartbeats sit out a
-//! cooldown before they may re-claim — the backend heartbeats whether or not it is
-//! draining the port, so without the cooldown a stalled link flaps
-//! claimed/stalled/claimed and starves the wifi fallback. A probe (a fresh session
-//! opening the port) always claims immediately.
+//! cooldown before they may re-claim. A probe (a fresh session opening the port)
+//! always claims immediately.
 //!
 //! The tests run on the device (this crate only builds for Xtensa): the espflash
 //! runner flashes the libtest binary, and the results come out on the USB console,
@@ -31,15 +29,13 @@ use std::time::{Duration, Instant};
 /// What the caller must do after an accepted probe or heartbeat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClaimOutcome {
-    /// The link just became the data link: hang up TCP and stand the dialer down.
+    /// The serial CDC link just became eligible to carry the stream.
     pub became_claimed: bool,
     /// Send the device hello (a fresh claim, or a probe's fresh session waiting for it).
     pub announce: bool,
 }
 
-/// Why [`SerialClaimPolicy::expire`] released a claim, for the release log line —
-/// the two causes point at opposite ends of the cable and were once
-/// indistinguishable, which cost a day of misattributed flap debugging.
+/// Why [`SerialClaimPolicy::expire`] released a claim, for the release log line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReleaseReason {
     /// No probe or heartbeat inside the claim timeout.

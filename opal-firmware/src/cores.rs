@@ -17,11 +17,8 @@
 //! The full map, including the placements sdkconfig.defaults owns:
 //!
 //! - **Core 0**: the main task (inference and link writes,
-//!   `CONFIG_ESP_MAIN_TASK_AFFINITY_CPU0`), wifi
-//!   (`CONFIG_ESP_WIFI_TASK_PINNED_TO_CORE_0`), lwIP
-//!   (`CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0`), chip A's pipeline thread, the
-//!   wifi link-management thread, TCP transport readers, and esp-idf's
-//!   housekeeping tasks (timers, events), which default there.
+//!   `CONFIG_ESP_MAIN_TASK_AFFINITY_CPU0`), chip A's pipeline thread, and
+//!   esp-idf's housekeeping tasks (timers, events), which default there.
 //! - **Core 0**, continued: the combiner (below the pipelines in priority), the
 //!   feedback and BLE session threads, and chip A's SPI host completion interrupt — allocated
 //!   wherever `build_front_end` runs, which for chip A is the main task.
@@ -61,12 +58,6 @@ pub(crate) const COMBINER_CORE: Core = Core::Core0;
 /// bring-up installs it from a thread pinned here. Whatever else is put on this
 /// core is added directly to both chips' edge-service latency.
 pub(crate) const GPIO_INTERRUPT_DISPATCHER_CORE: Core = front_end_core(Board::B);
-
-/// Wifi association and TCP dialing, beside the wifi and lwIP tasks they drive.
-pub(crate) const WIFI_LINK_MANAGEMENT_CORE: Core = Core::Core0;
-
-/// TCP transport read loops, beside lwIP.
-pub(crate) const TCP_READER_CORE: Core = Core::Core0;
 
 /// The validation bench's playback worker (`playback` feature only): filter
 /// bank, feature windows, and the calibration fit. Core 1 because a playback

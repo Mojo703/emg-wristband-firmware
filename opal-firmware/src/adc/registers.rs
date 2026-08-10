@@ -24,13 +24,8 @@
 //! Everything here is `const fn` over plain enums and bools, so the generated code is
 //! the same byte literal the driver used to write by hand.
 //!
-//! Only a subset of the map is used by the current bring-up sequence. The rest is a
-//! reference for when lead-off, gain and reference configuration get worked on, and
-//! for reading a register that came back wrong -- naming an encoding is how the
-//! readback path says what a chip actually did. So the unused encodings stay, and the
-//! module allows dead code as a whole rather than tagging thirty enum variants
-//! individually.
-#![allow(dead_code)]
+//! The active driver retains only register encodings it writes or checks in the
+//! current serial-production configuration.
 
 use core::fmt;
 
@@ -186,6 +181,7 @@ pub(super) trait RegisterValue: Copy + Sized {
     /// suggest, because the only bytes that reach it come off the wire. Rounding a
     /// readback of `GAIN = 0b111` into a legal gain would hide exactly the kind of
     /// fault a readback exists to catch.
+    #[cfg(test)]
     fn from_byte(byte: u8) -> Option<Self>;
 }
 
@@ -250,12 +246,18 @@ impl fmt::Display for ChannelMask {
 /// [`DataRate::from_bits`] is fallible.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum DataRate {
+    #[cfg(test)]
     ModulatorClockOver16 = 0b000,
+    #[cfg(test)]
     ModulatorClockOver32 = 0b001,
+    #[cfg(test)]
     ModulatorClockOver64 = 0b010,
+    #[cfg(test)]
     ModulatorClockOver128 = 0b011,
     ModulatorClockOver256 = 0b100,
+    #[cfg(test)]
     ModulatorClockOver512 = 0b101,
+    #[cfg(test)]
     ModulatorClockOver1024 = 0b110,
 }
 
@@ -264,6 +266,7 @@ impl DataRate {
         self as u8
     }
 
+    #[cfg(test)]
     const fn from_bits(bits: u8) -> Option<DataRate> {
         match bits {
             0b000 => Some(DataRate::ModulatorClockOver16),
@@ -311,6 +314,7 @@ pub(super) struct Config1 {
 }
 
 /// Bits 4:3 of CONFIG1 are reserved and must be written 0.
+#[cfg(test)]
 const CONFIG1_RESERVED_ZEROS: u8 = 0b0001_1000;
 
 impl RegisterValue for Config1 {
@@ -325,6 +329,7 @@ impl RegisterValue for Config1 {
             | self.data_rate.bits()
     }
 
+    #[cfg(test)]
     fn from_byte(byte: u8) -> Option<Config1> {
         if byte & CONFIG1_RESERVED_ZEROS != 0 {
             return None;
@@ -347,6 +352,7 @@ impl RegisterValue for Config1 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum TestSignalAmplitude {
     Single = 0,
+    #[cfg(test)]
     Double = 1,
 }
 
@@ -357,12 +363,15 @@ pub(super) enum TestSignalFrequency {
     /// Square wave at fCLK / 2^21, about 1 Hz at the 2.048 MHz clock.
     PulsedSlow = 0b00,
     /// Square wave at fCLK / 2^20, twice `PulsedSlow`.
+    #[cfg(test)]
     PulsedFast = 0b01,
     /// The signal is held at one level instead of alternating.
+    #[cfg(test)]
     HeldAtDirectCurrent = 0b11,
 }
 
 impl TestSignalFrequency {
+    #[cfg(test)]
     const fn from_bits(bits: u8) -> Option<TestSignalFrequency> {
         match bits {
             0b00 => Some(TestSignalFrequency::PulsedSlow),
@@ -390,6 +399,7 @@ pub(super) struct Config2 {
 }
 
 /// Bits 7:6 and bit 3 of CONFIG2 are reserved and must be written 0.
+#[cfg(test)]
 const CONFIG2_RESERVED_ZEROS: u8 = 0b1100_1000;
 
 impl RegisterValue for Config2 {
@@ -404,6 +414,7 @@ impl RegisterValue for Config2 {
             | (self.test_signal_frequency as u8)
     }
 
+    #[cfg(test)]
     fn from_byte(byte: u8) -> Option<Config2> {
         if byte & CONFIG2_RESERVED_ZEROS != 0 {
             return None;
@@ -475,6 +486,7 @@ impl RegisterValue for Config3 {
             | ((self.right_leg_drive_lead_off_sense as u8) << 1)
     }
 
+    #[cfg(test)]
     fn from_byte(byte: u8) -> Option<Config3> {
         if byte & CONFIG3_RESERVED_ONE == 0 {
             return None;
@@ -499,16 +511,24 @@ impl RegisterValue for Config3 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum LeadOffComparatorThreshold {
     NinetyFivePercent = 0b000,
+    #[cfg(test)]
     NinetyTwoAndAHalfPercent = 0b001,
+    #[cfg(test)]
     NinetyPercent = 0b010,
+    #[cfg(test)]
     EightySevenAndAHalfPercent = 0b011,
+    #[cfg(test)]
     EightyFivePercent = 0b100,
+    #[cfg(test)]
     EightyPercent = 0b101,
+    #[cfg(test)]
     SeventyFivePercent = 0b110,
+    #[cfg(test)]
     SeventyPercent = 0b111,
 }
 
 impl LeadOffComparatorThreshold {
+    #[cfg(test)]
     const fn from_bits(bits: u8) -> Option<LeadOffComparatorThreshold> {
         match bits {
             0b000 => Some(LeadOffComparatorThreshold::NinetyFivePercent),
@@ -528,12 +548,16 @@ impl LeadOffComparatorThreshold {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum LeadOffCurrent {
     SixNanoamps = 0b00,
+    #[cfg(test)]
     TwelveNanoamps = 0b01,
+    #[cfg(test)]
     EighteenNanoamps = 0b10,
+    #[cfg(test)]
     TwentyFourNanoamps = 0b11,
 }
 
 impl LeadOffCurrent {
+    #[cfg(test)]
     const fn from_bits(bits: u8) -> Option<LeadOffCurrent> {
         match bits {
             0b00 => Some(LeadOffCurrent::SixNanoamps),
@@ -549,6 +573,7 @@ impl LeadOffCurrent {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum LeadOffDetection {
     /// Alternating-current detection at a quarter of the data rate.
+    #[cfg(test)]
     AlternatingCurrent = 0b00,
     /// Direct-current detection, which is what the driver uses: the comparators simply
     /// watch the electrode's DC level.
@@ -556,6 +581,7 @@ pub(super) enum LeadOffDetection {
 }
 
 impl LeadOffDetection {
+    #[cfg(test)]
     const fn from_bits(bits: u8) -> Option<LeadOffDetection> {
         match bits {
             0b00 => Some(LeadOffDetection::AlternatingCurrent),
@@ -593,6 +619,7 @@ impl RegisterValue for LeadOffControl {
             | (self.detection as u8)
     }
 
+    #[cfg(test)]
     fn from_byte(byte: u8) -> Option<LeadOffControl> {
         Some(LeadOffControl {
             comparator_threshold: LeadOffComparatorThreshold::from_bits(byte >> 5)?,
@@ -616,15 +643,22 @@ impl RegisterValue for LeadOffControl {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Gain {
     Six = 0b000,
+    #[cfg(test)]
     One = 0b001,
+    #[cfg(test)]
     Two = 0b010,
+    #[cfg(test)]
     Three = 0b011,
+    #[cfg(test)]
     Four = 0b100,
+    #[cfg(test)]
     Eight = 0b101,
+    #[cfg(test)]
     Twelve = 0b110,
 }
 
 impl Gain {
+    #[cfg(test)]
     const fn from_bits(bits: u8) -> Option<Gain> {
         match bits {
             0b000 => Some(Gain::Six),
@@ -647,17 +681,23 @@ pub(super) enum ChannelInput {
     /// Both inputs tied to the same mid-supply point, so the channel reads its own
     /// noise and offset. Used on the channels that are not carrying the test signal.
     Shorted = 0b001,
+    #[cfg(test)]
     RightLegDriveMeasurement = 0b010,
+    #[cfg(test)]
     SupplyMeasurement = 0b011,
+    #[cfg(test)]
     TemperatureSensor = 0b100,
     /// The internal square wave, which only exists when
     /// [`Config2::test_signal_enabled`] is set.
     TestSignal = 0b101,
+    #[cfg(test)]
     RightLegDrivePositiveDriver = 0b110,
+    #[cfg(test)]
     RightLegDriveNegativeDriver = 0b111,
 }
 
 impl ChannelInput {
+    #[cfg(test)]
     const fn from_bits(bits: u8) -> Option<ChannelInput> {
         match bits {
             0b000 => Some(ChannelInput::Electrode),
@@ -690,6 +730,7 @@ pub(super) struct ChannelSettings {
 }
 
 /// Bit 3 of CHnSET is reserved and must be written 0.
+#[cfg(test)]
 const CHANNEL_SETTINGS_RESERVED_ZEROS: u8 = 0b0000_1000;
 
 impl ChannelSettings {
@@ -705,6 +746,7 @@ impl ChannelSettings {
 
     /// Symmetry with [`RegisterValue::from_byte`]; CHnSET has no `ADDRESS`, so it
     /// cannot implement the trait.
+    #[cfg(test)]
     pub(super) const fn from_byte(byte: u8) -> Option<ChannelSettings> {
         if byte & CHANNEL_SETTINGS_RESERVED_ZEROS != 0 {
             return None;
@@ -749,6 +791,7 @@ macro_rules! channel_mask_register {
                 Self::RESERVED_ONES | self.0.bits()
             }
 
+            #[cfg(test)]
             fn from_byte(byte: u8) -> Option<Self> {
                 Some($name(ChannelMask::from_bits(byte)))
             }
@@ -795,16 +838,24 @@ channel_mask_register! {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RespirationPhase {
     Zero = 0b000,
+    #[cfg(test)]
     One = 0b001,
+    #[cfg(test)]
     Two = 0b010,
+    #[cfg(test)]
     Three = 0b011,
+    #[cfg(test)]
     Four = 0b100,
+    #[cfg(test)]
     Five = 0b101,
+    #[cfg(test)]
     Six = 0b110,
+    #[cfg(test)]
     Seven = 0b111,
 }
 
 impl RespirationPhase {
+    #[cfg(test)]
     const fn from_bits(bits: u8) -> Option<RespirationPhase> {
         match bits {
             0b000 => Some(RespirationPhase::Zero),
@@ -826,12 +877,16 @@ pub(super) enum RespirationControl {
     /// No respiration measurement. The only setting this firmware uses: an EMG
     /// wristband has no thoracic impedance to measure.
     None = 0b00,
+    #[cfg(test)]
     External = 0b01,
+    #[cfg(test)]
     InternalSignals = 0b10,
+    #[cfg(test)]
     UserGeneratedSignals = 0b11,
 }
 
 impl RespirationControl {
+    #[cfg(test)]
     const fn from_bits(bits: u8) -> Option<RespirationControl> {
         match bits {
             0b00 => Some(RespirationControl::None),
@@ -871,6 +926,7 @@ impl RegisterValue for Respiration {
             | (self.control as u8)
     }
 
+    #[cfg(test)]
     fn from_byte(byte: u8) -> Option<Respiration> {
         if byte & RESPIRATION_RESERVED_ONE == 0 {
             return None;
@@ -893,16 +949,24 @@ impl RegisterValue for Respiration {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RespirationFrequency {
     SixtyFourKilohertz = 0b000,
+    #[cfg(test)]
     ThirtyTwoKilohertz = 0b001,
+    #[cfg(test)]
     SixteenKilohertz = 0b010,
+    #[cfg(test)]
     EightKilohertz = 0b011,
+    #[cfg(test)]
     FourKilohertz = 0b100,
+    #[cfg(test)]
     TwoKilohertz = 0b101,
+    #[cfg(test)]
     OneKilohertz = 0b110,
+    #[cfg(test)]
     FiveHundredHertz = 0b111,
 }
 
 impl RespirationFrequency {
+    #[cfg(test)]
     const fn from_bits(bits: u8) -> Option<RespirationFrequency> {
         match bits {
             0b000 => Some(RespirationFrequency::SixtyFourKilohertz),
@@ -934,6 +998,7 @@ pub(super) struct Config4 {
 }
 
 /// Bits 4 and 0 of CONFIG4 are reserved and must be written 0.
+#[cfg(test)]
 const CONFIG4_RESERVED_ZEROS: u8 = 0b0001_0001;
 
 impl RegisterValue for Config4 {
@@ -948,6 +1013,7 @@ impl RegisterValue for Config4 {
             | ((self.lead_off_comparators_enabled as u8) << 1)
     }
 
+    #[cfg(test)]
     fn from_byte(byte: u8) -> Option<Config4> {
         if byte & CONFIG4_RESERVED_ZEROS != 0 {
             return None;
@@ -985,6 +1051,7 @@ macro_rules! all_zero_register {
                 Self::RESERVED_ONES
             }
 
+            #[cfg(test)]
             fn from_byte(byte: u8) -> Option<Self> {
                 if byte == 0x00 {
                     Some($name)
