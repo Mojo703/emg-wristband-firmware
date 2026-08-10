@@ -74,17 +74,15 @@ async function waitFor(label, predicate, timeoutMilliseconds = 15_000) {
 
 function guided(action) {
   if (!snapshot) fail(`no guided snapshot for ${action.name}`);
-  const lifecycle = snapshot.lifecycle;
   send({
     type: 'guided_session_intent',
-    expected_revision: snapshot.revision,
-    expected_run_revision: snapshot.run_revision,
-    expected_session_id:
-      lifecycle.state === 'calibration' || lifecycle.state === 'collection'
-        ? lifecycle.session_id
-        : null,
+    authority: snapshot.action_authority,
     action,
   });
+}
+
+function guidedWithAuthority(authority, action) {
+  send({ type: 'guided_session_intent', authority, action });
 }
 
 function calibration(snapshotValue) {
@@ -186,12 +184,28 @@ async function main() {
   if (schedule.content_identity !== track.content_identity || schedule.anchor_device_monotonic_microseconds - schedule.acknowledged_device_monotonic_microseconds !== 3_000_000) {
     fail('ScheduleAccepted did not echo content identity and exact 3-second anchor');
   }
-  await waitFor('device-anchored playback snapshot', value => value.type === 'guided_session_snapshot' && calibration(value.snapshot)?.phase === 'playing', 8_000);
+  const playing = await waitFor('device-anchored playback snapshot', value => value.type === 'guided_session_snapshot' && calibration(value.snapshot)?.phase === 'playing', 8_000);
+  const playingAuthority = playing.snapshot.action_authority;
 
   // Let the first authored cue become eligible, then use the UI pause intent
-  // to withhold the backend heartbeat.  The device must authoritatively interrupt.
-  await new Promise(resolve => setTimeout(resolve, playbackObservationMilliseconds));
-  guided({ name: 'pause_calibration' });
+  // to withhold the backend heartbeat. Exercise an authority captured before
+  // many projection-only updates: telemetry revisions must not invalidate the
+  // control for the still-current actionable phase.
+  let samePhaseUpdates = 0;
+  const requiredSamePhaseUpdates = playbackObservationMilliseconds >= 20_000
+    ? 41
+    : Math.max(1, Math.floor(playbackObservationMilliseconds / 500));
+  while (samePhaseUpdates < requiredSamePhaseUpdates) {
+    const update = await waitFor('same-phase playback projection', value =>
+      value.type === 'guided_session_snapshot' &&
+      calibration(value.snapshot)?.phase === 'playing', 2_000);
+    if (JSON.stringify(update.snapshot.action_authority) !== JSON.stringify(playingAuthority)) {
+      fail('action authority changed during same-phase playback telemetry');
+    }
+    samePhaseUpdates += 1;
+  }
+  record('stable_action_authority', { authority: playingAuthority, same_phase_updates: samePhaseUpdates });
+  guidedWithAuthority(playingAuthority, { name: 'pause_calibration' });
   const interruption = await waitFor('heartbeat-timeout interruption', value =>
     value.type === 'calibration_song_interrupted' &&
     value.interruption.run.session_id === schedule.run.session_id &&
