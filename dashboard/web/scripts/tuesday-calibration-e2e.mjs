@@ -191,10 +191,10 @@ async function main() {
   const playing = await waitFor('device-anchored playback snapshot', value => value.type === 'guided_session_snapshot' && calibration(value.snapshot)?.phase === 'playing', 8_000);
   const playingAuthority = playing.snapshot.action_authority;
 
-  // Let the first authored cue become eligible, then use the UI Stop song
-  // intent to request an explicit device interruption. Exercise an authority captured
-  // before many projection-only updates: telemetry revisions must not
-  // invalidate the control for the still-current actionable phase.
+  // Observe anchored playback, then use the UI Stop song intent to request an
+  // explicit device interruption. Exercise an authority captured before many
+  // projection-only updates: telemetry revisions must not invalidate the
+  // control for the still-current actionable phase.
   let samePhaseUpdates = 0;
   const requiredSamePhaseUpdates = playbackObservationMilliseconds >= 20_000
     ? 41
@@ -215,11 +215,18 @@ async function main() {
     value.interruption.run.session_id === schedule.run.session_id &&
     value.interruption.run.run_id === schedule.run.run_id, 8_000);
   if (interruption.interruption.reason !== 'operator') fail(`unexpected interruption ${interruption.interruption.reason}`);
-  await waitFor('between-songs snapshot', value =>
+  if (!Array.isArray(interruption.interruption.counts) || interruption.interruption.counts.length !== 10) {
+    fail('operator interruption did not carry all retained recipe counts');
+  }
+  const betweenSongs = await waitFor('between-songs snapshot', value =>
     value.type === 'guided_session_snapshot' &&
     value.snapshot.lifecycle.state === 'calibration' &&
     value.snapshot.lifecycle.session_id === startedSessionId &&
     calibration(value.snapshot)?.phase === 'between_songs', 8_000);
+  const stopped = calibration(betweenSongs.snapshot);
+  if (!stopped.continue_available || stopped.candidate_available) {
+    fail('an incomplete stopped song did not project Continue-only authority');
+  }
   // Initial Idle snapshots remain in the asynchronous inbox for the whole run;
   // do not let one make Discard appear complete before the device's exact ACK.
   inbox.length = 0;
