@@ -101,15 +101,33 @@ fn effective_gate(requested: RunGate, commit: &ScheduleCommitPhase) -> RunGate {
 fn schedule_commit_is_authorized(
     gate: RunGate,
     upload: &UploadPhase,
-    device_ready: bool,
+    device_readiness: DeviceCommitReadiness,
     playback_ready: bool,
     commit: &ScheduleCommitPhase,
 ) -> bool {
     matches!(gate, RunGate::Running)
         && matches!(upload, UploadPhase::Complete)
-        && device_ready
+        && matches!(device_readiness, DeviceCommitReadiness::Ready)
         && playback_ready
         && matches!(commit, ScheduleCommitPhase::AwaitingDeviceReadiness)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeviceCommitReadiness {
+    AwaitingFreshStatus,
+    Ready,
+}
+
+fn apply_commit_deferral(
+    commit: &mut ScheduleCommitPhase,
+    device_readiness: &mut DeviceCommitReadiness,
+) {
+    // A deferral invalidates the readiness observation that authorized the
+    // rejected Commit.  Require a later device status to create fresh retry
+    // authority; otherwise the actor's next turn immediately resends Commit
+    // and can spin against the firmware's reliable deferral response.
+    *commit = ScheduleCommitPhase::AwaitingDeviceReadiness;
+    *device_readiness = DeviceCommitReadiness::AwaitingFreshStatus;
 }
 
 fn enqueue_run_action(
@@ -585,7 +603,7 @@ impl CalibrationModeAdapter {
         )));
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut commit_phase = ScheduleCommitPhase::AwaitingDeviceReadiness;
-        let mut device_ready_for_commit = false;
+        let mut device_readiness = DeviceCommitReadiness::AwaitingFreshStatus;
         let mut heartbeat_mode = HeartbeatMode::Sending {
             schedule_revision,
             next_sequence: 0,
@@ -627,7 +645,7 @@ impl CalibrationModeAdapter {
             if schedule_commit_is_authorized(
                 gate_state,
                 &upload,
-                device_ready_for_commit,
+                device_readiness,
                 prepared_playback.is_ready(),
                 &commit_phase,
             ) {
@@ -670,7 +688,7 @@ impl CalibrationModeAdapter {
                             if schedule_commit_is_authorized(
                                 gate_state,
                                 &upload,
-                                device_ready_for_commit,
+                                device_readiness,
                                 prepared_playback.is_ready(),
                                 &commit_phase,
                             ) {
@@ -799,7 +817,7 @@ impl CalibrationModeAdapter {
                         if schedule_commit_is_authorized(
                             gate_state,
                             &upload,
-                            device_ready_for_commit,
+                            device_readiness,
                             prepared_playback.is_ready(),
                             &commit_phase,
                         ) {
@@ -834,11 +852,15 @@ impl CalibrationModeAdapter {
                                 break SessionExit::DependencyFailed(detail);
                             }
                         }
-                        device_ready_for_commit = ready_for_schedule;
+                        device_readiness = if ready_for_schedule {
+                            DeviceCommitReadiness::Ready
+                        } else {
+                            DeviceCommitReadiness::AwaitingFreshStatus
+                        };
                         if schedule_commit_is_authorized(
                             gate_state,
                             &upload,
-                            ready_for_schedule,
+                            device_readiness,
                             prepared_playback.is_ready(),
                             &commit_phase,
                         ) {
@@ -925,7 +947,10 @@ impl CalibrationModeAdapter {
                         // The preparation status is the retry authority.  A
                         // retryable refusal returns to its explicit ready
                         // phase; no backend stopwatch recreates that phase.
-                        commit_phase = ScheduleCommitPhase::AwaitingDeviceReadiness;
+                        apply_commit_deferral(
+                            &mut commit_phase,
+                            &mut device_readiness,
+                        );
                         heartbeat_mode = HeartbeatMode::Sending {
                             schedule_revision,
                             next_sequence: 0,
@@ -1033,7 +1058,7 @@ impl CalibrationModeAdapter {
                             // pre-Commit transaction and may follow the latest
                             // visibility request again.
                             gate_state = effective_gate(*gate.borrow(), &commit_phase);
-                            device_ready_for_commit = false;
+                            device_readiness = DeviceCommitReadiness::AwaitingFreshStatus;
                             evidence = EvidenceState::Fresh;
                             prepared_playback = prepare_playback(playback_collection.clone(), &track);
                             heartbeat_mode = HeartbeatMode::Sending {
@@ -1811,14 +1836,14 @@ mod tests {
         assert!(!schedule_commit_is_authorized(
             RunGate::Interrupted,
             &UploadPhase::Complete,
-            true,
+            DeviceCommitReadiness::Ready,
             true,
             &awaiting,
         ));
         assert!(schedule_commit_is_authorized(
             RunGate::Running,
             &UploadPhase::Complete,
-            true,
+            DeviceCommitReadiness::Ready,
             true,
             &awaiting,
         ));
@@ -1830,9 +1855,29 @@ mod tests {
         assert!(!schedule_commit_is_authorized(
             RunGate::Running,
             &UploadPhase::Complete,
-            true,
+            DeviceCommitReadiness::Ready,
             false,
             &awaiting,
+        ));
+    }
+
+    #[test]
+    fn deferred_commit_requires_a_fresh_device_readiness_observation() {
+        let mut commit = ScheduleCommitPhase::sent_at(tokio::time::Instant::now());
+        let mut device_readiness = DeviceCommitReadiness::Ready;
+
+        apply_commit_deferral(&mut commit, &mut device_readiness);
+
+        assert!(matches!(
+            commit,
+            ScheduleCommitPhase::AwaitingDeviceReadiness
+        ));
+        assert!(!schedule_commit_is_authorized(
+            RunGate::Running,
+            &UploadPhase::Complete,
+            device_readiness,
+            true,
+            &commit,
         ));
     }
 
