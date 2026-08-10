@@ -221,8 +221,7 @@ mod tests {
         let mut stage = InputStage::new(INPUT_SCALE, SAMPLE_RATE_HZ);
         let out = drive(&mut stage, 5_000.0, 200.0, 8000);
         let expected = (1.0 / INPUT_SCALE) as i8;
-        for slot in 0..CHANNELS_PER_DEVICE {
-            let counts = out[slot];
+        for (slot, &counts) in out.iter().take(CHANNELS_PER_DEVICE).enumerate() {
             assert!(
                 counts.abs() < 127,
                 "slot {slot} saturated at {counts}: conditioning did not take"

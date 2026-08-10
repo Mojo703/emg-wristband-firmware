@@ -226,9 +226,9 @@ const NORMAL_CONFIG2: Config2 = Config2 {
 /// LOFF: DC lead-off detection, comparators at the widest thresholds, in resistor mode
 /// so no excitation current is pushed into the electrode.
 const LEAD_OFF_CONTROL: LeadOffControl = LeadOffControl {
-    comparator_threshold: LeadOffComparatorThreshold::NinetyFivePercent,
+    comparator_threshold: LeadOffComparatorThreshold::NinetyFive,
     pull_resistor_mode: true,
-    current: LeadOffCurrent::SixNanoamps,
+    current: LeadOffCurrent::Six,
     detection: LeadOffDetection::DirectCurrent,
 };
 

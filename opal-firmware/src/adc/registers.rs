@@ -510,35 +510,35 @@ impl RegisterValue for Config3 {
 /// percentage of the supply. `NinetyFive` compares against 95% and 5%.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum LeadOffComparatorThreshold {
-    NinetyFivePercent = 0b000,
+    NinetyFive = 0b000,
     #[cfg(test)]
-    NinetyTwoAndAHalfPercent = 0b001,
+    NinetyTwoAndAHalf = 0b001,
     #[cfg(test)]
-    NinetyPercent = 0b010,
+    Ninety = 0b010,
     #[cfg(test)]
-    EightySevenAndAHalfPercent = 0b011,
+    EightySevenAndAHalf = 0b011,
     #[cfg(test)]
-    EightyFivePercent = 0b100,
+    EightyFive = 0b100,
     #[cfg(test)]
-    EightyPercent = 0b101,
+    Eighty = 0b101,
     #[cfg(test)]
-    SeventyFivePercent = 0b110,
+    SeventyFive = 0b110,
     #[cfg(test)]
-    SeventyPercent = 0b111,
+    Seventy = 0b111,
 }
 
 impl LeadOffComparatorThreshold {
     #[cfg(test)]
     const fn from_bits(bits: u8) -> Option<LeadOffComparatorThreshold> {
         match bits {
-            0b000 => Some(LeadOffComparatorThreshold::NinetyFivePercent),
-            0b001 => Some(LeadOffComparatorThreshold::NinetyTwoAndAHalfPercent),
-            0b010 => Some(LeadOffComparatorThreshold::NinetyPercent),
-            0b011 => Some(LeadOffComparatorThreshold::EightySevenAndAHalfPercent),
-            0b100 => Some(LeadOffComparatorThreshold::EightyFivePercent),
-            0b101 => Some(LeadOffComparatorThreshold::EightyPercent),
-            0b110 => Some(LeadOffComparatorThreshold::SeventyFivePercent),
-            _ => Some(LeadOffComparatorThreshold::SeventyPercent),
+            0b000 => Some(LeadOffComparatorThreshold::NinetyFive),
+            0b001 => Some(LeadOffComparatorThreshold::NinetyTwoAndAHalf),
+            0b010 => Some(LeadOffComparatorThreshold::Ninety),
+            0b011 => Some(LeadOffComparatorThreshold::EightySevenAndAHalf),
+            0b100 => Some(LeadOffComparatorThreshold::EightyFive),
+            0b101 => Some(LeadOffComparatorThreshold::Eighty),
+            0b110 => Some(LeadOffComparatorThreshold::SeventyFive),
+            _ => Some(LeadOffComparatorThreshold::Seventy),
         }
     }
 }
@@ -547,23 +547,23 @@ impl LeadOffComparatorThreshold {
 /// pushes through the electrode, in nanoamps. Only used in current-source mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum LeadOffCurrent {
-    SixNanoamps = 0b00,
+    Six = 0b00,
     #[cfg(test)]
-    TwelveNanoamps = 0b01,
+    Twelve = 0b01,
     #[cfg(test)]
-    EighteenNanoamps = 0b10,
+    Eighteen = 0b10,
     #[cfg(test)]
-    TwentyFourNanoamps = 0b11,
+    TwentyFour = 0b11,
 }
 
 impl LeadOffCurrent {
     #[cfg(test)]
     const fn from_bits(bits: u8) -> Option<LeadOffCurrent> {
         match bits {
-            0b00 => Some(LeadOffCurrent::SixNanoamps),
-            0b01 => Some(LeadOffCurrent::TwelveNanoamps),
-            0b10 => Some(LeadOffCurrent::EighteenNanoamps),
-            _ => Some(LeadOffCurrent::TwentyFourNanoamps),
+            0b00 => Some(LeadOffCurrent::Six),
+            0b01 => Some(LeadOffCurrent::Twelve),
+            0b10 => Some(LeadOffCurrent::Eighteen),
+            _ => Some(LeadOffCurrent::TwentyFour),
         }
     }
 }

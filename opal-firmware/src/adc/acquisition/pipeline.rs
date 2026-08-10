@@ -34,6 +34,7 @@ use std::sync::Arc;
 use crate::device_now_us as now_us;
 
 use super::super::ads1298::Ads1298FrontEnd;
+use super::super::channel::Board;
 use super::super::decode::{parse_sample, Sample};
 use super::super::frame_reader::FrameReader;
 use super::super::status::StatusWord;
@@ -654,19 +655,40 @@ impl Pipeline {
     }
 }
 
-/// Spawns the draining thread for one chip, pinned to `core` (the caller takes
-/// that from the core plan). `power_down` is the chip's PWDN line, parked in the
-/// thread so it stays high for as long as the chip is being sampled.
-pub(super) fn spawn(
-    index: usize,
-    core: esp_idf_svc::hal::cpu::Core,
-    chip: Ads1298FrontEnd,
-    reader: FrameReader,
-    power_down: PinDriver<'static, Output>,
-    events: SyncSender<(usize, ChipEvent)>,
-    recycled_batches: Receiver<Vec<(u64, Sample)>>,
-    counters: Arc<HealthCounters>,
-) -> anyhow::Result<()> {
+/// Hardware and scheduling resources owned for the lifetime of one chip's
+/// acquisition thread. Keeping these together prevents a call site from mixing
+/// one chip's front end, interrupt reader, or PWDN pin with another chip's thread.
+pub(super) struct ThreadHardware {
+    pub(super) board: Board,
+    pub(super) chip: Ads1298FrontEnd,
+    pub(super) reader: FrameReader,
+    pub(super) power_down: PinDriver<'static, Output>,
+}
+
+/// The complete channel boundary between one chip thread and the combiner.
+pub(super) struct ThreadChannels {
+    pub(super) events: SyncSender<(usize, ChipEvent)>,
+    pub(super) recycled_batches: Receiver<Vec<(u64, Sample)>>,
+    pub(super) counters: Arc<HealthCounters>,
+}
+
+/// Spawns the draining thread for one chip, pinned according to its board identity.
+/// The PWDN line is parked in the thread so it stays high for as long as the chip
+/// is being sampled.
+pub(super) fn spawn(hardware: ThreadHardware, channels: ThreadChannels) -> anyhow::Result<()> {
+    let ThreadHardware {
+        board,
+        chip,
+        reader,
+        power_down,
+    } = hardware;
+    let index = board.device_index();
+    let core = crate::cores::front_end_core(board);
+    let ThreadChannels {
+        events,
+        recycled_batches,
+        counters,
+    } = channels;
     crate::cores::spawn_pinned(core, || {
         std::thread::Builder::new()
             .name(format!("adc{index}"))

@@ -379,16 +379,19 @@ pub(crate) fn start(
     {
         let index = board.device_index();
         pipeline::spawn(
-            index,
-            crate::cores::front_end_core(board),
-            chip,
-            reader,
-            power_down,
-            event_sender.clone(),
-            batch_receivers[index]
-                .take()
-                .expect("each chip owns one batch recycler"),
-            counters.clone(),
+            pipeline::ThreadHardware {
+                board,
+                chip,
+                reader,
+                power_down,
+            },
+            pipeline::ThreadChannels {
+                events: event_sender.clone(),
+                recycled_batches: batch_receivers[index]
+                    .take()
+                    .expect("each chip owns one batch recycler"),
+                counters: counters.clone(),
+            },
         )?;
     }
     drop(event_sender); // the pipelines hold the only senders now
@@ -402,17 +405,18 @@ pub(crate) fn start(
             .spawn(move || {
                 crate::cores::set_current_thread_priority(THREAD_PRIORITY);
                 info!("combiner running");
-                combine(
+                Combiner {
                     events,
-                    batch_senders,
+                    batch_recyclers: batch_senders,
                     window_sender,
                     recycled,
-                    combiner_counters,
-                    combiner_acquisition_sample,
+                    counters: combiner_counters,
+                    acquisition_sample: combiner_acquisition_sample,
                     window_length,
                     input_scale,
                     buffers,
-                );
+                }
+                .run();
             })
     })??;
 
@@ -428,190 +432,206 @@ pub(crate) fn start(
 /// The combiner loop: pipeline events in, aligned/conditioned windows out. Returns
 /// when every pipeline is gone (the receive fails) or the main loop is gone (the
 /// window send disconnects).
-fn combine(
+struct Combiner {
     events: Receiver<(usize, ChipEvent)>,
     batch_recyclers: [SyncSender<Vec<(u64, Sample)>>; DEVICE_COUNT],
-    windows: SyncSender<AcquiredWindow>,
+    window_sender: SyncSender<AcquiredWindow>,
     recycled: Receiver<(Vec<i8>, Vec<u8>, Vec<u8>)>,
     counters: Arc<HealthCounters>,
     acquisition_sample: Arc<MonotonicCounter>,
     window_length: usize,
     input_scale: f32,
     buffers: AcquisitionBuffers,
-) {
-    let samples_per_window = window_length * INPUT_CH;
-    let mut aligner = GridAligner::<Sample, DEVICE_COUNT>::new(SAMPLE_RATE_HZ);
-    // Owned here rather than shared: the conditioning carries per-channel filter
-    // state across time steps, and this thread is the only writer.
-    let mut input_stage = InputStage::new(input_scale, SAMPLE_RATE_HZ as f32);
-    let AcquisitionBuffers {
-        mut building,
-        next_building,
-        mut building_wire,
-        packed_wire,
-        mut building_missing,
-        next_missing,
-    } = buffers;
-    // The wire stream, filled in lockstep with `building`; the two are always the
-    // same length and are cleared together.
-    // The window's missing-mask bit planes (`Frame::Emg::missing`), set in
-    // lockstep with the buffers above and zeroed whenever they are cleared.
-    let missing_mask_len = DEVICE_COUNT * protocol::missing_plane_stride(window_length);
-    let mut spare_buffers = Some((next_building, packed_wire, next_missing));
-    // Device-clock time of the first time step in `building`; stamped when the
-    // first step lands, cleared with the buffer.
-    let mut building_started_us: u64 = 0;
-    // The previous emitted grid step, for spotting skipped stretches.
-    let mut previous_step_us: Option<u64> = None;
-    // Device-time anchor for the acquisition counter. Unlike feature-pipeline
-    // state, this is established by the first aligned sample and never resets.
-    let mut acquisition_anchor_us: Option<u64> = None;
-    let mut ticks_at_last_log: u64 = 0;
+}
 
-    loop {
-        let (chip, event) = match events.recv() {
-            Ok(received) => received,
-            Err(_) => {
-                info!("every chip pipeline is gone; combining stopping");
-                return;
-            }
-        };
-        match event {
-            ChipEvent::Present => aligner.set_present(chip, true),
-            ChipEvent::Absent => {
-                aligner.set_present(chip, false);
-                // That chip's stream is about to jump: the reset pulse re-settles
-                // its reference and its electrodes may come back sitting somewhere
-                // else. Only its own eight slots re-seed.
-                input_stage.reset_device_after_gap(chip);
-                // The partial window would silently span the outage on half its
-                // channels; discard it rather than stitch across the gap.
-                building.clear();
-                building_wire.clear();
-                building_missing.fill(0);
-            }
-            ChipEvent::Frames(frames) => {
-                for &(at_us, frame) in &frames {
-                    aligner.push(chip, at_us, frame);
+impl Combiner {
+    fn run(self) {
+        let Combiner {
+            events,
+            batch_recyclers,
+            window_sender: windows,
+            recycled,
+            counters,
+            acquisition_sample,
+            window_length,
+            input_scale,
+            buffers,
+        } = self;
+        let samples_per_window = window_length * INPUT_CH;
+        let mut aligner = GridAligner::<Sample, DEVICE_COUNT>::new(SAMPLE_RATE_HZ);
+        // Owned here rather than shared: the conditioning carries per-channel filter
+        // state across time steps, and this thread is the only writer.
+        let mut input_stage = InputStage::new(input_scale, SAMPLE_RATE_HZ as f32);
+        let AcquisitionBuffers {
+            mut building,
+            next_building,
+            mut building_wire,
+            packed_wire,
+            mut building_missing,
+            next_missing,
+        } = buffers;
+        // The wire stream, filled in lockstep with `building`; the two are always the
+        // same length and are cleared together.
+        // The window's missing-mask bit planes (`Frame::Emg::missing`), set in
+        // lockstep with the buffers above and zeroed whenever they are cleared.
+        let missing_mask_len = DEVICE_COUNT * protocol::missing_plane_stride(window_length);
+        let mut spare_buffers = Some((next_building, packed_wire, next_missing));
+        // Device-clock time of the first time step in `building`; stamped when the
+        // first step lands, cleared with the buffer.
+        let mut building_started_us: u64 = 0;
+        // The previous emitted grid step, for spotting skipped stretches.
+        let mut previous_step_us: Option<u64> = None;
+        // Device-time anchor for the acquisition counter. Unlike feature-pipeline
+        // state, this is established by the first aligned sample and never resets.
+        let mut acquisition_anchor_us: Option<u64> = None;
+        let mut ticks_at_last_log: u64 = 0;
+
+        loop {
+            let (chip, event) = match events.recv() {
+                Ok(received) => received,
+                Err(_) => {
+                    info!("every chip pipeline is gone; combining stopping");
+                    return;
                 }
-                let mut frames = frames;
-                frames.clear();
-                let _ = batch_recyclers[chip].try_send(frames);
-                while let Some(step) = aligner.poll() {
-                    let anchor_us = *acquisition_anchor_us.get_or_insert(step.at_us);
-                    let elapsed_us = step.at_us - anchor_us;
-                    let seconds = elapsed_us / 1_000_000;
-                    let subsecond_us = elapsed_us % 1_000_000;
-                    let current_sample = seconds * SAMPLE_RATE_HZ as u64
-                        + subsecond_us * SAMPLE_RATE_HZ as u64 / 1_000_000
-                        + 1;
-                    acquisition_sample.store(current_sample);
-                    // Skipped ticks mean the emitted timeline has a hole (every
-                    // present source gapped at once); a window must not span it.
-                    if previous_step_us
-                        .is_some_and(|previous| step.at_us - previous > STEP_DISCONTINUITY_US)
-                        && !building.is_empty()
-                    {
-                        building.clear();
-                        building_wire.clear();
-                        building_missing.fill(0);
+            };
+            match event {
+                ChipEvent::Present => aligner.set_present(chip, true),
+                ChipEvent::Absent => {
+                    aligner.set_present(chip, false);
+                    // That chip's stream is about to jump: the reset pulse re-settles
+                    // its reference and its electrodes may come back sitting somewhere
+                    // else. Only its own eight slots re-seed.
+                    input_stage.reset_device_after_gap(chip);
+                    // The partial window would silently span the outage on half its
+                    // channels; discard it rather than stitch across the gap.
+                    building.clear();
+                    building_wire.clear();
+                    building_missing.fill(0);
+                }
+                ChipEvent::Frames(frames) => {
+                    for &(at_us, frame) in &frames {
+                        aligner.push(chip, at_us, frame);
                     }
-                    previous_step_us = Some(step.at_us);
-                    if building.is_empty() {
-                        building_started_us = step.at_us;
-                    }
-                    let step_index = building.len() / INPUT_CH;
-                    for (source, slot) in step.slots.iter().enumerate() {
-                        if slot.is_none() {
-                            let plane = source * protocol::missing_plane_stride(window_length);
-                            building_missing[plane + step_index / 8] |= 1 << (step_index % 8);
-                        }
-                    }
-                    building.extend_from_slice(&input_stage.time_step(&step.slots));
-                    building_wire.extend_from_slice(&wire_time_step(&step.slots));
-
-                    if building.len() >= samples_per_window {
-                        // Both outgoing buffers cycle through the pool: whatever the
-                        // main loop has returned is reused. A rejected output is
-                        // reclaimed locally; only cold start costs fresh allocations.
-                        let available = spare_buffers.take().or_else(|| recycled.try_recv().ok());
-                        let Some((mut next_building, mut packed_wire, mut next_missing)) =
-                            available
-                        else {
-                            counters.dropped.fetch_add(1, Ordering::Relaxed);
+                    let mut frames = frames;
+                    frames.clear();
+                    let _ = batch_recyclers[chip].try_send(frames);
+                    while let Some(step) = aligner.poll() {
+                        let anchor_us = *acquisition_anchor_us.get_or_insert(step.at_us);
+                        let elapsed_us = step.at_us - anchor_us;
+                        let seconds = elapsed_us / 1_000_000;
+                        let subsecond_us = elapsed_us % 1_000_000;
+                        let current_sample = seconds * SAMPLE_RATE_HZ as u64
+                            + subsecond_us * SAMPLE_RATE_HZ as u64 / 1_000_000
+                            + 1;
+                        acquisition_sample.store(current_sample);
+                        // Skipped ticks mean the emitted timeline has a hole (every
+                        // present source gapped at once); a window must not span it.
+                        if previous_step_us
+                            .is_some_and(|previous| step.at_us - previous > STEP_DISCONTINUITY_US)
+                            && !building.is_empty()
+                        {
                             building.clear();
                             building_wire.clear();
                             building_missing.fill(0);
-                            continue;
-                        };
-                        next_building.clear();
-                        next_missing.clear();
-                        next_missing.resize(missing_mask_len, 0);
-                        // The wire payload leaves here already packed, straight off
-                        // the persistent i16 buffer (channel-major, matching the
-                        // `Frame::Emg` layout), into the pooled payload buffer that
-                        // is itself the bytes the link writes.
-                        let wire = building_wire.as_slice();
-                        protocol::pack_sample_stream_into(
-                            &mut packed_wire,
-                            (0..INPUT_CH).flat_map(|ch| {
-                                (0..window_length).map(move |ti| wire[ti * INPUT_CH + ch])
-                            }),
-                        );
-                        building_wire.clear();
-                        // Derive the acquisition index from the aligner's device-time
-                        // grid rather than from delivered-window count. Sustained gaps
-                        // skip emitted ticks, but they must still advance the clock a
-                        // future cue mapping is measured against.
-                        let full = AcquiredWindow {
-                            started_us: building_started_us,
-                            end_sample: current_sample,
-                            samples: std::mem::replace(&mut building, next_building),
-                            packed_wire,
-                            missing: std::mem::replace(&mut building_missing, next_missing),
-                        };
-                        match windows.try_send(full) {
-                            Ok(()) => {}
-                            Err(TrySendError::Full(window)) => {
+                        }
+                        previous_step_us = Some(step.at_us);
+                        if building.is_empty() {
+                            building_started_us = step.at_us;
+                        }
+                        let step_index = building.len() / INPUT_CH;
+                        for (source, slot) in step.slots.iter().enumerate() {
+                            if slot.is_none() {
+                                let plane = source * protocol::missing_plane_stride(window_length);
+                                building_missing[plane + step_index / 8] |= 1 << (step_index % 8);
+                            }
+                        }
+                        building.extend_from_slice(&input_stage.time_step(&step.slots));
+                        building_wire.extend_from_slice(&wire_time_step(&step.slots));
+
+                        if building.len() >= samples_per_window {
+                            // Both outgoing buffers cycle through the pool: whatever the
+                            // main loop has returned is reused. A rejected output is
+                            // reclaimed locally; only cold start costs fresh allocations.
+                            let available =
+                                spare_buffers.take().or_else(|| recycled.try_recv().ok());
+                            let Some((mut next_building, mut packed_wire, mut next_missing)) =
+                                available
+                            else {
                                 counters.dropped.fetch_add(1, Ordering::Relaxed);
-                                spare_buffers =
-                                    Some((window.samples, window.packed_wire, window.missing));
-                            }
-                            Err(TrySendError::Disconnected(_)) => {
-                                // The main loop is gone, so there is nobody left
-                                // to feed.
-                                info!("ADC consumer disconnected; combining stopping");
-                                return;
+                                building.clear();
+                                building_wire.clear();
+                                building_missing.fill(0);
+                                continue;
+                            };
+                            next_building.clear();
+                            next_missing.clear();
+                            next_missing.resize(missing_mask_len, 0);
+                            // The wire payload leaves here already packed, straight off
+                            // the persistent i16 buffer (channel-major, matching the
+                            // `Frame::Emg` layout), into the pooled payload buffer that
+                            // is itself the bytes the link writes.
+                            let wire = building_wire.as_slice();
+                            protocol::pack_sample_stream_into(
+                                &mut packed_wire,
+                                (0..INPUT_CH).flat_map(|ch| {
+                                    (0..window_length).map(move |ti| wire[ti * INPUT_CH + ch])
+                                }),
+                            );
+                            building_wire.clear();
+                            // Derive the acquisition index from the aligner's device-time
+                            // grid rather than from delivered-window count. Sustained gaps
+                            // skip emitted ticks, but they must still advance the clock a
+                            // future cue mapping is measured against.
+                            let full = AcquiredWindow {
+                                started_us: building_started_us,
+                                end_sample: current_sample,
+                                samples: std::mem::replace(&mut building, next_building),
+                                packed_wire,
+                                missing: std::mem::replace(&mut building_missing, next_missing),
+                            };
+                            match windows.try_send(full) {
+                                Ok(()) => {}
+                                Err(TrySendError::Full(window)) => {
+                                    counters.dropped.fetch_add(1, Ordering::Relaxed);
+                                    spare_buffers =
+                                        Some((window.samples, window.packed_wire, window.missing));
+                                }
+                                Err(TrySendError::Disconnected(_)) => {
+                                    // The main loop is gone, so there is nobody left
+                                    // to feed.
+                                    info!("ADC consumer disconnected; combining stopping");
+                                    return;
+                                }
                             }
                         }
                     }
-                }
-                let ticks = aligner.ticks_emitted();
-                if ticks - ticks_at_last_log >= ALIGNER_REPORT_TICKS {
-                    ticks_at_last_log = ticks;
-                    // The alignment accounting IS the measured clock behaviour:
-                    // surplus on a healthy chip is its oscillator running fast
-                    // against the grid, duplicates are it running slow, missing is
-                    // a genuine gap in its stream. All counters cumulative since
-                    // boot, so a dropped report costs nothing.
-                    let metric = crate::telemetry::metric;
-                    let mut metrics = vec![
-                        metric("ticks_emitted", ticks as f64),
-                        metric("ticks_skipped", aligner.ticks_skipped() as f64),
-                    ];
-                    for source in 0..DEVICE_COUNT {
-                        let counters = aligner.counters(source);
-                        for (name, value) in [
-                            ("surplus_dropped", counters.surplus_dropped),
-                            ("duplicated", counters.duplicated),
-                            ("missing", counters.missing),
-                            ("rejected", counters.rejected),
-                            ("overflowed", counters.overflowed),
-                        ] {
-                            metrics.push(metric(&format!("chip{source}_{name}"), value as f64));
+                    let ticks = aligner.ticks_emitted();
+                    if ticks - ticks_at_last_log >= ALIGNER_REPORT_TICKS {
+                        ticks_at_last_log = ticks;
+                        // The alignment accounting IS the measured clock behaviour:
+                        // surplus on a healthy chip is its oscillator running fast
+                        // against the grid, duplicates are it running slow, missing is
+                        // a genuine gap in its stream. All counters cumulative since
+                        // boot, so a dropped report costs nothing.
+                        let metric = crate::telemetry::metric;
+                        let mut metrics = vec![
+                            metric("ticks_emitted", ticks as f64),
+                            metric("ticks_skipped", aligner.ticks_skipped() as f64),
+                        ];
+                        for source in 0..DEVICE_COUNT {
+                            let counters = aligner.counters(source);
+                            for (name, value) in [
+                                ("surplus_dropped", counters.surplus_dropped),
+                                ("duplicated", counters.duplicated),
+                                ("missing", counters.missing),
+                                ("rejected", counters.rejected),
+                                ("overflowed", counters.overflowed),
+                            ] {
+                                metrics.push(metric(&format!("chip{source}_{name}"), value as f64));
+                            }
                         }
+                        crate::telemetry::report("aligner", metrics);
                     }
-                    crate::telemetry::report("aligner", metrics);
                 }
             }
         }

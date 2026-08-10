@@ -382,8 +382,10 @@ fn device_now_us() -> u64 {
 
 fn timing_status_due(anchor: Option<u64>, last_reported_at: Option<u64>, observed: u64) -> bool {
     anchor.is_some()
-        && last_reported_at
-            .is_none_or(|last| observed.saturating_sub(last) >= TIMING_STATUS_CADENCE_MICROSECONDS)
+        && match last_reported_at {
+            None => true,
+            Some(last) => observed.saturating_sub(last) >= TIMING_STATUS_CADENCE_MICROSECONDS,
+        }
 }
 
 struct App {

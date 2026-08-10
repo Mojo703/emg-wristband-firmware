@@ -1214,20 +1214,19 @@ fn float_at(bits: &[u8], index: usize) -> f32 {
 mod tests {
     use super::*;
 
-    fn worker_output(
-        control_depth: usize,
-        payload_depth: usize,
-    ) -> (
-        WorkerOutput,
-        mpsc::Receiver<SequencedFrame>,
-        mpsc::Receiver<SequencedFrame>,
-        Arc<Mutex<Option<Frame>>>,
-    ) {
+    struct WorkerFixture {
+        output: WorkerOutput,
+        control: mpsc::Receiver<SequencedFrame>,
+        payload: mpsc::Receiver<SequencedFrame>,
+        latest_credit: Arc<Mutex<Option<Frame>>>,
+    }
+
+    fn worker_output(control_depth: usize, payload_depth: usize) -> WorkerFixture {
         let (control, control_rx) = mpsc::sync_channel(control_depth);
         let (payload, payload_rx) = mpsc::sync_channel(payload_depth);
         let latest_credit = Arc::new(Mutex::new(None));
-        (
-            WorkerOutput {
+        WorkerFixture {
+            output: WorkerOutput {
                 control,
                 payload,
                 latest_credit: Arc::clone(&latest_credit),
@@ -1237,10 +1236,10 @@ mod tests {
                 superseded_credits: AtomicU32::new(0),
                 disconnected_reported: AtomicBool::new(false),
             },
-            control_rx,
-            payload_rx,
+            control: control_rx,
+            payload: payload_rx,
             latest_credit,
-        )
+        }
     }
 
     fn feature_frame(first_window: u32) -> Frame {
@@ -1262,7 +1261,12 @@ mod tests {
 
     #[test]
     fn saturated_payload_cannot_starve_control_output() {
-        let (output, control, payload, _) = worker_output(1, 1);
+        let WorkerFixture {
+            output,
+            control,
+            payload,
+            ..
+        } = worker_output(1, 1);
         assert_eq!(output.send(feature_frame(0)), Delivery::Queued);
         assert_eq!(output.send(feature_frame(1)), Delivery::Full);
         assert_eq!(output.dropped_payload.load(Ordering::Relaxed), 1);
@@ -1292,7 +1296,12 @@ mod tests {
 
     #[test]
     fn split_outbound_queues_preserve_worker_production_order() {
-        let (output, control, payload, _) = worker_output(2, 2);
+        let WorkerFixture {
+            output,
+            control,
+            payload,
+            ..
+        } = worker_output(2, 2);
         assert_eq!(output.send(feature_frame(7)), Delivery::Queued);
         assert_eq!(
             output.send(Frame::BenchError {
@@ -1308,7 +1317,11 @@ mod tests {
 
     #[test]
     fn credits_are_overwrite_latest_instead_of_filling_a_queue() {
-        let (output, _, _, latest) = worker_output(1, 1);
+        let WorkerFixture {
+            output,
+            latest_credit: latest,
+            ..
+        } = worker_output(1, 1);
         assert_eq!(
             output.send(Frame::PlaybackCredit {
                 next_sequence: 1,
@@ -1335,7 +1348,12 @@ mod tests {
 
     #[test]
     fn stopped_outbound_consumer_is_reported_without_blocking() {
-        let (output, control, payload, _) = worker_output(1, 1);
+        let WorkerFixture {
+            output,
+            control,
+            payload,
+            ..
+        } = worker_output(1, 1);
         drop(control);
         drop(payload);
         assert_eq!(

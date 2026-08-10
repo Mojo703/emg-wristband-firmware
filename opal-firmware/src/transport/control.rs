@@ -143,6 +143,25 @@ impl Control {
     }
 }
 
+#[cfg(feature = "playback")]
+impl Control {
+    pub fn is_bench(&self) -> bool {
+        matches!(
+            self,
+            Control::PlaybackBegin { .. }
+                | Control::PlaybackSamples { .. }
+                | Control::PlaybackEnd {}
+                | Control::BenchModelLoad { .. }
+                | Control::BenchReplayRows { .. }
+                | Control::BenchFitBegin { .. }
+                | Control::BenchFitRows { .. }
+                | Control::BenchFitRun { .. }
+                | Control::BenchStatusRequest {}
+                | Control::BenchReset {}
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,24 +182,5 @@ mod tests {
                 host_send_nanoseconds: u64::MAX,
             }
         ));
-    }
-}
-
-#[cfg(feature = "playback")]
-impl Control {
-    pub fn is_bench(&self) -> bool {
-        matches!(
-            self,
-            Control::PlaybackBegin { .. }
-                | Control::PlaybackSamples { .. }
-                | Control::PlaybackEnd {}
-                | Control::BenchModelLoad { .. }
-                | Control::BenchReplayRows { .. }
-                | Control::BenchFitBegin { .. }
-                | Control::BenchFitRows { .. }
-                | Control::BenchFitRun { .. }
-                | Control::BenchStatusRequest {}
-                | Control::BenchReset {}
-        )
     }
 }
