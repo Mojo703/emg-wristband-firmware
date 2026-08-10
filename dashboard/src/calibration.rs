@@ -102,11 +102,13 @@ fn schedule_commit_is_authorized(
     gate: RunGate,
     upload: &UploadPhase,
     device_ready: bool,
+    playback_ready: bool,
     commit: &ScheduleCommitPhase,
 ) -> bool {
     matches!(gate, RunGate::Running)
         && matches!(upload, UploadPhase::Complete)
         && device_ready
+        && playback_ready
         && matches!(commit, ScheduleCommitPhase::AwaitingDeviceReadiness)
 }
 
@@ -230,6 +232,16 @@ enum PlaybackPreparation {
         task: tokio::task::JoinHandle<anyhow::Result<crate::collect::audio::Playback>>,
     },
     Consumed,
+}
+
+impl PlaybackPreparation {
+    /// Commit creates an absolute device-time anchor only three seconds ahead.
+    /// The audio task must therefore have completed before Commit crosses the
+    /// wire; awaiting an unfinished task after acceptance would suspend this
+    /// actor's heartbeats and could miss that irrevocable anchor.
+    fn is_ready(&self) -> bool {
+        matches!(self, Self::Pending { task, .. } if task.is_finished())
+    }
 }
 
 fn prepare_playback(
@@ -565,6 +577,24 @@ impl CalibrationModeAdapter {
         upload_ack_timeout.tick().await;
         let mut chunk_ack_retries = 0u8;
         let outcome = loop {
+            // Playback readiness is independent of device traffic. Re-check it
+            // on every actor turn (the heartbeat supplies a 500-ms upper bound)
+            // and authorize Commit only once acceptance can be handled without
+            // awaiting unfinished host work.
+            if schedule_commit_is_authorized(
+                gate_state,
+                &upload,
+                device_ready_for_commit,
+                prepared_playback.is_ready(),
+                &commit_phase,
+            ) {
+                if let Err(error) =
+                    send_schedule_commit(&self.registry, &device, run, schedule_revision, &track)
+                {
+                    break delivery_failure(error);
+                }
+                commit_phase = ScheduleCommitPhase::sent_at(tokio::time::Instant::now());
+            }
             let schedule_acceptance_deadline =
                 commit_phase.acceptance_deadline().unwrap_or_else(|| {
                     tokio::time::Instant::now() + std::time::Duration::from_secs(365 * 24 * 60 * 60)
@@ -598,6 +628,7 @@ impl CalibrationModeAdapter {
                                 gate_state,
                                 &upload,
                                 device_ready_for_commit,
+                                prepared_playback.is_ready(),
                                 &commit_phase,
                             ) {
                                 if let Err(error) = send_schedule_commit(
@@ -726,6 +757,7 @@ impl CalibrationModeAdapter {
                             gate_state,
                             &upload,
                             device_ready_for_commit,
+                            prepared_playback.is_ready(),
                             &commit_phase,
                         ) {
                             if let Err(error) = send_schedule_commit(
@@ -764,6 +796,7 @@ impl CalibrationModeAdapter {
                             gate_state,
                             &upload,
                             ready_for_schedule,
+                            prepared_playback.is_ready(),
                             &commit_phase,
                         ) {
                             if let Err(error) = send_schedule_commit(
@@ -1738,12 +1771,26 @@ mod tests {
             RunGate::Interrupted,
             &UploadPhase::Complete,
             true,
+            true,
             &awaiting,
         ));
         assert!(schedule_commit_is_authorized(
             RunGate::Running,
             &UploadPhase::Complete,
             true,
+            true,
+            &awaiting,
+        ));
+    }
+
+    #[test]
+    fn commit_waits_for_host_playback_preparation() {
+        let awaiting = ScheduleCommitPhase::AwaitingDeviceReadiness;
+        assert!(!schedule_commit_is_authorized(
+            RunGate::Running,
+            &UploadPhase::Complete,
+            true,
+            false,
             &awaiting,
         ));
     }
