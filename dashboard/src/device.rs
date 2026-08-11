@@ -273,6 +273,7 @@ impl DeviceSender {
         }
     }
 
+    #[cfg(test)]
     async fn send_reliable(&self, frame: Frame) -> Result<(), OutboundDeliveryError> {
         self.send_outbound_reliable(OutboundFrame {
             frame,
@@ -345,6 +346,34 @@ impl DeviceReceiver {
                 } else {
                     self.reliable.blocking_recv()
                 }
+            }
+        }
+    }
+}
+
+async fn forward_device_controls(
+    mut controls: mpsc::Receiver<Frame>,
+    outgoing: DeviceSender,
+    control_link_closed: mpsc::Sender<()>,
+    timeout: Duration,
+) {
+    while let Some(frame) = controls.recv().await {
+        let outbound = OutboundFrame {
+            frame,
+            forced_wire: None,
+        };
+        match outgoing
+            .send_outbound_reliable_with_timeout(outbound, timeout)
+            .await
+        {
+            Ok(()) => {}
+            Err(OutboundDeliveryError::TimedOut | OutboundDeliveryError::Full) => {
+                tracing::warn!("device transport control delivery timed out; keeping the connection available for retry");
+            }
+            Err(OutboundDeliveryError::Closed) => {
+                tracing::warn!("device transport writer closed; ending the device session");
+                let _ = control_link_closed.try_send(());
+                break;
             }
         }
     }
@@ -463,7 +492,7 @@ async fn device_session(
 
     let DeviceHandle {
         frames,
-        mut control_rx,
+        control_rx,
         token,
     } = registry.register(
         device_id.clone(),
@@ -507,17 +536,25 @@ async fn device_session(
         }
     });
 
-    // Forward control frames (browser → device) to the transport writer.
-    let control_task = tokio::spawn(async move {
-        while let Some(frame) = control_rx.recv().await {
-            if let Err(error) = outgoing.send_reliable(frame).await {
-                tracing::warn!(?error, "device transport control delivery failed");
-                break;
-            }
-        }
-    });
+    // Forward control frames (browser -> device) to the transport writer. A
+    // full writer queue is a failed command, not a dead connection: closing
+    // this receiver on that temporary timeout leaves ingress streaming while
+    // every later command sees `SessionClosed`. Conversely, an actually closed
+    // writer makes this whole device session unusable and must tear it down.
+    let (control_link_closed, mut control_link_closed_rx) = mpsc::channel(1);
+    let control_task = tokio::spawn(forward_device_controls(
+        control_rx,
+        outgoing,
+        control_link_closed,
+        RELIABLE_OUTBOUND_TIMEOUT,
+    ));
 
-    while let Some(frame) = incoming.recv().await {
+    loop {
+        let frame = tokio::select! {
+            frame = incoming.recv() => frame,
+            _ = control_link_closed_rx.recv() => None,
+        };
+        let Some(frame) = frame else { break };
         match frame {
             // Re-announced config (e.g. after honoring a SetSensitivity).
             Frame::DeviceHello {
@@ -1243,6 +1280,42 @@ mod tests {
             sender.send_reliable(Frame::Probe {}).await,
             Err(OutboundDeliveryError::Closed)
         );
+    }
+
+    #[tokio::test]
+    async fn temporary_writer_backpressure_does_not_close_future_controls() {
+        let (outgoing, mut writer) = DeviceSender::channel_with_capacity(1);
+        outgoing.send_reliable(Frame::Heartbeat {}).await.unwrap();
+        let (controls, control_rx) = mpsc::channel(2);
+        let (closed, mut closed_rx) = mpsc::channel(1);
+        let task = tokio::spawn(forward_device_controls(
+            control_rx,
+            outgoing,
+            closed,
+            Duration::from_millis(10),
+        ));
+
+        controls.send(Frame::Probe {}).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(closed_rx.try_recv().is_err());
+        assert!(matches!(
+            writer.recv().await,
+            Some(OutboundFrame {
+                frame: Frame::Heartbeat {},
+                ..
+            })
+        ));
+
+        controls.send(Frame::Probe {}).await.unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_millis(100), writer.recv()).await,
+            Ok(Some(OutboundFrame {
+                frame: Frame::Probe {},
+                ..
+            }))
+        ));
+        drop(controls);
+        task.await.unwrap();
     }
 
     #[tokio::test]

@@ -1064,7 +1064,8 @@ export interface GuidedCalibrationCue {
   readonly visual_lane: 0 | 1 | 2 | 3 | 4;
   readonly at: number;
   readonly hold: number;
-  readonly thumb_variant: 'up' | 'down';
+  readonly gesture: CalibrationGesture;
+  readonly modifier: 'command' | 'center_extension' | 'grip_soft' | 'grip_medium' | 'grip_hard';
 }
 
 export interface GuidedCalibrationCount {
@@ -1806,7 +1807,12 @@ function isGuidedCalibrationCue(value: unknown): value is GuidedCalibrationCue {
     isVisualLane(value['visual_lane']) &&
     isNonnegativeInteger(value['at']) &&
     isPositiveInteger(value['hold']) &&
-    (value['thumb_variant'] === 'up' || value['thumb_variant'] === 'down')
+    Object.values(CalibrationGesture).includes(value['gesture'] as CalibrationGesture) &&
+    (value['modifier'] === 'command' ||
+      value['modifier'] === 'center_extension' ||
+      value['modifier'] === 'grip_soft' ||
+      value['modifier'] === 'grip_medium' ||
+      value['modifier'] === 'grip_hard')
   );
 }
 
@@ -1836,7 +1842,7 @@ export function isGuidedCalibrationSnapshot(
       if (
         !isGuidedCalibrationTrack(value['track']) ||
         !Array.isArray(value['lanes']) ||
-        value['lanes'].length !== 2 ||
+        value['lanes'].length !== 3 ||
         !value['lanes'].every(isGuidedCalibrationLane)
       ) {
         return false;

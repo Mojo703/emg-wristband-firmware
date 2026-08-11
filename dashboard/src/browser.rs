@@ -687,6 +687,16 @@ pub async fn handle_browser(
                 if matches!(frame, Frame::CalibrationTimingLoopStatus { .. }) {
                     continue;
                 }
+                // Resident exports belong exclusively to the HTTP download
+                // subscriber. Forwarding hundreds of chunks to the live UI
+                // would add work and expose protocol frames it never consumes.
+                if matches!(
+                    frame,
+                    Frame::CalibrationExportChunk { .. }
+                        | Frame::CalibrationExportFailed { .. }
+                ) {
+                    continue;
+                }
                 let msg = Message::Binary(frame::encode(&frame));
                 let result = match delivery_for(&frame) {
                     Delivery::Reliable => send_reliable(&browser_tx, msg).await,

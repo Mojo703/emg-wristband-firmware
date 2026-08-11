@@ -108,16 +108,19 @@ test('playing renders a persistent cue-variant legend and accessible cue narrati
   assert.ok(playing?.phase === 'playing');
   const body = await render(playing);
 
-  assert.match(body, /aria-label="Cue variant legend"/);
+  assert.match(body, /aria-label="Cue modifier legend"/);
   assert.match(body, /Command/);
-  assert.match(body, /No-op/);
-  assert.match(body, /white symbol circle/);
-  assert.match(body, /white symbol diamond/);
+  assert.doesNotMatch(body, /Center anti/);
+  assert.doesNotMatch(body, /pole vertical, extend index \+ middle/i);
+  assert.match(body, /Soft grip/);
+  assert.match(body, /Medium grip/);
+  assert.match(body, /Hard grip/);
   assert.match(body, /Current cue:/);
   assert.match(body, /Next cue:/);
   assert.match(body, /<canvas[^>]*aria-hidden="true"/);
   assert.match(body, /Tip forward/);
   assert.match(body, /Tip back/);
+  assert.match(body, /Pole vertical — do not trigger/);
   assert.match(body, /color: #3dd68c/);
   assert.match(body, /color: #d19dff/);
   assert.doesNotMatch(body, /WristPronation|WristSupination|Lift thumb/);
@@ -148,7 +151,7 @@ test('song end keeps unavailable actions visible and disabled', async () => {
   assert.match(button(body, 'Continue'), DISABLED_ATTRIBUTE);
   assert.doesNotMatch(button(body, 'Discard'), DISABLED_ATTRIBUTE);
   assert.match(button(body, 'Fixture Track'), DISABLED_ATTRIBUTE);
-  assert.match(body, /<li[^>]*>Tip forward, thumb down: 14\/16<\/li>/);
+  assert.match(body, /<li[^>]*>Radial, hard grip: 4\/5<\/li>/);
   assert.match(body, /No saveable result is available for this song/);
 });
 

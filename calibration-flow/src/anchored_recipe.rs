@@ -10,7 +10,11 @@ use protocol::{CalibrationGesture, CalibrationModifier, CalibrationScheduleEntry
 use crate::{Constants, LabeledSpan, SongAnchor};
 
 pub const ANCHORED_COMMAND_TARGET: u32 = 10;
-pub const ANCHORED_NO_OP_TARGET: u32 = 16;
+pub const ANCHORED_GRIP_SOFT_TARGET: u32 = 6;
+pub const ANCHORED_GRIP_MEDIUM_TARGET: u32 = 5;
+pub const ANCHORED_GRIP_HARD_TARGET: u32 = 5;
+pub const ANCHORED_NO_OP_TARGET: u32 = ACTIVE_GESTURE_COUNT as u32
+    * (ANCHORED_GRIP_SOFT_TARGET + ANCHORED_GRIP_MEDIUM_TARGET + ANCHORED_GRIP_HARD_TARGET);
 /// One complete paired semantic cycle. The validated streaming fit checkpoints
 /// after this many newly retained prompts; wall-clock fit completion must not
 /// choose the checkpoint boundaries.
@@ -21,7 +25,45 @@ pub const ACTIVE_CALIBRATION_GESTURES: [CalibrationGesture; 2] = [
     CalibrationGesture::WristUlnarDeviation,
 ];
 pub const ACTIVE_GESTURE_COUNT: usize = ACTIVE_CALIBRATION_GESTURES.len();
-pub const ANCHORED_CLASS_COUNT: usize = ACTIVE_GESTURE_COUNT * 2;
+/// The golden recipe's eight retained classes. Grip prompts share one visual
+/// center lane, but retain paired radial/ulnar prototypes at each strength.
+/// That exact ten-output model (including two prior rest classes) is the one
+/// validated on the wearer and preserved in the golden resident slot.
+pub const ACTIVE_CALIBRATION_CLASSES: [(CalibrationGesture, CalibrationModifier); 8] = [
+    (
+        CalibrationGesture::WristRadialDeviation,
+        CalibrationModifier::Command,
+    ),
+    (
+        CalibrationGesture::WristUlnarDeviation,
+        CalibrationModifier::Command,
+    ),
+    (
+        CalibrationGesture::WristRadialDeviation,
+        CalibrationModifier::GripSoft,
+    ),
+    (
+        CalibrationGesture::WristUlnarDeviation,
+        CalibrationModifier::GripSoft,
+    ),
+    (
+        CalibrationGesture::WristRadialDeviation,
+        CalibrationModifier::GripMedium,
+    ),
+    (
+        CalibrationGesture::WristUlnarDeviation,
+        CalibrationModifier::GripMedium,
+    ),
+    (
+        CalibrationGesture::WristRadialDeviation,
+        CalibrationModifier::GripHard,
+    ),
+    (
+        CalibrationGesture::WristUlnarDeviation,
+        CalibrationModifier::GripHard,
+    ),
+];
+pub const ANCHORED_CLASS_COUNT: usize = ACTIVE_CALIBRATION_CLASSES.len();
 pub const CALIBRATION_MODEL_CLASS_COUNT: usize = ANCHORED_CLASS_COUNT + 2;
 
 /// Compact command index in the active model, independent of the protocol
@@ -100,31 +142,22 @@ impl AnchoredRecipeProgress {
     /// flash-row retention. A host may show a short song's counts, but only a
     /// complete recipe may enter final fitting and resident promotion.
     pub fn is_complete(&self) -> bool {
-        ACTIVE_CALIBRATION_GESTURES.into_iter().all(|gesture| {
-            [CalibrationModifier::ThumbUp, CalibrationModifier::ThumbDown]
-                .into_iter()
-                .all(|modifier| {
-                    self.counts[anchored_class_index_parts(gesture, modifier)
-                        .expect("active gesture has a recipe class")]
-                    .accepted
-                        >= anchored_target_count(modifier)
-                })
-        })
+        ACTIVE_CALIBRATION_CLASSES
+            .into_iter()
+            .enumerate()
+            .all(|(index, (_, modifier))| {
+                self.counts[index].accepted >= anchored_target_count(modifier)
+            })
     }
 
     pub fn retained_rep_count(&self) -> u32 {
-        ACTIVE_CALIBRATION_GESTURES
+        ACTIVE_CALIBRATION_CLASSES
             .into_iter()
-            .flat_map(|gesture| {
-                [CalibrationModifier::ThumbUp, CalibrationModifier::ThumbDown]
-                    .into_iter()
-                    .map(move |modifier| (gesture, modifier))
-            })
-            .map(|(gesture, modifier)| {
-                self.counts[anchored_class_index_parts(gesture, modifier)
-                    .expect("active gesture has a recipe class")]
-                .accepted
-                .min(anchored_target_count(modifier))
+            .enumerate()
+            .map(|(index, (_, modifier))| {
+                self.counts[index]
+                    .accepted
+                    .min(anchored_target_count(modifier))
             })
             .sum()
     }
@@ -141,8 +174,13 @@ impl AnchoredRecipeProgress {
 
 pub const fn anchored_target_count(modifier: CalibrationModifier) -> u32 {
     match modifier {
+        CalibrationModifier::Command => ANCHORED_COMMAND_TARGET,
+        CalibrationModifier::CenterExtension => 0,
+        CalibrationModifier::GripSoft => ANCHORED_GRIP_SOFT_TARGET,
+        CalibrationModifier::GripMedium => ANCHORED_GRIP_MEDIUM_TARGET,
+        CalibrationModifier::GripHard => ANCHORED_GRIP_HARD_TARGET,
         CalibrationModifier::ThumbUp => ANCHORED_COMMAND_TARGET,
-        CalibrationModifier::ThumbDown => ANCHORED_NO_OP_TARGET,
+        CalibrationModifier::ThumbDown => ANCHORED_GRIP_SOFT_TARGET,
     }
 }
 
@@ -155,13 +193,15 @@ fn anchored_class_index_parts(
     modifier: CalibrationModifier,
 ) -> Option<usize> {
     let gesture = usize::from(active_gesture_index(gesture)?);
-    Some(
-        gesture
-            + match modifier {
-                CalibrationModifier::ThumbUp => 0,
-                CalibrationModifier::ThumbDown => ACTIVE_GESTURE_COUNT,
-            },
-    )
+    Some(match modifier {
+        CalibrationModifier::Command | CalibrationModifier::ThumbUp => gesture,
+        CalibrationModifier::CenterExtension => return None,
+        CalibrationModifier::GripSoft | CalibrationModifier::ThumbDown => {
+            ACTIVE_GESTURE_COUNT + gesture
+        }
+        CalibrationModifier::GripMedium => 2 * ACTIVE_GESTURE_COUNT + gesture,
+        CalibrationModifier::GripHard => 3 * ACTIVE_GESTURE_COUNT + gesture,
+    })
 }
 
 /// Project an authored cue instant onto the acquisition grid and return the
@@ -225,18 +265,15 @@ mod tests {
     #[test]
     fn complete_recipe_goes_directly_to_final_polish() {
         let mut progress = AnchoredRecipeProgress::default();
-        for gesture in ACTIVE_CALIBRATION_GESTURES {
-            for _ in 0..ANCHORED_COMMAND_TARGET {
-                assert!(progress.record_accepted(entry(gesture, CalibrationModifier::ThumbUp,)));
-            }
-            for _ in 0..ANCHORED_NO_OP_TARGET {
-                assert!(progress.record_accepted(entry(gesture, CalibrationModifier::ThumbDown,)));
+        for (gesture, modifier) in ACTIVE_CALIBRATION_CLASSES {
+            for _ in 0..anchored_target_count(modifier) {
+                assert!(progress.record_accepted(entry(gesture, modifier)));
             }
         }
         assert!(progress.is_complete());
         assert_eq!(
             progress.retained_rep_count(),
-            ACTIVE_GESTURE_COUNT as u32 * (ANCHORED_COMMAND_TARGET + ANCHORED_NO_OP_TARGET)
+            ACTIVE_GESTURE_COUNT as u32 * ANCHORED_COMMAND_TARGET + ANCHORED_NO_OP_TARGET
         );
         assert!(!progress.checkpoint_due());
     }
@@ -247,24 +284,21 @@ mod tests {
         let mut progress = AnchoredRecipeProgress::default();
         assert!(!progress.is_complete());
         let mut retained_rows = 0;
-        for gesture in ACTIVE_CALIBRATION_GESTURES {
-            for modifier in [CalibrationModifier::ThumbUp, CalibrationModifier::ThumbDown] {
-                let cue = entry(gesture, modifier);
-                for _ in 0..anchored_target_count(modifier) + 20 {
-                    if progress.record_accepted(cue) {
-                        retained_rows += constants.rows_per_rep();
-                    }
+        for (gesture, modifier) in ACTIVE_CALIBRATION_CLASSES {
+            let cue = entry(gesture, modifier);
+            for _ in 0..anchored_target_count(modifier) + 20 {
+                if progress.record_accepted(cue) {
+                    retained_rows += constants.rows_per_rep();
                 }
             }
         }
         assert_eq!(
             progress.retained_rep_count(),
-            ACTIVE_GESTURE_COUNT as u32 * (ANCHORED_COMMAND_TARGET + ANCHORED_NO_OP_TARGET)
+            ACTIVE_GESTURE_COUNT as u32 * ANCHORED_COMMAND_TARGET + ANCHORED_NO_OP_TARGET
         );
         assert_eq!(
             retained_rows,
-            ACTIVE_GESTURE_COUNT as u32
-                * (ANCHORED_COMMAND_TARGET + ANCHORED_NO_OP_TARGET)
+            (ACTIVE_GESTURE_COUNT as u32 * ANCHORED_COMMAND_TARGET + ANCHORED_NO_OP_TARGET)
                 * constants.rows_per_rep()
         );
         assert!(progress.is_complete());
@@ -287,7 +321,7 @@ mod tests {
     }
 
     #[test]
-    fn active_gestures_use_compact_paired_labels() {
+    fn active_gestures_use_compact_commands_and_paired_grip_labels() {
         for (index, gesture) in ACTIVE_CALIBRATION_GESTURES.into_iter().enumerate() {
             assert_eq!(active_gesture_index(gesture), Some(index as u8));
             assert_eq!(active_gesture_from_index(index as u8), Some(gesture));
@@ -298,6 +332,14 @@ mod tests {
             assert_eq!(
                 anchored_class_index(entry(gesture, CalibrationModifier::ThumbDown)),
                 Some(ACTIVE_GESTURE_COUNT + index)
+            );
+            assert_eq!(
+                anchored_class_index(entry(gesture, CalibrationModifier::GripHard)),
+                Some(3 * ACTIVE_GESTURE_COUNT + index)
+            );
+            assert_eq!(
+                anchored_class_index(entry(gesture, CalibrationModifier::CenterExtension)),
+                None
             );
         }
         assert_eq!(active_gesture_from_index(ACTIVE_GESTURE_COUNT as u8), None);

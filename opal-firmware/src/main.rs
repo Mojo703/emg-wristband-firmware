@@ -971,6 +971,11 @@ impl App {
             }
         }
         self.flush_calibration_outbox();
+        if let Some(frame) = self.calibration.take_export_chunk() {
+            // Export chunks are immutable and offset-addressed. The host only
+            // publishes an archive after receiving the complete slot.
+            let _ = self.links.send_reliable_frame(&frame);
+        }
         if let Some(update) = self.calibration.take_resident_runtime_update() {
             self.apply_resident_runtime_update(update);
         }
@@ -1197,8 +1202,8 @@ impl App {
         inference: ClassificationOutcome,
         streamed: StreamOutcome,
     ) {
-        // The calibrated model contains active command classes followed by their
-        // paired thumb-down anti-gesture classes. Only the command prefix is ever
+        // The calibrated model contains active command classes followed by the
+        // soft, medium, and hard grip counterexample classes. Only the command prefix is ever
         // eligible to reach HID; an unbound anti class must not fall through to
         // Settings::key_for's default media action.
         let next_commit = calibrated_command_key(
@@ -1328,7 +1333,8 @@ fn apply_control(
         | Control::CalibrationInterrupt { .. }
         | Control::CalibrationContinue { .. }
         | Control::CalibrationSave { .. }
-        | Control::CalibrationDiscard { .. } => false,
+        | Control::CalibrationDiscard { .. }
+        | Control::CalibrationExportRequest { .. } => false,
         // The serve loop routes these to the playback engine before they reach
         // here, and a build without the feature has no engine to route them to.
         // Listed rather than caught by a wildcard so a new control frame still
@@ -1484,9 +1490,10 @@ mod startup_memory_tests {
     }
 
     #[test]
-    fn paired_thumb_down_classes_cannot_reach_hid() {
+    fn grip_counterexample_classes_cannot_reach_hid() {
         let settings = Settings::default();
-        for anti_gesture in CALIBRATION_COMMAND_CLASSES as u8..CALIBRATION_COMMAND_CLASSES as u8 * 2
+        for anti_gesture in CALIBRATION_COMMAND_CLASSES as u8
+            ..(calibration_flow::CALIBRATION_MODEL_CLASS_COUNT - 2) as u8
         {
             assert_eq!(
                 calibrated_command_key(WakeState::Active, anti_gesture, false, &settings),

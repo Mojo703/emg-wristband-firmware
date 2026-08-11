@@ -17,6 +17,7 @@ export interface CalibrationLane {
 export type ActiveCalibrationLanes = readonly [
   CalibrationLane,
   CalibrationLane,
+  CalibrationLane,
 ];
 
 export interface CalibrationCount {
@@ -93,7 +94,7 @@ export type GuidedCalibrationSnapshot =
 export type CalibrationSongEndAction = 'save' | 'continue' | 'discard';
 
 /** Convert wire naming to the neutral playfield's presentation naming without
- * deriving any session state. The protocol guard has already proved two lanes
+ * deriving any session state. The protocol guard has already proved three lanes
  * in visual order before this function runs. */
 export function presentGuidedCalibration(
   snapshot: WireGuidedCalibrationSnapshot,
@@ -111,13 +112,31 @@ export function presentGuidedCalibration(
   };
   return {
     ...snapshot,
-    lanes: [lane(0), lane(1)],
-    cues: snapshot.cues.map((cue) => ({
-      visualLane: cue.visual_lane,
-      at: cue.at,
-      hold: cue.hold,
-      thumbVariant: cue.thumb_variant,
-    })),
+    lanes: [lane(0), lane(1), lane(2)],
+    cues: snapshot.cues.map((cue) => {
+      const gestureLane = cue.gesture === 'wrist_radial_deviation' ? lane(0) : lane(1);
+      const isCommand = cue.modifier === 'command';
+      return {
+        visualLane: cue.visual_lane,
+        at: cue.at,
+        hold: cue.hold,
+        thumbVariant: isCommand
+          ? 'command'
+          : cue.modifier === 'grip_soft'
+            ? 'grip_soft'
+            : cue.modifier === 'grip_medium'
+              ? 'grip_medium'
+              : cue.modifier === 'grip_hard'
+                ? 'grip_hard'
+                : 'center_extension',
+        cueMotion: isCommand ? gestureLane.motion : null,
+        cueLabel: isCommand
+          ? gestureLane.label
+          : cue.modifier === 'center_extension'
+            ? 'Legacy center extension — do not use'
+            : `Pole vertical, ${cue.modifier === 'grip_soft' ? 'soft grip' : cue.modifier === 'grip_medium' ? 'medium grip' : 'hard grip'}`,
+      };
+    }),
   };
 }
 
@@ -148,8 +167,18 @@ export function cueAnnouncements(snapshot: CalibrationPlayingSnapshot): CueAnnou
   const describe = (prefix: string, cue: CuePresentation | undefined): string => {
     if (cue === undefined) return `${prefix}: none`;
     const lane = snapshot.lanes.find((candidate) => candidate.visualLane === cue.visualLane);
-    const label = lane?.label ?? 'Unknown gesture';
-    return `${prefix}: ${label}, thumb ${cue.thumbVariant}`;
+    const label = cue.cueLabel ?? lane?.label ?? 'Unknown gesture';
+    const modifier =
+      cue.thumbVariant === 'command'
+        ? 'extend index and middle fingers'
+        : cue.thumbVariant === 'center_extension'
+          ? 'hold pole vertical and extend index and middle fingers; do not move wrist'
+        : cue.thumbVariant === 'grip_soft'
+          ? 'soft grip'
+          : cue.thumbVariant === 'grip_medium'
+            ? 'medium grip'
+            : 'hard grip';
+    return `${prefix}: ${label}, ${modifier}`;
   };
   const current = snapshot.cues.find(
     (cue) => cue.at <= snapshot.position_ms && snapshot.position_ms <= cue.at + cue.hold,

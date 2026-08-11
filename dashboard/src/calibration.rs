@@ -540,20 +540,11 @@ fn counts_have_deficits(counts: &[protocol::CalibrationClassCounts]) -> bool {
 /// is met. This keeps an arbitrary short song on the Continue path and makes
 /// an empty or malformed terminal projection fail closed.
 fn counts_complete_recipe(counts: &[protocol::CalibrationClassCounts]) -> bool {
-    let modifiers = [
-        protocol::CalibrationModifier::ThumbUp,
-        protocol::CalibrationModifier::ThumbDown,
-    ];
-    if counts.len() != calibration_flow::ACTIVE_GESTURE_COUNT * modifiers.len() {
+    if counts.len() != calibration_flow::ACTIVE_CALIBRATION_CLASSES.len() {
         return false;
     }
-    calibration_flow::ACTIVE_CALIBRATION_GESTURES
+    calibration_flow::ACTIVE_CALIBRATION_CLASSES
         .into_iter()
-        .flat_map(|gesture| {
-            modifiers
-                .into_iter()
-                .map(move |modifier| (gesture, modifier))
-        })
         .all(|(gesture, modifier)| {
             let mut matching = counts
                 .iter()
@@ -1901,13 +1892,32 @@ fn playing_snapshot(
         .entries
         .iter()
         .map(|entry| protocol::GuidedCalibrationCue {
-            visual_lane: calibration_flow::active_gesture_index(entry.gesture)
-                .expect("calibration tracks contain only active gestures"),
+            visual_lane: if entry.modifier == protocol::CalibrationModifier::Command {
+                calibration_flow::active_gesture_index(entry.gesture)
+                    .expect("calibration tracks contain only active gestures")
+            } else {
+                calibration_flow::ACTIVE_GESTURE_COUNT as u8
+            },
             at: u64::from(entry.track_offset.get()),
             hold: u64::from(entry.hold.get()),
-            thumb_variant: match entry.modifier {
-                protocol::CalibrationModifier::ThumbUp => protocol::GuidedThumbVariant::Up,
-                protocol::CalibrationModifier::ThumbDown => protocol::GuidedThumbVariant::Down,
+            gesture: entry.gesture,
+            modifier: match entry.modifier {
+                protocol::CalibrationModifier::Command | protocol::CalibrationModifier::ThumbUp => {
+                    protocol::GuidedCalibrationModifier::Command
+                }
+                protocol::CalibrationModifier::CenterExtension => {
+                    protocol::GuidedCalibrationModifier::CenterExtension
+                }
+                protocol::CalibrationModifier::GripSoft
+                | protocol::CalibrationModifier::ThumbDown => {
+                    protocol::GuidedCalibrationModifier::GripSoft
+                }
+                protocol::CalibrationModifier::GripMedium => {
+                    protocol::GuidedCalibrationModifier::GripMedium
+                }
+                protocol::CalibrationModifier::GripHard => {
+                    protocol::GuidedCalibrationModifier::GripHard
+                }
             },
         })
         .collect();
@@ -1935,7 +1945,7 @@ fn playing_snapshot(
 fn calibration_lanes(
     collection_classes: &[protocol::CollectionClass],
 ) -> Vec<protocol::GuidedCalibrationLane> {
-    calibration_flow::ACTIVE_CALIBRATION_GESTURES
+    let mut lanes: Vec<_> = calibration_flow::ACTIVE_CALIBRATION_GESTURES
         .into_iter()
         .enumerate()
         .map(|(visual_lane, gesture)| {
@@ -1951,7 +1961,15 @@ fn calibration_lanes(
                 motion: descriptor.and_then(|value| value.motion.clone()),
             }
         })
-        .collect()
+        .collect();
+    lanes.push(protocol::GuidedCalibrationLane {
+        visual_lane: calibration_flow::ACTIVE_GESTURE_COUNT as u8,
+        id: "center_counterexample".into(),
+        label: "Pole vertical — do not trigger".into(),
+        color_name: "gray".into(),
+        motion: None,
+    });
+    lanes
 }
 
 fn calibration_gesture_id(gesture: protocol::CalibrationGesture) -> &'static str {
@@ -1977,8 +1995,15 @@ fn calibration_count_label(
             |descriptor| descriptor.label.clone(),
         );
     let variant = match count.modifier {
-        protocol::CalibrationModifier::ThumbUp => "command",
-        protocol::CalibrationModifier::ThumbDown => "no-op",
+        protocol::CalibrationModifier::Command | protocol::CalibrationModifier::ThumbUp => {
+            "command"
+        }
+        protocol::CalibrationModifier::CenterExtension => "legacy center + fingers extended",
+        protocol::CalibrationModifier::GripSoft | protocol::CalibrationModifier::ThumbDown => {
+            "soft grip"
+        }
+        protocol::CalibrationModifier::GripMedium => "medium grip",
+        protocol::CalibrationModifier::GripHard => "hard grip",
     };
     format!("{gesture}, {variant}")
 }
@@ -2466,7 +2491,7 @@ mod tests {
             entries: vec![protocol::CalibrationScheduleEntry {
                 cue_id: protocol::CalibrationCueId::new(1).unwrap(),
                 gesture: calibration_flow::ACTIVE_CALIBRATION_GESTURES[0],
-                modifier: protocol::CalibrationModifier::ThumbUp,
+                modifier: protocol::CalibrationModifier::Command,
                 track_offset: protocol::TrackMilliseconds::new(0),
                 hold: protocol::DurationMilliseconds::new(1_500),
             }],
@@ -2474,21 +2499,10 @@ mod tests {
     }
 
     fn complete_recipe_counts() -> Vec<protocol::CalibrationClassCounts> {
-        calibration_flow::ACTIVE_CALIBRATION_GESTURES
+        calibration_flow::ACTIVE_CALIBRATION_CLASSES
             .into_iter()
-            .flat_map(|gesture| {
-                [
-                    protocol::CalibrationModifier::ThumbUp,
-                    protocol::CalibrationModifier::ThumbDown,
-                ]
-                .into_iter()
-                .map(move |modifier| (gesture, modifier))
-            })
             .map(|(gesture, modifier)| {
-                let target_count = match modifier {
-                    protocol::CalibrationModifier::ThumbUp => 10,
-                    protocol::CalibrationModifier::ThumbDown => 16,
-                };
+                let target_count = calibration_flow::anchored_target_count(modifier);
                 protocol::CalibrationClassCounts {
                     gesture,
                     modifier,
@@ -3280,26 +3294,15 @@ mod tests {
             })
             .unwrap();
 
-        let second_counts = calibration_flow::ACTIVE_CALIBRATION_GESTURES
+        let second_counts = calibration_flow::ACTIVE_CALIBRATION_CLASSES
             .into_iter()
-            .flat_map(|gesture| {
-                [
-                    protocol::CalibrationModifier::ThumbUp,
-                    protocol::CalibrationModifier::ThumbDown,
-                ]
-                .into_iter()
-                .map(move |modifier| (gesture, modifier))
-            })
             .enumerate()
             .map(|(index, (gesture, modifier))| {
-                let (accepted_count, target_count) = match modifier {
-                    protocol::CalibrationModifier::ThumbUp => (12, 10),
-                    protocol::CalibrationModifier::ThumbDown
-                        if index + 1 == calibration_flow::ANCHORED_CLASS_COUNT =>
-                    {
-                        (16, 16)
-                    }
-                    protocol::CalibrationModifier::ThumbDown => (17, 16),
+                let target_count = calibration_flow::anchored_target_count(modifier);
+                let accepted_count = if index + 1 == calibration_flow::ANCHORED_CLASS_COUNT {
+                    target_count
+                } else {
+                    target_count + 2
                 };
                 protocol::CalibrationClassCounts {
                     gesture,
@@ -3347,8 +3350,8 @@ mod tests {
                 track_title,
                 candidate_available: true,
                 continue_available: false,
-                valid_reps: 57,
-                invalid_reps: 12,
+                valid_reps: 66,
+                invalid_reps: 28,
                 ref deficits,
                 ..
             }) if track_title == &second_track.title && deficits.is_empty()
@@ -4013,8 +4016,8 @@ mod tests {
         });
 
         let lanes = calibration_lanes(&classes);
-        assert_eq!(lanes.len(), calibration_flow::ACTIVE_GESTURE_COUNT);
-        for (lane, gesture) in lanes
+        assert_eq!(lanes.len(), calibration_flow::ACTIVE_GESTURE_COUNT + 1);
+        for (lane, gesture) in lanes[..calibration_flow::ACTIVE_GESTURE_COUNT]
             .iter()
             .zip(calibration_flow::ACTIVE_CALIBRATION_GESTURES)
         {
@@ -4024,6 +4027,9 @@ mod tests {
             assert_eq!(lane.color_name, class.color);
             assert_eq!(lane.motion, class.motion);
         }
+        assert_eq!(lanes[2].id, "center_counterexample");
+        assert_eq!(lanes[2].label, "Pole vertical — do not trigger");
+        assert_eq!(lanes[2].motion, None);
         assert!(lanes.iter().all(|lane| !lane.label.starts_with("Wrist")));
 
         let observed_at = protocol::UnixMilliseconds::new(1_800_000_012_345);
@@ -4132,7 +4138,7 @@ mod tests {
         let counts = [
             protocol::CalibrationClassCounts {
                 gesture: protocol::CalibrationGesture::WristPronation,
-                modifier: protocol::CalibrationModifier::ThumbUp,
+                modifier: protocol::CalibrationModifier::Command,
                 accepted_count: 2,
                 rejected_count: 1,
                 target_count: 10,
@@ -4140,11 +4146,11 @@ mod tests {
             },
             protocol::CalibrationClassCounts {
                 gesture: protocol::CalibrationGesture::WristPronation,
-                modifier: protocol::CalibrationModifier::ThumbDown,
+                modifier: protocol::CalibrationModifier::GripSoft,
                 accepted_count: 3,
                 rejected_count: 0,
-                target_count: 16,
-                deficit_count: 13,
+                target_count: 6,
+                deficit_count: 3,
             },
         ];
 
@@ -4163,7 +4169,7 @@ mod tests {
                 deficits,
                 continue_available: true,
                 ..
-            } if deficits == ["Tilt in, command: 8 short", "Tilt in, no-op: 13 short"]
+            } if deficits == ["Tilt in, command: 8 short", "Tilt in, soft grip: 3 short"]
         ));
     }
 

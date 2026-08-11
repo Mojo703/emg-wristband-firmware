@@ -28,6 +28,12 @@ from training import fit_weighted
 
 FEATURES = 64
 DEFAULT_ACTIVE = (2, 3, 7, 8, 10, 11)
+# Golden ten-class layout: two commands; paired radial/ulnar soft, medium and
+# hard grip negatives; then static and moving rest. Historical paired anti rows
+# seed the soft prototypes at labels 2/3. Medium and hard are learned live.
+DEFAULT_TARGET_LABELS = (0, 1, 2, 3, 8, 9)
+DEFAULT_CLASS_COUNT = 10
+DEFAULT_COMMAND_COUNT = 2
 DEFAULT_LIVE = (
     "2026-08-07T22-08-47_Matthew",
     "2026-08-07T22-16-46_Matthew",
@@ -51,15 +57,15 @@ def parse_active(text):
     return values
 
 
-def validate_active(active):
-    if len(active) < 4 or (len(active) - 2) % 2:
-        raise ValueError("the reduced v2 image must contain paired commands plus two rest classes")
-    command_count = (len(active) - 2) // 2
-    commands = active[:command_count]
-    if active[command_count:2 * command_count] != tuple(value + 5 for value in commands):
-        raise ValueError("active classes must be commands followed by their matching no-ops")
-    if active[2 * command_count:] != (10, 11):
-        raise ValueError("active classes must retain static and moving rest as old labels 10,11")
+def validate_active(active, target_labels=DEFAULT_TARGET_LABELS,
+                    class_count=DEFAULT_CLASS_COUNT,
+                    command_count=DEFAULT_COMMAND_COUNT):
+    if len(active) != len(target_labels) or len(active) != len(set(active)):
+        raise ValueError("source and target class mappings must be unique and equally sized")
+    if any(label < 0 or label >= class_count for label in target_labels):
+        raise ValueError("target class mapping exceeds the emitted class count")
+    if active[-2:] != (10, 11) or target_labels[-2:] != (class_count - 2, class_count - 1):
+        raise ValueError("active classes must retain static and moving rest as the final labels")
 
 
 def read_sources(document, total_rows):
@@ -74,8 +80,9 @@ def read_sources(document, total_rows):
     return sources
 
 
-def filter_by_source(rows, labels, sources, active):
-    remap = {old: new for new, old in enumerate(active)}
+def filter_by_source(rows, labels, sources, active,
+                     target_labels=DEFAULT_TARGET_LABELS):
+    remap = dict(zip(active, target_labels))
     row_blocks, label_blocks, breakdown = [], [], []
     for source in sources:
         block_labels = labels[source.start:source.start + source.rows]
@@ -89,15 +96,15 @@ def filter_by_source(rows, labels, sources, active):
     return np.vstack(row_blocks).astype(np.float32), np.concatenate(label_blocks), breakdown
 
 
-def class_scales(labels, command_count):
+def class_scales(labels, command_count, class_count):
     scales = np.ones(len(labels), np.float32)
-    scales[(labels >= command_count) & (labels < 2 * command_count)] = np.float32(NO_OP_SCALE)
+    scales[(labels >= command_count) & (labels < class_count - 2)] = np.float32(NO_OP_SCALE)
     return scales
 
 
-def normalized_row_weights(labels, command_count):
-    scales = class_scales(labels, command_count).astype(np.float64)
-    counts = np.bincount(labels, minlength=2 * command_count + 2).astype(np.float64)
+def normalized_row_weights(labels, command_count, class_count):
+    scales = class_scales(labels, command_count, class_count).astype(np.float64)
+    counts = np.bincount(labels, minlength=class_count).astype(np.float64)
     return scales / counts[labels]
 
 
@@ -112,7 +119,7 @@ def fit_prior(prior_rows, prior_labels, command_count, class_count):
     design = np.hstack([quantized, np.ones((len(quantized), 1), np.float32)])
     onehot = np.zeros((len(prior_labels), class_count), np.float32)
     onehot[np.arange(len(prior_labels)), prior_labels] = 1.0
-    weights = normalized_row_weights(prior_labels, command_count).astype(np.float32)
+    weights = normalized_row_weights(prior_labels, command_count, class_count).astype(np.float32)
     # run_passes performs the device's sequential weight normalization and
     # reciprocal-form float32 softmax. The initial matrix is explicitly zero.
     fitted, _ = run_passes(
@@ -139,10 +146,10 @@ def set_quantization_constant(constants, scale):
 
 
 def build(source_model, source_constants, output, active=DEFAULT_ACTIVE,
-          live_sessions=DEFAULT_LIVE):
-    validate_active(active)
-    command_count = (len(active) - 2) // 2
-    class_count = len(active)
+          live_sessions=DEFAULT_LIVE, target_labels=DEFAULT_TARGET_LABELS,
+          class_count=DEFAULT_CLASS_COUNT,
+          command_count=DEFAULT_COMMAND_COUNT):
+    validate_active(active, target_labels, class_count, command_count)
     document = json.loads((source_model / "model.json").read_text())
     rows = np.load(source_model / "training_rows.npy").astype(np.float32)
     labels = np.load(source_model / "training_labels.npy").astype(np.int32)
@@ -150,7 +157,7 @@ def build(source_model, source_constants, output, active=DEFAULT_ACTIVE,
         raise ValueError("source training arrays have incompatible shapes")
     sources = read_sources(document, len(rows))
     reduced_rows, reduced_labels, breakdown = filter_by_source(
-        rows, labels, sources, active
+        rows, labels, sources, active, target_labels
     )
 
     starts = np.cumsum([0] + [entry["rows"] for entry in breakdown])
@@ -168,7 +175,7 @@ def build(source_model, source_constants, output, active=DEFAULT_ACTIVE,
     )
 
     standardized = standardize(reduced_rows, mean, deviation)
-    row_weights = normalized_row_weights(reduced_labels, command_count)
+    row_weights = normalized_row_weights(reduced_labels, command_count, class_count)
     full_weights = fit_weighted(
         standardized, reduced_labels, class_count, row_weights, np.float32
     ).astype(np.float32)
@@ -189,7 +196,14 @@ def build(source_model, source_constants, output, active=DEFAULT_ACTIVE,
         "number_of_commands": command_count,
         "command_classes": command_names,
         "old_class_labels": list(active),
-        "old_to_new": {str(old): new for new, old in enumerate(active)},
+        "old_to_new": {str(old): new for old, new in zip(active, target_labels)},
+        "grip_negative_layout": {
+            "command": [0, 1],
+            "soft_grip": [2, 3],
+            "medium_grip_live_only": [4, 5],
+            "hard_grip_live_only": [6, 7],
+            "rest": [8, 9],
+        },
         "no_op_weight": NO_OP_SCALE,
         "tau": document.get("tau", 0.5),
         "needed": document.get("needed", 3),
@@ -213,6 +227,7 @@ def build(source_model, source_constants, output, active=DEFAULT_ACTIVE,
         "class_count": class_count,
         "command_count": command_count,
         "old_class_labels": list(active),
+        "target_class_labels": list(target_labels),
         "default_live_sessions": list(live_sessions),
         "prior_rows": int(len(prior_rows)),
         "row_quantization_scale_bits": scale_bits(prior_scale),

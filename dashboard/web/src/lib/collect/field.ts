@@ -30,8 +30,11 @@ import type {
 export const FALL_DURATION_MILLISECONDS = 3000;
 
 export const ThumbVariant = {
-  Up: 'up',
-  Down: 'down',
+  Up: 'command',
+  CenterExtension: 'center_extension',
+  Down: 'grip_soft',
+  Medium: 'grip_medium',
+  Hard: 'grip_hard',
 } as const;
 
 export type ThumbVariant = (typeof ThumbVariant)[keyof typeof ThumbVariant];
@@ -67,6 +70,7 @@ export interface Block {
   readonly at: number;
   readonly release: number;
   readonly thumbVariant: ThumbVariant;
+  readonly cueMotion?: GestureMotion | null;
 }
 
 /** One lane: a collection class and its hold blocks, ascending by onset. Built
@@ -108,6 +112,8 @@ export interface CuePresentation {
   readonly at: number;
   readonly hold: number;
   readonly thumbVariant: ThumbVariant;
+  readonly cueMotion?: GestureMotion | null;
+  readonly cueLabel?: string;
 }
 
 /** Lanes follow the catalog order. A note whose class is not in the catalog is
@@ -159,6 +165,7 @@ export function buildPresentedPlayfield(
       at: cue.at,
       release: cue.at + cue.hold,
       thumbVariant: cue.thumbVariant,
+      ...(cue.cueMotion === undefined ? {} : { cueMotion: cue.cueMotion }),
     });
     totalNotes += 1;
   }
@@ -415,7 +422,8 @@ export function renderField(context: CanvasRenderingContext2D, frame: FieldFrame
         context.fillStyle = withAlpha(color, alpha);
         context.fillRect(blockLeft, bottom - 3, blockWidth, 3);
       }
-      if (block.thumbVariant === ThumbVariant.Down) {
+      const cueMotion = block.cueMotion === undefined ? lane.motion : block.cueMotion;
+      if (block.thumbVariant !== ThumbVariant.Up) {
         drawThumbDownMarker(
           context,
           thumbDownMarkerGeometry({
@@ -424,9 +432,25 @@ export function renderField(context: CanvasRenderingContext2D, frame: FieldFrame
             top: bottom - blockHeight,
             bottom,
           }),
-          lane.motion,
+          cueMotion,
           alpha,
         );
+        if (block.thumbVariant === ThumbVariant.CenterExtension) {
+          drawFingerExtension(
+            context,
+            blockLeft + blockWidth / 2,
+            bottom - Math.min(18, blockHeight / 2),
+            alpha,
+          );
+        } else {
+          drawGripPressure(
+            context,
+            block.thumbVariant,
+            blockLeft + blockWidth / 2,
+            bottom - Math.min(18, blockHeight / 2),
+            alpha,
+          );
+        }
       } else {
         drawThumbUpMarker(
           context,
@@ -435,7 +459,7 @@ export function renderField(context: CanvasRenderingContext2D, frame: FieldFrame
             centerY: bottom,
             radius: Math.min(11, blockWidth / 2),
           },
-          lane.motion,
+          cueMotion,
           alpha,
         );
       }
@@ -456,6 +480,40 @@ export function renderField(context: CanvasRenderingContext2D, frame: FieldFrame
       impact: holding,
       motion: lane.motion,
     });
+  }
+}
+
+function drawGripPressure(
+  context: CanvasRenderingContext2D,
+  modifier: ThumbVariant,
+  centerX: number,
+  centerY: number,
+  alpha: number,
+): void {
+  const count = modifier === ThumbVariant.Hard ? 3 : modifier === ThumbVariant.Medium ? 2 : 1;
+  const spacing = 7;
+  context.fillStyle = `rgb(255 255 255 / ${alpha})`;
+  for (let index = 0; index < count; index += 1) {
+    context.beginPath();
+    context.arc(centerX + (index - (count - 1) / 2) * spacing, centerY, 2.2, 0, Math.PI * 2);
+    context.fill();
+  }
+}
+
+function drawFingerExtension(
+  context: CanvasRenderingContext2D,
+  centerX: number,
+  centerY: number,
+  alpha: number,
+): void {
+  context.strokeStyle = `rgb(255 255 255 / ${alpha})`;
+  context.lineWidth = 3;
+  context.lineCap = 'round';
+  for (const offset of [-4, 4]) {
+    context.beginPath();
+    context.moveTo(centerX + offset, centerY + 4);
+    context.lineTo(centerX + offset, centerY - 5);
+    context.stroke();
   }
 }
 

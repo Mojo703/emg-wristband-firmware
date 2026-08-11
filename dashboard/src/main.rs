@@ -163,6 +163,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/collection/camera/preview", get(collection_camera_preview))
         .route("/calibration/tracks", get(calibration_tracks))
         .route(
+            "/devices/:device_id/calibration/current",
+            get(download_current_calibration),
+        )
+        .route(
             "/collection/tracks/import/upload",
             post(import_uploaded_map).layer(axum::extract::DefaultBodyLimit::max(
                 collect::import::MAXIMUM_ARCHIVE_BYTES,
@@ -328,6 +332,120 @@ async fn calibration_tracks(
     State(state): State<AppState>,
 ) -> axum::Json<Vec<collect::beatmap::CalibrationTrack>> {
     axum::Json(state.collection.calibration_tracks())
+}
+
+/// Ask the selected live device for its exact resident slot and return it as a
+/// normal browser download. Nothing is published until every offset arrives.
+async fn download_current_calibration(
+    axum::extract::Path(device_id): axum::extract::Path<String>,
+    State(state): State<AppState>,
+) -> Result<Response, RequestFailure> {
+    use axum::response::IntoResponse;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static NEXT_TRANSFER: AtomicU32 = AtomicU32::new(1);
+    let transfer_id = NEXT_TRANSFER.fetch_add(1, Ordering::Relaxed);
+    let mut frames = state
+        .registry
+        .subscribe(&device_id)
+        .ok_or_else(|| anyhow::anyhow!("device {device_id} is not connected"))?;
+    state
+        .registry
+        .send_control(
+            &device_id,
+            protocol::Frame::CalibrationExportRequest { transfer_id },
+        )
+        .map_err(|error| anyhow::anyhow!(error.operator_message()))?;
+
+    let transfer = async {
+        let mut output = Vec::new();
+        let mut sequence = None;
+        let mut total = None;
+        loop {
+            match frames.recv().await {
+                Ok(protocol::Frame::CalibrationExportChunk {
+                    transfer_id: received,
+                    sequence: received_sequence,
+                    offset,
+                    total_bytes,
+                    bytes,
+                }) if received == transfer_id => {
+                    if offset as usize != output.len() {
+                        anyhow::bail!(
+                            "calibration export became incomplete at byte {} (received offset {offset})",
+                            output.len()
+                        );
+                    }
+                    if let Some(expected) = total {
+                        if expected != total_bytes {
+                            anyhow::bail!("calibration export size changed during transfer");
+                        }
+                    }
+                    if let Some(expected) = sequence {
+                        if expected != received_sequence {
+                            anyhow::bail!("resident calibration changed during transfer");
+                        }
+                    }
+                    total = Some(total_bytes);
+                    sequence = Some(received_sequence);
+                    output.extend_from_slice(&bytes);
+                    if output.len() == total_bytes as usize {
+                        return Ok::<_, anyhow::Error>((output, received_sequence));
+                    }
+                    if output.len() > total_bytes as usize {
+                        anyhow::bail!("calibration export exceeded its declared size");
+                    }
+                }
+                Ok(protocol::Frame::CalibrationExportFailed {
+                    transfer_id: received,
+                    reason,
+                }) if received == transfer_id => anyhow::bail!(reason),
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    anyhow::bail!("calibration export lost {skipped} chunks; retry the download")
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    anyhow::bail!("device disconnected during calibration export")
+                }
+            }
+        }
+    };
+    let (bytes, sequence) = tokio::time::timeout(std::time::Duration::from_secs(30), transfer)
+        .await
+        .map_err(|_| anyhow::anyhow!("calibration export timed out"))??;
+    let filename = format!(
+        "{}-calibration-{}.opal-slot.bin",
+        safe_filename(&device_id),
+        sequence
+    );
+    Ok((
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "application/octet-stream".to_string(),
+            ),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{filename}\""),
+            ),
+            (axum::http::header::CACHE_CONTROL, "no-store".to_string()),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
+fn safe_filename(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// Stream the camera to the setup form's preview as motion JPEG, which an

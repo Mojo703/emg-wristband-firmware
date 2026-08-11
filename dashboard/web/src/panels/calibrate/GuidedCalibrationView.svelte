@@ -150,9 +150,11 @@
         Stop song
       </Button>
     </div>
-    <div class="thumb-legend" aria-label="Cue variant legend">
-      <span><i class="up-swatch">→</i><strong>Command</strong> white symbol circle</span>
-      <span><i class="down-swatch">→</i><strong>No-op</strong> white symbol diamond</span>
+    <div class="thumb-legend" aria-label="Cue modifier legend">
+      <span><i class="up-swatch">→</i><strong>Command</strong> extend index + middle</span>
+      <span><i class="down-swatch">•</i><strong>Soft grip</strong></span>
+      <span><i class="down-swatch">••</i><strong>Medium grip</strong></span>
+      <span><i class="down-swatch">•••</i><strong>Hard grip</strong></span>
     </div>
     {#if announcements !== null}
       <div class="cue-text" aria-live="polite" aria-atomic="true">
@@ -173,7 +175,7 @@
     </div>
     <div class="counts card">
       {#each snapshot.counts as count (count.class_id)}
-        <span><strong>{count.label}</strong> ↑ {count.thumb_up} · ↓ {count.thumb_down} · invalid {count.invalid}</span>
+        <span><strong>{count.label}</strong> command {count.thumb_up} · grip {count.thumb_down} · invalid {count.invalid}</span>
       {/each}
     </div>
   </section>

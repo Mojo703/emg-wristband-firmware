@@ -1,7 +1,7 @@
 use calibration_flow::{
     anchored_class_index, anchored_labeled_span, AnchoredFitPlan, AnchoredFitStage,
     AnchoredRecipeProgress, AnchoredSong, AnchoredSongAction, AnchoredSongIdentity, Constants,
-    RepEvidence, SongState, ACTIVE_CALIBRATION_GESTURES, ACTIVE_GESTURE_COUNT,
+    RepEvidence, SongState, ACTIVE_CALIBRATION_CLASSES, ACTIVE_GESTURE_COUNT,
     ANCHORED_COMMAND_TARGET, ANCHORED_NO_OP_TARGET, CALIBRATION_MODEL_CLASS_COUNT,
     MAX_ANCHORED_SONG_CHUNK_CUES,
 };
@@ -15,15 +15,14 @@ use emg_runtime::streaming_fit::{
     ROW_STRIDE,
 };
 use protocol::{
-    CalibrationCueId, CalibrationModifier, CalibrationRunId, CalibrationRunKey,
-    CalibrationScheduleEntry, CalibrationScheduleRevision, CalibrationSessionId,
-    DurationMilliseconds, TrackMilliseconds,
+    CalibrationCueId, CalibrationRunId, CalibrationRunKey, CalibrationScheduleEntry,
+    CalibrationScheduleRevision, CalibrationSessionId, DurationMilliseconds, TrackMilliseconds,
 };
 
 const CLASS_COUNT: usize = CALIBRATION_MODEL_CLASS_COUNT;
-const CUES_PER_SONG: usize = 36;
+const CUES_PER_SONG: usize = 52;
 const RECIPE_REP_COUNT: usize =
-    ACTIVE_GESTURE_COUNT * (ANCHORED_COMMAND_TARGET as usize + ANCHORED_NO_OP_TARGET as usize);
+    ACTIVE_GESTURE_COUNT * ANCHORED_COMMAND_TARGET as usize + ANCHORED_NO_OP_TARGET as usize;
 const RECIPE_ROW_COUNT: usize = RECIPE_REP_COUNT * Constants::DEFAULT.labeled_windows as usize;
 
 fn run_key() -> CalibrationRunKey {
@@ -34,22 +33,26 @@ fn run_key() -> CalibrationRunKey {
 }
 
 fn song_entries() -> Vec<CalibrationScheduleEntry> {
-    (0..CUES_PER_SONG)
-        .map(|index| {
-            let class = index % (ACTIVE_GESTURE_COUNT * 2);
-            CalibrationScheduleEntry {
+    let mut remaining = [10usize, 10, 6, 6, 5, 5, 5, 5];
+    let mut entries = Vec::with_capacity(CUES_PER_SONG);
+    while entries.len() < CUES_PER_SONG {
+        for (class_index, (gesture, modifier)) in ACTIVE_CALIBRATION_CLASSES.into_iter().enumerate()
+        {
+            if remaining[class_index] == 0 {
+                continue;
+            }
+            let index = entries.len();
+            entries.push(CalibrationScheduleEntry {
                 cue_id: CalibrationCueId::new(index as u32 + 1).unwrap(),
-                gesture: ACTIVE_CALIBRATION_GESTURES[class % ACTIVE_GESTURE_COUNT],
-                modifier: if class < ACTIVE_GESTURE_COUNT {
-                    CalibrationModifier::ThumbUp
-                } else {
-                    CalibrationModifier::ThumbDown
-                },
+                gesture,
+                modifier,
                 track_offset: TrackMilliseconds::new(index as u32 * 2_000),
                 hold: DurationMilliseconds::new(1_500),
-            }
-        })
-        .collect()
+            });
+            remaining[class_index] -= 1;
+        }
+    }
+    entries
 }
 
 fn nor_program(destination: &mut [u8], source: &[u8]) {
@@ -185,8 +188,8 @@ fn imperfect_song_continue_surplus_final_polish_crc_and_save_complete_in_seconds
     let mut row_count = 0usize;
     let mut fit_plan = AnchoredFitPlan::Idle;
 
-    // Song one is intentionally imperfect: the first two no-op cues for every
-    // gesture are short. Commands reach 9/10 and no-ops reach 7/16.
+    // Song one is intentionally imperfect: each gesture's first soft-grip cue
+    // is short. Every other class reaches its exact target.
     run_song(
         &mut song,
         1,
@@ -194,14 +197,11 @@ fn imperfect_song_continue_surplus_final_polish_crc_and_save_complete_in_seconds
         &mut slot,
         &mut row_count,
         &mut fit_plan,
-        |entry| {
-            entry.modifier == CalibrationModifier::ThumbDown
-                && (((entry.cue_id.get() - 1) as usize / (ACTIVE_GESTURE_COUNT * 2)) < 2)
-        },
+        |entry| matches!(entry.cue_id.get(), 2 | 6),
     );
     assert_eq!(
         row_count,
-        (CUES_PER_SONG - ACTIVE_GESTURE_COUNT * 2) * Constants::DEFAULT.rows_per_rep() as usize
+        (CUES_PER_SONG - ACTIVE_GESTURE_COUNT) * Constants::DEFAULT.rows_per_rep() as usize
     );
     assert_eq!(fit_plan, AnchoredFitPlan::Checkpoint);
 

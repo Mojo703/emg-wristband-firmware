@@ -21,12 +21,18 @@ const track = {
   cue_shortfall: 0,
 } as const;
 
-const pairedCycle = [0, 2, 1, 3] as const;
-const antiCycle = [2, 3] as const;
-const semanticSchedule = [
-  ...Array.from({ length: 10 }, () => pairedCycle).flat(),
-  ...Array.from({ length: 6 }, () => antiCycle).flat(),
-];
+const semanticSchedule: number[] = [];
+const remaining = [10, 10, 6, 6, 5, 5, 5, 5];
+while (remaining.some((count) => count > 0)) {
+  for (let command = 0; command < 2; command += 1) {
+    for (let modifier = 0; modifier < 4; modifier += 1) {
+      const semantic = command + modifier * 2;
+      if (remaining[semantic] === 0) continue;
+      semanticSchedule.push(semantic);
+      remaining[semantic] = remaining[semantic]! - 1;
+    }
+  }
+}
 
 const lanes: ActiveCalibrationLanes = [
   {
@@ -42,6 +48,13 @@ const lanes: ActiveCalibrationLanes = [
     label: 'Tip back',
     colorName: 'purple',
     motion: { arrow: 'down', hint: 'pole tip back' },
+  },
+  {
+    visualLane: VisualLane.Gesture2,
+    id: 'center_counterexample',
+    label: 'Pole vertical — do not trigger',
+    colorName: 'gray',
+    motion: null,
   },
 ];
 
@@ -59,10 +72,27 @@ export const calibrationPlayingFixture: CalibrationPlayingSnapshot = {
   track,
   lanes,
   cues: semanticSchedule.map((semanticColumn, index) => ({
-    visualLane: lanes[semanticColumn % 2]!.visualLane,
+    visualLane:
+      semanticColumn === 0
+        ? lanes[0].visualLane
+        : semanticColumn === 1
+          ? lanes[1].visualLane
+          : VisualLane.Gesture2,
     at: 4_000 + index * 2_100,
     hold: 1_500,
-    thumbVariant: semanticColumn < 2 ? ThumbVariant.Up : ThumbVariant.Down,
+    thumbVariant:
+      semanticColumn < 2
+        ? ThumbVariant.Up
+        : semanticColumn < 4
+          ? ThumbVariant.Down
+          : semanticColumn < 6
+            ? ThumbVariant.Medium
+            : ThumbVariant.Hard,
+    cueMotion: semanticColumn < 2 ? lanes[semanticColumn]!.motion : null,
+    cueLabel:
+      semanticColumn < 2
+        ? lanes[semanticColumn]!.label
+        : `Pole vertical, ${semanticColumn < 4 ? 'soft grip' : semanticColumn < 6 ? 'medium grip' : 'hard grip'}`,
   })),
   position_ms: 18_000,
   position_observed_at_unix_ms: asUnixMilliseconds(1_800_000_018_000),
@@ -87,7 +117,7 @@ export const calibrationSongEndFixture: CalibrationSongEndSnapshot = {
   continue_available: true,
   valid_reps: 72,
   invalid_reps: 6,
-  deficits: ['Tip forward, thumb down: 14/16'],
+  deficits: ['Radial, hard grip: 4/5'],
 };
 
 export const calibrationTechnicalFailureFixture: CalibrationTechnicalFailureSnapshot = {

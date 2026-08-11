@@ -36,6 +36,7 @@ enum ReliableIdentity {
     CandidateStatus(CalibrationRunKey, CalibrationScheduleRevision),
     ResidentActivated(CalibrationRunKey, CalibrationScheduleRevision),
     RunFailed(CalibrationRunKey, CalibrationScheduleRevision),
+    ExportFailed(u32),
     /// Refusals have no run identity. Only the newest undelivered diagnostic
     /// is useful, and coalescing them prevents a malformed host from growing a
     /// second log queue through the calibration path.
@@ -219,6 +220,9 @@ fn classify(frame: &Frame) -> Option<FrameClass> {
         Frame::CalibrationRunFailed { failure } => FrameClass::Reliable(
             ReliableIdentity::RunFailed(failure.run, failure.schedule_revision),
         ),
+        Frame::CalibrationExportFailed { transfer_id, .. } => {
+            FrameClass::Reliable(ReliableIdentity::ExportFailed(*transfer_id))
+        }
         Frame::BenchError {
             source: protocol::BenchErrorSource::Calibration,
             ..

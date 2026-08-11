@@ -70,6 +70,9 @@ pub enum Control {
     CalibrationDiscard {
         run: CalibrationRunKey,
     },
+    CalibrationExportRequest {
+        transfer_id: u32,
+    },
     #[cfg(feature = "playback")]
     PlaybackBegin {
         session: String,
@@ -137,6 +140,7 @@ impl Control {
                 | Control::CalibrationContinue { .. }
                 | Control::CalibrationSave { .. }
                 | Control::CalibrationDiscard { .. }
+                | Control::CalibrationExportRequest { .. }
         )
     }
 

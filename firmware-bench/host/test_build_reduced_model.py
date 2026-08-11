@@ -3,7 +3,7 @@ import unittest
 import numpy as np
 
 from build_reduced_model import (
-    DEFAULT_ACTIVE, Source, filter_by_source, read_sources, scale_bits,
+    DEFAULT_ACTIVE, DEFAULT_TARGET_LABELS, Source, filter_by_source, read_sources, scale_bits,
     set_quantization_constant, validate_active,
 )
 
@@ -17,7 +17,7 @@ class ReducedModelTests(unittest.TestCase):
         kept, mapped, breakdown = filter_by_source(
             rows, labels, sources, DEFAULT_ACTIVE
         )
-        self.assertEqual(mapped.tolist(), [0, 1, 2, 3, 4, 5])
+        self.assertEqual(mapped.tolist(), list(DEFAULT_TARGET_LABELS))
         self.assertEqual([entry["rows"] for entry in breakdown], [4, 2])
         np.testing.assert_array_equal(kept, rows[[0, 1, 2, 3, 6, 7]])
 
@@ -27,10 +27,10 @@ class ReducedModelTests(unittest.TestCase):
                 {"session": "a", "role": "x", "rows": 4}
             ]}, 5)
 
-    def test_active_layout_requires_matching_no_ops_and_rest(self):
+    def test_active_layout_requires_commands_and_final_rest(self):
         validate_active(DEFAULT_ACTIVE)
-        with self.assertRaisesRegex(ValueError, "matching no-ops"):
-            validate_active((2, 3, 7, 9, 10, 11))
+        with self.assertRaisesRegex(ValueError, "retain static and moving rest"):
+            validate_active((2, 3, 7, 8, 9, 10))
 
     def test_emitted_quantization_bits_are_the_fit_scale(self):
         constants = {"row_quantization": {

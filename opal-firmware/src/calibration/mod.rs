@@ -34,11 +34,11 @@ use crate::feedback::{Calibrating, Prompt, RepNotice};
 use crate::transport::Control;
 use adapter_guard::{rows_ready_to_install, ActionGuard, FitPassSchedule, FitScheduleProgress};
 use calibration_flow::{
-    active_gesture_from_index, active_gesture_index, anchored_labeled_span, anchored_target_count,
-    Action, AnchoredClassCount, AnchoredFitPlan, AnchoredFitStage, AnchoredRecipeProgress,
-    Constants, LabeledSpan, RepEvidence, Run, RunOutcome, ACTIVE_CALIBRATION_GESTURES,
-    ACTIVE_GESTURE_COUNT, ANCHORED_CLASS_COUNT, ANCHORED_COMMAND_TARGET, ANCHORED_NO_OP_TARGET,
-    CALIBRATION_MODEL_CLASS_COUNT,
+    active_gesture_from_index, active_gesture_index, anchored_class_index, anchored_labeled_span,
+    anchored_target_count, Action, AnchoredClassCount, AnchoredFitPlan, AnchoredFitStage,
+    AnchoredRecipeProgress, Constants, LabeledSpan, RepEvidence, Run, RunOutcome,
+    ACTIVE_CALIBRATION_CLASSES, ACTIVE_GESTURE_COUNT, ANCHORED_CLASS_COUNT,
+    ANCHORED_COMMAND_TARGET, ANCHORED_NO_OP_TARGET, CALIBRATION_MODEL_CLASS_COUNT,
 };
 use calibration_flow::{
     AnchoredSong, AnchoredSongAction, AnchoredSongError, AnchoredSongIdentity, SongInterruption,
@@ -55,15 +55,17 @@ use gains::GainEstimator;
 use log::{info, warn};
 use protocol::{
     CalibrationCandidatePresence, CalibrationCandidateStatus, CalibrationCandidateValidity,
-    CalibrationClassCounts, CalibrationGesture, CalibrationModifier, CalibrationOutcome,
-    CalibrationPreparationPhase, CalibrationPreparationStatus, CalibrationResidentActivation,
-    CalibrationRunFailure, CalibrationRunKey, CalibrationScheduleAccepted,
-    CalibrationScheduleCommitDeferral, CalibrationScheduleCommitDeferralReason,
-    CalibrationScheduleRevision, CalibrationScheduleUploadAcknowledgement,
-    CalibrationScheduleUploadOperationAcknowledgement, CalibrationSongInterruption,
-    CalibrationSongInterruptionReason, CalibrationSongResult, Frame,
+    CalibrationClassCounts, CalibrationGesture, CalibrationOutcome, CalibrationPreparationPhase,
+    CalibrationPreparationStatus, CalibrationResidentActivation, CalibrationRunFailure,
+    CalibrationRunKey, CalibrationScheduleAccepted, CalibrationScheduleCommitDeferral,
+    CalibrationScheduleCommitDeferralReason, CalibrationScheduleRevision,
+    CalibrationScheduleUploadAcknowledgement, CalibrationScheduleUploadOperationAcknowledgement,
+    CalibrationSongInterruption, CalibrationSongInterruptionReason, CalibrationSongResult, Frame,
 };
 use training_rows::CalibrationPartition;
+
+#[cfg(test)]
+use calibration_flow::ACTIVE_CALIBRATION_GESTURES;
 
 use resident_selector::{
     PhysicalSlot, ResidentIdentity, SelectorPersistenceCapability, StoreSelector, StoredIdentity,
@@ -187,14 +189,7 @@ fn preparation_progress(
 }
 
 fn anchored_label(entry: protocol::CalibrationScheduleEntry) -> Option<u8> {
-    let gesture = active_gesture_index(entry.gesture)?;
-    Some(
-        gesture
-            + match entry.modifier {
-                CalibrationModifier::ThumbUp => 0,
-                CalibrationModifier::ThumbDown => ACTIVE_GESTURE_COUNT as u8,
-            },
-    )
+    u8::try_from(anchored_class_index(entry)?).ok()
 }
 
 #[cfg(test)]
@@ -814,6 +809,16 @@ pub(crate) enum ResidentRuntimeUpdate {
     Activated(ResidentActivation),
 }
 
+const CALIBRATION_EXPORT_CHUNK_BYTES: usize = 512;
+
+#[derive(Clone, Copy)]
+struct CalibrationExport {
+    transfer_id: u32,
+    physical: PhysicalSlot,
+    sequence: u32,
+    offset: usize,
+}
+
 pub(crate) struct Calibration {
     constants: Constants,
     partition: Option<CalibrationPartition>,
@@ -849,6 +854,7 @@ pub(crate) struct Calibration {
     action_guard: ActionGuard<Step>,
     active_selector: StoreSelector,
     pending_resident_update: Option<ResidentRuntimeUpdate>,
+    export: Option<CalibrationExport>,
 
     /// Microseconds the partition has stalled this run, and the reading taken
     /// when the current rep's span opened. The difference is what the validity
@@ -995,6 +1001,7 @@ impl Calibration {
             action_guard: ActionGuard::default(),
             active_selector,
             pending_resident_update: None,
+            export: None,
             flash_microseconds: 0,
             acquisition_sample: 0,
             adopted_gains: None,
@@ -1562,9 +1569,64 @@ impl Calibration {
             Control::CalibrationContinue { .. } => {}
             Control::CalibrationSave { run } => self.save_anchored_candidate(run),
             Control::CalibrationDiscard { run } => self.discard_anchored_candidate(run),
+            Control::CalibrationExportRequest { transfer_id } => {
+                self.begin_resident_export(transfer_id)
+            }
             _ => {}
         }
         None
+    }
+
+    fn begin_resident_export(&mut self, transfer_id: u32) {
+        if self.anchored_preparation.is_live()
+            || self.anchored.song().is_some_and(anchored_song_is_runnable)
+        {
+            self.outbound.push(Frame::CalibrationExportFailed {
+                transfer_id,
+                reason: "calibration acquisition is active; stop it before downloading".into(),
+            });
+            return;
+        }
+        let Some(identity) = self.active_selector.resident() else {
+            self.outbound.push(Frame::CalibrationExportFailed {
+                transfer_id,
+                reason: "the device has no active resident calibration".into(),
+            });
+            return;
+        };
+        self.export = Some(CalibrationExport {
+            transfer_id,
+            physical: identity.physical,
+            sequence: identity.generation,
+            offset: 0,
+        });
+    }
+
+    /// Produce one bounded archive chunk per serve-loop iteration. The caller
+    /// sends it outside the calibration control outbox: chunks are immutable,
+    /// offset-addressed, and the HTTP adapter rejects incomplete transfers.
+    pub(crate) fn take_export_chunk(&mut self) -> Option<Frame> {
+        let export = self.export?;
+        let partition = self.partition.as_ref()?;
+        let bytes = partition.slot_chunk(
+            export.physical.index(),
+            export.offset,
+            CALIBRATION_EXPORT_CHUNK_BYTES,
+        )?;
+        let offset = export.offset;
+        let next = offset + bytes.len();
+        if next == flash_image::SLOT_BYTES {
+            self.export = None;
+        } else if let Some(active) = self.export.as_mut() {
+            active.offset = next;
+        }
+        Some(Frame::CalibrationExportChunk {
+            transfer_id: export.transfer_id,
+            sequence: export.sequence,
+            offset: offset as u32,
+            total_bytes: flash_image::SLOT_BYTES as u32,
+            bytes,
+        })
     }
 
     /// Warm-start weights from the prior image, so the first round improves a
@@ -2398,28 +2460,29 @@ impl Calibration {
     /// interruption snapshot exact after its open cue has been rejected.
     fn anchored_count_projection(&self) -> Option<Vec<CalibrationClassCounts>> {
         let mut counts = Vec::with_capacity(ANCHORED_CLASS_COUNT);
-        for gesture in ACTIVE_CALIBRATION_GESTURES {
-            for modifier in [CalibrationModifier::ThumbUp, CalibrationModifier::ThumbDown] {
-                let index = usize::from(
-                    active_gesture_index(gesture).expect("selected gestures have compact indices"),
-                ) + match modifier {
-                    CalibrationModifier::ThumbUp => 0,
-                    CalibrationModifier::ThumbDown => ACTIVE_GESTURE_COUNT,
-                };
-                let count = self
-                    .anchored
-                    .counts()
-                    .expect("a song result belongs to an active run")[index];
-                let target_count = anchored_target_count(modifier);
-                counts.push(CalibrationClassCounts {
-                    gesture,
-                    modifier,
-                    accepted_count: count.accepted,
-                    rejected_count: count.rejected,
-                    target_count,
-                    deficit_count: target_count.saturating_sub(count.accepted),
-                });
-            }
+        for (gesture, modifier) in ACTIVE_CALIBRATION_CLASSES {
+            let entry = protocol::CalibrationScheduleEntry {
+                cue_id: protocol::CalibrationCueId::new(1).expect("one is a cue id"),
+                gesture,
+                modifier,
+                track_offset: protocol::TrackMilliseconds::new(0),
+                hold: protocol::DurationMilliseconds::new(1),
+            };
+            let index = anchored_class_index(entry)
+                .expect("selected gesture modifiers have compact indices");
+            let count = self
+                .anchored
+                .counts()
+                .expect("a song result belongs to an active run")[index];
+            let target_count = anchored_target_count(modifier);
+            counts.push(CalibrationClassCounts {
+                gesture,
+                modifier,
+                accepted_count: count.accepted,
+                rejected_count: count.rejected,
+                target_count,
+                deficit_count: target_count.saturating_sub(count.accepted),
+            });
         }
         Some(counts)
     }
@@ -3485,8 +3548,8 @@ fn row_at(source: &RowSource<'_>, index: usize) -> Option<([u8; FEATURE_COUNT], 
 mod anchored_lifecycle_tests {
     use super::*;
     use protocol::{
-        CalibrationCueId, CalibrationRunId, CalibrationScheduleEntry, CalibrationSessionId,
-        DurationMilliseconds, TrackMilliseconds,
+        CalibrationCueId, CalibrationModifier, CalibrationRunId, CalibrationScheduleEntry,
+        CalibrationSessionId, DurationMilliseconds, TrackMilliseconds,
     };
 
     fn cue_entry(cue_id: u32) -> CalibrationScheduleEntry {

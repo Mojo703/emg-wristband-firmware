@@ -376,6 +376,13 @@ impl CalibrationPartition {
         &self.mapped[at..at + SLOT_BYTES]
     }
 
+    /// Copy a bounded piece of one physical slot for host archival. Returning
+    /// owned bytes keeps no flash-map borrow alive across transport work.
+    pub(super) fn slot_chunk(&self, index: usize, offset: usize, count: usize) -> Option<Vec<u8>> {
+        let end = offset.checked_add(count)?.min(SLOT_BYTES);
+        (offset < end && index < SLOT_COUNT).then(|| self.slot_bytes(index)[offset..end].to_vec())
+    }
+
     /// Validate one slot against the mapped prior. Every failure is named, so a
     /// dead slot is reported as dead rather than skipped.
     pub(super) fn slot(&self, index: usize) -> Result<LiveSlot<'_>, ImageError> {

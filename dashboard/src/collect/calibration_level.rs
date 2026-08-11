@@ -11,14 +11,21 @@ pub const HOLD_MILLISECONDS: u32 = protocol::CALIBRATION_CUE_HOLD_MILLISECONDS;
 pub const MINIMUM_RECOVERY_MILLISECONDS: u32 = protocol::CALIBRATION_CUE_RECOVERY_MILLISECONDS;
 pub const COMMAND_SEMANTIC_COUNT: usize = calibration_flow::ACTIVE_GESTURE_COUNT;
 pub const COMMAND_CUES_PER_CLASS: usize = 10;
-pub const ANTI_CUES_PER_CLASS: usize = 16;
+pub const GRIP_SOFT_CUES_PER_CLASS: usize = 6;
+pub const GRIP_MEDIUM_CUES_PER_CLASS: usize = 5;
+pub const GRIP_HARD_CUES_PER_CLASS: usize = 5;
+pub const ANTI_CUES_PER_CLASS: usize =
+    GRIP_SOFT_CUES_PER_CLASS + GRIP_MEDIUM_CUES_PER_CLASS + GRIP_HARD_CUES_PER_CLASS;
 pub const MAXIMUM_CUES: usize =
     COMMAND_SEMANTIC_COUNT * (COMMAND_CUES_PER_CLASS + ANTI_CUES_PER_CLASS);
-pub const SEMANTIC_COLUMN_COUNT: usize = COMMAND_SEMANTIC_COUNT * 2;
+pub const SEMANTIC_COLUMN_COUNT: usize = COMMAND_SEMANTIC_COUNT * 4;
 pub const CALIBRATION_LEVEL_SCHEMA_VERSION: u32 = 2;
 const LEGACY_CALIBRATION_LEVEL_GENERATOR_VERSION: u32 = 2;
 const FULL_GESTURE_CALIBRATION_LEVEL_GENERATOR_VERSION: u32 = 4;
 const THREE_GESTURE_CALIBRATION_LEVEL_GENERATOR_VERSION: u32 = 5;
+const TWO_GESTURE_BINARY_MODIFIER_GENERATOR_VERSION: u32 = 6;
+const DIRECTIONAL_GRIP_GENERATOR_VERSION: u32 = 7;
+const CENTER_NEGATIVE_GENERATOR_VERSION: u32 = 8;
 const LEGACY_COMMAND_SEMANTIC_COUNT: usize = protocol::CalibrationGesture::ALL.len();
 const LEGACY_SEMANTIC_COLUMN_COUNT: usize = LEGACY_COMMAND_SEMANTIC_COUNT * 2;
 const LEGACY_MAXIMUM_CUES: usize =
@@ -27,7 +34,7 @@ const LEGACY_MAXIMUM_CUES: usize =
 /// anchored-song contract still requires 500 ms after every cue. Catalog loading
 /// regenerates this version in memory from the retained source schedule.
 pub(crate) const INCOMPATIBLE_CALIBRATION_LEVEL_GENERATOR_VERSION: u32 = 3;
-pub const CALIBRATION_LEVEL_GENERATOR_VERSION: u32 = 6;
+pub const CALIBRATION_LEVEL_GENERATOR_VERSION: u32 = 9;
 #[cfg(test)]
 pub const CALIBRATION_SOURCE_LEVEL: &str = "hard";
 /// Prefer the established hard schedule when counts tie, but allow a more
@@ -141,6 +148,9 @@ impl CalibrationLevelProduct {
             LEGACY_CALIBRATION_LEVEL_GENERATOR_VERSION
                 | FULL_GESTURE_CALIBRATION_LEVEL_GENERATOR_VERSION
                 | THREE_GESTURE_CALIBRATION_LEVEL_GENERATOR_VERSION
+                | TWO_GESTURE_BINARY_MODIFIER_GENERATOR_VERSION
+                | DIRECTIONAL_GRIP_GENERATOR_VERSION
+                | CENTER_NEGATIVE_GENERATOR_VERSION
                 | CALIBRATION_LEVEL_GENERATOR_VERSION
         ) {
             anyhow::bail!(
@@ -303,9 +313,8 @@ const fn recovery_between(previous: u8, next: u8, generator_version: u32) -> u32
     }
 }
 
-/// Deal authored cue slots through the measured class queues. Commands stop
-/// after ten occurrences each; anti classes continue to sixteen each while the
-/// dealer skips exhausted command positions in the same fixed cycle.
+/// Deal authored cue slots through two commands and their soft/medium/hard
+/// grip-negative prototypes. All six negative columns render in one center lane.
 #[cfg(test)]
 fn sequential_columns(cue_count: usize) -> Vec<u8> {
     sequential_columns_for_version(cue_count, CALIBRATION_LEVEL_GENERATOR_VERSION)
@@ -314,12 +323,29 @@ fn sequential_columns(cue_count: usize) -> Vec<u8> {
 fn sequential_columns_for_version(cue_count: usize, generator_version: u32) -> Vec<u8> {
     let (command_count, semantic_count, maximum_cues) = recipe_shape(generator_version);
     let mut remaining = [0usize; LEGACY_SEMANTIC_COLUMN_COUNT];
-    remaining[..command_count].fill(COMMAND_CUES_PER_CLASS);
-    remaining[command_count..semantic_count].fill(ANTI_CUES_PER_CLASS);
+    if matches!(
+        generator_version,
+        CALIBRATION_LEVEL_GENERATOR_VERSION | DIRECTIONAL_GRIP_GENERATOR_VERSION
+    ) {
+        remaining[..command_count].fill(COMMAND_CUES_PER_CLASS);
+        remaining[2..4].fill(GRIP_SOFT_CUES_PER_CLASS);
+        remaining[4..6].fill(GRIP_MEDIUM_CUES_PER_CLASS);
+        remaining[6..8].fill(GRIP_HARD_CUES_PER_CLASS);
+    } else if generator_version == CENTER_NEGATIVE_GENERATOR_VERSION {
+        remaining[..2].fill(COMMAND_CUES_PER_CLASS);
+        remaining[2] = 16;
+        remaining[3] = GRIP_SOFT_CUES_PER_CLASS;
+        remaining[4] = GRIP_MEDIUM_CUES_PER_CLASS;
+        remaining[5] = GRIP_HARD_CUES_PER_CLASS;
+    } else {
+        remaining[..command_count].fill(COMMAND_CUES_PER_CLASS);
+        remaining[command_count..semantic_count].fill(ANTI_CUES_PER_CLASS);
+    }
     let mut columns = Vec::with_capacity(cue_count.min(maximum_cues));
     while columns.len() < cue_count && remaining[..semantic_count].iter().any(|&count| count > 0) {
         for command in 0..command_count {
-            for column in [command, command + command_count] {
+            for modifier in 0..semantic_count / command_count {
+                let column = command + modifier * command_count;
                 let remaining = &mut remaining[column];
                 if *remaining == 0 {
                     continue;
@@ -343,6 +369,9 @@ const fn recipe_shape(generator_version: u32) -> (usize, usize, usize) {
         CALIBRATION_LEVEL_GENERATOR_VERSION => {
             (COMMAND_SEMANTIC_COUNT, SEMANTIC_COLUMN_COUNT, MAXIMUM_CUES)
         }
+        DIRECTIONAL_GRIP_GENERATOR_VERSION => (2, 8, 52),
+        CENTER_NEGATIVE_GENERATOR_VERSION => (2, 6, 52),
+        TWO_GESTURE_BINARY_MODIFIER_GENERATOR_VERSION => (2, 4, 52),
         THREE_GESTURE_CALIBRATION_LEVEL_GENERATOR_VERSION => (3, 6, 78),
         _ => (
             LEGACY_COMMAND_SEMANTIC_COUNT,
@@ -358,12 +387,24 @@ pub(crate) fn semantic_column_parts(
     if usize::from(semantic_column) >= SEMANTIC_COLUMN_COUNT {
         return None;
     }
-    let compact = semantic_column % COMMAND_SEMANTIC_COUNT as u8;
-    let gesture = calibration_flow::active_gesture_from_index(compact)?;
-    let modifier = if usize::from(semantic_column) < COMMAND_SEMANTIC_COUNT {
-        protocol::CalibrationModifier::ThumbUp
-    } else {
-        protocol::CalibrationModifier::ThumbDown
+    let (gesture, modifier) = match semantic_column {
+        0 | 1 => (
+            calibration_flow::active_gesture_from_index(semantic_column)?,
+            protocol::CalibrationModifier::Command,
+        ),
+        2 | 3 => (
+            calibration_flow::active_gesture_from_index(semantic_column - 2)?,
+            protocol::CalibrationModifier::GripSoft,
+        ),
+        4 | 5 => (
+            calibration_flow::active_gesture_from_index(semantic_column - 4)?,
+            protocol::CalibrationModifier::GripMedium,
+        ),
+        6 | 7 => (
+            calibration_flow::active_gesture_from_index(semantic_column - 6)?,
+            protocol::CalibrationModifier::GripHard,
+        ),
+        _ => return None,
     };
     Some((gesture, modifier))
 }
@@ -415,7 +456,7 @@ mod tests {
         }
     }
 
-    const VISUAL_LANE_COUNT: usize = COMMAND_SEMANTIC_COUNT;
+    const VISUAL_LANE_COUNT: usize = COMMAND_SEMANTIC_COUNT + 1;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum ThumbVariant {
@@ -458,7 +499,11 @@ mod tests {
         }
 
         const fn visual_lane(self) -> VisualLane {
-            VisualLane(self.0 % COMMAND_SEMANTIC_COUNT as u8)
+            if self.0 < COMMAND_SEMANTIC_COUNT as u8 {
+                VisualLane(self.0)
+            } else {
+                VisualLane(COMMAND_SEMANTIC_COUNT as u8)
+            }
         }
 
         const fn thumb_variant(self) -> ThumbVariant {
@@ -607,7 +652,7 @@ mod tests {
         assert_eq!(summary.maximum_cue_count, MAXIMUM_CUES);
         assert!(summary.shorter_than_maximum);
         assert_eq!(summary.semantic_column_counts.iter().sum::<usize>(), 7);
-        assert_eq!(summary.semantic_column_counts, [2, 2, 2, 1]);
+        assert_eq!(summary.semantic_column_counts, [1, 1, 1, 1, 1, 1, 1, 0]);
     }
 
     #[test]
@@ -637,8 +682,11 @@ mod tests {
         let level = generate(&source, source_duration(&source));
 
         assert_eq!(level.notes().len(), MAXIMUM_CUES);
-        assert_eq!(level.summary().semantic_column_counts, [10, 10, 16, 16]);
-        assert_eq!(level.summary().visual_lane_counts, [26; VISUAL_LANE_COUNT]);
+        assert_eq!(
+            level.summary().semantic_column_counts,
+            [10, 10, 6, 6, 5, 5, 5, 5]
+        );
+        assert_eq!(level.summary().visual_lane_counts, [10, 10, 32]);
         assert_eq!(level.summary().thumb_variant_counts, [20, 32]);
         assert!(!level.summary().shorter_than_maximum);
     }
@@ -694,7 +742,7 @@ mod tests {
     }
 
     #[test]
-    fn paired_cycle_finishes_with_anti_only_cues_after_commands_reach_target() {
+    fn paired_grip_cycle_finishes_at_the_golden_class_targets() {
         let source = regular_source(MAXIMUM_CUES, 2_500);
         let columns = generate(&source, source_duration(&source))
             .notes()
@@ -704,9 +752,9 @@ mod tests {
 
         assert_eq!(
             &columns[..20],
-            &[0, 2, 1, 3, 0, 2, 1, 3, 0, 2, 1, 3, 0, 2, 1, 3, 0, 2, 1, 3]
+            &[0, 2, 4, 6, 1, 3, 5, 7, 0, 2, 4, 6, 1, 3, 5, 7, 0, 2, 4, 6]
         );
-        assert_eq!(&columns[40..], &[2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3]);
+        assert_eq!(&columns[40..], &[0, 2, 1, 3, 0, 1, 0, 1, 0, 1, 0, 1]);
     }
 
     #[test]
@@ -812,7 +860,11 @@ mod tests {
             assert_eq!(column.index(), index);
             assert_eq!(
                 column.visual_lane().index(),
-                index % COMMAND_SEMANTIC_COUNT as u8
+                if index < COMMAND_SEMANTIC_COUNT as u8 {
+                    index
+                } else {
+                    COMMAND_SEMANTIC_COUNT as u8
+                }
             );
             assert_eq!(
                 column.thumb_variant(),
@@ -830,25 +882,11 @@ mod tests {
     }
 
     #[test]
-    fn current_semantic_columns_name_only_the_active_gesture_pairs() {
-        let expected = [
-            protocol::CalibrationGesture::WristRadialDeviation,
-            protocol::CalibrationGesture::WristUlnarDeviation,
-        ];
+    fn current_semantic_columns_name_two_commands_and_six_grip_negatives() {
+        let expected = calibration_flow::ACTIVE_CALIBRATION_CLASSES;
         for column in 0..SEMANTIC_COLUMN_COUNT as u8 {
             let (gesture, modifier) = semantic_column_parts(column).unwrap();
-            assert_eq!(
-                gesture,
-                expected[usize::from(column) % COMMAND_SEMANTIC_COUNT]
-            );
-            assert_eq!(
-                modifier,
-                if usize::from(column) < COMMAND_SEMANTIC_COUNT {
-                    protocol::CalibrationModifier::ThumbUp
-                } else {
-                    protocol::CalibrationModifier::ThumbDown
-                }
-            );
+            assert_eq!((gesture, modifier), expected[usize::from(column)]);
         }
         assert_eq!(semantic_column_parts(SEMANTIC_COLUMN_COUNT as u8), None);
     }
@@ -915,7 +953,7 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(CALIBRATION_LEVEL_SCHEMA_VERSION, 2);
-        assert_eq!(CALIBRATION_LEVEL_GENERATOR_VERSION, 6);
+        assert_eq!(CALIBRATION_LEVEL_GENERATOR_VERSION, 9);
         assert_eq!(first.schema_version, CALIBRATION_LEVEL_SCHEMA_VERSION);
         assert_eq!(first.generator_version, CALIBRATION_LEVEL_GENERATOR_VERSION);
         assert_eq!(first.source_level, CALIBRATION_SOURCE_LEVEL);

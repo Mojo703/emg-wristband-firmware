@@ -28,7 +28,7 @@ function songEnd(
     continue_available: continueAvailable,
     valid_reps: 94,
     invalid_reps: 6,
-    deficits: ['Tip forward, thumb down: 14/16'],
+    deficits: ['Radial, hard grip: 4/5'],
   };
 }
 
@@ -47,8 +47,18 @@ test('song-end actions are projected only from backend availability flags', () =
 
 test('playing snapshot narrates current and next cues without reading canvas state', () => {
   const announcements = cueAnnouncements(calibrationPlayingFixture);
-  assert.match(announcements.current, /^Current cue: .+, thumb (up|down)$/);
-  assert.match(announcements.next, /^Next cue: .+, thumb (up|down)$/);
+  assert.match(announcements.current, /^Current cue: .+, (extend index and middle fingers|soft grip|medium grip|hard grip)$/);
+  assert.match(announcements.next, /^Next cue: .+, (extend index and middle fingers|soft grip|medium grip|hard grip)$/);
+});
+
+test('golden grip variants are narrated as vertical anti poses', () => {
+  const center = calibrationPlayingFixture.cues.find((cue) => cue.thumbVariant === 'grip_soft');
+  assert.ok(center);
+  const announcements = cueAnnouncements({
+    ...calibrationPlayingFixture,
+    position_ms: center.at,
+  });
+  assert.match(announcements.current, /Pole vertical, soft grip/);
 });
 
 test('fixtures cover every guided calibration presentation phase', () => {
@@ -62,21 +72,18 @@ test('fixtures cover every guided calibration presentation phase', () => {
     ],
     ['setup', 'playing', 'between_songs', 'finalizing', 'technical_failure'],
   );
-  assert.equal(calibrationPlayingFixture.lanes.length, 2);
+  assert.equal(calibrationPlayingFixture.lanes.length, 3);
   assert.equal(calibrationPlayingFixture.cues.length, 52);
   assert.deepEqual(
-    calibrationPlayingFixture.cues.slice(0, 4).map((cue) => [cue.visualLane, cue.thumbVariant]),
+    calibrationPlayingFixture.cues.slice(0, 6).map((cue) => [cue.visualLane, cue.thumbVariant]),
     [
-      [0, 'up'], [0, 'down'], [1, 'up'], [1, 'down'],
+      [0, 'command'], [2, 'grip_soft'], [2, 'grip_medium'], [2, 'grip_hard'],
+      [1, 'command'], [2, 'grip_soft'],
     ],
   );
   assert.deepEqual(
-    calibrationPlayingFixture.cues.slice(40, 42).map((cue) => [cue.visualLane, cue.thumbVariant]),
-    [[0, 'down'], [1, 'down']],
-  );
-  assert.deepEqual(
     new Set(calibrationPlayingFixture.cues.map((cue) => cue.thumbVariant)),
-    new Set(['up', 'down']),
+    new Set(['command', 'grip_soft', 'grip_medium', 'grip_hard']),
   );
 });
 
@@ -96,6 +103,12 @@ test('calibration lanes carry the same user-facing Collect presentation', () => 
     [
       { id: 'wrist_radial_deviation', label: 'Tip forward', colorName: 'green', arrow: 'up' },
       { id: 'wrist_ulnar_deviation', label: 'Tip back', colorName: 'purple', arrow: 'down' },
+      {
+        id: 'center_counterexample',
+        label: 'Pole vertical — do not trigger',
+        colorName: 'gray',
+        arrow: null,
+      },
     ],
   );
 });
@@ -114,7 +127,9 @@ test('playing wire snapshots require the source-time playhead pair', () => {
       visual_lane: cue.visualLane,
       at: cue.at,
       hold: cue.hold,
-      thumb_variant: cue.thumbVariant,
+      gesture:
+        cue.cueLabel === 'Tip forward' ? 'wrist_radial_deviation' : 'wrist_ulnar_deviation',
+      modifier: cue.thumbVariant,
     })),
   };
   assert.equal(isGuidedCalibrationSnapshot(wire), true);
@@ -123,11 +138,7 @@ test('playing wire snapshots require the source-time playhead pair', () => {
   assert.equal(
     isGuidedCalibrationSnapshot({
       ...wire,
-      lanes: [
-        ...wire.lanes,
-        { ...wire.lanes[0], visual_lane: 3 },
-        { ...wire.lanes[0], visual_lane: 4 },
-      ],
+      lanes: [...wire.lanes, { ...wire.lanes[0], visual_lane: 3 }],
     }),
     false,
   );

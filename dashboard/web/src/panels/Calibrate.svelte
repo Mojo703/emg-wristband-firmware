@@ -42,21 +42,37 @@
             : 'discard_calibration',
     });
   }
+
+  function downloadCurrentCalibration(): void {
+    if (selection === null) return;
+    window.location.assign(
+      `/devices/${encodeURIComponent(selection.device_id)}/calibration/current`,
+    );
+  }
 </script>
 
 <div class="calibration-heading">
   <h2>Calibrate</h2>
-  <Button
-    variant="secondary"
-    disabled={guidedSnapshot === null || terminalPending}
-    onclick={() => sendGuided({ name: 'exit_calibration' })}
-  >
-    {calibrationSnapshot?.phase === 'finalizing'
-      ? 'Saving…'
-      : calibrationSnapshot?.phase === 'exiting'
-        ? 'Exiting…'
-        : 'Exit calibration'}
-  </Button>
+  <div class="calibration-actions">
+    <Button
+      variant="secondary"
+      disabled={selection === null || calibrationSnapshot?.phase === 'playing' || terminalPending}
+      onclick={downloadCurrentCalibration}
+    >
+      Download current calibration
+    </Button>
+    <Button
+      variant="secondary"
+      disabled={guidedSnapshot === null || terminalPending}
+      onclick={() => sendGuided({ name: 'exit_calibration' })}
+    >
+      {calibrationSnapshot?.phase === 'finalizing'
+        ? 'Saving…'
+        : calibrationSnapshot?.phase === 'exiting'
+          ? 'Exiting…'
+          : 'Exit calibration'}
+    </Button>
+  </div>
 </div>
 
 {#if calibrationSnapshot?.phase === 'exiting'}
@@ -91,5 +107,12 @@
 
   .exit-status {
     max-width: 760px;
+  }
+
+  .calibration-actions {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 8px;
   }
 </style>

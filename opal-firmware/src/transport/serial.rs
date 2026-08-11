@@ -208,6 +208,7 @@ fn control_kind(control: &Control) -> &'static str {
         Control::CalibrationContinue { .. } => "calibration_continue",
         Control::CalibrationSave { .. } => "calibration_save",
         Control::CalibrationDiscard { .. } => "calibration_discard",
+        Control::CalibrationExportRequest { .. } => "calibration_export_request",
         #[cfg(feature = "playback")]
         Control::PlaybackBegin { .. } => "playback_begin",
         #[cfg(feature = "playback")]
