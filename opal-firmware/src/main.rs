@@ -768,13 +768,16 @@ impl App {
             self.note_wear_state();
             self.flush_calibration_outbox();
             let config_changed = self.apply_pending_controls();
+            if config_changed {
+                self.announce_config_change();
+            }
             self.replay_phone_state();
             self.service_playback();
             self.advance_calibration();
             self.report_timing_status_if_due();
 
             match self.take_window() {
-                Some(window) => self.process_window(window, config_changed),
+                Some(window) => self.process_window(window),
                 None => self.handle_idle_iteration(),
             }
         }
@@ -845,6 +848,21 @@ impl App {
         }
         self.config_generation += u32::from(config_changed);
         config_changed
+    }
+
+    /// Publish persisted settings as control-plane state immediately after applying
+    /// them. Controls normally arrive between ADC windows; tying this announcement
+    /// to the same iteration's optional window made the update disappear whenever
+    /// `take_window` returned `None`, leaving the dashboard stale until reconnect.
+    fn announce_config_change(&mut self) {
+        let hello = Frame::DeviceHello {
+            device_id: self.device_id.clone(),
+            config: self.settings.to_wire(),
+            provenance: provenance::device(),
+        };
+        // A failed reliable write releases the claim. The next Probe then announces
+        // the already-persisted current settings as part of the fresh link session.
+        self.links.send_reliable_frame(&hello);
     }
 
     fn reconcile_calibration_link_generation(&mut self) {
@@ -1035,37 +1053,21 @@ impl App {
         FreeRtos::delay_ms(IDLE_POLL_MS);
     }
 
-    fn process_window(&mut self, window: AcquiredWindow, config_changed: bool) {
+    fn process_window(&mut self, window: AcquiredWindow) {
         self.note_front_end_recovery();
         if self.calibrated.is_none() {
             self.stream_and_recycle_window(window);
-            if config_changed {
-                let hello = Frame::DeviceHello {
-                    device_id: self.device_id.clone(),
-                    config: self.settings.to_wire(),
-                    provenance: provenance::device(),
-                };
-                self.links.send_window(Some(&hello), &[]);
-            }
             self.publish_feedback_state();
             return;
         }
         let started_at = Instant::now();
         let streamed = self.stream_and_recycle_window(window);
         let Some(features) = streamed.newest_features else {
-            if config_changed {
-                let hello = Frame::DeviceHello {
-                    device_id: self.device_id.clone(),
-                    config: self.settings.to_wire(),
-                    provenance: provenance::device(),
-                };
-                self.links.send_window(Some(&hello), &[]);
-            }
             self.publish_feedback_state();
             return;
         };
         let classification = self.classify_features(&features, started_at);
-        self.publish_decision_frames(&classification, streamed.newest_seq, config_changed);
+        self.publish_decision_frames(&classification, streamed.newest_seq);
         self.finish_processed_batch(classification, streamed);
     }
 
@@ -1170,12 +1172,7 @@ impl App {
         }
     }
 
-    fn publish_decision_frames(
-        &mut self,
-        inference: &ClassificationOutcome,
-        newest_seq: u32,
-        config_changed: bool,
-    ) {
+    fn publish_decision_frames(&mut self, inference: &ClassificationOutcome, newest_seq: u32) {
         let mut frames = vec![frames::prediction(
             newest_seq,
             &inference.logits,
@@ -1189,12 +1186,7 @@ impl App {
             &self.settings,
             inference.t_us,
         ));
-        let hello = config_changed.then(|| Frame::DeviceHello {
-            device_id: self.device_id.clone(),
-            config: self.settings.to_wire(),
-            provenance: provenance::device(),
-        });
-        self.links.send_window(hello.as_ref(), &frames);
+        self.links.send_window(None, &frames);
     }
 
     fn finish_processed_batch(
