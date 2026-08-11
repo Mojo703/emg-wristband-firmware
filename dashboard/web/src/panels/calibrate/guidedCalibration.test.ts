@@ -28,7 +28,7 @@ function songEnd(
     continue_available: continueAvailable,
     valid_reps: 94,
     invalid_reps: 6,
-    deficits: ['Tip back, thumb down: 14/16'],
+    deficits: ['Tip forward, thumb down: 14/16'],
   };
 }
 
@@ -62,18 +62,18 @@ test('fixtures cover every guided calibration presentation phase', () => {
     ],
     ['setup', 'playing', 'between_songs', 'finalizing', 'technical_failure'],
   );
-  assert.equal(calibrationPlayingFixture.lanes.length, 5);
-  assert.equal(calibrationPlayingFixture.cues.length, 130);
+  assert.equal(calibrationPlayingFixture.lanes.length, 3);
+  assert.equal(calibrationPlayingFixture.cues.length, 78);
   assert.deepEqual(
-    calibrationPlayingFixture.cues.slice(0, 10).map((cue) => [cue.visualLane, cue.thumbVariant]),
+    calibrationPlayingFixture.cues.slice(0, 6).map((cue) => [cue.visualLane, cue.thumbVariant]),
     [
       [0, 'up'], [0, 'down'], [1, 'up'], [1, 'down'], [2, 'up'],
-      [2, 'down'], [3, 'up'], [3, 'down'], [4, 'up'], [4, 'down'],
+      [2, 'down'],
     ],
   );
   assert.deepEqual(
-    calibrationPlayingFixture.cues.slice(100, 105).map((cue) => [cue.visualLane, cue.thumbVariant]),
-    [[0, 'down'], [1, 'down'], [2, 'down'], [3, 'down'], [4, 'down']],
+    calibrationPlayingFixture.cues.slice(60, 63).map((cue) => [cue.visualLane, cue.thumbVariant]),
+    [[0, 'down'], [1, 'down'], [2, 'down']],
   );
   assert.deepEqual(
     new Set(calibrationPlayingFixture.cues.map((cue) => cue.thumbVariant)),
@@ -98,8 +98,6 @@ test('calibration lanes carry the same user-facing Collect presentation', () => 
       { id: 'wrist_pronation', label: 'Tip out', colorName: 'blue', arrow: 'right' },
       { id: 'wrist_supination', label: 'Tip in', colorName: 'amber', arrow: 'left' },
       { id: 'wrist_radial_deviation', label: 'Tip forward', colorName: 'green', arrow: 'up' },
-      { id: 'wrist_ulnar_deviation', label: 'Tip back', colorName: 'purple', arrow: 'down' },
-      { id: 'thumb_extension', label: 'Tip center', colorName: 'pink', arrow: null },
     ],
   );
 });
@@ -124,4 +122,22 @@ test('playing wire snapshots require the source-time playhead pair', () => {
   assert.equal(isGuidedCalibrationSnapshot(wire), true);
   const { position_observed_at_unix_ms: _omitted, ...untimestamped } = wire;
   assert.equal(isGuidedCalibrationSnapshot(untimestamped), false);
+  assert.equal(
+    isGuidedCalibrationSnapshot({
+      ...wire,
+      lanes: [
+        ...wire.lanes,
+        { ...wire.lanes[0], visual_lane: 3 },
+        { ...wire.lanes[0], visual_lane: 4 },
+      ],
+    }),
+    false,
+  );
+  assert.equal(
+    isGuidedCalibrationSnapshot({
+      ...wire,
+      cues: [{ ...wire.cues[0], visual_lane: 3 }, ...wire.cues.slice(1)],
+    }),
+    false,
+  );
 });

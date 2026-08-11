@@ -1,26 +1,27 @@
 use calibration_flow::{
     anchored_class_index, anchored_labeled_span, AnchoredFitPlan, AnchoredFitStage,
     AnchoredRecipeProgress, AnchoredSong, AnchoredSongAction, AnchoredSongIdentity, Constants,
-    RepEvidence, SongState, MAX_ANCHORED_SONG_CHUNK_CUES,
+    RepEvidence, SongState, ACTIVE_CALIBRATION_GESTURES, ACTIVE_GESTURE_COUNT,
+    CALIBRATION_MODEL_CLASS_COUNT, MAX_ANCHORED_SONG_CHUNK_CUES,
 };
 use emg_runtime::band_features::FEATURE_COUNT;
 use emg_runtime::flash_image::{
-    self, parse_slot, resident_promotion_crc, SlotRecord, SlotRole,
-    CALIBRATION_RECIPE_ROW_CAPACITY, SLOT_CRC_OFFSET, SLOT_PROMOTION_CRC_OFFSET, SLOT_ROLE_OFFSET,
-    SLOT_ROWS_OFFSET,
+    self, parse_slot, resident_promotion_crc, SlotRecord, SlotRole, SLOT_CRC_OFFSET,
+    SLOT_PROMOTION_CRC_OFFSET, SLOT_ROLE_OFFSET, SLOT_ROWS_OFFSET,
 };
 use emg_runtime::streaming_fit::{
     FitCheckpoint, Fitter, RowBuffer, RowSource, Standardization, StandardizedQuantization,
     ROW_STRIDE,
 };
 use protocol::{
-    CalibrationCueId, CalibrationGesture, CalibrationModifier, CalibrationRunId, CalibrationRunKey,
+    CalibrationCueId, CalibrationModifier, CalibrationRunId, CalibrationRunKey,
     CalibrationScheduleEntry, CalibrationScheduleRevision, CalibrationSessionId,
     DurationMilliseconds, TrackMilliseconds,
 };
 
-const CLASS_COUNT: usize = 12;
-const CUES_PER_SONG: usize = 90;
+const CLASS_COUNT: usize = CALIBRATION_MODEL_CLASS_COUNT;
+const CUES_PER_SONG: usize = 54;
+const RECIPE_ROW_COUNT: usize = 702;
 
 fn run_key() -> CalibrationRunKey {
     CalibrationRunKey {
@@ -32,11 +33,11 @@ fn run_key() -> CalibrationRunKey {
 fn song_entries() -> Vec<CalibrationScheduleEntry> {
     (0..CUES_PER_SONG)
         .map(|index| {
-            let class = index % 10;
+            let class = index % (ACTIVE_GESTURE_COUNT * 2);
             CalibrationScheduleEntry {
                 cue_id: CalibrationCueId::new(index as u32 + 1).unwrap(),
-                gesture: CalibrationGesture::ALL[class % CalibrationGesture::ALL.len()],
-                modifier: if class < CalibrationGesture::ALL.len() {
+                gesture: ACTIVE_CALIBRATION_GESTURES[class % ACTIVE_GESTURE_COUNT],
+                modifier: if class < ACTIVE_GESTURE_COUNT {
                     CalibrationModifier::ThumbUp
                 } else {
                     CalibrationModifier::ThumbDown
@@ -62,7 +63,7 @@ fn nor_program(destination: &mut [u8], source: &[u8]) {
 
 fn append_rep(slot: &mut [u8], row_count: &mut usize, entry: CalibrationScheduleEntry) {
     let constants = Constants::DEFAULT;
-    let label = anchored_class_index(entry) as u8;
+    let label = anchored_class_index(entry).expect("test cue is active") as u8;
     let standardization = Standardization {
         mean: [0.0; FEATURE_COUNT],
         deviation: [1.0; FEATURE_COUNT],
@@ -76,7 +77,7 @@ fn append_rep(slot: &mut [u8], row_count: &mut usize, entry: CalibrationSchedule
             &standardization,
             &StandardizedQuantization::IDENTITY,
             label,
-            CalibrationGesture::ALL.len(),
+            ACTIVE_GESTURE_COUNT,
         ));
     }
     assert_eq!(rows.len(), constants.labeled_windows as usize);
@@ -84,7 +85,7 @@ fn append_rep(slot: &mut [u8], row_count: &mut usize, entry: CalibrationSchedule
     let end = first + rows.as_bytes().len();
     nor_program(&mut slot[first..end], rows.as_bytes());
     *row_count += rows.len();
-    assert!(*row_count <= CALIBRATION_RECIPE_ROW_CAPACITY);
+    assert!(*row_count <= RECIPE_ROW_COUNT);
 }
 
 fn run_song(
@@ -192,10 +193,10 @@ fn imperfect_song_continue_surplus_final_polish_crc_and_save_complete_in_seconds
         &mut fit_plan,
         |entry| {
             entry.modifier == CalibrationModifier::ThumbDown
-                && (((entry.cue_id.get() - 1) as usize / 10) < 2)
+                && (((entry.cue_id.get() - 1) as usize / (ACTIVE_GESTURE_COUNT * 2)) < 2)
         },
     );
-    assert_eq!(row_count, 80 * Constants::DEFAULT.rows_per_rep() as usize);
+    assert_eq!(row_count, 48 * Constants::DEFAULT.rows_per_rep() as usize);
     assert_eq!(fit_plan, AnchoredFitPlan::Checkpoint);
 
     // Complete one coalesced checkpoint, just as recovery-gap work can finish
@@ -216,11 +217,11 @@ fn imperfect_song_continue_surplus_final_polish_crc_and_save_complete_in_seconds
         &mut fit_plan,
         |_| false,
     );
-    assert_eq!(progress.retained_rep_count(), 130);
-    assert_eq!(row_count, CALIBRATION_RECIPE_ROW_CAPACITY);
+    assert_eq!(progress.retained_rep_count(), 78);
+    assert_eq!(row_count, RECIPE_ROW_COUNT);
     assert_eq!(
         song.retained_progress().accepted_rows as usize,
-        CALIBRATION_RECIPE_ROW_CAPACITY
+        RECIPE_ROW_COUNT
     );
 
     // Save is the terminal edge: the queued checkpoint is owed first, then
@@ -276,7 +277,7 @@ fn imperfect_song_continue_surplus_final_polish_crc_and_save_complete_in_seconds
     );
     let candidate = parse_slot(1, &slot, prior_hash).unwrap();
     assert_eq!(candidate.record.role, SlotRole::ExportableCandidate);
-    assert_eq!(candidate.rows().len(), CALIBRATION_RECIPE_ROW_CAPACITY);
+    assert_eq!(candidate.rows().len(), row_count);
     assert_eq!(candidate.record.reference_gains, [1.25; 16]);
 
     // Save's promotion is promotion-CRC first and role bit last. Before the
@@ -297,6 +298,6 @@ fn imperfect_song_continue_surplus_final_polish_crc_and_save_complete_in_seconds
     );
     let resident = parse_slot(1, &slot, prior_hash).unwrap();
     assert_eq!(resident.record.role, SlotRole::Resident);
-    assert_eq!(resident.rows().len(), CALIBRATION_RECIPE_ROW_CAPACITY);
+    assert_eq!(resident.rows().len(), row_count);
     assert_eq!(resident.crc, promotion_crc);
 }

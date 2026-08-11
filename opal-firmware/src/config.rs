@@ -114,7 +114,12 @@ impl Settings {
     pub fn to_wire(&self) -> DeviceConfig {
         DeviceConfig {
             gestures: CALIBRATION_COMMAND_CLASSES as u8,
-            keymap: self.keymap.clone(),
+            keymap: self
+                .keymap
+                .iter()
+                .filter(|binding| usize::from(binding.gesture) < CALIBRATION_COMMAND_CLASSES)
+                .cloned()
+                .collect(),
             wifi_ssid: (!self.wifi_ssid.is_empty()).then(|| self.wifi_ssid.clone()),
             sensitivity: self.sensitivity.id().into(),
             sensitivity_levels: Sensitivity::ALL
@@ -162,5 +167,26 @@ impl Store {
                 log::warn!("nvs save failed: {e:?}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn advertised_config_excludes_historical_dropped_bindings() {
+        let mut settings = Settings::default();
+        settings.keymap.push(Binding {
+            gesture: 4,
+            key: MediaKey::PlayPause,
+        });
+        let wire = settings.to_wire();
+        assert_eq!(wire.gestures, CALIBRATION_COMMAND_CLASSES as u8);
+        assert_eq!(wire.keymap.len(), CALIBRATION_COMMAND_CLASSES);
+        assert!(wire
+            .keymap
+            .iter()
+            .all(|binding| usize::from(binding.gesture) < CALIBRATION_COMMAND_CLASSES));
     }
 }

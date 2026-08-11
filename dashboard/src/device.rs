@@ -6,11 +6,11 @@
 //! [`framed_session`], so the link is genuinely transport-independent; only
 //! [`device_session`] knows about the registry, and it knows nothing of bytes.
 //!
-//! Serial ports are discovered, not configured: every USB-Serial-JTAG device
-//! (VID:PID 303a:1001) is opened and probed. The probe tells the device a dashboard
-//! now owns the link (it answers `DeviceHello` and routes its stream here), and a
-//! heartbeat keeps that claim alive — a serial port has no connection semantics, so
-//! the protocol invents them.
+//! Every discovered USB-Serial-JTAG device (VID:PID 303a:1001) is opened, placed in
+//! raw binary mode, and probed. The probe tells the device a dashboard now owns the
+//! link (it answers `DeviceHello` and routes its stream here), and a heartbeat keeps
+//! that claim alive — a serial port has no connection semantics, so the protocol
+//! invents them.
 
 use crate::frame;
 use crate::registry::{DeviceHandle, Registry};
@@ -944,6 +944,10 @@ async fn serial_session(
             return;
         }
     };
+    if let Err(e) = configure_raw_serial(&reader_port) {
+        tracing::warn!("serial {path} raw-mode setup failed ({e})");
+        return;
+    }
     connections.opened(path);
     // A later successful open means the earlier failure was transient — allow it to be
     // reported again if it recurs.
@@ -1153,6 +1157,29 @@ async fn serial_session(
     device_session(in_rx, outgoing, registry, DeviceTransport::Serial, timing).await;
     heartbeat_task.abort();
     tracing::info!("serial device at {path} closed");
+}
+
+/// Put a CDC TTY in transparent byte-stream mode.
+///
+/// A newly enumerated Linux TTY defaults to canonical, echoing terminal behavior.
+/// In that mode `ICRNL` rewrites payload bytes, `IXON` consumes flow-control bytes,
+/// and `ECHO` sends device bytes back to the device. Flash tools happen to leave the
+/// descriptor raw, but unplugging creates a fresh node with those defaults again, so
+/// the dashboard must establish the framing contract itself on every open.
+fn configure_raw_serial(file: &std::fs::File) -> io::Result<()> {
+    let descriptor = file.as_raw_fd();
+    let mut settings = std::mem::MaybeUninit::<libc::termios>::uninit();
+    if unsafe { libc::tcgetattr(descriptor, settings.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: tcgetattr returned success and initialized the termios structure.
+    let mut settings = unsafe { settings.assume_init() };
+    unsafe { libc::cfmakeraw(&mut settings) };
+    settings.c_cflag |= libc::CLOCAL | libc::CREAD;
+    if unsafe { libc::tcsetattr(descriptor, libc::TCSANOW, &settings) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Wait for a plain-file serial descriptor to become readable without making
@@ -1677,5 +1704,58 @@ mod tests {
         let mut byte = [0; 1];
         reader.read_exact(&mut byte).unwrap();
         assert_eq!(byte, [b'x']);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn serial_open_forces_a_cooked_tty_to_raw_binary_mode() {
+        let mut master = -1;
+        let mut slave = -1;
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        // SAFETY: openpty returned two owned descriptors; each is moved into one
+        // File and therefore closed exactly once at the end of this test.
+        let _master = unsafe { std::fs::File::from_raw_fd(master) };
+        let slave = unsafe { std::fs::File::from_raw_fd(slave) };
+
+        let mut cooked = std::mem::MaybeUninit::<libc::termios>::uninit();
+        assert_eq!(
+            unsafe { libc::tcgetattr(slave.as_raw_fd(), cooked.as_mut_ptr()) },
+            0
+        );
+        // SAFETY: tcgetattr returned success and initialized the structure.
+        let mut cooked = unsafe { cooked.assume_init() };
+        cooked.c_iflag |= libc::ICRNL | libc::IXON;
+        cooked.c_oflag |= libc::OPOST;
+        cooked.c_lflag |= libc::ICANON | libc::ECHO | libc::ISIG;
+        assert_eq!(
+            unsafe { libc::tcsetattr(slave.as_raw_fd(), libc::TCSANOW, &cooked) },
+            0
+        );
+
+        configure_raw_serial(&slave).unwrap();
+
+        let mut raw = std::mem::MaybeUninit::<libc::termios>::uninit();
+        assert_eq!(
+            unsafe { libc::tcgetattr(slave.as_raw_fd(), raw.as_mut_ptr()) },
+            0
+        );
+        // SAFETY: tcgetattr returned success and initialized the structure.
+        let raw = unsafe { raw.assume_init() };
+        assert_eq!(raw.c_iflag & (libc::ICRNL | libc::IXON), 0);
+        assert_eq!(raw.c_oflag & libc::OPOST, 0);
+        assert_eq!(raw.c_lflag & (libc::ICANON | libc::ECHO | libc::ISIG), 0);
+        assert_ne!(raw.c_cflag & libc::CLOCAL, 0);
+        assert_ne!(raw.c_cflag & libc::CREAD, 0);
     }
 }

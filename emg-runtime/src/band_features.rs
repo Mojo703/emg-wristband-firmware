@@ -30,6 +30,45 @@ const REFERENCE_DIVISOR: f32 = 7.0;
 /// Keeps log10 finite when a quarter's mean power underflows to zero.
 const POWER_FLOOR: f32 = 1e-12;
 
+/// The mean of the other seven slots on one ADS1298.
+///
+/// Gain estimation and feature preprocessing must use this exact arithmetic:
+/// a differently scaled reference produces a correspondingly mis-scaled
+/// least-squares gain.
+#[inline(always)]
+pub fn other_slot_mean(chip: &[f32], excluded_slot: usize) -> f32 {
+    debug_assert_eq!(chip.len(), CHIP_SLOTS);
+    debug_assert!(excluded_slot < CHIP_SLOTS);
+    let mut others = 0.0f32;
+    for (slot, &value) in chip.iter().enumerate() {
+        if slot != excluded_slot {
+            others += value;
+        }
+    }
+    others / REFERENCE_DIVISOR
+}
+
+/// Apply the gain-weighted per-chip reference to one microvolt sample instant.
+#[inline(always)]
+pub fn apply_reference(
+    microvolts: &[f32; CHANNEL_COUNT],
+    reference_gains: &[f32; CHANNEL_COUNT],
+) -> [f32; CHANNEL_COUNT] {
+    let mut referenced = [0.0f32; CHANNEL_COUNT];
+    let chips = microvolts
+        .chunks_exact(CHIP_SLOTS)
+        .zip(reference_gains.chunks_exact(CHIP_SLOTS))
+        .zip(referenced.chunks_exact_mut(CHIP_SLOTS));
+    for ((chip, gains), out) in chips {
+        for (slot, ((&value, &gain), result)) in
+            chip.iter().zip(gains).zip(out.iter_mut()).enumerate()
+        {
+            *result = value - gain * other_slot_mean(chip, slot);
+        }
+    }
+    referenced
+}
+
 /// The seven mains notches (60..420 Hz, Q = 30), packed b0, b1, b2, a1, a2 with
 /// a0 normalized to 1, in application order.
 const NOTCH_BITS: [[u32; 5]; NOTCH_COUNT] = [
@@ -238,26 +277,7 @@ impl BandFeaturePipeline {
         for (value, &count) in scaled.iter_mut().zip(raw.iter()) {
             *value = count as f32 * self.microvolts_per_count;
         }
-
-        let mut referenced = [0.0f32; CHANNEL_COUNT];
-        let chips = scaled
-            .chunks_exact(CHIP_SLOTS)
-            .zip(self.reference_gains.chunks_exact(CHIP_SLOTS))
-            .zip(referenced.chunks_exact_mut(CHIP_SLOTS));
-        for ((chip, gains), out) in chips {
-            for (slot, ((&value, &gain), result)) in
-                chip.iter().zip(gains).zip(out.iter_mut()).enumerate()
-            {
-                let mut others = 0.0f32;
-                for (index, &other) in chip.iter().enumerate() {
-                    if index != slot {
-                        others += other;
-                    }
-                }
-                *result = value - gain * (others / REFERENCE_DIVISOR);
-            }
-        }
-        referenced
+        apply_reference(&scaled, &self.reference_gains)
     }
 
     /// The notch chain then the four parallel bandpass cascades, accumulating

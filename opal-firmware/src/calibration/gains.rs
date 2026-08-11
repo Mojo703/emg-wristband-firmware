@@ -24,15 +24,10 @@
 //! means at the end. Two passes would mean holding the window, which is sixty
 //! thousand instants of nothing anyone needs to keep.
 
-use emg_runtime::band_features::CHANNEL_COUNT;
+use emg_runtime::band_features::{other_slot_mean, CHANNEL_COUNT};
 
 /// Slots per ADS1298.
 const CHIP_SLOTS: usize = 8;
-/// What `band_features` divides the summed other-slot signal by to form a
-/// chip's reference. Held here as the same constant it uses, because the
-/// estimate must project onto the reference the pipeline will actually
-/// subtract, not onto a differently scaled one.
-const REFERENCE_DIVISOR: f32 = 8.0;
 /// Keep software-emulated f64 arithmetic off the 2 kHz sample path. Products
 /// accumulate in f32 for a short block, then fold into the stable f64 totals.
 const ACCUMULATION_BLOCK: u32 = 32;
@@ -83,9 +78,8 @@ impl GainEstimator {
         self.instants += 1;
         self.block_instants += 1;
         for (chip, values) in microvolts.chunks_exact(CHIP_SLOTS).enumerate() {
-            let total: f32 = values.iter().sum();
             for (slot, &value) in values.iter().enumerate() {
-                let reference = (total - value) / REFERENCE_DIVISOR;
+                let reference = other_slot_mean(values, slot);
                 let index = chip * CHIP_SLOTS + slot;
                 self.block_cross[index] += value * reference;
                 self.block_reference_energy[index] += reference * reference;
@@ -158,6 +152,7 @@ impl GainEstimator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use emg_runtime::band_features::apply_reference;
 
     #[test]
     fn partial_blocks_are_included_when_the_estimate_freezes() {
@@ -175,11 +170,44 @@ mod tests {
         assert_eq!(estimator.instants(), ACCUMULATION_BLOCK + 7);
         for (slot, gain) in gains.iter().enumerate() {
             let slope = (slot % CHIP_SLOTS + 1) as f32;
-            let expected = REFERENCE_DIVISOR * slope / (36.0 - slope);
+            let expected = 7.0 * slope / (36.0 - slope);
             assert!(
                 (gain - expected).abs() < 1e-4,
                 "slot {slot}: {gain} != {expected}"
             );
+        }
+    }
+
+    #[test]
+    fn estimated_gains_remove_the_projected_signal_through_feature_referencing() {
+        let slopes = [1.0, 2.0, 3.5, 5.0, 6.5, 8.0, 9.5, 11.0];
+        let offsets = [13.0, -7.0, 29.0, 3.0, -17.0, 41.0, 5.0, -23.0];
+        let sample = |instant: u32| {
+            let t = instant as f32 - 71.0;
+            core::array::from_fn(|slot| {
+                let local = slot % CHIP_SLOTS;
+                let chip_offset = (slot / CHIP_SLOTS) as f32 * 19.0;
+                slopes[local] * t + offsets[local] + chip_offset
+            })
+        };
+
+        let mut estimator = GainEstimator::new();
+        for instant in 0..143 {
+            estimator.observe(&sample(instant));
+        }
+        let gains = estimator.freeze();
+
+        let first = apply_reference(&sample(0), &gains);
+        for instant in 1..143 {
+            let referenced = apply_reference(&sample(instant), &gains);
+            for slot in 0..CHANNEL_COUNT {
+                assert!(
+                    (referenced[slot] - first[slot]).abs() < 2e-3,
+                    "slot {slot}, instant {instant}: projected signal remained ({:?} vs {:?})",
+                    referenced[slot],
+                    first[slot]
+                );
+            }
         }
     }
 }

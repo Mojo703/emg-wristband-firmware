@@ -41,9 +41,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context};
 use protocol::{
-    ActivityCondition, Beatmap, BeatsPerMinute, CalibrationCueId, CalibrationGesture,
-    CalibrationModifier, CalibrationScheduleEntry, ClassId, CollectionClass, DifficultyLevel,
-    DurationMilliseconds, Note, SubjectId, SweatLevel, TrackId, TrackInfo, TrackMilliseconds,
+    ActivityCondition, Beatmap, BeatsPerMinute, CalibrationCueId, CalibrationScheduleEntry,
+    ClassId, CollectionClass, DifficultyLevel, DurationMilliseconds, Note, SubjectId, SweatLevel,
+    TrackId, TrackInfo, TrackMilliseconds,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -493,18 +493,17 @@ fn load_track(directory: &Path) -> anyhow::Result<CatalogTrack> {
                     .notes
                     .iter()
                     .enumerate()
-                    .map(|(index, note)| CalibrationScheduleEntry {
-                        cue_id: CalibrationCueId::new((index + 1) as u32)
-                            .expect("validated calibration cue ids are nonzero"),
-                        gesture: CalibrationGesture::from_index(note.semantic_column % 5)
-                            .expect("validated calibration semantic column names a gesture"),
-                        modifier: if note.semantic_column < 5 {
-                            CalibrationModifier::ThumbUp
-                        } else {
-                            CalibrationModifier::ThumbDown
-                        },
-                        track_offset: TrackMilliseconds::new(note.map_note.time_ms),
-                        hold: DurationMilliseconds::new(note.map_note.hold_ms),
+                    .filter_map(|(index, note)| {
+                        let (gesture, modifier) =
+                            super::calibration_level::semantic_column_parts(note.semantic_column)?;
+                        Some(CalibrationScheduleEntry {
+                            cue_id: CalibrationCueId::new((index + 1) as u32)
+                                .expect("validated calibration cue ids are nonzero"),
+                            gesture,
+                            modifier,
+                            track_offset: TrackMilliseconds::new(note.map_note.time_ms),
+                            hold: DurationMilliseconds::new(note.map_note.hold_ms),
+                        })
                     })
                     .collect(),
             })
@@ -732,19 +731,18 @@ mod tests {
                                 .notes
                                 .iter()
                                 .enumerate()
-                                .map(|(index, note)| CalibrationScheduleEntry {
-                                    cue_id: CalibrationCueId::new((index + 1) as u32).unwrap(),
-                                    gesture: CalibrationGesture::from_index(
-                                        note.semantic_column % 5,
-                                    )
-                                    .unwrap(),
-                                    modifier: if note.semantic_column < 5 {
-                                        CalibrationModifier::ThumbUp
-                                    } else {
-                                        CalibrationModifier::ThumbDown
-                                    },
-                                    track_offset: TrackMilliseconds::new(note.map_note.time_ms),
-                                    hold: DurationMilliseconds::new(note.map_note.hold_ms),
+                                .filter_map(|(index, note)| {
+                                    let (gesture, modifier) =
+                                        crate::collect::calibration_level::semantic_column_parts(
+                                            note.semantic_column,
+                                        )?;
+                                    Some(CalibrationScheduleEntry {
+                                        cue_id: CalibrationCueId::new((index + 1) as u32).unwrap(),
+                                        gesture,
+                                        modifier,
+                                        track_offset: TrackMilliseconds::new(note.map_note.time_ms),
+                                        hold: DurationMilliseconds::new(note.map_note.hold_ms),
+                                    })
                                 })
                                 .collect(),
                         }
@@ -957,6 +955,7 @@ mod tests {
                     + crate::collect::calibration_level::MINIMUM_RECOVERY_MILLISECONDS
         }));
         entry.calibration = Some(incompatible.clone());
+        let expected = CalibrationLevelProduct::generate_best(&entry.levels, duration_ms).unwrap();
 
         let directory = std::env::temp_dir().join(format!(
             "dashboard-calibration-v3-migration-{}",
@@ -977,6 +976,12 @@ mod tests {
             .calibration
             .expect("retained source should repair the incompatible product");
         assert_ne!(calibration.content_identity, incompatible.content_identity);
+        assert_eq!(calibration.cue_count, expected.cue_count());
+        assert_eq!(calibration.content_identity, expected.content_identity);
+        assert!(calibration
+            .entries
+            .iter()
+            .all(|entry| { calibration_flow::active_gesture_index(entry.gesture).is_some() }));
         assert!(calibration.entries.windows(2).all(|pair| {
             pair[1].track_offset.get()
                 >= pair[0].track_offset.get()
@@ -987,7 +992,7 @@ mod tests {
     }
 
     #[test]
-    fn valid_stored_product_is_regenerated_from_a_more_productive_retained_level() {
+    fn preferred_hard_level_wins_when_reduced_recipe_counts_tie() {
         let duration_ms = 410_000;
         let hard = (0..196)
             .map(|index| MapNote {
@@ -1014,8 +1019,11 @@ mod tests {
             ),
         );
         let expected = CalibrationLevelProduct::generate_best(&entry.levels, duration_ms).unwrap();
-        assert_eq!(expected.source_level, "medium");
-        assert_eq!(expected.cue_count(), 130);
+        assert_eq!(expected.source_level, "hard");
+        assert_eq!(
+            expected.cue_count(),
+            crate::collect::calibration_level::MAXIMUM_CUES
+        );
 
         let directory = std::env::temp_dir().join(format!(
             "dashboard-calibration-best-source-{}",
@@ -1033,7 +1041,7 @@ mod tests {
 
         let loaded = load_track(&directory).unwrap();
         let calibration = loaded.calibration.unwrap();
-        assert_eq!(calibration.cue_count, 130);
+        assert_eq!(calibration.cue_count, expected.cue_count());
         assert_eq!(calibration.content_identity, expected.content_identity);
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -1076,16 +1084,18 @@ mod tests {
                     .notes
                     .iter()
                     .enumerate()
-                    .map(|(index, note)| CalibrationScheduleEntry {
-                        cue_id: CalibrationCueId::new((index + 1) as u32).unwrap(),
-                        gesture: CalibrationGesture::from_index(note.semantic_column % 5).unwrap(),
-                        modifier: if note.semantic_column < 5 {
-                            CalibrationModifier::ThumbUp
-                        } else {
-                            CalibrationModifier::ThumbDown
-                        },
-                        track_offset: TrackMilliseconds::new(note.map_note.time_ms),
-                        hold: DurationMilliseconds::new(note.map_note.hold_ms),
+                    .filter_map(|(index, note)| {
+                        let (gesture, modifier) =
+                            crate::collect::calibration_level::semantic_column_parts(
+                                note.semantic_column,
+                            )?;
+                        Some(CalibrationScheduleEntry {
+                            cue_id: CalibrationCueId::new((index + 1) as u32).unwrap(),
+                            gesture,
+                            modifier,
+                            track_offset: TrackMilliseconds::new(note.map_note.time_ms),
+                            hold: DurationMilliseconds::new(note.map_note.hold_ms),
+                        })
                     })
                     .collect(),
             }]

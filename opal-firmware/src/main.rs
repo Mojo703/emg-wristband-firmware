@@ -107,8 +107,8 @@ pub(crate) const SERIAL_RX_BUFFER_BYTES: usize = 16 * 1024;
 /// `ARITHMETIC.md`. Smaller than the model's own class count, which also holds
 /// the no-op and rest classes — their probability mass is never eligible to
 /// commit, which is the whole reason they are in the model.
-pub(crate) const CALIBRATION_COMMAND_CLASSES: usize = 5;
-const CALIBRATION_CLASS_COUNT: usize = 12;
+pub(crate) const CALIBRATION_COMMAND_CLASSES: usize = calibration_flow::ACTIVE_GESTURE_COUNT;
+const CALIBRATION_CLASS_COUNT: usize = calibration_flow::CALIBRATION_MODEL_CLASS_COUNT;
 
 /// How long the loop sleeps when no window is waiting.
 ///
@@ -945,7 +945,10 @@ impl App {
         if let Some(gesture) = self.calibration.take_anchored_prompt() {
             self.feedback.calibration_prompt(Prompt {
                 gesture,
-                key: self.settings.key_for(gesture.index()),
+                key: self.settings.key_for(
+                    calibration_flow::active_gesture_index(gesture)
+                        .expect("anchored prompts are active gestures"),
+                ),
             });
         }
         let frames = self.calibration.drain_outbound();
@@ -1194,8 +1197,8 @@ impl App {
         inference: ClassificationOutcome,
         streamed: StreamOutcome,
     ) {
-        // The calibrated model contains five command classes followed by their
-        // paired thumb-down anti-gesture classes. Only the first five are ever
+        // The calibrated model contains active command classes followed by their
+        // paired thumb-down anti-gesture classes. Only the command prefix is ever
         // eligible to reach HID; an unbound anti class must not fall through to
         // Settings::key_for's default media action.
         let next_commit = calibrated_command_key(
@@ -1287,7 +1290,10 @@ fn apply_control(
             None => false,
         },
         Control::SetKeymap { bindings } => {
-            settings.keymap = bindings;
+            settings.keymap = bindings
+                .into_iter()
+                .filter(|binding| usize::from(binding.gesture) < CALIBRATION_COMMAND_CLASSES)
+                .collect();
             store.save(settings);
             true
         }
@@ -1467,14 +1473,14 @@ mod startup_memory_tests {
         assert_eq!(WearerFeatureBuffers::reserve().reserved_bytes(), 16_000);
         assert_eq!(
             CalibrationBuffers::reserve(calibration_flow::Constants::DEFAULT).reserved_bytes(),
-            14_832
+            13_728
         );
     }
 
     #[test]
     fn named_storage_excludes_the_removed_tds_buffers() {
         let memory = AppMemory::reserve();
-        assert_eq!(memory.reserved_bytes, 71_084);
+        assert_eq!(memory.reserved_bytes, 69_980);
     }
 
     #[test]

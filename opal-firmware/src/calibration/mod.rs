@@ -34,9 +34,11 @@ use crate::feedback::{Calibrating, Prompt, RepNotice};
 use crate::transport::Control;
 use adapter_guard::{rows_ready_to_install, ActionGuard, FitPassSchedule, FitScheduleProgress};
 use calibration_flow::{
-    anchored_labeled_span, anchored_target_count, Action, AnchoredClassCount, AnchoredFitPlan,
-    AnchoredFitStage, AnchoredRecipeProgress, Constants, LabeledSpan, RepEvidence, Run, RunOutcome,
-    ANCHORED_CLASS_COUNT, ANCHORED_COMMAND_TARGET, ANCHORED_NO_OP_TARGET,
+    active_gesture_from_index, active_gesture_index, anchored_labeled_span, anchored_target_count,
+    Action, AnchoredClassCount, AnchoredFitPlan, AnchoredFitStage, AnchoredRecipeProgress,
+    Constants, LabeledSpan, RepEvidence, Run, RunOutcome, ACTIVE_CALIBRATION_GESTURES,
+    ACTIVE_GESTURE_COUNT, ANCHORED_CLASS_COUNT, ANCHORED_COMMAND_TARGET, ANCHORED_NO_OP_TARGET,
+    CALIBRATION_MODEL_CLASS_COUNT,
 };
 use calibration_flow::{
     AnchoredSong, AnchoredSongAction, AnchoredSongError, AnchoredSongIdentity, SongInterruption,
@@ -44,7 +46,7 @@ use calibration_flow::{
 };
 use core::num::NonZeroU32;
 use emg_runtime::band_features::{CHANNEL_COUNT, FEATURE_COUNT};
-use emg_runtime::calibration::CalibrationModel;
+use emg_runtime::calibration::{CalibrationModel, INPUT_COUNT};
 use emg_runtime::flash_image::{self, SlotRecord};
 use emg_runtime::streaming_fit::{
     FitCheckpoint, FitPass, FitPassProgress, Fitter, FitterBuffers, RowBuffer, RowSource, Schedule,
@@ -70,20 +72,23 @@ use resident_selector::{
 
 /// Rows the RAM buffer holds: one round, with room to spare.
 ///
-/// A round is at most five gestures of nine rows each, so forty-five. The old
+/// A round is at most three gestures of nine rows each. The old
 /// number here was the whole slot's capacity, which is 2,559 rows. That buffer
 /// the architecture inside out and would not fit a boot heap whose largest
 /// block is about a hundred kilobytes. Rows live in flash; RAM buffers the
 /// round in front of the next flush and nothing more.
 const ROUND_ROW_CAPACITY: usize = 128;
-const CALIBRATION_CLASS_CAPACITY: usize = 12;
+const CALIBRATION_CLASS_CAPACITY: usize = CALIBRATION_MODEL_CLASS_COUNT;
+const ACTIVE_RECIPE_ROW_COUNT: usize = ACTIVE_GESTURE_COUNT
+    * (ANCHORED_COMMAND_TARGET + ANCHORED_NO_OP_TARGET) as usize
+    * Constants::DEFAULT.labeled_windows as usize;
 const _: () = assert!(
-    flash_image::CALIBRATION_RECIPE_ROW_CAPACITY <= flash_image::slot_row_capacity(),
+    ACTIVE_RECIPE_ROW_COUNT <= flash_image::slot_row_capacity(),
     "the audited calibration recipe must fit one physical slot"
 );
 const _: () = assert!(
-    flash_image::CALIBRATION_RECIPE_ROW_CAPACITY
-        == CalibrationGesture::ALL.len()
+    ACTIVE_RECIPE_ROW_COUNT
+        == ACTIVE_GESTURE_COUNT
             * (ANCHORED_COMMAND_TARGET + ANCHORED_NO_OP_TARGET) as usize
             * Constants::DEFAULT.labeled_windows as usize,
     "the flash recipe budget must equal every targeted anchored row"
@@ -94,8 +99,7 @@ const _: () = assert!(
 /// V's constants. Checked at compile time so a swept `labeled_windows` cannot
 /// quietly overflow the buffer on a wrist and abandon the run mid-round.
 const _: () = assert!(
-    ROUND_ROW_CAPACITY
-        >= CalibrationGesture::ALL.len() * Constants::DEFAULT.labeled_windows as usize,
+    ROUND_ROW_CAPACITY >= ACTIVE_GESTURE_COUNT * Constants::DEFAULT.labeled_windows as usize,
     "the row buffer cannot hold one round"
 );
 
@@ -119,6 +123,27 @@ const _: () = assert!(
 /// so far. At the measured 0.6-0.9 seconds per pass, 64 rows project to about
 /// 8-15 ms of fit work before links, windows, and the watchdog get another turn.
 const FIT_ROWS_PER_POLL: usize = 64;
+
+/// Product validity belongs to this firmware build's selected class space.
+/// The generic flash format intentionally accepts historical class counts.
+fn is_active_calibration_model(record: &SlotRecord) -> bool {
+    record.class_count == CALIBRATION_MODEL_CLASS_COUNT
+        && record.centroids.len() == CALIBRATION_MODEL_CLASS_COUNT * FEATURE_COUNT
+        && record.spreads.len() == CALIBRATION_MODEL_CLASS_COUNT * FEATURE_COUNT
+        && record.weights.len() == INPUT_COUNT * CALIBRATION_MODEL_CLASS_COUNT
+        && record.reference_gains.iter().all(|value| value.is_finite())
+        && record.mean.iter().all(|value| value.is_finite())
+        && record
+            .deviation
+            .iter()
+            .all(|value| value.is_finite() && *value > 0.0)
+        && record.centroids.iter().all(|value| value.is_finite())
+        && record
+            .spreads
+            .iter()
+            .all(|value| value.is_finite() && *value >= 0.0)
+        && record.weights.iter().all(|value| value.is_finite())
+}
 
 /// The anchored Tuesday path has an explicit 10 s still settling phase then
 /// 20 s reference-gain estimate. It intentionally does not inherit the
@@ -161,12 +186,15 @@ fn preparation_progress(
     }
 }
 
-fn anchored_label(entry: protocol::CalibrationScheduleEntry) -> u8 {
-    entry.gesture.index()
-        + match entry.modifier {
-            CalibrationModifier::ThumbUp => 0,
-            CalibrationModifier::ThumbDown => CalibrationGesture::ALL.len() as u8,
-        }
+fn anchored_label(entry: protocol::CalibrationScheduleEntry) -> Option<u8> {
+    let gesture = active_gesture_index(entry.gesture)?;
+    Some(
+        gesture
+            + match entry.modifier {
+                CalibrationModifier::ThumbUp => 0,
+                CalibrationModifier::ThumbDown => ACTIVE_GESTURE_COUNT as u8,
+            },
+    )
 }
 
 #[cfg(test)]
@@ -1360,6 +1388,13 @@ impl Calibration {
                 first_entry,
                 entries,
             } => {
+                if entries
+                    .iter()
+                    .any(|entry| active_gesture_index(entry.gesture).is_none())
+                {
+                    self.refuse("anchored schedule contains a gesture disabled in this build");
+                    return None;
+                }
                 info!(
                     "anchored schedule chunk received: run {:?}, revision {:?}, first {}, count {}",
                     run,
@@ -1682,7 +1717,7 @@ impl Calibration {
             &prior.standardization(),
             &prior.quantization(),
             label,
-            CalibrationGesture::ALL.len(),
+            ACTIVE_GESTURE_COUNT,
         )
     }
 
@@ -1710,10 +1745,10 @@ impl Calibration {
                 .enumerate()
                 .max_by(|left, right| left.1.total_cmp(right.1))
                 .map(|(index, _)| index as u8);
-            // Only the five command classes are gestures; anything else the
+            // Only the active command classes are gestures; anything else the
             // model preferred is "no command", which counts against the class
             // without being confusion with another gesture.
-            let predicted = argmax.and_then(CalibrationGesture::from_index);
+            let predicted = argmax.and_then(active_gesture_from_index);
             run.record_held_out_window(gesture, predicted);
         }
     }
@@ -1802,7 +1837,7 @@ impl Calibration {
         // Continue replays a complete authored song, including classes whose
         // quota was already met. Those clean surplus cues remain useful
         // operator feedback, but retaining their rows would exceed the
-        // audited 130-rep/1,170-row recipe and poison the scratch slot before
+        // audited bounded recipe and poison the scratch slot before
         // the candidate metadata could be committed.
         let retain_rows = self.anchored_class_needs_rows(entry);
         if retain_rows && self.rows.capacity().saturating_sub(self.rows.len()) < self.rep_rows.len()
@@ -1825,7 +1860,8 @@ impl Calibration {
         match result {
             Ok(Ok(())) => {
                 if retain_rows {
-                    let label = anchored_label(entry);
+                    let label = anchored_label(entry)
+                        .expect("uploaded anchored schedules contain only active gestures");
                     let mut rows = core::mem::take(&mut self.rep_rows);
                     for features in &rows {
                         let pushed = self.push_row(features, label);
@@ -1836,14 +1872,19 @@ impl Calibration {
                 } else {
                     self.rep_rows.clear();
                 }
-                let recorded_retention = self
-                    .anchored
-                    .recipe_mut()
-                    .expect("an active run owns recipe progress")
-                    .record_accepted(entry);
+                let (recorded_retention, checkpoint_due) = {
+                    let recipe = self
+                        .anchored
+                        .recipe_mut()
+                        .expect("an active run owns recipe progress");
+                    let retained = recipe.record_accepted(entry);
+                    (retained, recipe.checkpoint_due())
+                };
                 debug_assert_eq!(recorded_retention, retain_rows);
                 if retain_rows && self.flush_anchored_rows() {
-                    self.request_anchored_checkpoint();
+                    if checkpoint_due {
+                        self.request_anchored_checkpoint();
+                    }
                 }
             }
             Ok(Err(_)) => {
@@ -1921,10 +1962,10 @@ impl Calibration {
             });
     }
 
-    /// A newly accepted cue always needs a checkpoint.  If a fit is already
-    /// consuming the previous cue's rows, retain that work and queue exactly
-    /// one further checkpoint rather than representing the queue with an
-    /// unrelated flag.
+    /// A validated retained-prompt boundary needs a checkpoint. If a fit is
+    /// still consuming the previous boundary's rows, retain that work and
+    /// queue exactly one further checkpoint rather than representing the queue
+    /// with an unrelated flag.
     fn request_anchored_checkpoint(&mut self) {
         let fit = self
             .anchored
@@ -2171,7 +2212,7 @@ impl Calibration {
         record.deviation = standardization.deviation;
         record.weights.copy_from_slice(checkpoint.weights());
         self.fill_class_statistics(&mut record);
-        if !record.is_product_calibration_model() {
+        if !is_active_calibration_model(&record) {
             self.fail_anchored_execution("anchored fitter produced a non-finite candidate model");
             return;
         }
@@ -2356,14 +2397,15 @@ impl Calibration {
     /// interruption. Keeping this one calculation shared makes the terminal
     /// interruption snapshot exact after its open cue has been rejected.
     fn anchored_count_projection(&self) -> Option<Vec<CalibrationClassCounts>> {
-        let mut counts = Vec::with_capacity(CalibrationGesture::ALL.len() * 2);
-        for gesture in CalibrationGesture::ALL {
+        let mut counts = Vec::with_capacity(ANCHORED_CLASS_COUNT);
+        for gesture in ACTIVE_CALIBRATION_GESTURES {
             for modifier in [CalibrationModifier::ThumbUp, CalibrationModifier::ThumbDown] {
-                let index = usize::from(gesture.index())
-                    + match modifier {
-                        CalibrationModifier::ThumbUp => 0,
-                        CalibrationModifier::ThumbDown => CalibrationGesture::ALL.len(),
-                    };
+                let index = usize::from(
+                    active_gesture_index(gesture).expect("selected gestures have compact indices"),
+                ) + match modifier {
+                    CalibrationModifier::ThumbUp => 0,
+                    CalibrationModifier::ThumbDown => ACTIVE_GESTURE_COUNT,
+                };
                 let count = self
                     .anchored
                     .counts()
@@ -2405,7 +2447,7 @@ impl Calibration {
                 partition
                     .slot(candidate.physical.index())
                     .ok()
-                    .map(|slot| slot.record.is_product_calibration_model())
+                    .map(|slot| is_active_calibration_model(&slot.record))
             })
             .unwrap_or(false);
         // `StoreSelector` only sees a candidate after `parse_slot` has checked
@@ -2871,7 +2913,10 @@ impl Calibration {
         let _ = gains;
         self.prompt = Some(Prompt {
             gesture,
-            key: settings.key_for(gesture.index()),
+            key: settings.key_for(
+                active_gesture_index(gesture)
+                    .expect("the calibration machine prompts active gestures"),
+            ),
         });
         self.notice = None;
         // The span, on the wire's own sample grid, at the moment it is opened.
@@ -3301,7 +3346,7 @@ impl Calibration {
         }
         let live = partition.slot(identity.physical.index()).ok()?;
         let record = &live.record;
-        if !record.is_product_calibration_model() {
+        if !is_active_calibration_model(record) {
             warn!(
                 "refusing resident generation {} in slot {}: product calibration model is malformed",
                 identity.generation,
@@ -3447,7 +3492,7 @@ mod anchored_lifecycle_tests {
     fn cue_entry(cue_id: u32) -> CalibrationScheduleEntry {
         CalibrationScheduleEntry {
             cue_id: CalibrationCueId::new(cue_id).unwrap(),
-            gesture: CalibrationGesture::ALL[0],
+            gesture: ACTIVE_CALIBRATION_GESTURES[0],
             modifier: CalibrationModifier::ThumbUp,
             track_offset: TrackMilliseconds::new(1_000),
             hold: DurationMilliseconds::new(1_500),
@@ -3498,7 +3543,7 @@ mod anchored_lifecycle_tests {
     fn anchored_cue_owns_capture_and_exactly_once_prompt_delivery() {
         let mut cue = AnchoredCueLifecycle::open(capture(1));
         assert!(cue.is_open());
-        assert_eq!(cue.take_prompt(), Some(CalibrationGesture::ALL[0]));
+        assert_eq!(cue.take_prompt(), Some(ACTIVE_CALIBRATION_GESTURES[0]));
         assert_eq!(cue.take_prompt(), None);
 
         let closed = cue.take_capture().expect("the open cue owns its capture");
@@ -3845,7 +3890,7 @@ mod anchored_lifecycle_tests {
         .unwrap();
         let cue = CalibrationScheduleEntry {
             cue_id: CalibrationCueId::new(1).unwrap(),
-            gesture: CalibrationGesture::ALL[0],
+            gesture: ACTIVE_CALIBRATION_GESTURES[0],
             modifier: CalibrationModifier::ThumbUp,
             track_offset: TrackMilliseconds::new(0),
             hold: DurationMilliseconds::new(1_500),
@@ -3900,11 +3945,35 @@ mod anchored_lifecycle_tests {
     }
 
     #[test]
+    fn reduced_anchored_labels_are_compact_and_exclude_dropped_gestures() {
+        for (index, gesture) in ACTIVE_CALIBRATION_GESTURES.into_iter().enumerate() {
+            let mut entry = cue_entry(index as u32 + 1);
+            entry.gesture = gesture;
+            entry.modifier = CalibrationModifier::ThumbUp;
+            assert_eq!(anchored_label(entry), Some(index as u8));
+            entry.modifier = CalibrationModifier::ThumbDown;
+            assert_eq!(
+                anchored_label(entry),
+                Some((ACTIVE_GESTURE_COUNT + index) as u8)
+            );
+        }
+        for gesture in [
+            CalibrationGesture::WristUlnarDeviation,
+            CalibrationGesture::ThumbExtension,
+        ] {
+            let mut entry = cue_entry(99);
+            entry.gesture = gesture;
+            assert_eq!(anchored_label(entry), None);
+        }
+        assert_eq!(CALIBRATION_CLASS_CAPACITY, 8);
+    }
+
+    #[test]
     fn continue_never_retains_more_than_the_audited_recipe() {
         let constants = Constants::DEFAULT;
         let mut retained_rows = 0usize;
         let mut progress = AnchoredRecipeProgress::default();
-        for gesture in CalibrationGesture::ALL {
+        for gesture in ACTIVE_CALIBRATION_GESTURES {
             for modifier in [CalibrationModifier::ThumbUp, CalibrationModifier::ThumbDown] {
                 let mut entry = cue_entry(1);
                 entry.gesture = gesture;
@@ -3918,11 +3987,10 @@ mod anchored_lifecycle_tests {
         }
 
         assert_eq!(
-            retained_rows,
-            flash_image::CALIBRATION_RECIPE_ROW_CAPACITY,
+            retained_rows, ACTIVE_RECIPE_ROW_COUNT,
             "surplus clean cues from Continue must not consume flash rows"
         );
-        assert_eq!(progress.retained_rep_count(), 130);
+        assert_eq!(progress.retained_rep_count(), 78);
     }
 
     #[test]
@@ -3951,7 +4019,7 @@ mod anchored_lifecycle_tests {
         .unwrap();
         let cue = CalibrationScheduleEntry {
             cue_id: CalibrationCueId::new(1).unwrap(),
-            gesture: CalibrationGesture::ALL[0],
+            gesture: ACTIVE_CALIBRATION_GESTURES[0],
             modifier: CalibrationModifier::ThumbUp,
             track_offset: TrackMilliseconds::new(0),
             hold: DurationMilliseconds::new(1_500),
@@ -3999,12 +4067,16 @@ mod anchored_lifecycle_tests {
     #[test]
     fn candidate_requires_all_fitted_numbers_to_be_finite_before_save() {
         let mut record = SlotRecord::empty(CALIBRATION_CLASS_CAPACITY);
-        assert!(record.is_product_calibration_model());
+        assert!(is_active_calibration_model(&record));
         record.weights[0] = f32::NAN;
-        assert!(!record.is_product_calibration_model());
+        assert!(!is_active_calibration_model(&record));
         record.weights[0] = 0.0;
         record.deviation[0] = 0.0;
-        assert!(!record.is_product_calibration_model());
+        assert!(!is_active_calibration_model(&record));
+
+        let historical = SlotRecord::empty(12);
+        assert!(historical.is_product_calibration_model());
+        assert!(!is_active_calibration_model(&historical));
     }
 
     #[test]

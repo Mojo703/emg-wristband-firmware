@@ -15,6 +15,7 @@
 //! at a precision the caller can name.
 
 use anyhow::{bail, Context, Result};
+use calibration_flow::CALIBRATION_MODEL_CLASS_COUNT;
 #[cfg(feature = "playback")]
 use emg_runtime::calibration::{FeaturePrecision, Int8Quantization};
 use emg_runtime::flash_image::{
@@ -266,7 +267,7 @@ pub(super) struct CalibrationPartition {
     /// Tracked here rather than passed in, because it is the one number a
     /// caller cannot afford to get wrong: reading one row past what was
     /// actually written hands the fit erased flash, whose label byte is 0xFF,
-    /// and a label of 255 indexes off the end of a 12-class probability vector.
+    /// and a label of 255 indexes off the end of the model probability vector.
     flushed: [usize; SLOT_COUNT],
 }
 
@@ -292,6 +293,13 @@ impl CalibrationPartition {
         mapped.open()?;
         match PriorImage::parse(mapped.mapped) {
             Ok(prior) => {
+                if prior.class_count() != CALIBRATION_MODEL_CLASS_COUNT {
+                    bail!(
+                        "v2 prior has {} classes, this reduced build requires {}; its residents cannot be scored safely",
+                        prior.class_count(),
+                        CALIBRATION_MODEL_CLASS_COUNT,
+                    );
+                }
                 info!(
                     "v2 prior mapped: {} rows x {} classes, hash {:08x}, {:?} standardization",
                     prior.row_count(),
@@ -515,11 +523,11 @@ impl CalibrationPartition {
         let rows = bytes.len() / ROW_STRIDE;
         let first_row = self.flushed[index];
         let capacity = flash_image::slot_row_capacity();
-        if first_row + rows > flash_image::CALIBRATION_RECIPE_ROW_CAPACITY {
+        if first_row + rows > super::ACTIVE_RECIPE_ROW_COUNT {
             bail!(
                 "rows {first_row}..{} past the calibration recipe's {}-row budget",
                 first_row + rows,
-                flash_image::CALIBRATION_RECIPE_ROW_CAPACITY
+                super::ACTIVE_RECIPE_ROW_COUNT
             );
         }
         if first_row + rows > capacity {

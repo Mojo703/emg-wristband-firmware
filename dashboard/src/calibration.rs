@@ -544,10 +544,10 @@ fn counts_complete_recipe(counts: &[protocol::CalibrationClassCounts]) -> bool {
         protocol::CalibrationModifier::ThumbUp,
         protocol::CalibrationModifier::ThumbDown,
     ];
-    if counts.len() != protocol::CalibrationGesture::ALL.len() * modifiers.len() {
+    if counts.len() != calibration_flow::ACTIVE_GESTURE_COUNT * modifiers.len() {
         return false;
     }
-    protocol::CalibrationGesture::ALL
+    calibration_flow::ACTIVE_CALIBRATION_GESTURES
         .into_iter()
         .flat_map(|gesture| {
             modifiers
@@ -1901,7 +1901,8 @@ fn playing_snapshot(
         .entries
         .iter()
         .map(|entry| protocol::GuidedCalibrationCue {
-            visual_lane: entry.gesture.index(),
+            visual_lane: calibration_flow::active_gesture_index(entry.gesture)
+                .expect("calibration tracks contain only active gestures"),
             at: u64::from(entry.track_offset.get()),
             hold: u64::from(entry.hold.get()),
             thumb_variant: match entry.modifier {
@@ -1934,15 +1935,16 @@ fn playing_snapshot(
 fn calibration_lanes(
     collection_classes: &[protocol::CollectionClass],
 ) -> Vec<protocol::GuidedCalibrationLane> {
-    protocol::CalibrationGesture::ALL
+    calibration_flow::ACTIVE_CALIBRATION_GESTURES
         .into_iter()
-        .map(|gesture| {
+        .enumerate()
+        .map(|(visual_lane, gesture)| {
             let id = calibration_gesture_id(gesture);
             let descriptor = collection_classes
                 .iter()
                 .find(|descriptor| descriptor.id.0 == id);
             protocol::GuidedCalibrationLane {
-                visual_lane: gesture.index(),
+                visual_lane: visual_lane as u8,
                 id: id.into(),
                 label: descriptor.map_or_else(|| id.replace('_', " "), |value| value.label.clone()),
                 color_name: descriptor.map_or_else(|| "gray".into(), |value| value.color.clone()),
@@ -2297,6 +2299,10 @@ mod tests {
         duplicate[1] = duplicate[0];
         assert!(!counts_complete_recipe(&duplicate));
 
+        let mut inactive = complete.clone();
+        inactive[0].gesture = protocol::CalibrationGesture::WristUlnarDeviation;
+        assert!(!counts_complete_recipe(&inactive));
+
         let mut zero_target = complete;
         zero_target[0].target_count = 0;
         assert!(!counts_complete_recipe(&zero_target));
@@ -2468,7 +2474,7 @@ mod tests {
     }
 
     fn complete_recipe_counts() -> Vec<protocol::CalibrationClassCounts> {
-        protocol::CalibrationGesture::ALL
+        calibration_flow::ACTIVE_CALIBRATION_GESTURES
             .into_iter()
             .flat_map(|gesture| {
                 [
@@ -2978,7 +2984,7 @@ mod tests {
         second_track.id = protocol::TrackId("second-calibration-track".into());
         second_track.title = "Second Calibration Track".into();
         second_track.cue_count = 2;
-        second_track.cue_shortfall = 128;
+        second_track.cue_shortfall = 76;
         second_track
             .entries
             .push(protocol::CalibrationScheduleEntry {
@@ -3274,7 +3280,7 @@ mod tests {
             })
             .unwrap();
 
-        let second_counts = protocol::CalibrationGesture::ALL
+        let second_counts = calibration_flow::ACTIVE_CALIBRATION_GESTURES
             .into_iter()
             .flat_map(|gesture| {
                 [
@@ -3288,14 +3294,14 @@ mod tests {
             .map(|(index, (gesture, modifier))| {
                 let (accepted_count, target_count) = match modifier {
                     protocol::CalibrationModifier::ThumbUp => (12, 10),
-                    protocol::CalibrationModifier::ThumbDown if index == 9 => (16, 16),
+                    protocol::CalibrationModifier::ThumbDown if index == 5 => (16, 16),
                     protocol::CalibrationModifier::ThumbDown => (17, 16),
                 };
                 protocol::CalibrationClassCounts {
                     gesture,
                     modifier,
                     accepted_count,
-                    rejected_count: if index == 9 { 0 } else { 4 },
+                    rejected_count: if index == 5 { 0 } else { 4 },
                     target_count,
                     deficit_count: 0,
                 }
@@ -3333,8 +3339,8 @@ mod tests {
                 track_title,
                 candidate_available: true,
                 continue_available: false,
-                valid_reps: 144,
-                invalid_reps: 36,
+                valid_reps: 86,
+                invalid_reps: 20,
                 ref deficits,
                 ..
             }) if track_title == &second_track.title && deficits.is_empty()
@@ -3726,7 +3732,8 @@ mod tests {
         track.entries = (0..130)
             .map(|index| protocol::CalibrationScheduleEntry {
                 cue_id: protocol::CalibrationCueId::new(index + 1).unwrap(),
-                gesture: protocol::CalibrationGesture::ALL[index as usize % 5],
+                gesture: calibration_flow::ACTIVE_CALIBRATION_GESTURES
+                    [index as usize % calibration_flow::ACTIVE_GESTURE_COUNT],
                 modifier: if index % 2 == 0 {
                     protocol::CalibrationModifier::ThumbUp
                 } else {
@@ -3998,8 +4005,11 @@ mod tests {
         });
 
         let lanes = calibration_lanes(&classes);
-        assert_eq!(lanes.len(), 5);
-        for (lane, class) in lanes.iter().zip(&classes) {
+        assert_eq!(lanes.len(), calibration_flow::ACTIVE_GESTURE_COUNT);
+        for (lane, class) in lanes
+            .iter()
+            .zip(&classes[..calibration_flow::ACTIVE_GESTURE_COUNT])
+        {
             assert_eq!(lane.id, class.id.0);
             assert_eq!(lane.label, class.label);
             assert_eq!(lane.color_name, class.color);

@@ -11,7 +11,36 @@ use crate::{Constants, LabeledSpan, SongAnchor};
 
 pub const ANCHORED_COMMAND_TARGET: u32 = 10;
 pub const ANCHORED_NO_OP_TARGET: u32 = 16;
-pub const ANCHORED_CLASS_COUNT: usize = CalibrationGesture::ALL.len() * 2;
+/// One complete paired semantic cycle. The validated streaming fit checkpoints
+/// after this many newly retained prompts; wall-clock fit completion must not
+/// choose the checkpoint boundaries.
+pub const ANCHORED_CHECKPOINT_PROMPTS: u32 = 10;
+/// The one product selection point for guided calibration and model commands.
+pub const ACTIVE_CALIBRATION_GESTURES: [CalibrationGesture; 3] = [
+    CalibrationGesture::WristPronation,
+    CalibrationGesture::WristSupination,
+    CalibrationGesture::WristRadialDeviation,
+];
+pub const ACTIVE_GESTURE_COUNT: usize = ACTIVE_CALIBRATION_GESTURES.len();
+pub const ANCHORED_CLASS_COUNT: usize = ACTIVE_GESTURE_COUNT * 2;
+pub const CALIBRATION_MODEL_CLASS_COUNT: usize = ANCHORED_CLASS_COUNT + 2;
+
+/// Compact command index in the active model, independent of the protocol
+/// enum's stable full-gesture index.
+pub fn active_gesture_index(gesture: CalibrationGesture) -> Option<u8> {
+    ACTIVE_CALIBRATION_GESTURES
+        .iter()
+        .position(|candidate| *candidate == gesture)
+        .map(|index| index as u8)
+}
+
+pub const fn active_gesture_from_index(index: u8) -> Option<CalibrationGesture> {
+    if (index as usize) < ACTIVE_GESTURE_COUNT {
+        Some(ACTIVE_CALIBRATION_GESTURES[index as usize])
+    } else {
+        None
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AnchoredClassCount {
@@ -37,23 +66,31 @@ impl AnchoredRecipeProgress {
         &self.counts
     }
 
-    pub fn count_mut(&mut self, entry: CalibrationScheduleEntry) -> &mut AnchoredClassCount {
-        &mut self.counts[anchored_class_index(entry)]
+    fn count_mut(&mut self, entry: CalibrationScheduleEntry) -> &mut AnchoredClassCount {
+        &mut self.counts[anchored_class_index(entry).expect("inactive gesture has no recipe class")]
     }
 
     /// Whether a clean next cue belongs to the bounded training recipe.
     pub fn retains_next(&self, entry: CalibrationScheduleEntry) -> bool {
-        self.counts[anchored_class_index(entry)].accepted < anchored_target_count(entry.modifier)
+        anchored_class_index(entry).is_some_and(|index| {
+            self.counts[index].accepted < anchored_target_count(entry.modifier)
+        })
     }
 
     pub fn record_accepted(&mut self, entry: CalibrationScheduleEntry) -> bool {
         let retain = self.retains_next(entry);
+        if !retain && anchored_class_index(entry).is_none() {
+            return false;
+        }
         let count = self.count_mut(entry);
         count.accepted = count.accepted.saturating_add(1);
         retain
     }
 
     pub fn record_rejected(&mut self, entry: CalibrationScheduleEntry) {
+        if anchored_class_index(entry).is_none() {
+            return;
+        }
         let count = self.count_mut(entry);
         count.rejected = count.rejected.saturating_add(1);
     }
@@ -64,18 +101,20 @@ impl AnchoredRecipeProgress {
     /// flash-row retention. A host may show a short song's counts, but only a
     /// complete recipe may enter final fitting and resident promotion.
     pub fn is_complete(&self) -> bool {
-        CalibrationGesture::ALL.into_iter().all(|gesture| {
+        ACTIVE_CALIBRATION_GESTURES.into_iter().all(|gesture| {
             [CalibrationModifier::ThumbUp, CalibrationModifier::ThumbDown]
                 .into_iter()
                 .all(|modifier| {
-                    self.counts[anchored_class_index_parts(gesture, modifier)].accepted
+                    self.counts[anchored_class_index_parts(gesture, modifier)
+                        .expect("active gesture has a recipe class")]
+                    .accepted
                         >= anchored_target_count(modifier)
                 })
         })
     }
 
     pub fn retained_rep_count(&self) -> u32 {
-        CalibrationGesture::ALL
+        ACTIVE_CALIBRATION_GESTURES
             .into_iter()
             .flat_map(|gesture| {
                 [CalibrationModifier::ThumbUp, CalibrationModifier::ThumbDown]
@@ -83,11 +122,21 @@ impl AnchoredRecipeProgress {
                     .map(move |modifier| (gesture, modifier))
             })
             .map(|(gesture, modifier)| {
-                self.counts[anchored_class_index_parts(gesture, modifier)]
-                    .accepted
-                    .min(anchored_target_count(modifier))
+                self.counts[anchored_class_index_parts(gesture, modifier)
+                    .expect("active gesture has a recipe class")]
+                .accepted
+                .min(anchored_target_count(modifier))
             })
             .sum()
+    }
+
+    /// Whether the rows retained so far end a validated non-final checkpoint.
+    ///
+    /// The completed recipe goes directly to final polish rather than running
+    /// a redundant non-final checkpoint first.
+    pub fn checkpoint_due(&self) -> bool {
+        let retained = self.retained_rep_count();
+        retained != 0 && retained % ANCHORED_CHECKPOINT_PROMPTS == 0 && !self.is_complete()
     }
 }
 
@@ -98,16 +147,22 @@ pub const fn anchored_target_count(modifier: CalibrationModifier) -> u32 {
     }
 }
 
-pub fn anchored_class_index(entry: CalibrationScheduleEntry) -> usize {
+pub fn anchored_class_index(entry: CalibrationScheduleEntry) -> Option<usize> {
     anchored_class_index_parts(entry.gesture, entry.modifier)
 }
 
-fn anchored_class_index_parts(gesture: CalibrationGesture, modifier: CalibrationModifier) -> usize {
-    usize::from(gesture.index())
-        + match modifier {
-            CalibrationModifier::ThumbUp => 0,
-            CalibrationModifier::ThumbDown => CalibrationGesture::ALL.len(),
-        }
+fn anchored_class_index_parts(
+    gesture: CalibrationGesture,
+    modifier: CalibrationModifier,
+) -> Option<usize> {
+    let gesture = usize::from(active_gesture_index(gesture)?);
+    Some(
+        gesture
+            + match modifier {
+                CalibrationModifier::ThumbUp => 0,
+                CalibrationModifier::ThumbDown => ACTIVE_GESTURE_COUNT,
+            },
+    )
 }
 
 /// Project an authored cue instant onto the acquisition grid and return the
@@ -150,12 +205,50 @@ mod tests {
     }
 
     #[test]
+    fn checkpoints_follow_retained_prompt_count_not_executor_timing() {
+        let mut progress = AnchoredRecipeProgress::default();
+        let command = entry(
+            CalibrationGesture::WristPronation,
+            CalibrationModifier::ThumbUp,
+        );
+        for retained in 1..ANCHORED_COMMAND_TARGET {
+            assert!(progress.record_accepted(command));
+            assert_eq!(
+                progress.checkpoint_due(),
+                retained % ANCHORED_CHECKPOINT_PROMPTS == 0
+            );
+        }
+        assert!(progress.record_accepted(command));
+        assert!(progress.checkpoint_due());
+        // Surplus authored cues are not retained and cannot manufacture a new
+        // checkpoint boundary.
+        assert!(!progress.record_accepted(command));
+        assert!(progress.checkpoint_due());
+    }
+
+    #[test]
+    fn complete_recipe_goes_directly_to_final_polish() {
+        let mut progress = AnchoredRecipeProgress::default();
+        for gesture in ACTIVE_CALIBRATION_GESTURES {
+            for _ in 0..ANCHORED_COMMAND_TARGET {
+                assert!(progress.record_accepted(entry(gesture, CalibrationModifier::ThumbUp,)));
+            }
+            for _ in 0..ANCHORED_NO_OP_TARGET {
+                assert!(progress.record_accepted(entry(gesture, CalibrationModifier::ThumbDown,)));
+            }
+        }
+        assert!(progress.is_complete());
+        assert_eq!(progress.retained_rep_count(), 78);
+        assert!(!progress.checkpoint_due());
+    }
+
+    #[test]
     fn surplus_continue_cues_count_but_never_consume_recipe_rows() {
         let constants = Constants::DEFAULT;
         let mut progress = AnchoredRecipeProgress::default();
         assert!(!progress.is_complete());
         let mut retained_rows = 0;
-        for gesture in CalibrationGesture::ALL {
+        for gesture in ACTIVE_CALIBRATION_GESTURES {
             for modifier in [CalibrationModifier::ThumbUp, CalibrationModifier::ThumbDown] {
                 let cue = entry(gesture, modifier);
                 for _ in 0..anchored_target_count(modifier) + 20 {
@@ -165,9 +258,41 @@ mod tests {
                 }
             }
         }
-        assert_eq!(progress.retained_rep_count(), 130);
-        assert_eq!(retained_rows, 1_170);
+        assert_eq!(progress.retained_rep_count(), 78);
+        assert_eq!(retained_rows, 702);
         assert!(progress.is_complete());
+    }
+
+    #[test]
+    fn inactive_protocol_gestures_have_no_recipe_class() {
+        let mut progress = AnchoredRecipeProgress::default();
+        for gesture in [
+            CalibrationGesture::WristUlnarDeviation,
+            CalibrationGesture::ThumbExtension,
+        ] {
+            let cue = entry(gesture, CalibrationModifier::ThumbUp);
+            assert_eq!(anchored_class_index(cue), None);
+            assert!(!progress.record_accepted(cue));
+            progress.record_rejected(cue);
+        }
+        assert_eq!(progress, AnchoredRecipeProgress::default());
+    }
+
+    #[test]
+    fn active_gestures_use_compact_paired_labels() {
+        for (index, gesture) in ACTIVE_CALIBRATION_GESTURES.into_iter().enumerate() {
+            assert_eq!(active_gesture_index(gesture), Some(index as u8));
+            assert_eq!(active_gesture_from_index(index as u8), Some(gesture));
+            assert_eq!(
+                anchored_class_index(entry(gesture, CalibrationModifier::ThumbUp)),
+                Some(index)
+            );
+            assert_eq!(
+                anchored_class_index(entry(gesture, CalibrationModifier::ThumbDown)),
+                Some(ACTIVE_GESTURE_COUNT + index)
+            );
+        }
+        assert_eq!(active_gesture_from_index(ACTIVE_GESTURE_COUNT as u8), None);
     }
 
     #[test]

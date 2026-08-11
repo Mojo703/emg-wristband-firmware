@@ -112,9 +112,9 @@ fn decode(bytes: &[u8]) -> Option<Control> {
 mod tests {
     use super::*;
     use protocol::{
-        CalibrationCueId, CalibrationGesture, CalibrationModifier, CalibrationRunId,
-        CalibrationRunKey, CalibrationScheduleEntry, CalibrationScheduleRevision,
-        CalibrationSessionId, DurationMilliseconds, TrackMilliseconds,
+        CalibrationCueId, CalibrationModifier, CalibrationRunId, CalibrationRunKey,
+        CalibrationScheduleEntry, CalibrationScheduleRevision, CalibrationSessionId,
+        DurationMilliseconds, TrackMilliseconds,
     };
 
     #[test]
@@ -181,17 +181,18 @@ mod tests {
     }
 
     #[test]
-    fn anchored_song_controls_accept_the_complete_130_cue_upload_shape() {
+    fn anchored_song_controls_accept_the_complete_78_cue_upload_shape() {
         let run = CalibrationRunKey {
             session_id: CalibrationSessionId::new(7).unwrap(),
             run_id: CalibrationRunId::new(3).unwrap(),
         };
         let schedule_revision = CalibrationScheduleRevision::new(9).unwrap();
         let content_identity = "track-content-sha256".to_owned();
-        let entries: Vec<_> = (0..130)
+        let entries: Vec<_> = (0..78)
             .map(|index| CalibrationScheduleEntry {
                 cue_id: CalibrationCueId::new(index + 1).unwrap(),
-                gesture: CalibrationGesture::ALL[index as usize % CalibrationGesture::ALL.len()],
+                gesture: calibration_flow::ACTIVE_CALIBRATION_GESTURES
+                    [index as usize % calibration_flow::ACTIVE_GESTURE_COUNT],
                 modifier: if index % 2 == 0 {
                     CalibrationModifier::ThumbUp
                 } else {
@@ -237,8 +238,8 @@ mod tests {
         });
         assert_eq!(
             frames.len(),
-            9,
-            "begin + 32/32/32/32/2 + commit + heartbeat + explicit interrupt"
+            7,
+            "begin + 32/32/14 + commit + heartbeat + explicit interrupt"
         );
         let mut wire = Vec::new();
         let mut chunk_zero_payload_len = None;

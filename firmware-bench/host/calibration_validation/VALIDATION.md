@@ -976,6 +976,33 @@ with a threshold that does not work.
    same wearer as every fixture; second-wearer sensitivity belongs in the
    capstone limitations rather than blocking here.
 
+## 19. One shared gain vector breaks the paired result
+
+The interleaved and sequential-assignment experiments consumed the existing
+device feature cache. That cache references every recording with its own
+host-fitted full-session gain vector. The paired thumb-up and thumb-down rows
+therefore carry different transforms, while a real calibration estimates one
+gain vector before the combined song and retains it for collection and later
+inference.
+
+`experiment_19_shared_gain_parity.py` holds the selected paired recipe fixed at
+10/16 reps, ten-prompt checkpoints, sixteen checkpoint passes, ten final
+passes, and prior stride two. It then recomputes all four mission sessions with
+one shared gain vector at a time. The checked run produced:
+
+| gain condition | gain RMS delta | gain max delta | FN | misclass | false fires | rest s/m | fit passes |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| per-session fixture control | -- | -- | 5/50 | 0/50 | 2/80 | 0/0 | 202 |
+| shared 22-08-47 command gain | 1.851 | 8.041 | 7/50 | 2/50 | 21/80 | 0/1 | 202 |
+| shared 22-16-46 anti gain | 1.653 | 5.830 | 5/50 | 4/50 | 32/80 | 0/6 | 202 |
+| shared 21-22-54 static-rest gain | 2.234 | 8.041 | 4/50 | 11/50 | 26/80 | 0/6 | 202 |
+| shared 21-28-08 moving-rest gain | 1.480 | 4.591 | 12/50 | 0/50 | 18/80 | 0/3 | 202 |
+
+None of the four possible shared mission vectors preserves the result. Every
+one violates at least command classification or recall, false-fire, and
+moving-rest requirements. The paired recipe must be revalidated with one common
+gain transform before its golden result can be claimed end to end.
+
 ## Running
 
 ```
@@ -991,6 +1018,7 @@ python3 experiment_8_cue_floor.py
 python3 experiment_9_budget.py            # quality against F1's measured cost
 python3 experiment_10_product_shape.py   # the two constants scored together
 python3 experiment_11_energy_floor.py    # the rep-validity energy check
+python3 experiment_19_shared_gain_parity.py # one live-device gain across missions
 python3 write_constants.py                # the deliverable
 ```
 

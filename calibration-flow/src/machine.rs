@@ -29,13 +29,13 @@
 use crate::gate::{GateVerdict, QualityGate};
 use crate::grid::LabeledSpan;
 use crate::validity::RepEvidence;
-use crate::Constants;
+use crate::{active_gesture_index, Constants, ACTIVE_CALIBRATION_GESTURES, ACTIVE_GESTURE_COUNT};
 use core::num::NonZeroU32;
 use protocol::{CalibrationGesture, CalibrationOutcome, CalibrationPhase, ClassPair, RepRejection};
 
 pub use protocol::CalibrationOutcome as RunOutcome;
 
-const CLASS_COUNT: usize = CalibrationGesture::ALL.len();
+const CLASS_COUNT: usize = ACTIVE_GESTURE_COUNT;
 
 /// The next thing the driver has to do. One at a time: the machine will not
 /// offer another until this one has been reported done.
@@ -49,7 +49,8 @@ pub enum Action {
     Prompt {
         gesture: CalibrationGesture,
         /// The class index the rows take, which is the gesture's own index in
-        /// the thumb-up block and five past it in the thumb-down block.
+        /// the thumb-up block and one active-command block past it in the
+        /// thumb-down block.
         label: u8,
         generation: u32,
         span: LabeledSpan,
@@ -117,12 +118,14 @@ impl Block {
     }
 
     /// The class index this block's rows carry. The thumb-up block collects the
-    /// five commands; the thumb-down block collects the five no-ops that share
+    /// active commands; the thumb-down block collects the paired no-ops that share
     /// their wrist motion and differ only by the modifier.
     fn label_for(self, gesture: CalibrationGesture) -> u8 {
+        let gesture =
+            active_gesture_index(gesture).expect("the machine prompts only active gestures");
         match self {
-            Block::ThumbUp => gesture.index(),
-            Block::ThumbDown => CLASS_COUNT as u8 + gesture.index(),
+            Block::ThumbUp => gesture,
+            Block::ThumbDown => CLASS_COUNT as u8 + gesture,
         }
     }
 
@@ -276,7 +279,7 @@ pub struct Prompting {
 
 impl Prompting {
     fn gesture(&self) -> CalibrationGesture {
-        CalibrationGesture::ALL[self.cursor]
+        ACTIVE_CALIBRATION_GESTURES[self.cursor]
     }
 
     /// Ask, at `now_sample`, and hand the phase over to the rep.
@@ -347,7 +350,8 @@ impl Performing {
             mut asking,
             in_flight,
         } = self;
-        let class = in_flight.gesture.index() as usize;
+        let class = active_gesture_index(in_flight.gesture).expect("an in-flight prompt is active")
+            as usize;
         let Some(rejection) = evidence.rejection() else {
             asking.progress.accepted_reps[class] += 1;
             asking.progress.rows_stored += asking.progress.constants.rows_per_rep();
@@ -738,8 +742,12 @@ impl Run {
 
     pub fn reps_for(&self, gesture: CalibrationGesture) -> (u32, u32) {
         let progress = self.progress();
-        let class = gesture.index() as usize;
-        (progress.accepted_reps[class], progress.rejected_reps[class])
+        active_gesture_index(gesture).map_or((0, 0), |class| {
+            (
+                progress.accepted_reps[class as usize],
+                progress.rejected_reps[class as usize],
+            )
+        })
     }
 
     pub fn rows_stored(&self) -> u32 {
@@ -904,7 +912,7 @@ mod tests {
 
     /// Answer every gesture of one round cleanly, stopping before the flush.
     fn clean_collection_round(mut run: Run, mut now: u64) -> (Run, u64) {
-        for gesture in CalibrationGesture::ALL {
+        for gesture in ACTIVE_CALIBRATION_GESTURES {
             let (asked, action) = run.poll(now);
             let Some(Action::Prompt {
                 gesture: prompted,
@@ -1076,7 +1084,7 @@ mod tests {
         let (mut run, settled) = started();
         let mut now = settled;
         let mut open_spans = alloc::vec::Vec::new();
-        for _ in CalibrationGesture::ALL {
+        for _ in ACTIVE_CALIBRATION_GESTURES {
             let (asked, action) = run.poll(now);
             let Some(Action::Prompt { span, .. }) = action else {
                 panic!("a prompt");
@@ -1124,7 +1132,7 @@ mod tests {
         // The prompt just issued is the first of the block; finish its round by
         // hand, then run the rest.
         let (mut run, _) = run.resolve(good_rep());
-        for gesture in &CalibrationGesture::ALL[1..] {
+        for gesture in &ACTIVE_CALIBRATION_GESTURES[1..] {
             let (asked, action) = run.poll(now);
             let Some(Action::Prompt {
                 gesture: prompted,
@@ -1136,8 +1144,11 @@ mod tests {
                 panic!("a prompt");
             };
             assert_eq!(prompted, *gesture);
-            // Thumb-down rows are the no-op classes, five past the commands.
-            assert_eq!(label, CLASS_COUNT as u8 + gesture.index());
+            // Thumb-down rows are the no-op classes, after the commands.
+            assert_eq!(
+                label,
+                CLASS_COUNT as u8 + active_gesture_index(*gesture).unwrap()
+            );
             now = span.end_sample;
             (run, _) = asked.resolve(good_rep());
         }
@@ -1181,7 +1192,7 @@ mod tests {
         assert_eq!(run.rounds_planned(), constants.thumb_up_round_floor);
 
         // One round where pronation is confused with supination throughout.
-        for gesture in CalibrationGesture::ALL {
+        for gesture in ACTIVE_CALIBRATION_GESTURES {
             let (asked, action) = run.poll(now);
             let Some(Action::Prompt { span, .. }) = action else {
                 panic!("a prompt");
@@ -1226,7 +1237,7 @@ mod tests {
         let (mut run, settled) = started();
         let mut now = settled;
         for _ in 0..constants.thumb_up_round_floor {
-            for gesture in CalibrationGesture::ALL {
+            for gesture in ACTIVE_CALIBRATION_GESTURES {
                 let (asked, action) = run.poll(now);
                 let Some(Action::Prompt { span, .. }) = action else {
                     panic!("a prompt");

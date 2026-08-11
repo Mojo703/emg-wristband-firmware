@@ -143,10 +143,10 @@ export function buildPlayfield(
   return { lanes, totalNotes };
 }
 
-/** Build the renderer's five-lane model from mode-neutral presentation data.
+/** Build the renderer's lane model from mode-neutral presentation data.
  * Session authority remains outside this module. */
 export function buildPresentedPlayfield(
-  lanes: FiveVisualLanes,
+  lanes: readonly VisualLanePresentation[],
   cues: readonly CuePresentation[],
 ): Playfield {
   const blocks = new Map<VisualLane, Block[]>();

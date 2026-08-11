@@ -9,7 +9,6 @@
   import PlayfieldView from '../../lib/collect/PlayfieldView.svelte';
   import {
     buildPresentedPlayfield,
-    type FiveVisualLanes,
     type VisualLanePresentation,
   } from '../../lib/collect/field';
   import {
@@ -76,7 +75,7 @@
         colorName: lane.colorName,
       };
     };
-    const lanes: FiveVisualLanes = [present(0), present(1), present(2), present(3), present(4)];
+    const lanes = snapshot.lanes.map((_, index) => present(index));
     return buildPresentedPlayfield(lanes, snapshot.cues);
   });
   const laneColors = $derived(

@@ -9,28 +9,29 @@ use sha2::{Digest, Sha256};
 
 pub const HOLD_MILLISECONDS: u32 = protocol::CALIBRATION_CUE_HOLD_MILLISECONDS;
 pub const MINIMUM_RECOVERY_MILLISECONDS: u32 = protocol::CALIBRATION_CUE_RECOVERY_MILLISECONDS;
-pub const COMMAND_SEMANTIC_COUNT: usize = 5;
+pub const COMMAND_SEMANTIC_COUNT: usize = calibration_flow::ACTIVE_GESTURE_COUNT;
 pub const COMMAND_CUES_PER_CLASS: usize = 10;
 pub const ANTI_CUES_PER_CLASS: usize = 16;
 pub const MAXIMUM_CUES: usize =
     COMMAND_SEMANTIC_COUNT * (COMMAND_CUES_PER_CLASS + ANTI_CUES_PER_CLASS);
-pub const SEMANTIC_COLUMN_COUNT: usize = 10;
+pub const SEMANTIC_COLUMN_COUNT: usize = COMMAND_SEMANTIC_COUNT * 2;
 pub const CALIBRATION_LEVEL_SCHEMA_VERSION: u32 = 2;
 const LEGACY_CALIBRATION_LEVEL_GENERATOR_VERSION: u32 = 2;
+const FULL_GESTURE_CALIBRATION_LEVEL_GENERATOR_VERSION: u32 = 4;
+const LEGACY_COMMAND_SEMANTIC_COUNT: usize = protocol::CalibrationGesture::ALL.len();
+const LEGACY_SEMANTIC_COLUMN_COUNT: usize = LEGACY_COMMAND_SEMANTIC_COUNT * 2;
+const LEGACY_MAXIMUM_CUES: usize =
+    LEGACY_COMMAND_SEMANTIC_COUNT * (COMMAND_CUES_PER_CLASS + ANTI_CUES_PER_CLASS);
 /// Version 3 allowed zero recovery for a paired thumb-state switch, but firmware's
 /// anchored-song contract still requires 500 ms after every cue. Catalog loading
 /// regenerates this version in memory from the retained source schedule.
 pub(crate) const INCOMPATIBLE_CALIBRATION_LEVEL_GENERATOR_VERSION: u32 = 3;
-pub const CALIBRATION_LEVEL_GENERATOR_VERSION: u32 = 4;
+pub const CALIBRATION_LEVEL_GENERATOR_VERSION: u32 = 5;
 #[cfg(test)]
 pub const CALIBRATION_SOURCE_LEVEL: &str = "hard";
 /// Prefer the established hard schedule when counts tie, but allow a more
 /// suitably spaced retained level to supply more valid calibration cues.
 pub const CALIBRATION_SOURCE_LEVEL_PREFERENCE: [&str; 3] = ["hard", "medium", "easy"];
-
-/// Fixed measured order, beginning at command zero. No implicit song/session
-/// rotation participates in the imported product.
-const PAIRED_SEMANTIC_CYCLE: [u8; SEMANTIC_COLUMN_COUNT] = [0, 5, 1, 6, 2, 7, 3, 8, 4, 9];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CalibrationLevelProduct {
@@ -136,7 +137,9 @@ impl CalibrationLevelProduct {
         }
         if !matches!(
             self.generator_version,
-            LEGACY_CALIBRATION_LEVEL_GENERATOR_VERSION | CALIBRATION_LEVEL_GENERATOR_VERSION
+            LEGACY_CALIBRATION_LEVEL_GENERATOR_VERSION
+                | FULL_GESTURE_CALIBRATION_LEVEL_GENERATOR_VERSION
+                | CALIBRATION_LEVEL_GENERATOR_VERSION
         ) {
             anyhow::bail!(
                 "calibration level generator {} is not supported",
@@ -146,16 +149,18 @@ impl CalibrationLevelProduct {
         if !CALIBRATION_SOURCE_LEVEL_PREFERENCE.contains(&self.source_level.as_str()) {
             anyhow::bail!("calibration level names source level {}", self.source_level);
         }
-        if self.notes.len() > MAXIMUM_CUES {
+        let (_, semantic_count, maximum_cues) = recipe_shape(self.generator_version);
+        if self.notes.len() > maximum_cues {
             anyhow::bail!("calibration level has {} cues", self.notes.len());
         }
 
-        let expected_columns = sequential_columns(self.notes.len());
+        let expected_columns =
+            sequential_columns_for_version(self.notes.len(), self.generator_version);
         for (position, (note, expected_column)) in
             self.notes.iter().zip(expected_columns).enumerate()
         {
             anyhow::ensure!(
-                usize::from(note.semantic_column) < SEMANTIC_COLUMN_COUNT,
+                usize::from(note.semantic_column) < semantic_count,
                 "calibration cue {position} has semantic column {}",
                 note.semantic_column
             );
@@ -248,9 +253,10 @@ fn select_notes(
     source_duration_ms: u32,
     generator_version: u32,
 ) -> Vec<CalibrationLevelProductNote> {
-    let mut selected = Vec::with_capacity(MAXIMUM_CUES.min(source_notes.len()));
+    let (_, _, maximum_cues) = recipe_shape(generator_version);
+    let mut selected = Vec::with_capacity(maximum_cues.min(source_notes.len()));
     let mut next_eligible_onset = 0;
-    let columns = sequential_columns(MAXIMUM_CUES);
+    let columns = sequential_columns_for_version(maximum_cues, generator_version);
 
     for (source_index, source) in source_notes.iter().copied().enumerate() {
         let Some(release) = source.time_ms.checked_add(HOLD_MILLISECONDS) else {
@@ -268,7 +274,7 @@ fn select_notes(
             },
             semantic_column,
         });
-        if selected.len() == MAXIMUM_CUES {
+        if selected.len() == maximum_cues {
             break;
         }
         next_eligible_onset = release.saturating_add(recovery_between(
@@ -285,8 +291,9 @@ fn select_notes(
 /// Version 3 incorrectly made paired thumb-state switches exempt; preserve that
 /// behavior only so tests and catalog migration can identify its persisted products.
 const fn recovery_between(previous: u8, next: u8, generator_version: u32) -> u32 {
+    let (command_count, _, _) = recipe_shape(generator_version);
     if generator_version == INCOMPATIBLE_CALIBRATION_LEVEL_GENERATOR_VERSION
-        && previous % COMMAND_SEMANTIC_COUNT as u8 == next % COMMAND_SEMANTIC_COUNT as u8
+        && previous % command_count as u8 == next % command_count as u8
     {
         0
     } else {
@@ -297,24 +304,64 @@ const fn recovery_between(previous: u8, next: u8, generator_version: u32) -> u32
 /// Deal authored cue slots through the measured class queues. Commands stop
 /// after ten occurrences each; anti classes continue to sixteen each while the
 /// dealer skips exhausted command positions in the same fixed cycle.
+#[cfg(test)]
 fn sequential_columns(cue_count: usize) -> Vec<u8> {
-    let mut remaining = [ANTI_CUES_PER_CLASS; SEMANTIC_COLUMN_COUNT];
-    remaining[..COMMAND_SEMANTIC_COUNT].fill(COMMAND_CUES_PER_CLASS);
-    let mut columns = Vec::with_capacity(cue_count.min(MAXIMUM_CUES));
-    while columns.len() < cue_count && remaining.iter().any(|&count| count > 0) {
-        for &column in &PAIRED_SEMANTIC_CYCLE {
-            let remaining = &mut remaining[usize::from(column)];
-            if *remaining == 0 {
-                continue;
+    sequential_columns_for_version(cue_count, CALIBRATION_LEVEL_GENERATOR_VERSION)
+}
+
+fn sequential_columns_for_version(cue_count: usize, generator_version: u32) -> Vec<u8> {
+    let (command_count, semantic_count, maximum_cues) = recipe_shape(generator_version);
+    let mut remaining = [0usize; LEGACY_SEMANTIC_COLUMN_COUNT];
+    remaining[..command_count].fill(COMMAND_CUES_PER_CLASS);
+    remaining[command_count..semantic_count].fill(ANTI_CUES_PER_CLASS);
+    let mut columns = Vec::with_capacity(cue_count.min(maximum_cues));
+    while columns.len() < cue_count && remaining[..semantic_count].iter().any(|&count| count > 0) {
+        for command in 0..command_count {
+            for column in [command, command + command_count] {
+                let remaining = &mut remaining[column];
+                if *remaining == 0 {
+                    continue;
+                }
+                columns.push(column as u8);
+                *remaining -= 1;
+                if columns.len() == cue_count {
+                    break;
+                }
             }
-            columns.push(column);
-            *remaining -= 1;
             if columns.len() == cue_count {
                 break;
             }
         }
     }
     columns
+}
+
+const fn recipe_shape(generator_version: u32) -> (usize, usize, usize) {
+    if generator_version >= CALIBRATION_LEVEL_GENERATOR_VERSION {
+        (COMMAND_SEMANTIC_COUNT, SEMANTIC_COLUMN_COUNT, MAXIMUM_CUES)
+    } else {
+        (
+            LEGACY_COMMAND_SEMANTIC_COUNT,
+            LEGACY_SEMANTIC_COLUMN_COUNT,
+            LEGACY_MAXIMUM_CUES,
+        )
+    }
+}
+
+pub(crate) fn semantic_column_parts(
+    semantic_column: u8,
+) -> Option<(protocol::CalibrationGesture, protocol::CalibrationModifier)> {
+    if usize::from(semantic_column) >= SEMANTIC_COLUMN_COUNT {
+        return None;
+    }
+    let compact = semantic_column % COMMAND_SEMANTIC_COUNT as u8;
+    let gesture = calibration_flow::active_gesture_from_index(compact)?;
+    let modifier = if usize::from(semantic_column) < COMMAND_SEMANTIC_COUNT {
+        protocol::CalibrationModifier::ThumbUp
+    } else {
+        protocol::CalibrationModifier::ThumbDown
+    };
+    Some((gesture, modifier))
 }
 
 #[cfg(test)]
@@ -364,7 +411,7 @@ mod tests {
         }
     }
 
-    const VISUAL_LANE_COUNT: usize = 5;
+    const VISUAL_LANE_COUNT: usize = COMMAND_SEMANTIC_COUNT;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum ThumbVariant {
@@ -556,10 +603,7 @@ mod tests {
         assert_eq!(summary.maximum_cue_count, MAXIMUM_CUES);
         assert!(summary.shorter_than_maximum);
         assert_eq!(summary.semantic_column_counts.iter().sum::<usize>(), 7);
-        assert!(summary
-            .semantic_column_counts
-            .iter()
-            .all(|&count| count <= 1));
+        assert_eq!(summary.semantic_column_counts, [2, 1, 1, 1, 1, 1]);
     }
 
     #[test]
@@ -584,17 +628,17 @@ mod tests {
     }
 
     #[test]
-    fn long_source_caps_at_130_with_measured_command_and_anti_targets() {
+    fn long_source_caps_at_active_gesture_command_and_anti_targets() {
         let source = regular_source(180, 2_000);
         let level = generate(&source, source_duration(&source));
 
         assert_eq!(level.notes().len(), MAXIMUM_CUES);
         assert_eq!(
             level.summary().semantic_column_counts,
-            [10, 10, 10, 10, 10, 16, 16, 16, 16, 16]
+            [10, 10, 10, 16, 16, 16]
         );
         assert_eq!(level.summary().visual_lane_counts, [26; VISUAL_LANE_COUNT]);
-        assert_eq!(level.summary().thumb_variant_counts, [50, 80]);
+        assert_eq!(level.summary().thumb_variant_counts, [30, 48]);
         assert!(!level.summary().shorter_than_maximum);
     }
 
@@ -620,10 +664,10 @@ mod tests {
 
         let product = CalibrationLevelProduct::generate_best(&levels, duration).unwrap();
 
-        assert_eq!(product.source_level, "medium");
+        assert_eq!(product.source_level, "hard");
         assert_eq!(product.cue_count(), MAXIMUM_CUES);
         product
-            .validate_against_source(&levels["medium"].map_notes, duration)
+            .validate_against_source(&levels["hard"].map_notes, duration)
             .unwrap();
     }
 
@@ -639,8 +683,12 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(columns, sequential_columns(count));
             let counts = level.summary().semantic_column_counts;
-            assert!(counts[..5].iter().all(|&value| value <= 10));
-            assert!(counts[5..].iter().all(|&value| value <= 16));
+            assert!(counts[..COMMAND_SEMANTIC_COUNT]
+                .iter()
+                .all(|&value| value <= 10));
+            assert!(counts[COMMAND_SEMANTIC_COUNT..]
+                .iter()
+                .all(|&value| value <= 16));
         }
     }
 
@@ -655,14 +703,11 @@ mod tests {
 
         assert_eq!(
             &columns[..20],
-            &[0, 5, 1, 6, 2, 7, 3, 8, 4, 9, 0, 5, 1, 6, 2, 7, 3, 8, 4, 9]
+            &[0, 3, 1, 4, 2, 5, 0, 3, 1, 4, 2, 5, 0, 3, 1, 4, 2, 5, 0, 3]
         );
         assert_eq!(
-            &columns[100..],
-            &[
-                5, 6, 7, 8, 9, 5, 6, 7, 8, 9, 5, 6, 7, 8, 9, 5, 6, 7, 8, 9, 5, 6, 7, 8, 9, 5, 6, 7,
-                8, 9
-            ]
+            &columns[60..],
+            &[3, 4, 5, 3, 4, 5, 3, 4, 5, 3, 4, 5, 3, 4, 5, 3, 4, 5]
         );
     }
 
@@ -765,19 +810,68 @@ mod tests {
     #[test]
     fn semantic_columns_expose_typed_lane_and_thumb_variant() {
         for index in 0..SEMANTIC_COLUMN_COUNT as u8 {
-            let column = SemanticColumn::from_index(index).expect("0 through 9 are valid");
+            let column = SemanticColumn::from_index(index).expect("current columns are valid");
             assert_eq!(column.index(), index);
-            assert_eq!(column.visual_lane().index(), index % 5);
+            assert_eq!(
+                column.visual_lane().index(),
+                index % COMMAND_SEMANTIC_COUNT as u8
+            );
             assert_eq!(
                 column.thumb_variant(),
-                if index < 5 {
+                if usize::from(index) < COMMAND_SEMANTIC_COUNT {
                     ThumbVariant::Up
                 } else {
                     ThumbVariant::Down
                 }
             );
         }
-        assert_eq!(SemanticColumn::from_index(10), None);
+        assert_eq!(
+            SemanticColumn::from_index(SEMANTIC_COLUMN_COUNT as u8),
+            None
+        );
+    }
+
+    #[test]
+    fn current_semantic_columns_name_only_the_active_gesture_pairs() {
+        let expected = [
+            protocol::CalibrationGesture::WristPronation,
+            protocol::CalibrationGesture::WristSupination,
+            protocol::CalibrationGesture::WristRadialDeviation,
+        ];
+        for column in 0..SEMANTIC_COLUMN_COUNT as u8 {
+            let (gesture, modifier) = semantic_column_parts(column).unwrap();
+            assert_eq!(
+                gesture,
+                expected[usize::from(column) % COMMAND_SEMANTIC_COUNT]
+            );
+            assert_eq!(
+                modifier,
+                if usize::from(column) < COMMAND_SEMANTIC_COUNT {
+                    protocol::CalibrationModifier::ThumbUp
+                } else {
+                    protocol::CalibrationModifier::ThumbDown
+                }
+            );
+        }
+        assert_eq!(semantic_column_parts(SEMANTIC_COLUMN_COUNT as u8), None);
+    }
+
+    #[test]
+    fn full_gesture_v4_product_stays_readable_and_differs_from_active_v5() {
+        let source = regular_source(LEGACY_MAXIMUM_CUES, 2_500);
+        let duration = source_duration(&source);
+        let legacy = CalibrationLevelProduct::generate_with_version(
+            &source,
+            duration,
+            FULL_GESTURE_CALIBRATION_LEVEL_GENERATOR_VERSION,
+        );
+        let current = CalibrationLevelProduct::generate(&source, duration);
+
+        assert_eq!(legacy.cue_count(), LEGACY_MAXIMUM_CUES);
+        assert_eq!(current.cue_count(), MAXIMUM_CUES);
+        assert_ne!(legacy.content_identity, current.content_identity);
+        legacy.validate_against_source(&source, duration).unwrap();
+        current.validate_against_source(&source, duration).unwrap();
     }
 
     #[test]
@@ -806,7 +900,7 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(CALIBRATION_LEVEL_SCHEMA_VERSION, 2);
-        assert_eq!(CALIBRATION_LEVEL_GENERATOR_VERSION, 4);
+        assert_eq!(CALIBRATION_LEVEL_GENERATOR_VERSION, 5);
         assert_eq!(first.schema_version, CALIBRATION_LEVEL_SCHEMA_VERSION);
         assert_eq!(first.generator_version, CALIBRATION_LEVEL_GENERATOR_VERSION);
         assert_eq!(first.source_level, CALIBRATION_SOURCE_LEVEL);

@@ -31,8 +31,10 @@ mod validity;
 
 pub use anchored_fit::{AnchoredFitPlan, AnchoredFitStage};
 pub use anchored_recipe::{
-    anchored_class_index, anchored_labeled_span, anchored_target_count, AnchoredClassCount,
-    AnchoredRecipeProgress, ANCHORED_CLASS_COUNT, ANCHORED_COMMAND_TARGET, ANCHORED_NO_OP_TARGET,
+    active_gesture_from_index, active_gesture_index, anchored_class_index, anchored_labeled_span,
+    anchored_target_count, AnchoredClassCount, AnchoredRecipeProgress, ACTIVE_CALIBRATION_GESTURES,
+    ACTIVE_GESTURE_COUNT, ANCHORED_CLASS_COUNT, ANCHORED_COMMAND_TARGET, ANCHORED_NO_OP_TARGET,
+    CALIBRATION_MODEL_CLASS_COUNT,
 };
 pub use anchored_song::{
     AnchoredSong, AnchoredSongAction, AnchoredSongError, AnchoredSongIdentity,

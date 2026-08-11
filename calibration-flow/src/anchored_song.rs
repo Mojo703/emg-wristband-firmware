@@ -9,20 +9,21 @@
 use alloc::{string::String, vec::Vec};
 use core::fmt;
 use protocol::{
-    CalibrationRunKey, CalibrationScheduleEntry, CalibrationScheduleRevision, RepRejection,
+    CalibrationGesture, CalibrationRunKey, CalibrationScheduleEntry, CalibrationScheduleRevision,
+    RepRejection,
 };
 pub use protocol::{
     CALIBRATION_CUE_HOLD_MILLISECONDS as REQUIRED_CUE_HOLD_MILLISECONDS,
     CALIBRATION_CUE_RECOVERY_MILLISECONDS as REQUIRED_CUE_RECOVERY_MILLISECONDS,
 };
 
-use crate::RepEvidence;
+use crate::{active_gesture_index, RepEvidence};
 
 /// The confirmed maximum at the upload boundary.  This is intentionally local
 /// while the protocol crate's cancelled partial implementation still says 16.
 pub const MAX_ANCHORED_SONG_CHUNK_CUES: usize = 32;
 /// A complete upload is bounded before either of its two exact-reserve calls.
-/// The shipped recipe needs 130 cues; 256 leaves room for alternate authored
+/// The shipped recipe needs 78 cues; 256 leaves room for alternate authored
 /// songs while keeping malformed input from consuming the device heap or
 /// flooding the 24-frame reliable acknowledgement outbox.
 pub const MAX_ANCHORED_SONG_CUES: u32 = 256;
@@ -207,6 +208,7 @@ pub enum AnchoredSongError {
     },
     CueIdentifiersNotStrictlyIncreasing,
     CueOffsetsNotStrictlyIncreasing,
+    InactiveGesture(CalibrationGesture),
     WrongCueHold {
         expected: u32,
         received: u32,
@@ -744,6 +746,9 @@ fn validate_appended_entries(
 ) -> Result<(), AnchoredSongError> {
     let mut previous = previous;
     for entry in entries {
+        if active_gesture_index(entry.gesture).is_none() {
+            return Err(AnchoredSongError::InactiveGesture(entry.gesture));
+        }
         if entry.hold.get() != REQUIRED_CUE_HOLD_MILLISECONDS {
             return Err(AnchoredSongError::WrongCueHold {
                 expected: REQUIRED_CUE_HOLD_MILLISECONDS,
@@ -895,6 +900,14 @@ mod tests {
             song.upload_chunk(&identity, 0, &[wrong_hold]),
             Err(AnchoredSongError::WrongCueHold { .. })
         ));
+        let mut inactive = cue(1, 0);
+        inactive.gesture = CalibrationGesture::ThumbExtension;
+        assert_eq!(
+            song.upload_chunk(&identity, 0, &[inactive]),
+            Err(AnchoredSongError::InactiveGesture(
+                CalibrationGesture::ThumbExtension
+            ))
+        );
         assert!(matches!(
             song.upload_chunk(&identity, 0, &[cue(2, 0), cue(1, 2_000)]),
             Err(AnchoredSongError::CueIdentifiersNotStrictlyIncreasing)

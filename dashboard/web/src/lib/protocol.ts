@@ -1836,7 +1836,7 @@ export function isGuidedCalibrationSnapshot(
       if (
         !isGuidedCalibrationTrack(value['track']) ||
         !Array.isArray(value['lanes']) ||
-        value['lanes'].length !== 5 ||
+        value['lanes'].length !== 3 ||
         !value['lanes'].every(isGuidedCalibrationLane)
       ) {
         return false;
@@ -1846,6 +1846,7 @@ export function isGuidedCalibrationSnapshot(
         lanes.every((lane, index) => lane.visual_lane === index) &&
         Array.isArray(value['cues']) &&
         value['cues'].every(isGuidedCalibrationCue) &&
+        value['cues'].every((cue) => cue.visual_lane < lanes.length) &&
         isNonnegativeInteger(value['position_ms']) &&
         isNonnegativeInteger(value['position_observed_at_unix_ms']) &&
         isNonnegativeInteger(value['valid_reps']) &&
