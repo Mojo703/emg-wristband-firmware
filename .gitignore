@@ -9,6 +9,10 @@ node_modules/
 dist/
 /tmp
 documentation/
+# Local wearer-derived calibration payloads. Their manifests are tracked, but
+# committing packed EMG feature rows would place biometric-derived data in Git
+# history permanently.
+calibration-artifacts/**/*.bin
 # JetBrains project files (RustRover).
 .idea/
 # Python virtual environments (e.g. pose-service/.venv).
