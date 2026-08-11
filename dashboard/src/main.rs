@@ -402,7 +402,7 @@ async fn download_current_calibration(
                 }) if received == transfer_id => anyhow::bail!(reason),
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                    anyhow::bail!("calibration export lost {skipped} chunks; retry the download")
+                    anyhow::bail!("Calibration export lost {skipped} chunks. Retry the download.")
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                     anyhow::bail!("device disconnected during calibration export")

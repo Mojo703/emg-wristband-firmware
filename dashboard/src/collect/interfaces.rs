@@ -255,7 +255,7 @@ pub struct VideoReport {
     /// When ffmpeg actually began capturing, relative to the requested start,
     /// on the shared clock — the summary's `video_start_offset`.
     pub start_offset: OffsetMilliseconds,
-    /// Human line for the files card, e.g. "30 fps · 1280x720".
+    /// Human line for the files card, e.g. "30 fps, 1280x720".
     pub detail: String,
 }
 

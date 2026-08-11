@@ -123,7 +123,7 @@
   <div class="row"><Icon name="wifi" /><strong>WiFi</strong></div>
   <div class="row">
     <label>SSID<input type="text" bind:value={ssid} placeholder="network name" /></label>
-    <label>Password<input type="password" bind:value={psk} placeholder="••••••" /></label>
+    <label>Password<input type="password" bind:value={psk} placeholder="password" /></label>
   </div>
   <div class="row">
     <Button onclick={saveWifi}>Save WiFi</Button>

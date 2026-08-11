@@ -354,7 +354,7 @@ impl TrackCatalog {
         }
         if config.collection_classes.len() > MAXIMUM_COLUMNS {
             anyhow::bail!(
-                "collection config lists {} classes; the game supports at most {}",
+                "Collection config lists {} classes. The game supports at most {}.",
                 config.collection_classes.len(),
                 MAXIMUM_COLUMNS
             );
@@ -544,7 +544,7 @@ fn load_levels(
     for level in DifficultyLevel::ALL {
         let Some(loaded) = entry.levels.get(&level.to_string()) else {
             anyhow::bail!(
-                "track {} has no {level} schedule; import it again",
+                "Track {} has no {level} schedule. Import it again.",
                 entry.id
             );
         };
@@ -648,7 +648,7 @@ impl BeatmapGenerator for TrackCatalog {
         }
         if classes.len() > MAXIMUM_COLUMNS {
             anyhow::bail!(
-                "{} classes offered for {track_id}; the lattice folds to at most {}",
+                "{} classes offered for {track_id}. The lattice folds to at most {}.",
                 classes.len(),
                 MAXIMUM_COLUMNS
             );

@@ -851,7 +851,7 @@ impl CalibrationModeAdapter {
                     // its upload/commit authority across that boundary.
                     Ok(Frame::DeviceHello { .. }) => {
                         break SessionExit::DependencyFailed(
-                            "the device link restarted during calibration; restart explicitly before any retained evidence can be continued".into(),
+                            "The device link restarted during calibration. Restart explicitly before continuing any retained evidence.".into(),
                         );
                     }
                     Ok(frame) if terminal.acknowledges(&frame, run, schedule_revision) => {
@@ -1190,7 +1190,7 @@ impl CalibrationModeAdapter {
                             // could replace a transaction whose ACK alone was
                             // lost. Fail explicitly and require a fresh run.
                             break SessionExit::DependencyFailed(
-                                "calibration Begin acknowledgement timed out; restart before uploading a schedule".into(),
+                                "Calibration Begin acknowledgement timed out. Restart before uploading a schedule.".into(),
                             );
                         }
                         UploadTimeoutAction::FailChunk => {
@@ -1219,7 +1219,7 @@ impl CalibrationModeAdapter {
                     // cannot safely be reconstructed by the host, especially
                     // once its exact three-second playback anchor has passed.
                     break SessionExit::DependencyFailed(
-                        "calibration schedule acceptance timed out after Commit; restart before playback".into(),
+                        "Calibration schedule acceptance timed out after Commit. Restart before playback.".into(),
                     );
                 }
                 _ = tokio::time::sleep_until(terminal_deadline),
@@ -1231,7 +1231,7 @@ impl CalibrationModeAdapter {
                         TerminalDecision::Open => unreachable!(),
                     };
                     break SessionExit::DependencyFailed(format!(
-                        "calibration {operation} acknowledgement timed out; reconnect before making another durable decision"
+                        "Calibration {operation} acknowledgement timed out. Reconnect before making another durable decision."
                     ));
                 }
                 command = actions.recv() => {
@@ -1965,7 +1965,7 @@ fn calibration_lanes(
     lanes.push(protocol::GuidedCalibrationLane {
         visual_lane: calibration_flow::ACTIVE_GESTURE_COUNT as u8,
         id: "center_counterexample".into(),
-        label: "Pole vertical — do not trigger".into(),
+        label: "Pole vertical: do not trigger".into(),
         color_name: "gray".into(),
         motion: None,
     });
@@ -4028,7 +4028,7 @@ mod tests {
             assert_eq!(lane.motion, class.motion);
         }
         assert_eq!(lanes[2].id, "center_counterexample");
-        assert_eq!(lanes[2].label, "Pole vertical — do not trigger");
+        assert_eq!(lanes[2].label, "Pole vertical: do not trigger");
         assert_eq!(lanes[2].motion, None);
         assert!(lanes.iter().all(|lane| !lane.label.starts_with("Wrist")));
 

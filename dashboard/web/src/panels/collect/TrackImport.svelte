@@ -144,7 +144,7 @@
     <section class="card">
       <h3>{report.title}</h3>
       <p class="muted numeric">
-        {report.difficulty_file} · {Math.round(report.beats_per_minute)} bpm · {formatMinutesSeconds(
+        {report.difficulty_file}, {Math.round(report.beats_per_minute)} bpm, {formatMinutesSeconds(
           report.duration_ms,
         )}
       </p>

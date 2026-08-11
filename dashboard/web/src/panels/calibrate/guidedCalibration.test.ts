@@ -105,7 +105,7 @@ test('calibration lanes carry the same user-facing Collect presentation', () => 
       { id: 'wrist_ulnar_deviation', label: 'Tip back', colorName: 'purple', arrow: 'down' },
       {
         id: 'center_counterexample',
-        label: 'Pole vertical — do not trigger',
+        label: 'Pole vertical: do not trigger',
         colorName: 'gray',
         arrow: null,
       },

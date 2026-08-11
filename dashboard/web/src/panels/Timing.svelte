@@ -45,7 +45,7 @@
   }
 
   function milliseconds(value: number | null | undefined): string {
-    return value === null || value === undefined ? '—' : `${value} ms`;
+    return value === null || value === undefined ? 'Unavailable' : `${value} ms`;
   }
 </script>
 
@@ -69,8 +69,8 @@
       <span class:active={display.color === 'blue'} class="blue">Blue</span>
     </div>
     <p class="muted note">
-      The wristband owns the 500 ms red → green → blue loop. This page renders the same sequence;
-      it never schedules the device LEDs.
+      The wristband owns the 500 ms red → green → blue loop. This page renders the same sequence.
+      It never schedules the device LEDs.
     </p>
 
     <div class="controls" aria-label="Timing correction controls">
@@ -101,7 +101,7 @@
     <div><span>Automatic estimate</span><strong>{milliseconds(measured?.automatic_offset_milliseconds)}</strong></div>
     <div><span>Manual trim</span><strong>{milliseconds(status?.manual_trim_milliseconds ?? 0)}</strong></div>
     <div><span>Total correction</span><strong>{milliseconds(totalCorrection)}</strong></div>
-    <div><span>Probe window</span><strong>{status === null ? '—' : `${status.estimate.availability === 'measured' ? status.estimate.sample_count : 0}/${status.estimate.capacity}`}</strong></div>
+    <div><span>Probe window</span><strong>{status === null ? 'Unavailable' : `${status.estimate.availability === 'measured' ? status.estimate.sample_count : 0}/${status.estimate.capacity}`}</strong></div>
   </section>
   {#if qualityWarning !== null}
     <p class="warn" role="status">{qualityWarning}</p>

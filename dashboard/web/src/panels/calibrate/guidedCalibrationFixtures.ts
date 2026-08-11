@@ -52,7 +52,7 @@ const lanes: ActiveCalibrationLanes = [
   {
     visualLane: VisualLane.Gesture2,
     id: 'center_counterexample',
-    label: 'Pole vertical — do not trigger',
+    label: 'Pole vertical: do not trigger',
     colorName: 'gray',
     motion: null,
   },

@@ -133,7 +133,7 @@ export function presentGuidedCalibration(
         cueLabel: isCommand
           ? gestureLane.label
           : cue.modifier === 'center_extension'
-            ? 'Legacy center extension — do not use'
+            ? 'Legacy center extension: do not use'
             : `Pole vertical, ${cue.modifier === 'grip_soft' ? 'soft grip' : cue.modifier === 'grip_medium' ? 'medium grip' : 'hard grip'}`,
       };
     }),
@@ -172,7 +172,7 @@ export function cueAnnouncements(snapshot: CalibrationPlayingSnapshot): CueAnnou
       cue.thumbVariant === 'command'
         ? 'extend index and middle fingers'
         : cue.thumbVariant === 'center_extension'
-          ? 'hold pole vertical and extend index and middle fingers; do not move wrist'
+          ? 'hold pole vertical and extend index and middle fingers without moving the wrist'
         : cue.thumbVariant === 'grip_soft'
           ? 'soft grip'
           : cue.thumbVariant === 'grip_medium'

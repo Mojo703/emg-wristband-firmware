@@ -385,7 +385,7 @@
                 >
                   <strong>{candidate.title}</strong>
                   <span class="muted">
-                    {Math.round(candidate.beats_per_minute)} bpm · {formatWholeMinutes(candidate.duration)}
+                    {Math.round(candidate.beats_per_minute)} bpm, {formatWholeMinutes(candidate.duration)}
                     min
                   </span>
                 </button>
@@ -559,7 +559,7 @@
       {:else if trackId === ''}
         <span class="muted">No track in the catalog to play.</span>
       {:else if recordsNothing}
-        <strong class="warn">No device selected — this run records nothing.</strong>
+        <strong class="warn">No device selected. This run records nothing.</strong>
       {:else}
         <span class="muted">
           Ready. Recording starts the moment you start the session, before the track.

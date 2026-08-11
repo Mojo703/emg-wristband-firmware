@@ -120,7 +120,7 @@ test('playing renders a persistent cue-variant legend and accessible cue narrati
   assert.match(body, /<canvas[^>]*aria-hidden="true"/);
   assert.match(body, /Tip forward/);
   assert.match(body, /Tip back/);
-  assert.match(body, /Pole vertical — do not trigger/);
+  assert.match(body, /Pole vertical: do not trigger/);
   assert.match(body, /color: #3dd68c/);
   assert.match(body, /color: #d19dff/);
   assert.doesNotMatch(body, /WristPronation|WristSupination|Lift thumb/);

@@ -14,7 +14,7 @@
       "color": "blue",
       "motion": {
         "arrow": "right",
-        "hint": "forearm rotates out; the pole tip swings away from you"
+        "hint": "rotate your forearm out so the pole tip swings away from you"
       }
     },
     {
@@ -23,7 +23,7 @@
       "color": "amber",
       "motion": {
         "arrow": "left",
-        "hint": "forearm rotates in; the pole tip swings toward you"
+        "hint": "rotate your forearm in so the pole tip swings toward you"
       }
     },
     {
@@ -32,7 +32,7 @@
       "color": "green",
       "motion": {
         "arrow": "up",
-        "hint": "wrist cocks toward the thumb; the pole tip swings down-track"
+        "hint": "cock your wrist toward the thumb so the pole tip swings down-track"
       }
     },
     {
@@ -41,7 +41,7 @@
       "color": "purple",
       "motion": {
         "arrow": "down",
-        "hint": "wrist drops toward the pinky; the pole tip swings behind you"
+        "hint": "drop your wrist toward the pinky so the pole tip swings behind you"
       }
     },
     {

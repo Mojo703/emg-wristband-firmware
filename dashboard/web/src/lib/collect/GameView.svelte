@@ -93,7 +93,7 @@
       (channel) => channel.saturated_fraction <= 0.5 && channel.noise_floor_microvolts <= limit,
     ).length;
     const leadOff = quality.channels.filter((channel) => channel.lead_off === 'lead_off').length;
-    return `${quiet}/${quality.channels.length} under ${limit.toFixed(0)} µV · ${railed} railed · ${leadOff} lead-off`;
+    return `${quiet}/${quality.channels.length} under ${limit.toFixed(0)} µV, ${railed} railed, ${leadOff} lead-off`;
   });
 
   // Which overlay the field needs, if any. Both cases come straight off the
@@ -209,7 +209,7 @@
       {#if recording.recorded === null}
         <!-- A session with no device: the game plays on the real schedule and
              nothing reaches disk, which is exactly what must not go unnoticed. -->
-        <strong class="practice">PRACTICE — nothing is being recorded</strong>
+        <strong class="practice">PRACTICE: nothing is being recorded</strong>
       {:else}
         <span class="dot-label">
           <span class="status-dot" data-state={streamState(recording.emg)}></span>rec EMG
@@ -277,7 +277,7 @@
              baseline nothing was cued in. -->
         {#if armedSeconds !== null}
           <p class="muted">
-            <strong>Already recording</strong> — {armedSeconds.toFixed(0)} s of baseline
+            <strong>Already recording:</strong> {armedSeconds.toFixed(0)} s of baseline
             written since the session armed.
           </p>
         {/if}
@@ -305,10 +305,10 @@
             <strong>Paused: this page closed at {clock(paused.track_position)}</strong>,
             so the cues stopped rather than run at nobody.
           </p>
-          <p class="muted">Resume picks up from there; the recording never stopped.</p>
+          <p class="muted">Resume picks up from there. The recording never stopped.</p>
         {:else}
           <p class="muted">
-            Paused at {clock(paused.track_position)}. Resume picks up from there; the
+            Paused at {clock(paused.track_position)}. Resume picks up from there. The
             recording never stopped.
           </p>
         {/if}

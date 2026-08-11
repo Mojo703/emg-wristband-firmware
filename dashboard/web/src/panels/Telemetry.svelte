@@ -338,7 +338,7 @@
                 {#if hovered}
                   at {uptime(reference[hovered.index]!.t_us)} uptime
                 {:else}
-                  {reference.length} samples · latest {uptime(
+                  {reference.length} samples, latest {uptime(
                     reference[reference.length - 1]!.t_us,
                   )}
                 {/if}

@@ -1577,7 +1577,7 @@ impl RunningSession {
         let Some(timeline) = self.playhead_after_command(PlaybackPhase::Playing).await else {
             self.playback.pause();
             self.manager
-                .publish_error("audio output did not start; the track has not begun".into());
+                .publish_error("Audio output did not start. The track has not begun.".into());
             return;
         };
         let at = timeline.heard_at.before_track_position(timeline.position);
@@ -1666,7 +1666,7 @@ impl RunningSession {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.manager.publish_error(format!(
-                    "could not switch audio output: {error:#}; still on {}",
+                    "Could not switch audio output: {error:#}. Still on {}.",
                     self.playback.output_name()
                 ));
                 self.output_switch = OutputSwitchState::Stable { applied };
@@ -1803,7 +1803,7 @@ impl RunningSession {
         let Some(timeline) = self.playhead_after_command(PlaybackPhase::Playing).await else {
             self.playback.pause();
             self.manager
-                .publish_error("audio output did not resume; the timeline is still frozen".into());
+                .publish_error("Audio output did not resume. The timeline is still frozen.".into());
             return;
         };
         let pause = self.paused.take().expect("checked above");
@@ -1922,7 +1922,7 @@ impl RunningSession {
             None => {
                 if current.since(self.armed_at).get() > ARMED_TIMEOUT.as_millis() as i64 {
                     self.manager
-                        .publish_error("armed session timed out; sending it to review".into());
+                        .publish_error("Armed session timed out. Sending it to review.".into());
                     return true;
                 }
             }
@@ -2197,10 +2197,10 @@ impl RunningSession {
 fn recording_stream_failure(error: broadcast::error::RecvError) -> (String, SessionExit) {
     let detail = match error {
         broadcast::error::RecvError::Lagged(skipped) => {
-            format!("device stream lost {skipped} frames mid-session; finalizing incomplete take")
+            format!("Device stream lost {skipped} frames mid-session. Finalizing incomplete take.")
         }
         broadcast::error::RecvError::Closed => {
-            "device stream ended mid-session; finalizing incomplete take".into()
+            "Device stream ended mid-session. Finalizing incomplete take.".into()
         }
     };
     (detail.clone(), SessionExit::DependencyFailed(detail))

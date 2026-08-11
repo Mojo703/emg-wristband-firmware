@@ -174,11 +174,11 @@ impl FileSessionRecorder {
     /// the summary screen's files card is where someone would notice it.
     fn emg_detail(&self) -> String {
         let stream = format!(
-            "{} sps · {} ch",
+            "{} sps, {} ch",
             self.manifest.hardware.sample_rate, self.manifest.hardware.channels
         );
         if self.tail_desynced {
-            format!("{stream} · tail desynced")
+            format!("{stream}, tail desynced")
         } else {
             stream
         }
@@ -552,7 +552,7 @@ mod tests {
         assert_eq!(reports.len(), 3);
         assert_eq!(reports[0].name, EMG_FILE_NAME);
         assert_eq!(reports[0].bytes, 16);
-        assert_eq!(reports[0].detail, "2000 sps · 16 ch");
+        assert_eq!(reports[0].detail, "2000 sps, 16 ch");
         assert_eq!(reports[1].name, EVENTS_FILE_NAME);
         assert_eq!(reports[1].detail, "7 events");
         assert_eq!(reports[1].bytes, events_text.len() as u64);
@@ -612,7 +612,7 @@ mod tests {
 
         let reports = Box::new(recorder).finish(&sample_summary()).unwrap();
         assert_eq!(reports[0].name, EMG_FILE_NAME);
-        assert_eq!(reports[0].detail, "2000 sps · 16 ch · tail desynced");
+        assert_eq!(reports[0].detail, "2000 sps, 16 ch, tail desynced");
 
         std::fs::remove_dir_all(&sessions_root).unwrap();
     }

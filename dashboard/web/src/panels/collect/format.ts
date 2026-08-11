@@ -34,7 +34,7 @@ export function formatMinutesAgo(unixMilliseconds: number, now: number): string 
 
 /** Byte counts as a human-readable size; binary units, one decimal above kibibytes. */
 export function formatByteSize(bytes: number): string {
-  if (!Number.isFinite(bytes) || bytes < 0) return '—';
+  if (!Number.isFinite(bytes) || bytes < 0) return 'Unavailable';
   if (bytes < 1024) return `${Math.round(bytes)} B`;
   const units = ['KiB', 'MiB', 'GiB', 'TiB'] as const;
   let value = bytes / 1024;
@@ -54,7 +54,7 @@ export function formatMillimetresAsCentimetres(millimetres: number): string {
 
 /** A signed offset in milliseconds, always carrying its sign. */
 export function formatSignedMilliseconds(milliseconds: number): string {
-  if (!Number.isFinite(milliseconds)) return '—';
+  if (!Number.isFinite(milliseconds)) return 'Unavailable';
   const sign = milliseconds < 0 ? '−' : '+';
   return `${sign}${Math.abs(Math.round(milliseconds))} ms`;
 }

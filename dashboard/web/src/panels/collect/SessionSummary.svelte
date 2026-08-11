@@ -64,7 +64,7 @@
 
 <div class="summary">
   <header>
-    <h3>Session complete — {sessionId} · {formatMinutesSeconds(summary.duration)}</h3>
+    <h3>Session complete: {sessionId}, {formatMinutesSeconds(summary.duration)}</h3>
   </header>
 
   <section class="card">
@@ -89,7 +89,7 @@
     <p>
       activity detected near cue: {summary.activity_hits}/{totalCues}
     </p>
-    <p class="muted">unscored session — no gesture verification yet</p>
+    <p class="muted">Unscored session. No gesture verification yet.</p>
   </section>
 
   <section class="card">

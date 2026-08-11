@@ -26,7 +26,7 @@
 {#if quality !== null}
   <section class="card quality">
     <div class="field-label">
-      Electrodes — noise floor under {microvolts(limit)} µV, mains at
+      Electrodes: noise floor under {microvolts(limit)} µV, mains at
       {quality.mains_fundamental_hertz.toFixed(2)} Hz
     </div>
     <table>
@@ -56,7 +56,7 @@
             </td>
             <td class:warn={channel.lead_off === 'lead_off'}>
               {#if channel.lead_off === 'unknown'}
-                <span class="muted">—</span>
+                <span class="muted">Unavailable</span>
               {:else}
                 {channel.lead_off === 'lead_off' ? 'off' : 'on'}
               {/if}

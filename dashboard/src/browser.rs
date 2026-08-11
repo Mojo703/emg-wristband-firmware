@@ -1364,7 +1364,7 @@ mod tests {
                     run,
                     schedule_revision: revision,
                     detail:
-                        "dashboard link changed during guided calibration; restart after reboot"
+                        "Dashboard link changed during guided calibration. Restart after reboot."
                             .into(),
                 },
             },
@@ -1389,7 +1389,7 @@ mod tests {
             Frame::CalibrationRunFailed { failure }
                 if failure.run == run
                     && failure.schedule_revision == revision
-                    && failure.detail.contains("restart after reboot")
+                && failure.detail.contains("Restart after reboot")
         ));
     }
 

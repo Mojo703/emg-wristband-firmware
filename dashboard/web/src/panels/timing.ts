@@ -51,7 +51,7 @@ export function timingQualityWarning(
   const rtt = status.estimate.median_round_trip_milliseconds;
   const spread = status.estimate.round_trip_spread_milliseconds;
   if (rtt > 50 || spread > 50) {
-    return 'Probe timing is noisy; correction remains available, but repeat the window if the wearer sees drift.';
+    return 'Probe timing is noisy. Correction remains available, but repeat the window if the wearer sees drift.';
   }
   return null;
 }

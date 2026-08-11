@@ -107,7 +107,7 @@
       <strong>Choose a Calibration track</strong>
       <p class="muted">
         Validated Calibration v2 levels appear with their authored cue count. Shortfall is shown as
-        a quality warning; any nonempty authored song can be run and continued with a new revision.
+        a quality warning. Any nonempty authored song can be run and continued with a new revision.
       </p>
     </div>
     {#if snapshot.tracks.length === 0}
@@ -122,10 +122,10 @@
             onclick={() => onSelectTrack?.(track.id)}
           >
             <strong>{track.title}</strong>
-            <span>{track.beats_per_minute} bpm · {clock(track.duration_ms)}</span>
+            <span>{track.beats_per_minute} bpm, {clock(track.duration_ms)}</span>
             <span class:warn={track.cue_shortfall > 0}>
               {track.cue_count} cues
-              {#if track.cue_shortfall > 0} · {track.cue_shortfall} short{/if}
+              {#if track.cue_shortfall > 0}, {track.cue_shortfall} short{/if}
             </span>
           </button>
         {/each}
@@ -141,7 +141,7 @@
       <strong>{snapshot.track.title}</strong>
       <span class="numeric">{clock(snapshot.position_ms)} / {clock(snapshot.track.duration_ms)}</span>
       <span class="spacer"></span>
-      <span>{snapshot.valid_reps} valid · {snapshot.invalid_reps} invalid</span>
+      <span>{snapshot.valid_reps} valid, {snapshot.invalid_reps} invalid</span>
       <Button
         variant="secondary"
         size="sm"
@@ -152,9 +152,9 @@
     </div>
     <div class="thumb-legend" aria-label="Cue modifier legend">
       <span><i class="up-swatch">→</i><strong>Command</strong> extend index + middle</span>
-      <span><i class="down-swatch">•</i><strong>Soft grip</strong></span>
-      <span><i class="down-swatch">••</i><strong>Medium grip</strong></span>
-      <span><i class="down-swatch">•••</i><strong>Hard grip</strong></span>
+      <span><i class="down-swatch">S</i><strong>Soft grip</strong></span>
+      <span><i class="down-swatch">M</i><strong>Medium grip</strong></span>
+      <span><i class="down-swatch">H</i><strong>Hard grip</strong></span>
     </div>
     {#if announcements !== null}
       <div class="cue-text" aria-live="polite" aria-atomic="true">
@@ -175,7 +175,7 @@
     </div>
     <div class="counts card">
       {#each snapshot.counts as count (count.class_id)}
-        <span><strong>{count.label}</strong> command {count.thumb_up} · grip {count.thumb_down} · invalid {count.invalid}</span>
+        <span><strong>{count.label}</strong> command {count.thumb_up}, grip {count.thumb_down}, invalid {count.invalid}</span>
       {/each}
     </div>
   </section>
@@ -189,10 +189,8 @@
           ? 'Hold still'
           : snapshot.stage === 'gain_estimation'
             ? 'Estimating reference gains'
-            : 'Uploading schedule; waiting for device acceptance'}
-        {#if snapshot.stage !== 'ready_for_schedule'}
-          · {Math.ceil(snapshot.remaining_milliseconds / 1000)} s remaining
-        {/if}
+            : 'Uploading schedule. Waiting for device acceptance'}
+        {#if snapshot.stage !== 'ready_for_schedule'}, {Math.ceil(snapshot.remaining_milliseconds / 1000)} s remaining{/if}
       </p>
     </div>
   </section>
@@ -201,7 +199,7 @@
     <div>
       <span class="eyebrow">Song complete</span>
       <h3>{snapshot.track_title}</h3>
-      <p>{snapshot.valid_reps} valid reps · {snapshot.invalid_reps} invalid spans</p>
+      <p>{snapshot.valid_reps} valid reps, {snapshot.invalid_reps} invalid spans</p>
     </div>
     {#if snapshot.deficits.length > 0}
       <div class="deficits">
@@ -229,7 +227,7 @@
           onclick={() => onSelectTrack?.(track.id)}
         >
           <strong>{track.title}</strong>
-          <span>{track.cue_count} cues{track.cue_shortfall > 0 ? ` · ${track.cue_shortfall} short` : ''}</span>
+          <span>{track.cue_count} cues{track.cue_shortfall > 0 ? `, ${track.cue_shortfall} short` : ''}</span>
         </button>
       {/each}
     </div>

@@ -105,11 +105,11 @@ impl CameraSettings {
     /// How the geometry reads on the summary screen's files card.
     fn describe(&self) -> String {
         let format = match &self.input_format {
-            Some(format) => format!(" · {format}"),
+            Some(format) => format!(", {format}"),
             None => String::new(),
         };
         format!(
-            "{} fps · {}x{}{format}",
+            "{} fps, {}x{}{format}",
             self.frames_per_second, self.width, self.height
         )
     }
@@ -357,7 +357,7 @@ impl FfmpegVideoCapture {
     pub fn start_preview(&mut self) -> anyhow::Result<PreviewSession> {
         if matches!(self.use_of_camera, Some(CameraUse::Recording(_))) {
             return Err(anyhow!(
-                "the camera is recording a session; the preview is a setup-time view"
+                "the camera is recording a session. The preview is a setup-time view"
             ));
         }
         self.evict_preview();
@@ -451,7 +451,7 @@ impl VideoCapture for FfmpegVideoCapture {
     ) -> anyhow::Result<RecordingHandle> {
         if self.recording().is_some() {
             return Err(anyhow!(
-                "a recording is already running; the camera takes one recording at a time"
+                "a recording is already running. The camera takes one recording at a time"
             ));
         }
         self.evict_preview();
@@ -920,7 +920,7 @@ mod tests {
         assert_eq!((settings.width, settings.height), (320, 240));
         assert_eq!(settings.frames_per_second, 30);
         assert_eq!(settings.input_format, None);
-        assert_eq!(settings.describe(), "30 fps · 320x240");
+        assert_eq!(settings.describe(), "30 fps, 320x240");
     }
 
     /// The preview must not resample a capture that is already small enough,
@@ -953,7 +953,7 @@ mod tests {
             frames_per_second: 30,
             input_format: Some("mjpeg".to_string()),
         };
-        assert_eq!(settings.describe(), "30 fps · 640x360 · mjpeg");
+        assert_eq!(settings.describe(), "30 fps, 640x360, mjpeg");
 
         let capture = FfmpegVideoCapture::new(PathBuf::from("/dev/video0"), settings);
         let arguments = capture.camera_input_arguments();

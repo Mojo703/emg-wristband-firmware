@@ -122,7 +122,7 @@
 <div
   class="stream-monitor"
   title={live.emgStream
-    ? 'EMG frames/s — dashed line is the real-time target, fill is what the browser receives'
+    ? 'EMG frames/s. The dashed line is the real-time target. The fill is what the browser receives.'
     : 'This panel draws no waveforms, so the backend is not sending it EMG. Recording is unaffected.'}
 >
   <div class="stream-head">

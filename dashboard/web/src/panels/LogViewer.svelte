@@ -33,7 +33,7 @@
   <div class="log-head">
     <h2>Device log</h2>
     <span class="muted">
-      {live.logs.length} lines{followTail ? '' : ' · scrolled (jump to end below)'}
+      {live.logs.length} lines{followTail ? '' : ', scrolled (jump to end below)'}
     </span>
   </div>
   <div class="log-scroll" bind:this={scroller} onscroll={onScroll}>

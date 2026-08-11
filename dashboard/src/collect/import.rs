@@ -78,7 +78,7 @@ pub struct CalibrationImportReport {
 pub fn import_archive(archive_bytes: &[u8], tracks_root: &Path) -> anyhow::Result<ImportReport> {
     if archive_bytes.len() > MAXIMUM_ARCHIVE_BYTES {
         anyhow::bail!(
-            "the map archive is {} MB; the importer accepts at most {} MB",
+            "The map archive is {} MB. The importer accepts at most {} MB.",
             archive_bytes.len() / (1024 * 1024),
             MAXIMUM_ARCHIVE_BYTES / (1024 * 1024)
         );
@@ -87,7 +87,7 @@ pub fn import_archive(archive_bytes: &[u8], tracks_root: &Path) -> anyhow::Resul
         .context("the upload is not a readable zip archive")?;
     if archive.len() > MAXIMUM_ARCHIVE_ENTRIES {
         anyhow::bail!(
-            "the archive holds {} entries; a Beat Saber map holds a handful",
+            "The archive holds {} entries. A Beat Saber map holds a handful.",
             archive.len()
         );
     }
@@ -352,7 +352,7 @@ pub fn ogg_duration_milliseconds(bytes: &[u8]) -> anyhow::Result<u32> {
     const VORBIS_IDENTIFICATION: &[u8; 7] = b"\x01vorbis";
 
     if bytes.len() < 4 || &bytes[..4] != CAPTURE_PATTERN {
-        anyhow::bail!("the audio is not an Ogg container; Beat Saber maps ship Ogg Vorbis");
+        anyhow::bail!("The audio is not an Ogg container. Beat Saber maps ship Ogg Vorbis.");
     }
 
     let mut sample_rate = None;
@@ -484,7 +484,7 @@ pub async fn download_map(key: &BeatSaverKey) -> anyhow::Result<Vec<u8>> {
         .map_err(|error| anyhow!("the download of {key} was cut short: {error}"))?;
     if archive.len() > MAXIMUM_ARCHIVE_BYTES {
         anyhow::bail!(
-            "the map {key} is {} MB; the importer accepts at most {} MB",
+            "The map {key} is {} MB. The importer accepts at most {} MB.",
             archive.len() / (1024 * 1024),
             MAXIMUM_ARCHIVE_BYTES / (1024 * 1024)
         );

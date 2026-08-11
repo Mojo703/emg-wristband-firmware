@@ -143,10 +143,10 @@ impl ControlDeliveryError {
     pub fn operator_message(self) -> &'static str {
         match self {
             Self::UnknownDevice => "no device is selected",
-            Self::Disconnected => "the selected device is offline; reconnect it and retry",
-            Self::StaleConnection => "the selected device reconnected; refresh and retry",
+            Self::Disconnected => "The selected device is offline. Reconnect it and retry.",
+            Self::StaleConnection => "The selected device reconnected. Refresh and retry.",
             Self::QueueFull => {
-                "the selected device is not accepting commands; retry after the link recovers"
+                "The selected device is not accepting commands. Retry after the link recovers."
             }
             Self::SessionClosed => {
                 "the selected device connection closed before the command was delivered"

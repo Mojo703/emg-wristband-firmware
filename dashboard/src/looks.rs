@@ -48,7 +48,7 @@ pub fn classes_for(config: &DeviceConfig) -> Vec<ClassInfo> {
                 .find(|binding| binding.gesture == gesture)
                 .map(|binding| media_label(binding.key));
             let label = match key {
-                Some(name) => format!("C{gesture} · {name}"),
+                Some(name) => format!("C{gesture}: {name}"),
                 None => format!("C{gesture}"),
             };
             ClassInfo {
