@@ -157,7 +157,6 @@ impl QualityGate {
 mod tests {
     use super::*;
     use crate::Constants;
-    use CalibrationGesture::*;
 
     fn gate() -> QualityGate {
         QualityGate::new(Constants::DEFAULT.holding_accuracy_permille)
@@ -202,29 +201,31 @@ mod tests {
 
     #[test]
     fn a_class_below_the_threshold_is_named_weak() {
+        let first = ACTIVE_CALIBRATION_GESTURES[0];
+        let second = ACTIVE_CALIBRATION_GESTURES[1];
         let mut gate = gate();
         for gesture in ACTIVE_CALIBRATION_GESTURES {
             score(&mut gate, gesture, gesture, 8);
         }
-        // Pronation recovers five of eight, which is 625 permille against a
+        // The first class recovers five of eight, which is 625 permille against a
         // 700 threshold.
         gate.clear();
         for gesture in ACTIVE_CALIBRATION_GESTURES {
             score(&mut gate, gesture, gesture, 8);
         }
-        score(&mut gate, WristPronation, WristSupination, 3);
+        score(&mut gate, first, second, 3);
         let verdict = gate.verdict();
-        let pronation = verdict.classes[active_gesture_index(WristPronation).unwrap() as usize];
-        assert_eq!(pronation.scored, 11);
-        assert_eq!(pronation.accuracy_permille(), Some(727));
-        assert_eq!(pronation.status, GateStatus::Holding);
+        let class = verdict.classes[active_gesture_index(first).unwrap() as usize];
+        assert_eq!(class.scored, 11);
+        assert_eq!(class.accuracy_permille(), Some(727));
+        assert_eq!(class.status, GateStatus::Holding);
 
         // Three more and it drops under.
-        score(&mut gate, WristPronation, WristSupination, 3);
+        score(&mut gate, first, second, 3);
         let verdict = gate.verdict();
-        let pronation = verdict.classes[active_gesture_index(WristPronation).unwrap() as usize];
-        assert_eq!(pronation.accuracy_permille(), Some(571));
-        assert_eq!(pronation.status, GateStatus::Weak);
+        let class = verdict.classes[active_gesture_index(first).unwrap() as usize];
+        assert_eq!(class.accuracy_permille(), Some(571));
+        assert_eq!(class.status, GateStatus::Weak);
     }
 
     #[test]
@@ -233,15 +234,15 @@ mod tests {
         // the number this work is judged on. Silently not scoring it would let
         // a class that never fires look perfect.
         let mut gate = gate();
-        score(&mut gate, WristRadialDeviation, WristRadialDeviation, 5);
+        let first = ACTIVE_CALIBRATION_GESTURES[0];
+        score(&mut gate, first, first, 5);
         for _ in 0..5 {
-            gate.record_window(WristRadialDeviation, None);
+            gate.record_window(first, None);
         }
-        let radial =
-            gate.verdict().classes[active_gesture_index(WristRadialDeviation).unwrap() as usize];
-        assert_eq!(radial.scored, 10);
-        assert_eq!(radial.correct, 5);
-        assert_eq!(radial.status, GateStatus::Weak);
+        let class = gate.verdict().classes[active_gesture_index(first).unwrap() as usize];
+        assert_eq!(class.scored, 10);
+        assert_eq!(class.correct, 5);
+        assert_eq!(class.status, GateStatus::Weak);
         // But it is not confusion with anything, so it names no pair.
         assert_eq!(gate.verdict().weak_pair, None);
     }
@@ -249,40 +250,30 @@ mod tests {
     #[test]
     fn the_weak_pair_is_unordered_and_counted_both_ways() {
         let mut gate = gate();
-        // Supination and radial trade four windows between them; pronation loses
-        // three to supination one way only.
-        score(&mut gate, WristRadialDeviation, WristSupination, 2);
-        score(&mut gate, WristSupination, WristRadialDeviation, 2);
-        score(&mut gate, WristPronation, WristSupination, 3);
-        assert_eq!(
-            gate.verdict().weak_pair,
-            Some(ClassPair {
-                first: WristSupination,
-                second: WristRadialDeviation
-            })
-        );
+        let first = ACTIVE_CALIBRATION_GESTURES[0];
+        let second = ACTIVE_CALIBRATION_GESTURES[1];
+        score(&mut gate, first, second, 2);
+        score(&mut gate, second, first, 2);
+        assert_eq!(gate.verdict().weak_pair, Some(ClassPair { first, second }));
     }
 
     #[test]
     fn a_tie_names_the_earlier_pair_so_the_report_does_not_wander() {
         let mut gate = gate();
-        score(&mut gate, WristPronation, WristSupination, 2);
-        score(&mut gate, WristSupination, WristRadialDeviation, 2);
-        assert_eq!(
-            gate.verdict().weak_pair,
-            Some(ClassPair {
-                first: WristPronation,
-                second: WristSupination
-            })
-        );
+        let first = ACTIVE_CALIBRATION_GESTURES[0];
+        let second = ACTIVE_CALIBRATION_GESTURES[1];
+        score(&mut gate, first, second, 2);
+        score(&mut gate, second, first, 2);
+        assert_eq!(gate.verdict().weak_pair, Some(ClassPair { first, second }));
     }
 
     #[test]
     fn clearing_forgets_the_previous_round() {
         let mut gate = gate();
-        score(&mut gate, WristPronation, WristSupination, 10);
+        let first = ACTIVE_CALIBRATION_GESTURES[0];
+        score(&mut gate, first, ACTIVE_CALIBRATION_GESTURES[1], 10);
         assert_eq!(
-            gate.verdict().classes[active_gesture_index(WristPronation).unwrap() as usize].status,
+            gate.verdict().classes[active_gesture_index(first).unwrap() as usize].status,
             GateStatus::Weak
         );
         gate.clear();

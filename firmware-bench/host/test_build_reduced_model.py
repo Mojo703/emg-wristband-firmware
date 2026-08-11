@@ -11,15 +11,15 @@ from build_reduced_model import (
 class ReducedModelTests(unittest.TestCase):
     def test_filters_inside_each_source_and_preserves_breakdown(self):
         rows = np.arange(8 * 2, dtype=np.float32).reshape(8, 2)
-        labels = np.array([0, 3, 5, 8, 1, 6, 10, 11], np.int32)
+        labels = np.array([2, 3, 7, 8, 1, 6, 10, 11], np.int32)
         sources = [Source("live", "command", 0, 4),
                    Source("prior", "rest", 4, 4)]
         kept, mapped, breakdown = filter_by_source(
             rows, labels, sources, DEFAULT_ACTIVE
         )
-        self.assertEqual(mapped.tolist(), [0, 3, 1, 4, 6, 7])
-        self.assertEqual([entry["rows"] for entry in breakdown], [2, 4])
-        np.testing.assert_array_equal(kept, rows[[0, 2, 4, 5, 6, 7]])
+        self.assertEqual(mapped.tolist(), [0, 1, 2, 3, 4, 5])
+        self.assertEqual([entry["rows"] for entry in breakdown], [4, 2])
+        np.testing.assert_array_equal(kept, rows[[0, 1, 2, 3, 6, 7]])
 
     def test_source_totals_are_checked(self):
         with self.assertRaisesRegex(ValueError, "describe 4 rows"):
@@ -30,7 +30,7 @@ class ReducedModelTests(unittest.TestCase):
     def test_active_layout_requires_matching_no_ops_and_rest(self):
         validate_active(DEFAULT_ACTIVE)
         with self.assertRaisesRegex(ValueError, "matching no-ops"):
-            validate_active((0, 1, 2, 5, 6, 8, 10, 11))
+            validate_active((2, 3, 7, 9, 10, 11))
 
     def test_emitted_quantization_bits_are_the_fit_scale(self):
         constants = {"row_quantization": {

@@ -17,7 +17,6 @@ export interface CalibrationLane {
 export type ActiveCalibrationLanes = readonly [
   CalibrationLane,
   CalibrationLane,
-  CalibrationLane,
 ];
 
 export interface CalibrationCount {
@@ -94,7 +93,7 @@ export type GuidedCalibrationSnapshot =
 export type CalibrationSongEndAction = 'save' | 'continue' | 'discard';
 
 /** Convert wire naming to the neutral playfield's presentation naming without
- * deriving any session state. The protocol guard has already proved three lanes
+ * deriving any session state. The protocol guard has already proved two lanes
  * in visual order before this function runs. */
 export function presentGuidedCalibration(
   snapshot: WireGuidedCalibrationSnapshot,
@@ -112,7 +111,7 @@ export function presentGuidedCalibration(
   };
   return {
     ...snapshot,
-    lanes: [lane(0), lane(1), lane(2)],
+    lanes: [lane(0), lane(1)],
     cues: snapshot.cues.map((cue) => ({
       visualLane: cue.visual_lane,
       at: cue.at,

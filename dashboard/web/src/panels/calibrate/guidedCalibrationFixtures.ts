@@ -16,13 +16,13 @@ const track = {
   title: 'Fixture Track',
   beats_per_minute: 128,
   duration_ms: 170_000,
-  cue_count: 78,
+  cue_count: 52,
   content_identity: contentIdentity,
   cue_shortfall: 0,
 } as const;
 
-const pairedCycle = [0, 3, 1, 4, 2, 5] as const;
-const antiCycle = [3, 4, 5] as const;
+const pairedCycle = [0, 2, 1, 3] as const;
+const antiCycle = [2, 3] as const;
 const semanticSchedule = [
   ...Array.from({ length: 10 }, () => pairedCycle).flat(),
   ...Array.from({ length: 6 }, () => antiCycle).flat(),
@@ -31,24 +31,17 @@ const semanticSchedule = [
 const lanes: ActiveCalibrationLanes = [
   {
     visualLane: VisualLane.Gesture0,
-    id: 'wrist_pronation',
-    label: 'Tip out',
-    colorName: 'blue',
-    motion: { arrow: 'right', hint: 'pole tip out' },
-  },
-  {
-    visualLane: VisualLane.Gesture1,
-    id: 'wrist_supination',
-    label: 'Tip in',
-    colorName: 'amber',
-    motion: { arrow: 'left', hint: 'pole tip in' },
-  },
-  {
-    visualLane: VisualLane.Gesture2,
     id: 'wrist_radial_deviation',
     label: 'Tip forward',
     colorName: 'green',
     motion: { arrow: 'up', hint: 'pole tip forward' },
+  },
+  {
+    visualLane: VisualLane.Gesture1,
+    id: 'wrist_ulnar_deviation',
+    label: 'Tip back',
+    colorName: 'purple',
+    motion: { arrow: 'down', hint: 'pole tip back' },
   },
 ];
 
@@ -56,7 +49,7 @@ export const calibrationSetupFixture: CalibrationSetupSnapshot = {
   phase: 'setup',
   tracks: [
     track,
-    { ...track, id: 'short-track', title: 'Short Fixture', cue_count: 64, cue_shortfall: 14 },
+    { ...track, id: 'short-track', title: 'Short Fixture', cue_count: 44, cue_shortfall: 8 },
   ],
   selected_track_id: track.id,
 };
@@ -66,10 +59,10 @@ export const calibrationPlayingFixture: CalibrationPlayingSnapshot = {
   track,
   lanes,
   cues: semanticSchedule.map((semanticColumn, index) => ({
-    visualLane: lanes[semanticColumn % 3]!.visualLane,
+    visualLane: lanes[semanticColumn % 2]!.visualLane,
     at: 4_000 + index * 2_100,
     hold: 1_500,
-    thumbVariant: semanticColumn < 3 ? ThumbVariant.Up : ThumbVariant.Down,
+    thumbVariant: semanticColumn < 2 ? ThumbVariant.Up : ThumbVariant.Down,
   })),
   position_ms: 18_000,
   position_observed_at_unix_ms: asUnixMilliseconds(1_800_000_018_000),
@@ -81,7 +74,7 @@ export const calibrationPlayingFixture: CalibrationPlayingSnapshot = {
     label: lane.label,
     thumb_up: 4,
     thumb_down: 3,
-    invalid: lane.visualLane === VisualLane.Gesture2 ? 2 : 0,
+    invalid: lane.visualLane === VisualLane.Gesture1 ? 2 : 0,
   })),
 };
 

@@ -8,7 +8,7 @@ const track = {
   title: 'Calibration Song',
   beats_per_minute: 128,
   duration_ms: 90_000,
-  cue_count: 78,
+  cue_count: 52,
   content_identity: 'a'.repeat(64),
   cue_shortfall: 0,
 };

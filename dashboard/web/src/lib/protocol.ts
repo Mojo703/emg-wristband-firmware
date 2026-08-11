@@ -1836,7 +1836,7 @@ export function isGuidedCalibrationSnapshot(
       if (
         !isGuidedCalibrationTrack(value['track']) ||
         !Array.isArray(value['lanes']) ||
-        value['lanes'].length !== 3 ||
+        value['lanes'].length !== 2 ||
         !value['lanes'].every(isGuidedCalibrationLane)
       ) {
         return false;

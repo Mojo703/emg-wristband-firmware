@@ -23,7 +23,7 @@ use crate::{active_gesture_index, RepEvidence};
 /// while the protocol crate's cancelled partial implementation still says 16.
 pub const MAX_ANCHORED_SONG_CHUNK_CUES: usize = 32;
 /// A complete upload is bounded before either of its two exact-reserve calls.
-/// The shipped recipe needs 78 cues; 256 leaves room for alternate authored
+/// The shipped recipe needs 52 cues; 256 leaves room for alternate authored
 /// songs while keeping malformed input from consuming the device heap or
 /// flooding the 24-frame reliable acknowledgement outbox.
 pub const MAX_ANCHORED_SONG_CUES: u32 = 256;
@@ -821,7 +821,7 @@ mod tests {
     fn cue(id: u32, at: u32) -> CalibrationScheduleEntry {
         CalibrationScheduleEntry {
             cue_id: CalibrationCueId::new(id).unwrap(),
-            gesture: CalibrationGesture::WristPronation,
+            gesture: crate::ACTIVE_CALIBRATION_GESTURES[0],
             modifier: CalibrationModifier::ThumbUp,
             track_offset: TrackMilliseconds::new(at),
             hold: DurationMilliseconds::new(REQUIRED_CUE_HOLD_MILLISECONDS),

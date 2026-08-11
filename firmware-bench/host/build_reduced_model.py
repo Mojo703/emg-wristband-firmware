@@ -27,7 +27,7 @@ from calibration_fit import (
 from training import fit_weighted
 
 FEATURES = 64
-DEFAULT_ACTIVE = (0, 1, 2, 5, 6, 7, 10, 11)
+DEFAULT_ACTIVE = (2, 3, 7, 8, 10, 11)
 DEFAULT_LIVE = (
     "2026-08-07T22-08-47_Matthew",
     "2026-08-07T22-16-46_Matthew",
@@ -52,12 +52,13 @@ def parse_active(text):
 
 
 def validate_active(active):
-    if len(active) != 8:
-        raise ValueError("the reduced v2 image must contain exactly eight classes")
-    commands = active[:3]
-    if active[3:6] != tuple(value + 5 for value in commands):
-        raise ValueError("active classes must be three commands followed by their matching no-ops")
-    if active[6:] != (10, 11):
+    if len(active) < 4 or (len(active) - 2) % 2:
+        raise ValueError("the reduced v2 image must contain paired commands plus two rest classes")
+    command_count = (len(active) - 2) // 2
+    commands = active[:command_count]
+    if active[command_count:2 * command_count] != tuple(value + 5 for value in commands):
+        raise ValueError("active classes must be commands followed by their matching no-ops")
+    if active[2 * command_count:] != (10, 11):
         raise ValueError("active classes must retain static and moving rest as old labels 10,11")
 
 
@@ -88,19 +89,19 @@ def filter_by_source(rows, labels, sources, active):
     return np.vstack(row_blocks).astype(np.float32), np.concatenate(label_blocks), breakdown
 
 
-def class_scales(labels, command_count=3):
+def class_scales(labels, command_count):
     scales = np.ones(len(labels), np.float32)
     scales[(labels >= command_count) & (labels < 2 * command_count)] = np.float32(NO_OP_SCALE)
     return scales
 
 
-def normalized_row_weights(labels, command_count=3):
+def normalized_row_weights(labels, command_count):
     scales = class_scales(labels, command_count).astype(np.float64)
     counts = np.bincount(labels, minlength=2 * command_count + 2).astype(np.float64)
     return scales / counts[labels]
 
 
-def fit_prior(prior_rows, prior_labels, class_count=8):
+def fit_prior(prior_rows, prior_labels, command_count, class_count):
     mean, deviation = standardization_of(prior_rows)
     standardized = standardize(prior_rows, mean, deviation)
     scales = quantization_scale(standardized, QUANTIZATION)
@@ -111,7 +112,7 @@ def fit_prior(prior_rows, prior_labels, class_count=8):
     design = np.hstack([quantized, np.ones((len(quantized), 1), np.float32)])
     onehot = np.zeros((len(prior_labels), class_count), np.float32)
     onehot[np.arange(len(prior_labels)), prior_labels] = 1.0
-    weights = normalized_row_weights(prior_labels).astype(np.float32)
+    weights = normalized_row_weights(prior_labels, command_count).astype(np.float32)
     # run_passes performs the device's sequential weight normalization and
     # reciprocal-form float32 softmax. The initial matrix is explicitly zero.
     fitted, _ = run_passes(
@@ -140,6 +141,8 @@ def set_quantization_constant(constants, scale):
 def build(source_model, source_constants, output, active=DEFAULT_ACTIVE,
           live_sessions=DEFAULT_LIVE):
     validate_active(active)
+    command_count = (len(active) - 2) // 2
+    class_count = len(active)
     document = json.loads((source_model / "model.json").read_text())
     rows = np.load(source_model / "training_rows.npy").astype(np.float32)
     labels = np.load(source_model / "training_labels.npy").astype(np.int32)
@@ -161,13 +164,13 @@ def build(source_model, source_constants, output, active=DEFAULT_ACTIVE,
     prior_rows = reduced_rows[prior_indices]
     prior_labels = reduced_labels[prior_indices]
     mean, deviation, _, prior_weights, clipped, prior_scale = fit_prior(
-        prior_rows, prior_labels
+        prior_rows, prior_labels, command_count, class_count
     )
 
     standardized = standardize(reduced_rows, mean, deviation)
-    row_weights = normalized_row_weights(reduced_labels)
+    row_weights = normalized_row_weights(reduced_labels, command_count)
     full_weights = fit_weighted(
-        standardized, reduced_labels, 8, row_weights, np.float32
+        standardized, reduced_labels, class_count, row_weights, np.float32
     ).astype(np.float32)
 
     model_dir = output / "model"
@@ -180,17 +183,17 @@ def build(source_model, source_constants, output, active=DEFAULT_ACTIVE,
     np.save(model_dir / "row_weights.npy", row_weights)
     np.save(model_dir / "weights.npy", full_weights)
 
-    command_names = [document["command_classes"][old] for old in active[:3]]
+    command_names = [document["command_classes"][old] for old in active[:command_count]]
     reduced_document = {
-        "classes": 8,
-        "number_of_commands": 3,
+        "classes": class_count,
+        "number_of_commands": command_count,
         "command_classes": command_names,
         "old_class_labels": list(active),
         "old_to_new": {str(old): new for new, old in enumerate(active)},
         "no_op_weight": NO_OP_SCALE,
         "tau": document.get("tau", 0.5),
         "needed": document.get("needed", 3),
-        "weights_shape": [FEATURES + 1, 8],
+        "weights_shape": [FEATURES + 1, class_count],
         "training_rows": int(len(reduced_rows)),
         "training_sources": breakdown,
         "default_live_sessions": list(live_sessions),
@@ -207,8 +210,8 @@ def build(source_model, source_constants, output, active=DEFAULT_ACTIVE,
     constants = json.loads(source_constants.read_text())
     set_quantization_constant(constants, prior_scale)
     constants["reduced_model"] = {
-        "class_count": 8,
-        "command_count": 3,
+        "class_count": class_count,
+        "command_count": command_count,
         "old_class_labels": list(active),
         "default_live_sessions": list(live_sessions),
         "prior_rows": int(len(prior_rows)),
@@ -237,7 +240,8 @@ def main():
     document = build(arguments.source_model, arguments.source_constants,
                      arguments.output, arguments.active_old_classes)
     print(f"wrote {arguments.output}: {document['training_rows']} rows, "
-          f"{document['prior_rows_after_default_exclusion']} prior, 8 classes")
+          f"{document['prior_rows_after_default_exclusion']} prior, "
+          f"{document['classes']} classes")
 
 
 if __name__ == "__main__":

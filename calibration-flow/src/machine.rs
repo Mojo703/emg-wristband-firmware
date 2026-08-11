@@ -795,7 +795,6 @@ impl Run {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use CalibrationGesture::*;
 
     fn constants() -> Constants {
         Constants {
@@ -996,7 +995,7 @@ mod tests {
         // span against a later sample — the label is fixed at the prompt.
         let (run, action) = run.poll(settled + 100);
         assert_eq!(action, None);
-        assert_eq!(run.prompt(), Some(WristPronation));
+        assert_eq!(run.prompt(), Some(ACTIVE_CALIBRATION_GESTURES[0]));
         assert_eq!(
             span.first_sample,
             settled + constants().prompt_delay_samples()
@@ -1029,7 +1028,7 @@ mod tests {
             panic!("a re-prompt");
         };
         assert_eq!(
-            gesture, WristPronation,
+            gesture, ACTIVE_CALIBRATION_GESTURES[0],
             "the same gesture, not the next one"
         );
         assert_eq!(generation, 2);
@@ -1061,7 +1060,7 @@ mod tests {
         assert_eq!(
             outcome,
             RepOutcome::GestureExhausted {
-                gesture: WristPronation,
+                gesture: ACTIVE_CALIBRATION_GESTURES[0],
                 rejection: RepRejection::MissingSamples
             }
         );
@@ -1070,9 +1069,9 @@ mod tests {
         assert!(matches!(
             action,
             Some(Action::Prompt {
-                gesture: WristSupination,
+                gesture,
                 ..
-            })
+            }) if gesture == ACTIVE_CALIBRATION_GESTURES[1]
         ));
     }
 
@@ -1191,7 +1190,7 @@ mod tests {
         let mut now = settled;
         assert_eq!(run.rounds_planned(), constants.thumb_up_round_floor);
 
-        // One round where pronation is confused with supination throughout.
+        // One round where the first active gesture is confused with the second.
         for gesture in ACTIVE_CALIBRATION_GESTURES {
             let (asked, action) = run.poll(now);
             let Some(Action::Prompt { span, .. }) = action else {
@@ -1200,8 +1199,8 @@ mod tests {
             now = span.end_sample;
             (run, _) = asked.resolve(good_rep());
             for _ in 0..4 {
-                let predicted = if gesture == WristPronation {
-                    WristSupination
+                let predicted = if gesture == ACTIVE_CALIBRATION_GESTURES[0] {
+                    ACTIVE_CALIBRATION_GESTURES[1]
                 } else {
                     gesture
                 };
@@ -1220,8 +1219,8 @@ mod tests {
         assert_eq!(
             run.weak_pair(),
             Some(ClassPair {
-                first: WristPronation,
-                second: WristSupination
+                first: ACTIVE_CALIBRATION_GESTURES[0],
+                second: ACTIVE_CALIBRATION_GESTURES[1]
             })
         );
 
@@ -1245,7 +1244,7 @@ mod tests {
                 now = span.end_sample;
                 (run, _) = asked.resolve(good_rep());
                 for _ in 0..4 {
-                    run.record_held_out_window(gesture, Some(WristPronation));
+                    run.record_held_out_window(gesture, Some(ACTIVE_CALIBRATION_GESTURES[0]));
                 }
             }
             assert_eq!(run.rounds_planned(), constants.thumb_up_round_floor);

@@ -72,7 +72,7 @@ use resident_selector::{
 
 /// Rows the RAM buffer holds: one round, with room to spare.
 ///
-/// A round is at most three gestures of nine rows each. The old
+/// A round is at most the active gestures' nine rows each. The old
 /// number here was the whole slot's capacity, which is 2,559 rows. That buffer
 /// the architecture inside out and would not fit a boot heap whose largest
 /// block is about a hundred kilobytes. Rows live in flash; RAM buffers the
@@ -3958,14 +3958,15 @@ mod anchored_lifecycle_tests {
             );
         }
         for gesture in [
-            CalibrationGesture::WristUlnarDeviation,
+            CalibrationGesture::WristPronation,
+            CalibrationGesture::WristSupination,
             CalibrationGesture::ThumbExtension,
         ] {
             let mut entry = cue_entry(99);
             entry.gesture = gesture;
             assert_eq!(anchored_label(entry), None);
         }
-        assert_eq!(CALIBRATION_CLASS_CAPACITY, 8);
+        assert_eq!(CALIBRATION_CLASS_CAPACITY, CALIBRATION_MODEL_CLASS_COUNT);
     }
 
     #[test]
@@ -3990,7 +3991,10 @@ mod anchored_lifecycle_tests {
             retained_rows, ACTIVE_RECIPE_ROW_COUNT,
             "surplus clean cues from Continue must not consume flash rows"
         );
-        assert_eq!(progress.retained_rep_count(), 78);
+        assert_eq!(
+            progress.retained_rep_count(),
+            ACTIVE_GESTURE_COUNT as u32 * (ANCHORED_COMMAND_TARGET + ANCHORED_NO_OP_TARGET)
+        );
     }
 
     #[test]

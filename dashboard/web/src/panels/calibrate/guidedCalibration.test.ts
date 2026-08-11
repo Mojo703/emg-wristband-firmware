@@ -62,18 +62,17 @@ test('fixtures cover every guided calibration presentation phase', () => {
     ],
     ['setup', 'playing', 'between_songs', 'finalizing', 'technical_failure'],
   );
-  assert.equal(calibrationPlayingFixture.lanes.length, 3);
-  assert.equal(calibrationPlayingFixture.cues.length, 78);
+  assert.equal(calibrationPlayingFixture.lanes.length, 2);
+  assert.equal(calibrationPlayingFixture.cues.length, 52);
   assert.deepEqual(
-    calibrationPlayingFixture.cues.slice(0, 6).map((cue) => [cue.visualLane, cue.thumbVariant]),
+    calibrationPlayingFixture.cues.slice(0, 4).map((cue) => [cue.visualLane, cue.thumbVariant]),
     [
-      [0, 'up'], [0, 'down'], [1, 'up'], [1, 'down'], [2, 'up'],
-      [2, 'down'],
+      [0, 'up'], [0, 'down'], [1, 'up'], [1, 'down'],
     ],
   );
   assert.deepEqual(
-    calibrationPlayingFixture.cues.slice(60, 63).map((cue) => [cue.visualLane, cue.thumbVariant]),
-    [[0, 'down'], [1, 'down'], [2, 'down']],
+    calibrationPlayingFixture.cues.slice(40, 42).map((cue) => [cue.visualLane, cue.thumbVariant]),
+    [[0, 'down'], [1, 'down']],
   );
   assert.deepEqual(
     new Set(calibrationPlayingFixture.cues.map((cue) => cue.thumbVariant)),
@@ -95,9 +94,8 @@ test('calibration lanes carry the same user-facing Collect presentation', () => 
       arrow: motion?.arrow ?? null,
     })),
     [
-      { id: 'wrist_pronation', label: 'Tip out', colorName: 'blue', arrow: 'right' },
-      { id: 'wrist_supination', label: 'Tip in', colorName: 'amber', arrow: 'left' },
       { id: 'wrist_radial_deviation', label: 'Tip forward', colorName: 'green', arrow: 'up' },
+      { id: 'wrist_ulnar_deviation', label: 'Tip back', colorName: 'purple', arrow: 'down' },
     ],
   );
 });

@@ -2087,7 +2087,7 @@ mod tests {
             record_crc_valid: true,
         });
         let with_deficit = [protocol::CalibrationClassCounts {
-            gesture: protocol::CalibrationGesture::WristPronation,
+            gesture: calibration_flow::ACTIVE_CALIBRATION_GESTURES[0],
             modifier: protocol::CalibrationModifier::ThumbUp,
             accepted_count: 9,
             rejected_count: 0,
@@ -2462,10 +2462,10 @@ mod tests {
             duration_ms: 60_000,
             cue_count: 1,
             content_identity: "test-content".into(),
-            cue_shortfall: 129,
+            cue_shortfall: 51,
             entries: vec![protocol::CalibrationScheduleEntry {
                 cue_id: protocol::CalibrationCueId::new(1).unwrap(),
-                gesture: protocol::CalibrationGesture::WristPronation,
+                gesture: calibration_flow::ACTIVE_CALIBRATION_GESTURES[0],
                 modifier: protocol::CalibrationModifier::ThumbUp,
                 track_offset: protocol::TrackMilliseconds::new(0),
                 hold: protocol::DurationMilliseconds::new(1_500),
@@ -3036,7 +3036,7 @@ mod tests {
         acknowledge_test_schedule(&mut device, run, first_revision, &first_track).await;
 
         let first_counts = vec![protocol::CalibrationClassCounts {
-            gesture: protocol::CalibrationGesture::WristPronation,
+            gesture: calibration_flow::ACTIVE_CALIBRATION_GESTURES[0],
             modifier: protocol::CalibrationModifier::ThumbUp,
             accepted_count: 9,
             rejected_count: 1,
@@ -3294,14 +3294,22 @@ mod tests {
             .map(|(index, (gesture, modifier))| {
                 let (accepted_count, target_count) = match modifier {
                     protocol::CalibrationModifier::ThumbUp => (12, 10),
-                    protocol::CalibrationModifier::ThumbDown if index == 5 => (16, 16),
+                    protocol::CalibrationModifier::ThumbDown
+                        if index + 1 == calibration_flow::ANCHORED_CLASS_COUNT =>
+                    {
+                        (16, 16)
+                    }
                     protocol::CalibrationModifier::ThumbDown => (17, 16),
                 };
                 protocol::CalibrationClassCounts {
                     gesture,
                     modifier,
                     accepted_count,
-                    rejected_count: if index == 5 { 0 } else { 4 },
+                    rejected_count: if index + 1 == calibration_flow::ANCHORED_CLASS_COUNT {
+                        0
+                    } else {
+                        4
+                    },
                     target_count,
                     deficit_count: 0,
                 }
@@ -3339,8 +3347,8 @@ mod tests {
                 track_title,
                 candidate_available: true,
                 continue_available: false,
-                valid_reps: 86,
-                invalid_reps: 20,
+                valid_reps: 57,
+                invalid_reps: 12,
                 ref deficits,
                 ..
             }) if track_title == &second_track.title && deficits.is_empty()
@@ -4006,10 +4014,11 @@ mod tests {
 
         let lanes = calibration_lanes(&classes);
         assert_eq!(lanes.len(), calibration_flow::ACTIVE_GESTURE_COUNT);
-        for (lane, class) in lanes
+        for (lane, gesture) in lanes
             .iter()
-            .zip(&classes[..calibration_flow::ACTIVE_GESTURE_COUNT])
+            .zip(calibration_flow::ACTIVE_CALIBRATION_GESTURES)
         {
+            let class = &classes[gesture.index() as usize];
             assert_eq!(lane.id, class.id.0);
             assert_eq!(lane.label, class.label);
             assert_eq!(lane.color_name, class.color);

@@ -2,7 +2,8 @@ use calibration_flow::{
     anchored_class_index, anchored_labeled_span, AnchoredFitPlan, AnchoredFitStage,
     AnchoredRecipeProgress, AnchoredSong, AnchoredSongAction, AnchoredSongIdentity, Constants,
     RepEvidence, SongState, ACTIVE_CALIBRATION_GESTURES, ACTIVE_GESTURE_COUNT,
-    CALIBRATION_MODEL_CLASS_COUNT, MAX_ANCHORED_SONG_CHUNK_CUES,
+    ANCHORED_COMMAND_TARGET, ANCHORED_NO_OP_TARGET, CALIBRATION_MODEL_CLASS_COUNT,
+    MAX_ANCHORED_SONG_CHUNK_CUES,
 };
 use emg_runtime::band_features::FEATURE_COUNT;
 use emg_runtime::flash_image::{
@@ -20,8 +21,10 @@ use protocol::{
 };
 
 const CLASS_COUNT: usize = CALIBRATION_MODEL_CLASS_COUNT;
-const CUES_PER_SONG: usize = 54;
-const RECIPE_ROW_COUNT: usize = 702;
+const CUES_PER_SONG: usize = 36;
+const RECIPE_REP_COUNT: usize =
+    ACTIVE_GESTURE_COUNT * (ANCHORED_COMMAND_TARGET as usize + ANCHORED_NO_OP_TARGET as usize);
+const RECIPE_ROW_COUNT: usize = RECIPE_REP_COUNT * Constants::DEFAULT.labeled_windows as usize;
 
 fn run_key() -> CalibrationRunKey {
     CalibrationRunKey {
@@ -196,7 +199,10 @@ fn imperfect_song_continue_surplus_final_polish_crc_and_save_complete_in_seconds
                 && (((entry.cue_id.get() - 1) as usize / (ACTIVE_GESTURE_COUNT * 2)) < 2)
         },
     );
-    assert_eq!(row_count, 48 * Constants::DEFAULT.rows_per_rep() as usize);
+    assert_eq!(
+        row_count,
+        (CUES_PER_SONG - ACTIVE_GESTURE_COUNT * 2) * Constants::DEFAULT.rows_per_rep() as usize
+    );
     assert_eq!(fit_plan, AnchoredFitPlan::Checkpoint);
 
     // Complete one coalesced checkpoint, just as recovery-gap work can finish
@@ -217,7 +223,7 @@ fn imperfect_song_continue_surplus_final_polish_crc_and_save_complete_in_seconds
         &mut fit_plan,
         |_| false,
     );
-    assert_eq!(progress.retained_rep_count(), 78);
+    assert_eq!(progress.retained_rep_count(), RECIPE_REP_COUNT as u32);
     assert_eq!(row_count, RECIPE_ROW_COUNT);
     assert_eq!(
         song.retained_progress().accepted_rows as usize,

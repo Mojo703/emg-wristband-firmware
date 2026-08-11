@@ -181,14 +181,17 @@ mod tests {
     }
 
     #[test]
-    fn anchored_song_controls_accept_the_complete_78_cue_upload_shape() {
+    fn anchored_song_controls_accept_the_complete_active_cue_upload_shape() {
         let run = CalibrationRunKey {
             session_id: CalibrationSessionId::new(7).unwrap(),
             run_id: CalibrationRunId::new(3).unwrap(),
         };
         let schedule_revision = CalibrationScheduleRevision::new(9).unwrap();
         let content_identity = "track-content-sha256".to_owned();
-        let entries: Vec<_> = (0..78)
+        let cue_count = calibration_flow::ACTIVE_GESTURE_COUNT
+            * (calibration_flow::ANCHORED_COMMAND_TARGET + calibration_flow::ANCHORED_NO_OP_TARGET)
+                as usize;
+        let entries: Vec<_> = (0..cue_count as u32)
             .map(|index| CalibrationScheduleEntry {
                 cue_id: CalibrationCueId::new(index + 1).unwrap(),
                 gesture: calibration_flow::ACTIVE_CALIBRATION_GESTURES

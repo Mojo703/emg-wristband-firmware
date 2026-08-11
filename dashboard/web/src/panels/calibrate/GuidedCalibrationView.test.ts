@@ -73,7 +73,7 @@ test('a selected short authored song keeps Start enabled', async () => {
   const body = await render({ ...setup, selected_track_id: 'short-track' });
 
   assert.doesNotMatch(button(body, 'Start calibration'), DISABLED_ATTRIBUTE);
-  assert.match(body, /14 short/);
+  assert.match(body, /8 short/);
 });
 
 test('strict authoritative wire snapshot reaches the real guided component', async () => {
@@ -116,11 +116,10 @@ test('playing renders a persistent cue-variant legend and accessible cue narrati
   assert.match(body, /Current cue:/);
   assert.match(body, /Next cue:/);
   assert.match(body, /<canvas[^>]*aria-hidden="true"/);
-  assert.match(body, /Tip out/);
-  assert.match(body, /Tip in/);
   assert.match(body, /Tip forward/);
-  assert.match(body, /color: #70b8ff/);
-  assert.match(body, /color: #ffca16/);
+  assert.match(body, /Tip back/);
+  assert.match(body, /color: #3dd68c/);
+  assert.match(body, /color: #d19dff/);
   assert.doesNotMatch(body, /WristPronation|WristSupination|Lift thumb/);
 });
 

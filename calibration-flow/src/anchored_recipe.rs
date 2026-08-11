@@ -16,10 +16,9 @@ pub const ANCHORED_NO_OP_TARGET: u32 = 16;
 /// choose the checkpoint boundaries.
 pub const ANCHORED_CHECKPOINT_PROMPTS: u32 = 10;
 /// The one product selection point for guided calibration and model commands.
-pub const ACTIVE_CALIBRATION_GESTURES: [CalibrationGesture; 3] = [
-    CalibrationGesture::WristPronation,
-    CalibrationGesture::WristSupination,
+pub const ACTIVE_CALIBRATION_GESTURES: [CalibrationGesture; 2] = [
     CalibrationGesture::WristRadialDeviation,
+    CalibrationGesture::WristUlnarDeviation,
 ];
 pub const ACTIVE_GESTURE_COUNT: usize = ACTIVE_CALIBRATION_GESTURES.len();
 pub const ANCHORED_CLASS_COUNT: usize = ACTIVE_GESTURE_COUNT * 2;
@@ -207,10 +206,7 @@ mod tests {
     #[test]
     fn checkpoints_follow_retained_prompt_count_not_executor_timing() {
         let mut progress = AnchoredRecipeProgress::default();
-        let command = entry(
-            CalibrationGesture::WristPronation,
-            CalibrationModifier::ThumbUp,
-        );
+        let command = entry(ACTIVE_CALIBRATION_GESTURES[0], CalibrationModifier::ThumbUp);
         for retained in 1..ANCHORED_COMMAND_TARGET {
             assert!(progress.record_accepted(command));
             assert_eq!(
@@ -238,7 +234,10 @@ mod tests {
             }
         }
         assert!(progress.is_complete());
-        assert_eq!(progress.retained_rep_count(), 78);
+        assert_eq!(
+            progress.retained_rep_count(),
+            ACTIVE_GESTURE_COUNT as u32 * (ANCHORED_COMMAND_TARGET + ANCHORED_NO_OP_TARGET)
+        );
         assert!(!progress.checkpoint_due());
     }
 
@@ -258,8 +257,16 @@ mod tests {
                 }
             }
         }
-        assert_eq!(progress.retained_rep_count(), 78);
-        assert_eq!(retained_rows, 702);
+        assert_eq!(
+            progress.retained_rep_count(),
+            ACTIVE_GESTURE_COUNT as u32 * (ANCHORED_COMMAND_TARGET + ANCHORED_NO_OP_TARGET)
+        );
+        assert_eq!(
+            retained_rows,
+            ACTIVE_GESTURE_COUNT as u32
+                * (ANCHORED_COMMAND_TARGET + ANCHORED_NO_OP_TARGET)
+                * constants.rows_per_rep()
+        );
         assert!(progress.is_complete());
     }
 
@@ -267,7 +274,8 @@ mod tests {
     fn inactive_protocol_gestures_have_no_recipe_class() {
         let mut progress = AnchoredRecipeProgress::default();
         for gesture in [
-            CalibrationGesture::WristUlnarDeviation,
+            CalibrationGesture::WristPronation,
+            CalibrationGesture::WristSupination,
             CalibrationGesture::ThumbExtension,
         ] {
             let cue = entry(gesture, CalibrationModifier::ThumbUp);

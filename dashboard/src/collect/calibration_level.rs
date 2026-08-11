@@ -18,6 +18,7 @@ pub const SEMANTIC_COLUMN_COUNT: usize = COMMAND_SEMANTIC_COUNT * 2;
 pub const CALIBRATION_LEVEL_SCHEMA_VERSION: u32 = 2;
 const LEGACY_CALIBRATION_LEVEL_GENERATOR_VERSION: u32 = 2;
 const FULL_GESTURE_CALIBRATION_LEVEL_GENERATOR_VERSION: u32 = 4;
+const THREE_GESTURE_CALIBRATION_LEVEL_GENERATOR_VERSION: u32 = 5;
 const LEGACY_COMMAND_SEMANTIC_COUNT: usize = protocol::CalibrationGesture::ALL.len();
 const LEGACY_SEMANTIC_COLUMN_COUNT: usize = LEGACY_COMMAND_SEMANTIC_COUNT * 2;
 const LEGACY_MAXIMUM_CUES: usize =
@@ -26,7 +27,7 @@ const LEGACY_MAXIMUM_CUES: usize =
 /// anchored-song contract still requires 500 ms after every cue. Catalog loading
 /// regenerates this version in memory from the retained source schedule.
 pub(crate) const INCOMPATIBLE_CALIBRATION_LEVEL_GENERATOR_VERSION: u32 = 3;
-pub const CALIBRATION_LEVEL_GENERATOR_VERSION: u32 = 5;
+pub const CALIBRATION_LEVEL_GENERATOR_VERSION: u32 = 6;
 #[cfg(test)]
 pub const CALIBRATION_SOURCE_LEVEL: &str = "hard";
 /// Prefer the established hard schedule when counts tie, but allow a more
@@ -139,6 +140,7 @@ impl CalibrationLevelProduct {
             self.generator_version,
             LEGACY_CALIBRATION_LEVEL_GENERATOR_VERSION
                 | FULL_GESTURE_CALIBRATION_LEVEL_GENERATOR_VERSION
+                | THREE_GESTURE_CALIBRATION_LEVEL_GENERATOR_VERSION
                 | CALIBRATION_LEVEL_GENERATOR_VERSION
         ) {
             anyhow::bail!(
@@ -337,14 +339,16 @@ fn sequential_columns_for_version(cue_count: usize, generator_version: u32) -> V
 }
 
 const fn recipe_shape(generator_version: u32) -> (usize, usize, usize) {
-    if generator_version >= CALIBRATION_LEVEL_GENERATOR_VERSION {
-        (COMMAND_SEMANTIC_COUNT, SEMANTIC_COLUMN_COUNT, MAXIMUM_CUES)
-    } else {
-        (
+    match generator_version {
+        CALIBRATION_LEVEL_GENERATOR_VERSION => {
+            (COMMAND_SEMANTIC_COUNT, SEMANTIC_COLUMN_COUNT, MAXIMUM_CUES)
+        }
+        THREE_GESTURE_CALIBRATION_LEVEL_GENERATOR_VERSION => (3, 6, 78),
+        _ => (
             LEGACY_COMMAND_SEMANTIC_COUNT,
             LEGACY_SEMANTIC_COLUMN_COUNT,
             LEGACY_MAXIMUM_CUES,
-        )
+        ),
     }
 }
 
@@ -603,7 +607,7 @@ mod tests {
         assert_eq!(summary.maximum_cue_count, MAXIMUM_CUES);
         assert!(summary.shorter_than_maximum);
         assert_eq!(summary.semantic_column_counts.iter().sum::<usize>(), 7);
-        assert_eq!(summary.semantic_column_counts, [2, 1, 1, 1, 1, 1]);
+        assert_eq!(summary.semantic_column_counts, [2, 2, 2, 1]);
     }
 
     #[test]
@@ -633,12 +637,9 @@ mod tests {
         let level = generate(&source, source_duration(&source));
 
         assert_eq!(level.notes().len(), MAXIMUM_CUES);
-        assert_eq!(
-            level.summary().semantic_column_counts,
-            [10, 10, 10, 16, 16, 16]
-        );
+        assert_eq!(level.summary().semantic_column_counts, [10, 10, 16, 16]);
         assert_eq!(level.summary().visual_lane_counts, [26; VISUAL_LANE_COUNT]);
-        assert_eq!(level.summary().thumb_variant_counts, [30, 48]);
+        assert_eq!(level.summary().thumb_variant_counts, [20, 32]);
         assert!(!level.summary().shorter_than_maximum);
     }
 
@@ -703,12 +704,9 @@ mod tests {
 
         assert_eq!(
             &columns[..20],
-            &[0, 3, 1, 4, 2, 5, 0, 3, 1, 4, 2, 5, 0, 3, 1, 4, 2, 5, 0, 3]
+            &[0, 2, 1, 3, 0, 2, 1, 3, 0, 2, 1, 3, 0, 2, 1, 3, 0, 2, 1, 3]
         );
-        assert_eq!(
-            &columns[60..],
-            &[3, 4, 5, 3, 4, 5, 3, 4, 5, 3, 4, 5, 3, 4, 5, 3, 4, 5]
-        );
+        assert_eq!(&columns[40..], &[2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3]);
     }
 
     #[test]
@@ -834,9 +832,8 @@ mod tests {
     #[test]
     fn current_semantic_columns_name_only_the_active_gesture_pairs() {
         let expected = [
-            protocol::CalibrationGesture::WristPronation,
-            protocol::CalibrationGesture::WristSupination,
             protocol::CalibrationGesture::WristRadialDeviation,
+            protocol::CalibrationGesture::WristUlnarDeviation,
         ];
         for column in 0..SEMANTIC_COLUMN_COUNT as u8 {
             let (gesture, modifier) = semantic_column_parts(column).unwrap();
@@ -857,7 +854,7 @@ mod tests {
     }
 
     #[test]
-    fn full_gesture_v4_product_stays_readable_and_differs_from_active_v5() {
+    fn full_gesture_v4_product_stays_readable_and_differs_from_active_v6() {
         let source = regular_source(LEGACY_MAXIMUM_CUES, 2_500);
         let duration = source_duration(&source);
         let legacy = CalibrationLevelProduct::generate_with_version(
@@ -871,6 +868,24 @@ mod tests {
         assert_eq!(current.cue_count(), MAXIMUM_CUES);
         assert_ne!(legacy.content_identity, current.content_identity);
         legacy.validate_against_source(&source, duration).unwrap();
+        current.validate_against_source(&source, duration).unwrap();
+    }
+
+    #[test]
+    fn three_gesture_v5_product_stays_readable_and_differs_from_active_v6() {
+        let source = regular_source(78, 2_500);
+        let duration = source_duration(&source);
+        let previous = CalibrationLevelProduct::generate_with_version(
+            &source,
+            duration,
+            THREE_GESTURE_CALIBRATION_LEVEL_GENERATOR_VERSION,
+        );
+        let current = CalibrationLevelProduct::generate(&source, duration);
+
+        assert_eq!(previous.cue_count(), 78);
+        assert_eq!(current.cue_count(), MAXIMUM_CUES);
+        assert_ne!(previous.content_identity, current.content_identity);
+        previous.validate_against_source(&source, duration).unwrap();
         current.validate_against_source(&source, duration).unwrap();
     }
 
@@ -900,7 +915,7 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(CALIBRATION_LEVEL_SCHEMA_VERSION, 2);
-        assert_eq!(CALIBRATION_LEVEL_GENERATOR_VERSION, 5);
+        assert_eq!(CALIBRATION_LEVEL_GENERATOR_VERSION, 6);
         assert_eq!(first.schema_version, CALIBRATION_LEVEL_SCHEMA_VERSION);
         assert_eq!(first.generator_version, CALIBRATION_LEVEL_GENERATOR_VERSION);
         assert_eq!(first.source_level, CALIBRATION_SOURCE_LEVEL);
