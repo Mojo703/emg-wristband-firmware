@@ -13,6 +13,7 @@
 pub mod command;
 pub mod config;
 pub mod hid;
+pub mod link_bench;
 pub mod phone;
 pub mod session;
 

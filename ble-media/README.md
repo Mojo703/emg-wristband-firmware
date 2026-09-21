@@ -9,6 +9,12 @@ The `ble-media-bench` example drives the keys from the serial console. The weare
 firmware drives the same `Phone` state machine from its feedback thread. A
 dashboard button replaces the console toggle.
 
+The `ble-gatt-bench` example adds a custom GATT service beside HID so a phone
+can measure the link: granted connection parameters, MTU and PHY, the
+write-to-notify round trip, and notification goodput. The page that drives it
+is [`../phone-app`](../phone-app); its README has the procedure. Flash it with
+`cargo run --example ble-gatt-bench`.
+
 ## How it works
 
 - **`src/phone.rs` is the state machine, and it runs on a laptop.** The BLE stack

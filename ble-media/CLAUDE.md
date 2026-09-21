@@ -18,15 +18,24 @@ Agent notes:
   toolchain. Build the standalone hardware bench without flashing via
   `. ~/export-esp.sh && cargo build --example ble-media-bench`. Flash and monitor
   it via `. ~/export-esp.sh && cargo run --example ble-media-bench`. Always name
-  the example; this library package has no default binary.
+  the example; this library package has no default binary. `ble-gatt-bench` is
+  the second example: the same remote plus the link bench service.
 - The radio dependencies are behind `[target.'cfg(target_os = "espidf")']` to keep
   that split working. New logic goes in `phone.rs`; only calls into esp32-nimble
   go in `nimble.rs`.
+- `src/link_bench.rs` is the second host-tested module: the byte layouts of the
+  bench service (`ble-gatt-bench` example, driven from `../phone-app`). Its
+  records are fixed little-endian, not CBOR, and `phone-app/src/lib/bench/
+  protocol.ts` mirrors them by hand; change both. `NimbleRadio::attach_link_bench`
+  must run before advertising starts, and it puts the service UUID in the scan
+  response so the primary advertisement iOS bonds against is unchanged.
 - Firmware otherwise: the example runs on hardware and cannot run on this host.
 - `Phone::press` / `Phone::tick` are the seam the wearer firmware calls from its
   feedback thread. Keep those stable. `tick` must be called unconditionally, not
   only when there is something to send: it also restarts advertising after a peer
-  leaves.
+  leaves, and it asks the central for the band's link settings (2M PHY, long
+  packets, 15 to 30 ms interval) once per encrypted link, through
+  `Radio::request_fast_link`. The band owns those; the app never asks.
 - `NimbleRadio::bring_up` and consuming `NimbleRadio::tear_down` bracket a radio
   lifecycle and deliberately are not `Radio` trait methods. Bring-up explicitly
   initializes NimBLE before taking its singleton, so it works again after full

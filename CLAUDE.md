@@ -16,8 +16,8 @@ with an empty `[workspace]` table so cargo treats it as its own root. Always bui
 and run from inside the relevant subproject directory, never from the repo root.
 
 The active subprojects are `ble-media`, `drv2605l`, and `opal-firmware` on the
-firmware side; `emg-tds`, `dashboard`, `pose-service`, and `protocol` on the host
-side; `emg-runtime`, which the firmware consumes but which also builds on the
+firmware side; `emg-tds`, `dashboard`, `phone-app`, `pose-service`, and
+`protocol` on the host side; `emg-runtime`, which the firmware consumes but which also builds on the
 host; and `engineering-logs` for the written record. The verified but deferred
 OTA client/server proof lives under `experiments/ota/`. Prefer a module in an
 existing active crate over a new crate.
@@ -44,8 +44,9 @@ example. Both device commands flash a libtest image and report through espflash.
 `--features cuda` and set `CUDARC_CUDA_VERSION=13020`, since CUDA 13.3 is
 ABI-compatible with cudarc's 13.2 target but auto-detect rejects 13.3; CPU works
 without the feature. Firmware uses `cargo run` to flash and open the serial
-monitor. The dashboard frontend uses pnpm (`pnpm install`, `pnpm run check`,
-`pnpm run build`); npm is not installed on this machine.
+monitor. The dashboard and phone-app frontends use pnpm (`pnpm install`,
+`pnpm run check`, `pnpm run build`; phone-app also has `pnpm run test`); npm
+is not installed on this machine.
 
 ## Conventions
 

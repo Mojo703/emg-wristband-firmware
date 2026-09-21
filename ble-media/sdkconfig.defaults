@@ -14,6 +14,22 @@ CONFIG_BT_NIMBLE_ENABLED=y
 CONFIG_BT_BLUEDROID_ENABLED=n
 # Persist bonding keys in NVS so the iPhone stays paired across reboots.
 CONFIG_BT_NIMBLE_NVS_PERSIST=y
+# Offer the largest ATT MTU the host allows, so the link bench can find the
+# phone's ceiling rather than ours. The central still picks the minimum.
+CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=517
+# NimBLE at info level prints two lines per notification from inside the
+# notify call, on the sending thread. Measured on the link bench: that log,
+# through the default UART0 console at 115200 baud, held every notification
+# for about 10 ms whatever the radio did. Warnings still come through.
+CONFIG_BT_NIMBLE_LOG_LEVEL_WARNING=y
+
+# Console on the USB port. This board's UART0 pins go nowhere, and the
+# polling UART driver blocks every log line for its whole duration at
+# 115200 baud. The USB-Serial-JTAG driver that console.rs installs is what
+# the monitor reads anyway.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_UART_DEFAULT=n
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
 
 # Rust's main task needs a larger stack than the IDF default.
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=20000

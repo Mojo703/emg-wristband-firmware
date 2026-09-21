@@ -1,0 +1,6 @@
+# esbuild needs its postinstall to link the platform binary that Vite uses.
+# cbor-x's native accelerator (cbor-extract) is optional — it falls back to JS.
+allowBuilds:
+  cbor-extract: false
+  esbuild: true
+verifyDepsBeforeRun: false

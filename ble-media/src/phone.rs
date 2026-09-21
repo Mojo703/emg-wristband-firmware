@@ -66,6 +66,12 @@ pub trait Radio {
 
     /// Notify the consumer-control input report.
     fn notify(&self, report: [u8; 2]) -> anyhow::Result<()>;
+
+    /// Ask the central for the link the band wants: the 2M PHY, the longest
+    /// link-layer packets, and a 15 to 30 ms interval. The central decides,
+    /// and every one of these dies with the connection, which is why
+    /// [`Phone::tick`] asks again on each encrypted link.
+    fn request_fast_link(&mut self) -> anyhow::Result<()>;
 }
 
 /// What the connection callbacks have seen. Raw observation, no judgement.
@@ -125,6 +131,10 @@ pub enum Phone<R> {
         radio: R,
         link: PhoneLink,
         hold: KeyHold,
+        /// Whether this encrypted link has been asked for its settings yet.
+        /// Asked once per link: a central that refused will refuse again, and
+        /// one that granted needs no reminder.
+        fast_link_requested: bool,
     },
     /// The stack refused at boot. Terminal for this boot and deliberately so:
     /// this value owns no radio to retry. A lifecycle owner may construct a new
@@ -266,6 +276,7 @@ impl<R: Radio> Phone<R> {
             radio,
             link: PhoneLink::Dormant,
             hold: KeyHold::idle(),
+            fast_link_requested: false,
         }
     }
 
@@ -381,11 +392,29 @@ impl<R: Radio> Phone<R> {
     /// asking the radio what it is actually doing is cheaper than trusting a
     /// callback to have got it right.
     pub fn tick(&mut self, elapsed: Duration) {
-        let Phone::Ready { radio, link, hold } = self else {
+        let Phone::Ready {
+            radio,
+            link,
+            hold,
+            fast_link_requested,
+        } = self
+        else {
             return;
         };
         if hold.elapse(elapsed) {
             let _ = radio.notify(hid::RELEASE_REPORT);
+        }
+
+        // The band owns its link settings. iOS bonds before anything else, so
+        // the request waits for encryption rather than the connect callback;
+        // a refusal is the central's to make and is not retried on this link.
+        match radio.peer() {
+            Peer::Encrypted if !*fast_link_requested => {
+                *fast_link_requested = true;
+                let _ = radio.request_fast_link();
+            }
+            Peer::Absent => *fast_link_requested = false,
+            _ => {}
         }
 
         // A disconnect leaves advertising stopped, and nothing else turns it
@@ -462,7 +491,10 @@ impl<R: Radio> Phone<R> {
     }
 
     fn disable(&mut self) {
-        let Phone::Ready { radio, link, hold } = self else {
+        let Phone::Ready {
+            radio, link, hold, ..
+        } = self
+        else {
             return;
         };
         // The release goes first, and unconditionally. Disarming a held key
@@ -601,6 +633,11 @@ mod tests {
                 anyhow::bail!("peer gone");
             }
             self.bench.reports.borrow_mut().push(report);
+            Ok(())
+        }
+
+        fn request_fast_link(&mut self) -> anyhow::Result<()> {
+            self.bench.operations.borrow_mut().push("fast link");
             Ok(())
         }
     }
@@ -1050,5 +1087,41 @@ mod tests {
         // And the failed press arms nothing, so no release chases it.
         phone.tick(Duration::from_millis(50));
         assert!(bench.reports.borrow().is_empty());
+    }
+    /// The link settings are the band's to ask for, once per encrypted link.
+    /// Not on connect, because iOS is still bonding then; not on every tick,
+    /// because a refusal would become a storm; and again after the phone
+    /// comes back, because the settings died with the old link.
+    #[test]
+    fn a_paired_phone_is_asked_for_the_fast_link_once_per_link() {
+        let (mut phone, bench) = booted();
+        phone.set_enabled(true, RadioClaim::Free);
+        bench.phone_connects();
+        phone.tick(SESSION_TICK);
+        assert!(
+            !bench.operations.borrow().contains(&"fast link"),
+            "a connected but unencrypted link is still bonding"
+        );
+
+        bench.phone_pairs();
+        phone.tick(SESSION_TICK);
+        phone.tick(SESSION_TICK);
+        phone.tick(SESSION_TICK);
+        let asks = |bench: &Bench| {
+            bench
+                .operations
+                .borrow()
+                .iter()
+                .filter(|operation| **operation == "fast link")
+                .count()
+        };
+        assert_eq!(asks(&bench), 1);
+
+        bench.phone_leaves();
+        phone.tick(SESSION_TICK);
+        bench.phone_connects();
+        bench.phone_pairs();
+        phone.tick(SESSION_TICK);
+        assert_eq!(asks(&bench), 2, "a new link needs the request again");
     }
 }

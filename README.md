@@ -29,6 +29,7 @@ Machine learning and tooling (host, plain Rust or Python):
 | Path | What it is |
 |------|------------|
 | [`emg-tds/`](emg-tds) | Historical depthwise-separable convolution experiments and export tooling. The production firmware no longer runs this model. The `.npy` training/eval/pose windows live in its `data/` directory. |
+| [`phone-app/`](phone-app) | The phone side as a website (Svelte, Web Bluetooth). Holds the link bench that drives `ble-media`'s `ble-gatt-bench` example; the setup and calibration screens land here. |
 | [`dashboard/`](dashboard) | Web dashboard. An axum backend relays CBOR frames between the wristband and a Svelte frontend, and runs the training-data collection game: import a Beat Saber map, play the falling-notes track, record labelled EMG. |
 | [`pose-service/`](pose-service) | Python WebSocket service that turns EMG windows into 3-D hand pose. Runs a mock estimator or Meta's `emg2pose` model. |
 | [`emg-runtime/`](emg-runtime) | Shared on-device classification arithmetic: filter-bank log-power features, wearer-model fitting/scoring, the reject pipeline, and the grid aligner. Historical int8 TDS kernels and blobs remain for reproducibility but are not linked into the production inference path. |
@@ -53,7 +54,7 @@ the Espressif Rust fork; their `rust-toolchain.toml` pins `channel = "esp"`, and
 every build shell must first source `. ~/export-esp.sh`. The host projects build
 with ordinary stable or nightly Rust.
 
-The dashboard frontend uses pnpm, not npm. Identifiers are spelled out, with no
+The dashboard and phone-app frontends use pnpm, not npm. Identifiers are spelled out, with no
 acronyms or abbreviations. Cross-process messages are CBOR frames defined once in
 `protocol/`, and bulk EMG rides as a little-endian `i16` byte blob.
 

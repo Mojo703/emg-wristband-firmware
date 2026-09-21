@@ -17,6 +17,10 @@ name = "ble_media"
 name = "ble-media-bench"
 path = "examples/ble-media-bench.rs"
 
+[[example]]
+name = "ble-gatt-bench"
+path = "examples/ble-gatt-bench.rs"
+
 [profile.release]
 opt-level = "s"
 
