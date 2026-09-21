@@ -5,7 +5,7 @@
 //! release is due, what the panel is told — are in [`crate::phone`], which is
 //! where they can be tested.
 
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
@@ -53,13 +53,12 @@ impl Drop for InitializationGuard {
     }
 }
 
-/// Owns the HID input characteristic and the peer state the NimBLE host task
-/// writes from its callbacks. Dropping it performs full teardown; use
-/// [`NimbleRadio::tear_down`] when the caller must receive a teardown error.
+/// Owns the HID input characteristic and the advertising handle. Dropping it
+/// performs full teardown; use [`NimbleRadio::tear_down`] when the caller
+/// must receive a teardown error.
 pub struct NimbleRadio {
     input: Option<Arc<Mutex<BLECharacteristic>>>,
     advertising: Option<&'static Mutex<BLEAdvertising>>,
-    peer: Arc<PeerState>,
     server: Option<&'static mut esp32_nimble::BLEServer>,
     // Cleared before deinit so Drop never retries a partially completed call.
     active: bool,
@@ -107,43 +106,28 @@ impl NimbleRadio {
             .set_io_cap(SecurityIOCap::NoInputNoOutput)
             .resolve_rpa();
 
-        let peer = Arc::new(PeerState::default());
         let server = device.get_server();
 
-        {
-            let peer = Arc::clone(&peer);
-            server.on_connect(move |_server, desc| {
-                info!("host connected: {desc:?}");
-                // Connected, not encrypted. iOS reads the report map in this
-                // window and discards anything we notify during it.
-                peer.set(Peer::Connected);
-            });
-        }
-        {
-            let peer = Arc::clone(&peer);
-            server.on_authentication_complete(move |_server, desc, result| {
-                match result {
-                    Ok(()) if desc.encrypted() => {
-                        info!("link encrypted; media keys can go out now");
-                        peer.set(Peer::Encrypted);
-                    }
-                    // Pairing failed, or completed without encryption. The link
-                    // is still up and still useless for HID, which is exactly
-                    // what `Connecting` means.
-                    other => {
-                        info!("pairing did not encrypt the link: {other:?}");
-                        peer.set(Peer::Connected);
-                    }
-                }
-            });
-        }
-        {
-            let peer = Arc::clone(&peer);
-            server.on_disconnect(move |_desc, reason| {
-                info!("host disconnected ({reason:?})");
-                peer.set(Peer::Absent);
-            });
-        }
+        // The callbacks only narrate. What the state machine asks, `peer`,
+        // is read from the connection descriptors on every call, so two
+        // centrals cannot overwrite each other's state through one flag.
+        server.on_connect(move |_server, desc| {
+            // Connected, not encrypted. iOS reads the report map in this
+            // window and discards anything we notify during it.
+            info!("host connected: {desc:?}");
+        });
+        server.on_authentication_complete(move |_server, desc, result| match result {
+            Ok(()) if desc.encrypted() => {
+                info!("link encrypted; media keys can go out now");
+            }
+            // Pairing failed, or completed without encryption. The link is
+            // still up and still useless for HID, which is what `Connecting`
+            // means.
+            other => info!("pairing did not encrypt the link: {other:?}"),
+        });
+        server.on_disconnect(move |_desc, reason| {
+            info!("host disconnected ({reason:?})");
+        });
         // The peer coming back is the state machine's business: `Phone` decides
         // whether we should be advertising at all, so the server must not
         // restart it behind our back on a disconnect.
@@ -177,7 +161,6 @@ impl NimbleRadio {
         let radio = Self {
             input: Some(input),
             advertising: Some(advertising),
-            peer,
             server: Some(server),
             active: true,
         };
@@ -199,7 +182,6 @@ impl NimbleRadio {
         self.input.take();
         self.advertising.take();
         self.server.take();
-        self.peer.set(Peer::Absent);
 
         if !std::mem::replace(&mut self.active, false) {
             return Ok(());
@@ -218,11 +200,21 @@ impl Drop for NimbleRadio {
 
 impl Radio for NimbleRadio {
     fn start_advertising(&mut self) -> Result<()> {
-        self.advertising
+        // Fast while nobody is connected, so a bonded phone reclaims the band
+        // quickly; slow once someone is, since the only listener then is an
+        // app looking for a band its phone already holds, and every
+        // advertisement is radio time taken from the link.
+        let (min, max) = if BLEDevice::take().get_server().connected_count() == 0 {
+            (ADVERTISING_FAST_MIN, ADVERTISING_FAST_MAX)
+        } else {
+            (ADVERTISING_SLOW, ADVERTISING_SLOW)
+        };
+        let mut advertising = self
+            .advertising
             .context("BLE advertising handle is unavailable")?
-            .lock()
-            .start()
-            .context("starting advertising")
+            .lock();
+        advertising.min_interval(min).max_interval(max);
+        advertising.start().context("starting advertising")
     }
 
     fn stop_advertising(&mut self) -> Result<()> {
@@ -254,7 +246,27 @@ impl Radio for NimbleRadio {
     }
 
     fn peer(&self) -> Peer {
-        self.peer.get()
+        let mut best = Peer::Absent;
+        for desc in BLEDevice::take().get_server().connections() {
+            if desc.encrypted() {
+                return Peer::Encrypted;
+            }
+            best = Peer::Connected;
+        }
+        best
+    }
+
+    fn encrypted_connection_count(&self) -> usize {
+        BLEDevice::take()
+            .get_server()
+            .connections()
+            .filter(|desc| desc.encrypted())
+            .count()
+    }
+
+    fn accepts_another_connection(&self) -> bool {
+        BLEDevice::take().get_server().connected_count()
+            < sys::CONFIG_BT_NIMBLE_MAX_CONNECTIONS as usize
     }
 
     fn notify(&self, report: [u8; 2]) -> Result<()> {
@@ -281,32 +293,25 @@ impl Radio for NimbleRadio {
     }
 
     fn request_fast_link(&mut self) -> Result<()> {
-        let handle = first_connection().context("no peer to ask")?.conn_handle();
-        request_fast_link(handle)
-    }
-}
-
-/// What the callbacks saw, shared with the NimBLE host task that writes it.
-///
-/// An atomic rather than a lock because it is written from a callback on the
-/// host task and read from whichever thread owns the outputs; a lock between
-/// those two buys nothing and can be held when the read happens.
-#[derive(Default)]
-struct PeerState(AtomicU8);
-
-impl PeerState {
-    fn set(&self, peer: Peer) {
-        self.0.store(peer as u8, Ordering::SeqCst);
-    }
-
-    fn get(&self) -> Peer {
-        match self.0.load(Ordering::SeqCst) {
-            n if n == Peer::Encrypted as u8 => Peer::Encrypted,
-            n if n == Peer::Connected as u8 => Peer::Connected,
-            _ => Peer::Absent,
+        let encrypted: Vec<u16> = BLEDevice::take()
+            .get_server()
+            .connections()
+            .filter(|desc| desc.encrypted())
+            .map(|desc| desc.conn_handle())
+            .collect();
+        anyhow::ensure!(!encrypted.is_empty(), "no encrypted link to ask");
+        for handle in encrypted {
+            request_fast_link(handle)?;
         }
+        Ok(())
     }
 }
+
+/// Advertising intervals in 0.625 ms units: 30 to 60 ms while nobody is
+/// connected, one second while someone is.
+const ADVERTISING_FAST_MIN: u16 = 48;
+const ADVERTISING_FAST_MAX: u16 = 96;
+const ADVERTISING_SLOW: u16 = 1600;
 
 /// The bench service beside HID: a command characteristic the phone writes,
 /// and echo, stream, and status characteristics the band notifies.
@@ -318,6 +323,9 @@ pub struct LinkBench {
     stream: Arc<Mutex<BLECharacteristic>>,
     status: Arc<Mutex<BLECharacteristic>>,
     published: Option<[u8; LinkStatus::ENCODED_LEN]>,
+    /// The connection that last wrote a command. Replies, the status record
+    /// and link requests go there, so two pages can bench one band in turn.
+    requester: Option<u16>,
 }
 
 /// Counters the stream thread keeps and the status record reports.
@@ -336,8 +344,12 @@ impl NimbleRadio {
     ///
     /// Echo replies are sent from inside the write callback, on the host
     /// task, so the round trip the phone measures has no thread hop in it.
-    /// Every other command is handed to `commands` for the bench loop.
-    pub fn attach_link_bench(&mut self, commands: Sender<BenchCommand>) -> Result<LinkBench> {
+    /// Every other command is handed to `commands` for the bench loop with
+    /// the handle of the connection that wrote it.
+    pub fn attach_link_bench(
+        &mut self,
+        commands: Sender<(u16, BenchCommand)>,
+    ) -> Result<LinkBench> {
         let server = self
             .server
             .as_deref_mut()
@@ -374,7 +386,7 @@ impl NimbleRadio {
                     }
                 }
                 Ok(command) => {
-                    if commands.send(command).is_err() {
+                    if commands.send((args.desc().conn_handle(), command)).is_err() {
                         warn!("bench loop is gone; command dropped");
                     }
                 }
@@ -400,6 +412,7 @@ impl NimbleRadio {
             stream,
             status,
             published: None,
+            requester: None,
         })
     }
 }
@@ -410,9 +423,32 @@ impl LinkBench {
         Arc::clone(&self.stream)
     }
 
-    /// The handle of the phone's connection, if there is one.
+    /// Remember who is asking. Called with every command's connection handle.
+    pub fn set_requester(&mut self, handle: u16) {
+        self.requester = Some(handle);
+    }
+
+    /// The connection replies go to: the last one that wrote a command, if
+    /// it is still up, else the first connection there is.
     pub fn connection(&self) -> Option<u16> {
-        first_connection().map(|desc| desc.conn_handle())
+        let server = BLEDevice::take().get_server();
+        let mut handles = server.connections().map(|desc| desc.conn_handle());
+        match self.requester {
+            Some(handle) if handles.any(|other| other == handle) => Some(handle),
+            _ => first_connection().map(|desc| desc.conn_handle()),
+        }
+    }
+
+    fn connection_descriptor(&self) -> Option<BLEConnDesc> {
+        let handle = self.connection()?;
+        BLEDevice::take()
+            .get_server()
+            .connections()
+            .find(|desc| desc.conn_handle() == handle)
+    }
+
+    fn connection_count(&self) -> u8 {
+        BLEDevice::take().get_server().connected_count() as u8
     }
 
     /// The link as the band sees it right now.
@@ -427,9 +463,10 @@ impl LinkBench {
             stream_payload: counters.payload.load(Ordering::Relaxed) as u16,
             last_media,
             uptime_millis: (band_micros() / 1000),
+            connections: self.connection_count(),
             ..LinkStatus::default()
         };
-        if let Some(desc) = first_connection() {
+        if let Some(desc) = self.connection_descriptor() {
             status.connected = true;
             status.encrypted = desc.encrypted();
             status.bonded = desc.bonded();

@@ -59,10 +59,18 @@ pub trait Radio {
     /// is exactly the gap a phone falls through.
     fn is_advertising(&self) -> bool;
 
-    /// What the connection callbacks have observed. Sampled on every read
-    /// rather than mirrored into a field here, so it cannot go stale between
-    /// the host task that writes it and the thread that acts on it.
+    /// The best link the band has right now: encrypted if any connection is,
+    /// connected if any exists, absent otherwise. Sampled on every read so it
+    /// cannot go stale between the host task and the thread that acts on it.
     fn peer(&self) -> Peer;
+
+    /// How many centrals hold an encrypted link. A change is a new arrival
+    /// to ask for the band's link settings; counting unencrypted links too
+    /// would ask before a newcomer can be asked and then never again.
+    fn encrypted_connection_count(&self) -> usize;
+
+    /// Whether the stack has room for one more central.
+    fn accepts_another_connection(&self) -> bool;
 
     /// Notify the consumer-control input report.
     fn notify(&self, report: [u8; 2]) -> anyhow::Result<()>;
@@ -131,10 +139,10 @@ pub enum Phone<R> {
         radio: R,
         link: PhoneLink,
         hold: KeyHold,
-        /// Whether this encrypted link has been asked for its settings yet.
-        /// Asked once per link: a central that refused will refuse again, and
-        /// one that granted needs no reminder.
-        fast_link_requested: bool,
+        /// The encrypted connection count when the link settings were last
+        /// asked for. Asked once per arrival: a central that refused will
+        /// refuse again, and one that granted needs no reminder.
+        fast_link_asked_at: usize,
     },
     /// The stack refused at boot. Terminal for this boot and deliberately so:
     /// this value owns no radio to retry. A lifecycle owner may construct a new
@@ -276,7 +284,7 @@ impl<R: Radio> Phone<R> {
             radio,
             link: PhoneLink::Dormant,
             hold: KeyHold::idle(),
-            fast_link_requested: false,
+            fast_link_asked_at: 0,
         }
     }
 
@@ -396,7 +404,7 @@ impl<R: Radio> Phone<R> {
             radio,
             link,
             hold,
-            fast_link_requested,
+            fast_link_asked_at,
         } = self
         else {
             return;
@@ -408,24 +416,27 @@ impl<R: Radio> Phone<R> {
         // The band owns its link settings. iOS bonds before anything else, so
         // the request waits for encryption rather than the connect callback;
         // a refusal is the central's to make and is not retried on this link.
+        // A changed encrypted count is a new arrival to ask again for.
+        let encrypted = radio.encrypted_connection_count();
         match radio.peer() {
-            Peer::Encrypted if !*fast_link_requested => {
-                *fast_link_requested = true;
+            Peer::Encrypted if encrypted != *fast_link_asked_at => {
+                *fast_link_asked_at = encrypted;
                 let _ = radio.request_fast_link();
             }
-            Peer::Absent => *fast_link_requested = false,
+            Peer::Absent => *fast_link_asked_at = 0,
             _ => {}
         }
 
-        // A disconnect leaves advertising stopped, and nothing else turns it
+        // Accepting a connection stops advertising, and nothing else turns it
         // back on: the server's own `advertise_on_disconnect` is off, because a
         // server restarting it behind our back would make `Standby` a lie. So
         // the restart lives here, where a refusal becomes a state the panel can
-        // show. `ble-media` used to discard this `Result` in the disconnect
-        // callback, which left a device that failed to restart unreachable
-        // until someone power-cycled it, with nothing in the log.
+        // show. It restarts while a phone is connected too, as long as there is
+        // room for another central: iOS reclaims a bonded band as a HID device
+        // the moment it advertises, and a band that then goes silent can never
+        // be found by the phone's own app, which discovers by scanning.
         if matches!(link, PhoneLink::Advertising)
-            && radio.peer() == Peer::Absent
+            && radio.accepts_another_connection()
             && !radio.is_advertising()
         {
             if let Err(err) = radio.start_advertising() {
@@ -536,6 +547,8 @@ mod tests {
     #[derive(Default)]
     struct Bench {
         peer: Cell<Peer>,
+        connections: Cell<usize>,
+        full: Cell<bool>,
         reports: RefCell<Vec<[u8; 2]>>,
         operations: RefCell<Vec<&'static str>>,
         advertising: Cell<bool>,
@@ -554,6 +567,7 @@ mod tests {
         fn phone_connects(&self) {
             self.advertising.set(false);
             self.peer.set(Peer::Connected);
+            self.connections.set(self.connections.get() + 1);
         }
 
         /// Pairing completes and the link is encrypted.
@@ -564,6 +578,15 @@ mod tests {
         /// The phone walks out of range. Advertising stays stopped.
         fn phone_leaves(&self) {
             self.peer.set(Peer::Absent);
+            self.connections.set(0);
+        }
+
+        fn fast_link_requests(&self) -> usize {
+            self.operations
+                .borrow()
+                .iter()
+                .filter(|operation| **operation == "fast link")
+                .count()
         }
     }
 
@@ -618,6 +641,18 @@ mod tests {
 
         fn peer(&self) -> Peer {
             self.bench.peer.get()
+        }
+
+        fn encrypted_connection_count(&self) -> usize {
+            if self.bench.peer.get() == Peer::Encrypted {
+                self.bench.connections.get()
+            } else {
+                0
+            }
+        }
+
+        fn accepts_another_connection(&self) -> bool {
+            !self.bench.full.get()
         }
 
         fn notify(&self, report: [u8; 2]) -> anyhow::Result<()> {
@@ -1035,9 +1070,15 @@ mod tests {
     #[test]
     fn advertising_restarts_after_the_phone_walks_away() {
         let (mut phone, bench) = paired();
-        assert!(!bench.advertising.get(), "still advertising while paired");
+        bench.full.set(true);
+        phone.tick(Duration::from_millis(5));
+        assert!(
+            !bench.advertising.get(),
+            "advertising with no room for anyone"
+        );
 
         bench.phone_leaves();
+        bench.full.set(false);
         phone.tick(Duration::from_millis(5));
 
         assert!(bench.advertising.get(), "the band went invisible");
@@ -1058,19 +1099,39 @@ mod tests {
         assert!(phone.reason().unwrap().contains("advertising busy"));
     }
 
-    /// The restart is for a peer that left, not for one that is sitting there
-    /// connected — re-advertising under a live phone is not what a HID
-    /// peripheral does.
+    /// A connected phone does not make the band go silent. Its own HID stack
+    /// reclaims a bonded band the moment it advertises, and the phone's app
+    /// can only find a band that is still on the air. The state stays what
+    /// the best link says.
     #[test]
-    fn a_connected_phone_does_not_provoke_a_restart() {
+    fn a_connected_phone_keeps_the_band_on_the_air_while_there_is_room() {
         let (mut phone, bench) = booted();
         phone.set_enabled(true, RadioClaim::Free);
         bench.phone_connects();
 
         phone.tick(Duration::from_millis(5));
 
-        assert!(!bench.advertising.get());
+        assert!(bench.advertising.get(), "went silent under a live phone");
         assert_eq!(phone.state(), PhoneState::Connecting);
+
+        bench.phone_pairs();
+        phone.tick(Duration::from_millis(5));
+        assert_eq!(phone.state(), PhoneState::Paired);
+        assert!(bench.advertising.get());
+    }
+
+    /// When the stack has no room for another central the band goes quiet,
+    /// and comes back the moment there is room again.
+    #[test]
+    fn a_full_stack_stops_advertising_until_a_slot_frees() {
+        let (mut phone, bench) = paired();
+        bench.full.set(true);
+        phone.tick(Duration::from_millis(5));
+        assert!(!bench.advertising.get());
+
+        bench.full.set(false);
+        phone.tick(Duration::from_millis(5));
+        assert!(bench.advertising.get());
     }
 
     /// A notify that fails is reported to the caller rather than counted as a
@@ -1107,21 +1168,30 @@ mod tests {
         phone.tick(SESSION_TICK);
         phone.tick(SESSION_TICK);
         phone.tick(SESSION_TICK);
-        let asks = |bench: &Bench| {
-            bench
-                .operations
-                .borrow()
-                .iter()
-                .filter(|operation| **operation == "fast link")
-                .count()
-        };
-        assert_eq!(asks(&bench), 1);
+        assert_eq!(bench.fast_link_requests(), 1);
+
+        // A second central arriving on the same band is a new link to ask
+        // for, and only once it has encrypted: asking on its connect would
+        // reach the first link twice and the newcomer never.
+        bench.phone_connects();
+        bench.peer.set(Peer::Encrypted);
+        bench.connections.set(1);
+        phone.tick(SESSION_TICK);
+        assert_eq!(
+            bench.fast_link_requests(),
+            1,
+            "an unencrypted arrival waits"
+        );
+        bench.connections.set(2);
+        phone.tick(SESSION_TICK);
+        phone.tick(SESSION_TICK);
+        assert_eq!(bench.fast_link_requests(), 2, "a second arrival is asked");
 
         bench.phone_leaves();
         phone.tick(SESSION_TICK);
         bench.phone_connects();
         bench.phone_pairs();
         phone.tick(SESSION_TICK);
-        assert_eq!(asks(&bench), 2, "a new link needs the request again");
+        assert_eq!(bench.fast_link_requests(), 3, "a fresh link is asked again");
     }
 }

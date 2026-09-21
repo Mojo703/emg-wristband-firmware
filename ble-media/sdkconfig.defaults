@@ -14,6 +14,11 @@ CONFIG_BT_NIMBLE_ENABLED=y
 CONFIG_BT_BLUEDROID_ENABLED=n
 # Persist bonding keys in NVS so the iPhone stays paired across reboots.
 CONFIG_BT_NIMBLE_NVS_PERSIST=y
+# One subscription record per notifying characteristic per bonded peer. The
+# default of 8 is two peers' worth here (HID input, battery, and the bench's
+# three), and NimBLE answers an overflow by unpairing the oldest peer, which
+# strands that central on a key the band no longer has. Room for three peers.
+CONFIG_BT_NIMBLE_MAX_CCCDS=24
 # Offer the largest ATT MTU the host allows, so the link bench can find the
 # phone's ceiling rather than ours. The central still picks the minimum.
 CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=517

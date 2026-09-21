@@ -286,10 +286,13 @@ pub struct LinkStatus {
     pub stream_payload: u16,
     pub last_media: MediaOutcome,
     pub uptime_millis: u32,
+    /// How many centrals hold a link. Two from one phone means its app opened
+    /// a second connection rather than sharing the HID one.
+    pub connections: u8,
 }
 
 impl LinkStatus {
-    pub const ENCODED_LEN: usize = 34;
+    pub const ENCODED_LEN: usize = 35;
 
     pub fn encode(&self) -> [u8; Self::ENCODED_LEN] {
         let mut out = [0u8; Self::ENCODED_LEN];
@@ -310,6 +313,7 @@ impl LinkStatus {
         out[31] = self.last_media as u8;
         let uptime_seconds = (self.uptime_millis / 1000).min(u32::from(u16::MAX)) as u16;
         out[32..34].copy_from_slice(&uptime_seconds.to_le_bytes());
+        out[34] = self.connections;
         out
     }
 }
@@ -466,6 +470,7 @@ mod tests {
             stream_payload: 244,
             last_media: MediaOutcome::Sent,
             uptime_millis: 65_000,
+            connections: 2,
         };
         let bytes = status.encode();
         assert_eq!(bytes.len(), LinkStatus::ENCODED_LEN);
@@ -478,6 +483,7 @@ mod tests {
         );
         assert_eq!(bytes[31], MediaOutcome::Sent as u8);
         assert_eq!(u16::from_le_bytes([bytes[32], bytes[33]]), 65);
+        assert_eq!(bytes[34], 2);
     }
 
     #[test]

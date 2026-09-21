@@ -41,6 +41,7 @@ test('a status record decodes field by field', () => {
   view.setUint16(29, 244, true);
   bytes[31] = 1;
   view.setUint16(32, 65, true);
+  bytes[34] = 2;
   const status = decodeLinkStatus(view);
   assert.equal(status.connected, true);
   assert.equal(status.bonded, false);
@@ -53,16 +54,19 @@ test('a status record decodes field by field', () => {
   assert.equal(status.streamPayload, 244);
   assert.equal(status.lastMedia, MediaOutcome.Sent);
   assert.equal(status.uptimeSeconds, 65);
+  assert.equal(status.connections, 2);
 });
 
 test('a stream packet checks its fill against the sequence', () => {
   const bytes = Uint8Array.of(0xfe, 0x01, 0, 0, 42, 0, 0, 0, 0xfe, 0xff, 0x00, 0x01);
   const packet = decodeStreamPacket(new DataView(bytes.buffer));
-  assert.equal(packet.sequence, 0x1fe);
-  assert.equal(packet.bandMicros, 42);
-  assert.equal(packet.intact, true);
+  assert.notEqual(packet, null);
+  assert.equal(packet?.sequence, 0x1fe);
+  assert.equal(packet?.bandMicros, 42);
+  assert.equal(packet?.intact, true);
   bytes[10] = 0x55;
-  assert.equal(decodeStreamPacket(new DataView(bytes.buffer)).intact, false);
+  assert.equal(decodeStreamPacket(new DataView(bytes.buffer))?.intact, false);
+  assert.equal(decodeStreamPacket(new DataView(new ArrayBuffer(0))), null, 'a probe is not a packet');
 });
 
 test('percentiles use the nearest rank', () => {

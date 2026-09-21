@@ -100,14 +100,6 @@
     });
   }
 
-  function reconnectKnown(): Promise<void> {
-    return guard('reconnect', async () => {
-      await link.reconnectKnown();
-      connected = true;
-      deviceName = link.name;
-    });
-  }
-
   function disconnect(): void {
     link.disconnect();
   }
@@ -220,7 +212,7 @@
     lines.push(`Device: ${deviceName}; browser: ${navigator.userAgent}`);
     if (status) {
       lines.push(
-        `Link: interval ${status.intervalMillis} ms, latency ${status.latency}, timeout ${status.supervisionTimeoutMillis} ms, MTU ${status.mtu}, PHY ${phyName(status.transmitPhy)}/${phyName(status.receivePhy)}, encrypted ${status.encrypted}, bonded ${status.bonded}`,
+        `Link: interval ${status.intervalMillis} ms, latency ${status.latency}, timeout ${status.supervisionTimeoutMillis} ms, MTU ${status.mtu}, PHY ${phyName(status.transmitPhy)}/${phyName(status.receivePhy)}, encrypted ${status.encrypted}, bonded ${status.bonded}, connections ${status.connections}`,
       );
     }
     if (echoResults.length > 0) {
@@ -264,7 +256,6 @@
         <button onclick={disconnect}>Disconnect {deviceName}</button>
       {:else}
         <button class="primary" onclick={connect} disabled={!available || busy !== null}>Connect to band</button>
-        <button onclick={reconnectKnown} disabled={!available || busy !== null}>Reconnect known band</button>
       {/if}
       {#if busy !== null}
         <span class="muted">{busy}{progress > 0 ? ` ${Math.round(progress * 100)}%` : ''}</span>
@@ -275,7 +266,7 @@
         <dt>Link</dt>
         <dd>
           {#if status.encrypted}<span class="good">encrypted</span>{:else}<span class="bad">not encrypted</span>{/if},
-          {status.bonded ? 'bonded' : 'not bonded'}
+          {status.bonded ? 'bonded' : 'not bonded'}, {status.connections} connection{status.connections === 1 ? '' : 's'} on the band
         </dd>
         <dt>Interval</dt>
         <dd>{format(status.intervalMillis, 2)} ms, latency {status.latency}, timeout {status.supervisionTimeoutMillis} ms</dd>

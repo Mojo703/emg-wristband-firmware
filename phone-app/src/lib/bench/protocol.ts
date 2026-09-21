@@ -10,7 +10,7 @@ export const STATUS_UUID = '5c3e7a10-2f4b-4d8e-9b61-0f1e2d3c4b04';
 
 export const STREAM_HEADER = 8;
 export const ECHO_HEADER = 8;
-export const STATUS_LENGTH = 34;
+export const STATUS_LENGTH = 35;
 
 export interface MediaKey {
   readonly id: string;
@@ -134,7 +134,8 @@ export interface StreamPacket {
   readonly intact: boolean;
 }
 
-export function decodeStreamPacket(view: DataView): StreamPacket {
+export function decodeStreamPacket(view: DataView): StreamPacket | null {
+  if (view.byteLength < STREAM_HEADER) return null;
   const sequence = view.getUint32(0, true);
   let intact = true;
   const base = sequence & 0xff;
@@ -187,6 +188,8 @@ export interface LinkStatus {
   readonly streamPayload: number;
   readonly lastMedia: MediaOutcome;
   readonly uptimeSeconds: number;
+  /** Centrals holding a link. Two from one phone means its app opened a second connection. */
+  readonly connections: number;
 }
 
 export function decodeLinkStatus(view: DataView): LinkStatus {
@@ -210,6 +213,7 @@ export function decodeLinkStatus(view: DataView): LinkStatus {
     streamPayload: view.getUint16(29, true),
     lastMedia: MEDIA_OUTCOMES[view.getUint8(31)] ?? MediaOutcome.None,
     uptimeSeconds: view.getUint16(32, true),
+    connections: view.getUint8(34),
   };
 }
 

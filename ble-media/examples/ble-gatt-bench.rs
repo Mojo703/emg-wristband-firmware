@@ -40,7 +40,7 @@ fn main() -> anyhow::Result<()> {
     info!("=== ble-gatt-bench starting as '{}' ===", cfg.device_name);
     console::init()?;
 
-    let (commands, command_inbox) = mpsc::channel::<BenchCommand>();
+    let (commands, command_inbox) = mpsc::channel::<(u16, BenchCommand)>();
     let (mut phone, mut bench) = match NimbleRadio::bring_up(cfg.device_name) {
         Ok(mut radio) => {
             let bench = radio.attach_link_bench(commands)?;
@@ -87,16 +87,19 @@ fn main() -> anyhow::Result<()> {
             None => {}
         }
 
-        while let Ok(command) = command_inbox.try_recv() {
+        while let Ok((requester, command)) = command_inbox.try_recv() {
+            bench.set_requester(requester);
             match command {
                 BenchCommand::Media(key) => {
                     last_media = report(phone.press(key), key);
                 }
                 BenchCommand::Echo { .. } => {}
                 BenchCommand::StartStream(plan) => {
-                    let connection = bench.connection();
-                    info!("stream start: {plan:?} on {connection:?}");
-                    stream.send(stream::Control::Start { plan, connection })?;
+                    info!("stream start: {plan:?} for connection {requester}");
+                    stream.send(stream::Control::Start {
+                        plan,
+                        connection: requester,
+                    })?;
                 }
                 BenchCommand::StopStream => {
                     info!("stream stop");
@@ -171,10 +174,7 @@ mod stream {
     use log::info;
 
     pub enum Control {
-        Start {
-            plan: StreamPlan,
-            connection: Option<u16>,
-        },
+        Start { plan: StreamPlan, connection: u16 },
         Stop,
     }
 
@@ -215,12 +215,10 @@ mod stream {
             let Control::Start { plan, connection } = control else {
                 continue;
             };
-            let Some(connection) = connection else {
-                info!("stream refused: no connection");
-                continue;
-            };
-            if characteristic.lock().subscribed_count() == 0 {
-                info!("stream refused: nothing subscribed");
+            // An empty notification is the cheapest way to ask whether the
+            // asking connection subscribed; the page ignores it.
+            if characteristic.lock().notify_with(&[], connection).is_err() {
+                info!("stream refused: connection {connection} is not subscribed");
                 continue;
             }
             let mtu = unsafe { esp_idf_svc::sys::ble_att_mtu(connection) };

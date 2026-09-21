@@ -35,7 +35,12 @@ Agent notes:
   only when there is something to send: it also restarts advertising after a peer
   leaves, and it asks the central for the band's link settings (2M PHY, long
   packets, 15 to 30 ms interval) once per encrypted link, through
-  `Radio::request_fast_link`. The band owns those; the app never asks.
+  `Radio::request_fast_link`. The band owns those; the app never asks. It also
+  keeps advertising while a central is connected, slowly, as long as NimBLE has
+  room for another: iOS reclaims a bonded band as HID the moment it advertises,
+  and a phone app discovers by scanning, so a silent band is unreachable.
+  `Radio::peer` is the best link across every connection, read from the
+  descriptors, never a flag a second central could overwrite.
 - `NimbleRadio::bring_up` and consuming `NimbleRadio::tear_down` bracket a radio
   lifecycle and deliberately are not `Radio` trait methods. Bring-up explicitly
   initializes NimBLE before taking its singleton, so it works again after full

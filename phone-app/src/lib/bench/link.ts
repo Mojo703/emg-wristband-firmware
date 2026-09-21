@@ -88,31 +88,6 @@ export class BandLink {
     await this.#attach(device);
   }
 
-  /**
-   * Reach a band this page was granted before without scanning for it. A
-   * bonded band that the phone already holds as a HID device does not
-   * advertise, so the chooser never lists it; this is the only door Web
-   * Bluetooth has to such a device, and not every browser has it.
-   */
-  async reconnectKnown(): Promise<void> {
-    if (!bluetoothAvailable()) {
-      throw new Error('Web Bluetooth is not available in this browser');
-    }
-    const bluetooth = navigator.bluetooth as Bluetooth & {
-      getDevices?: () => Promise<BluetoothDevice[]>;
-    };
-    if (bluetooth.getDevices === undefined) {
-      throw new Error('this browser has no getDevices(); a known band cannot be reached without a scan');
-    }
-    const known = await bluetooth.getDevices();
-    this.#emit({ kind: 'log', message: `getDevices() returned ${known.length} device(s)` });
-    const device = known.find((candidate) => candidate.name?.startsWith('EMG')) ?? known[0];
-    if (device === undefined) {
-      throw new Error('no previously granted band; connect once through the chooser first');
-    }
-    await this.#attach(device);
-  }
-
   async #attach(device: BluetoothDevice): Promise<void> {
     this.#device = device;
     device.addEventListener('gattserverdisconnected', () => {
@@ -222,6 +197,8 @@ export class BandLink {
       rearm();
       this.#streamSink = (view, now) => {
         const packet = decodeStreamPacket(view);
+        // The band probes a link with an empty notification before streaming.
+        if (packet === null) return;
         account.record(packet.sequence, packet.length, packet.intact, now, packet.bandMicros);
         progress?.(account.packets);
         if (options.packetCount !== 0 && account.packets >= options.packetCount) {

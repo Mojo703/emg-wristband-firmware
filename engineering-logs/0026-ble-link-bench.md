@@ -117,7 +117,8 @@ rate with no button pressed, media keys sent from the page arrived on that
 app-opened link, and keys pressed at the band's console arrived with the
 phone locked. The interval iOS granted was not read off.
 
-Discovery has a limit. After the first pairing, iOS reclaims the bonded
+Discovery had a limit, since removed by advertising while connected. After
+the first pairing, iOS reclaims the bonded
 band as a HID device the moment it advertises, and a connected peripheral
 goes silent. Bluefy's chooser is a scan, so it never lists the band again;
 the page gets in only after the phone forgets it in Settings. Native
@@ -127,6 +128,35 @@ returned the granted band by name, then failed to connect with its own
 error 2 while iOS held the link. Bluefy evidently reaches a device by
 scanning, which a silent one defeats. Grants belong to an origin, so a
 deploy to a fresh preview URL starts with none.
+
+### Advertising while connected
+
+The fix for discovery was the one most wearables use: keep advertising with
+a connection up. The state machine now restarts advertising after a connect
+as long as NimBLE has room for another central, at one advertisement per
+second while connected and 30 to 60 ms otherwise, and `peer` is read from
+the connection descriptors so two centrals cannot overwrite one flag. With
+that, Bluefy's chooser listed a band iOS already held, the page connected,
+and the stream and media keys worked on the result. The band's status
+record reported one connection, so iOS hands the app the system link and
+opens no second one; the spare slot exists only so the band can keep
+advertising. The desktop behaved the same with BlueZ holding the band. The reconnect-without-scan button came out
+of the page, since the chooser now covers it.
+
+A second central then exposed a store limit. With the phone holding the
+band, the desktop cycled for a while before it connected, and the band
+logged `Error while removing IRK`. That line is NimBLE evicting its oldest
+bond: the subscription store holds eight records by default, one per
+notifying characteristic per bonded peer, and two centrals with HID,
+battery and the bench's three characteristics exceed it. The eviction
+strands the evicted central on a key the band no longer has, which is the
+reconnect loop; the logged error is the identity key failing to leave the
+controller's resolving list while the band advertises. The ceiling is now
+24 in `sdkconfig.defaults`. After that a desktop joined a phone-held band
+cleanly, both survived disconnects on either side, and media keys from the
+band reached both at once. The bench then answered only the first
+subscriber, so a second page saw no packets. Stream, echo, status and link
+requests now go to the connection that wrote the command.
 
 ## Analysis
 
@@ -146,10 +176,9 @@ round trip is two events at a 30 ms interval, the interval iOS holds unless
 asked. The 15 to 30 ms request is the one Apple's rules allow.
 
 Pairing from the page is the demo path for the first connection: scan the
-code, tap the band, accept the prompt. Every later connection is the problem.
-iOS owns the bond, and the page needs a way to reach a peripheral that is
-not advertising. That favours the Capacitor build, which can ask
-CoreBluetooth for connected peripherals, over staying in Bluefy. The
+code, tap the band, accept the prompt. Every later connection needed the band to stay on the air, and now it
+does. The Capacitor build no longer has a discovery argument over Bluefy;
+its remaining case is the background data channel. The
 manual must also name the bond-mismatch loop seen on the desktop. A central
 holding a key the band no longer has reconnects and drops forever, and only
 the phone can clear it.
@@ -167,7 +196,9 @@ Bluetooth background mode keeps the data channel too.
 - Firmware: `CONFIG_BT_NIMBLE_LOG_LEVEL_WARNING` in `opal-firmware` too. Its
   console is off, so it does not pay the UART cost, but it still formats two
   lines per HID key.
-- Phone: read the granted interval. `getDevices()` is tested and does not
-  reach a bonded band in Bluefy.
+- Phone: read the granted interval.
+- Two centrals at once is a bench convenience, not a product need; the
+  product is one phone per band, and the gating of the advertising window
+  around the user flow is still to design.
 - Protocol: 244-byte notifications are the packet size to design the embedding
   stream around; frames larger than that need chunking in `protocol/`.

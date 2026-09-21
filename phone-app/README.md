@@ -38,11 +38,6 @@ service in its scan response.
   the granted connection interval, latency and supervision timeout, the
   negotiated MTU, the PHY each way, the band's free heap, and the outcome of
   the last media key. The band notifies it on change and once a second.
-- **Reconnect known band** reaches a band this page was granted before
-  without scanning, through `getDevices()`. A bonded band the phone already
-  holds as a HID device does not advertise, so the chooser never lists it
-  again; this button is the only door Web Bluetooth has to it, and the log
-  says whether the browser has that door at all.
 - **Link requests** ask the phone for a connection interval, for the 2M PHY
   with data length extension, to pair from the band's side, and to clear the
   band's bonds. Each is a request; the status shows what was granted. The
@@ -70,6 +65,9 @@ service in its scan response.
 - **Media keys** send a command the band turns into the same HID consumer key
   a gesture commit sends. The status says whether the band sent it or dropped
   it for want of an encrypted link.
+- Two pages can bench one band in turn. The band answers the connection
+  that wrote the last command, so a stream started from one page is counted
+  there and the other page's status shows its own link.
 - **Copy results** puts every table on the clipboard as markdown for the
   engineering log.
 
@@ -78,8 +76,8 @@ service in its scan response.
 Which of these works decides how the manual tells a stranger to connect.
 
 1. Pair through Settings first, so iOS holds the HID link, then open the page
-   and connect. A connected peripheral does not advertise, so the question is
-   whether Bluefy can still find it.
+   and connect. The band keeps advertising while connected, once a second,
+   so the chooser should list it; it may take a few seconds to appear.
 2. Connect from the page first, then press **Pair from band**. The question is
    whether the pairing dialog appears and whether iOS then attaches its HID
    driver on the same link, so the media buttons work without a trip through
