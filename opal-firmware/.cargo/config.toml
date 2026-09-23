@@ -23,3 +23,12 @@ test-device = [
     "--config",
     'env.ESP_IDF_SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.test"',
 ]
+# The deep-sleep bench logs its wake cause over the console; the LED carries the
+# result when the console is gone.
+sleep-bench = [
+    "run",
+    "--example",
+    "sleep-bench",
+    "--config",
+    'env.ESP_IDF_SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.test"',
+]
