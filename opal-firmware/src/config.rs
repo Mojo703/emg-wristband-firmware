@@ -1,31 +1,20 @@
-//! Device configuration. The device is the source of functional truth and runs
-//! standalone, so it owns the sensitivity table (the id → threshold mapping that
-//! gates commands) and the live settings. First-boot defaults come from `cfg.toml`
-//! (compile-time, via toml-cfg); thereafter the live settings are persisted to NVS
-//! as a CBOR blob so adding a field is a struct change with no migration.
+//! Device settings: the sensitivity preset that gates commands and the keymap
+//! from gesture to media key. The phone app changes them over the settings
+//! service; they persist to NVS as a CBOR blob, so adding a field is a struct
+//! change with no migration.
 
 use anyhow::Result;
-use emg_runtime::RejectPipeline;
+use ble_media::settings_service::{self, BandSettings, GestureBinding};
+use calibration_flow::{active_gesture_from_index, active_gesture_index};
 use esp_idf_svc::nvs::{EspDefaultNvs, EspDefaultNvsPartition};
-use protocol::{Binding, DeviceConfig, MediaKey, SensitivityLevel};
+use protocol::{Binding, MediaKey};
 use serde::{Deserialize, Serialize};
 
-use crate::CALIBRATION_COMMAND_CLASSES;
+use crate::COMMAND_CLASSES;
 
-#[toml_cfg::toml_config]
-pub struct CompileConfig {
-    #[default("")]
-    pub wifi_ssid: &'static str,
-    #[default("")]
-    pub wifi_psk: &'static str,
-    #[default("192.168.1.90:9000")]
-    pub server_addr: &'static str,
-}
-
-/// The device's sensitivity presets. Each maps to the reject threshold τ that gates
-/// commands (lower τ ⇒ easier to trigger); the device owns this because it must gate
-/// commands with no dashboard attached. The serde encoding must equal [`Self::id`] —
-/// saved NVS blobs and the wire both carry the id string.
+/// The sensitivity presets. Each maps to the reject threshold τ that gates
+/// commands (lower τ ⇒ easier to trigger). Saved NVS blobs carry the lowercase
+/// name, so the serde encoding must not change.
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Sensitivity {
@@ -35,29 +24,6 @@ pub enum Sensitivity {
 }
 
 impl Sensitivity {
-    pub const ALL: [Sensitivity; 3] = [Sensitivity::Low, Sensitivity::Medium, Sensitivity::High];
-
-    /// Resolve a wire id; unknown ids are rejected (`None`), never defaulted.
-    pub fn from_id(id: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|level| level.id() == id)
-    }
-
-    pub fn id(self) -> &'static str {
-        match self {
-            Sensitivity::Low => "low",
-            Sensitivity::Medium => "medium",
-            Sensitivity::High => "high",
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Sensitivity::Low => "Low",
-            Sensitivity::Medium => "Medium",
-            Sensitivity::High => "High",
-        }
-    }
-
     /// The reject threshold τ this preset gates commands with.
     pub fn tau(self) -> f32 {
         match self {
@@ -68,69 +34,89 @@ impl Sensitivity {
     }
 }
 
-/// Persisted, mutable device settings. Secrets (the wifi password) live here and are
-/// never put on the wire; [`Settings::to_wire`] projects only the public functional
-/// config.
+impl From<Sensitivity> for settings_service::Sensitivity {
+    fn from(level: Sensitivity) -> Self {
+        match level {
+            Sensitivity::Low => Self::Low,
+            Sensitivity::Medium => Self::Medium,
+            Sensitivity::High => Self::High,
+        }
+    }
+}
+
+impl From<settings_service::Sensitivity> for Sensitivity {
+    fn from(level: settings_service::Sensitivity) -> Self {
+        match level {
+            settings_service::Sensitivity::Low => Self::Low,
+            settings_service::Sensitivity::Medium => Self::Medium,
+            settings_service::Sensitivity::High => Self::High,
+        }
+    }
+}
+
+/// Persisted device settings. `keymap` is indexed by command class, the order
+/// of `calibration_flow::ACTIVE_CALIBRATION_GESTURES`.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Settings {
     pub sensitivity: Sensitivity,
     pub keymap: Vec<Binding>,
-    pub wifi_ssid: String,
-    pub wifi_psk: String,
-    pub server_addr: String,
 }
 
 impl Default for Settings {
-    /// First-boot settings: compile-time wifi from `cfg.toml`, and a starting keymap
-    /// binding each gesture to a distinct media key, cycling.
+    /// First-boot settings: each gesture bound to a distinct media key.
     fn default() -> Self {
-        let cfg = COMPILE_CONFIG;
         Self {
             sensitivity: Sensitivity::Medium,
-            keymap: (0..CALIBRATION_COMMAND_CLASSES as u8)
+            keymap: (0..COMMAND_CLASSES as u8)
                 .map(|gesture| Binding {
                     gesture,
                     key: MediaKey::ALL[gesture as usize % MediaKey::ALL.len()],
                 })
                 .collect(),
-            wifi_ssid: cfg.wifi_ssid.into(),
-            wifi_psk: cfg.wifi_psk.into(),
-            server_addr: cfg.server_addr.into(),
         }
     }
 }
 
 impl Settings {
-    /// The media key bound to a gesture (PlayPause if unbound).
-    pub fn key_for(&self, gesture: u8) -> MediaKey {
+    /// The media key bound to a command class (PlayPause if unbound).
+    pub fn key_for(&self, class: u8) -> MediaKey {
         self.keymap
             .iter()
-            .find(|binding| binding.gesture == gesture)
+            .find(|binding| binding.gesture == class)
             .map(|binding| binding.key)
             .unwrap_or(MediaKey::PlayPause)
     }
 
-    /// Project the functional config onto the wire (no secrets).
-    pub fn to_wire(&self) -> DeviceConfig {
-        DeviceConfig {
-            gestures: CALIBRATION_COMMAND_CLASSES as u8,
-            keymap: self
-                .keymap
-                .iter()
-                .filter(|binding| usize::from(binding.gesture) < CALIBRATION_COMMAND_CLASSES)
-                .cloned()
-                .collect(),
-            wifi_ssid: (!self.wifi_ssid.is_empty()).then(|| self.wifi_ssid.clone()),
-            sensitivity: self.sensitivity.id().into(),
-            sensitivity_levels: Sensitivity::ALL
-                .iter()
-                .map(|level| SensitivityLevel {
-                    id: level.id().into(),
-                    label: level.label().into(),
+    /// The record the settings service carries: every active gesture with its key.
+    pub fn to_band(&self) -> BandSettings {
+        BandSettings {
+            sensitivity: self.sensitivity.into(),
+            bindings: (0..COMMAND_CLASSES as u8)
+                .filter_map(|class| {
+                    Some(GestureBinding {
+                        gesture: active_gesture_from_index(class)?,
+                        key: self.key_for(class),
+                    })
                 })
                 .collect(),
-            tau: self.sensitivity.tau(),
-            needed: RejectPipeline::NEEDED as u8,
+        }
+    }
+
+    /// Take what the phone wrote. Bindings for gestures this model does not
+    /// score are ignored; gestures the record leaves out keep their key.
+    pub fn apply_band(&mut self, band: &BandSettings) {
+        self.sensitivity = band.sensitivity.into();
+        for binding in &band.bindings {
+            let Some(class) = active_gesture_index(binding.gesture) else {
+                continue;
+            };
+            match self.keymap.iter_mut().find(|kept| kept.gesture == class) {
+                Some(kept) => kept.key = binding.key,
+                None => self.keymap.push(Binding {
+                    gesture: class,
+                    key: binding.key,
+                }),
+            }
         }
     }
 }
@@ -173,20 +159,29 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use protocol::CalibrationGesture;
 
     #[test]
-    fn advertised_config_excludes_historical_dropped_bindings() {
+    fn a_written_record_round_trips_through_the_settings() {
         let mut settings = Settings::default();
-        settings.keymap.push(Binding {
-            gesture: 4,
-            key: MediaKey::PlayPause,
+        let mut band = settings.to_band();
+        band.sensitivity = settings_service::Sensitivity::High;
+        band.bindings[0].key = MediaKey::VolumeUp;
+        settings.apply_band(&band);
+        assert_eq!(settings.to_band(), band);
+    }
+
+    #[test]
+    fn a_binding_for_a_gesture_the_model_does_not_score_is_ignored() {
+        let mut settings = Settings::default();
+        let before = settings.to_band();
+        settings.apply_band(&BandSettings {
+            sensitivity: before.sensitivity,
+            bindings: vec![GestureBinding {
+                gesture: CalibrationGesture::ThumbExtension,
+                key: MediaKey::Mute,
+            }],
         });
-        let wire = settings.to_wire();
-        assert_eq!(wire.gestures, CALIBRATION_COMMAND_CLASSES as u8);
-        assert_eq!(wire.keymap.len(), CALIBRATION_COMMAND_CLASSES);
-        assert!(wire
-            .keymap
-            .iter()
-            .all(|binding| usize::from(binding.gesture) < CALIBRATION_COMMAND_CLASSES));
+        assert_eq!(settings.to_band(), before);
     }
 }

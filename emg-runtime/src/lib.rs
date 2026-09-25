@@ -26,6 +26,7 @@ pub mod mac;
 #[cfg(feature = "tds")]
 pub mod model;
 pub mod pipeline;
+pub mod resident_selector;
 pub mod streaming_fit;
 #[cfg(feature = "tds")]
 pub mod tensor;

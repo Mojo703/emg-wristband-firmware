@@ -1,9 +1,10 @@
 # phone-app
 
-The phone side of the band, as a website. Today it holds one screen, the link
-bench, which drives `ble-media`'s `ble-gatt-bench` firmware over Web Bluetooth
-and reports what the phone's radio stack grants. The setup, calibration, and
-collection screens land here later.
+The phone side of the band, as a website. The main page connects to a band
+running `opal-firmware`. It maps each gesture to a media key, sets sensitivity,
+and shows the last gesture the band committed. The link bench lives at
+`#bench`. It drives the `ble-gatt-bench` example in `ble-media` and reports
+what the phone's radio stack grants.
 
 ## Run
 
@@ -28,7 +29,7 @@ use Chrome. On Linux, Chrome exposes Web Bluetooth only behind
 5.41 or later; it works for developing the page, but its pairing behaviour and
 connection parameters say nothing about iOS.
 
-## What the bench measures
+## What the bench measures (`#bench`)
 
 Flash the band with `. ~/export-esp.sh && cargo run --example ble-gatt-bench`
 from `ble-media/`. It advertises as the HID media remote at boot with the bench

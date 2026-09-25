@@ -59,15 +59,6 @@ pub(crate) const COMBINER_CORE: Core = Core::Core0;
 /// core is added directly to both chips' edge-service latency.
 pub(crate) const GPIO_INTERRUPT_DISPATCHER_CORE: Core = front_end_core(Board::B);
 
-/// The validation bench's playback worker (`playback` feature only): filter
-/// bank, feature windows, and the calibration fit. Core 1 because a playback
-/// build has no front end — none of the acquisition threads or the GPIO
-/// dispatcher that own this core on real hardware exist — so the whole core is
-/// free, and the work is exactly the kind of sustained bulk compute that would
-/// otherwise add latency to the main task's link writes.
-#[cfg(feature = "playback")]
-pub(crate) const PLAYBACK_WORKER_CORE: Core = Core::Core1;
-
 /// The haptics and indicator-LED outputs. Core 0 because the I2C and RMT drivers
 /// allocate their interrupts on whichever core constructs them, and core 1's budget
 /// is the dispatcher's edge-service latency.

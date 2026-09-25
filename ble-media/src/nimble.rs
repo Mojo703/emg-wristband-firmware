@@ -6,7 +6,7 @@
 //! where they can be tested.
 
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Sender, SyncSender, TrySendError};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -22,6 +22,7 @@ use log::{error, info, warn};
 use crate::hid;
 use crate::link_bench::{self, BenchCommand, ConnectionParameters, LinkStatus, MediaOutcome, Phy};
 use crate::phone::{Peer, Radio};
+use crate::settings_service::{self, BandSettings, GestureEvent};
 
 /// `0x03C1` = HID Keyboard. Presenting as a keyboard makes iOS treat us as a
 /// media-capable input device.
@@ -396,17 +397,7 @@ impl NimbleRadio {
                 }
             });
 
-        let mut scan_response = [0u8; 18];
-        scan_response[0] = 17;
-        scan_response[1] = COMPLETE_LIST_OF_128_BIT_SERVICE_UUIDS;
-        scan_response[2..].copy_from_slice(&link_bench::uuid_bytes_little_endian(
-            link_bench::SERVICE_UUID,
-        ));
-        self.advertising
-            .context("BLE advertising handle is unavailable")?
-            .lock()
-            .set_raw_scan_response_data(&scan_response)
-            .context("setting the scan response")?;
+        self.advertise_service_in_scan_response(link_bench::SERVICE_UUID)?;
 
         Ok(LinkBench {
             stream,
@@ -414,6 +405,87 @@ impl NimbleRadio {
             published: None,
             requester: None,
         })
+    }
+}
+
+/// The settings service's two characteristics, held by whoever publishes to
+/// them once the radio has moved into a `Phone`.
+pub struct SettingsService {
+    settings: Arc<Mutex<BLECharacteristic>>,
+    gesture: Arc<Mutex<BLECharacteristic>>,
+}
+
+impl NimbleRadio {
+    /// Register the settings service and put its UUID in the scan response,
+    /// so the phone app can filter on it while the primary advertisement stays
+    /// what iOS recognises the bonded HID device by. Must run before
+    /// advertising starts; NimBLE freezes the attribute table then.
+    ///
+    /// A well-formed write is handed to `writes` and not applied here: the
+    /// owner of the settings validates, persists, and then calls
+    /// [`SettingsService::publish_settings`] with what it kept.
+    pub fn attach_settings_service(
+        &mut self,
+        current: &BandSettings,
+        writes: SyncSender<BandSettings>,
+    ) -> Result<SettingsService> {
+        let server = self
+            .server
+            .as_deref_mut()
+            .context("BLE server handle is unavailable")?;
+        let service = server.create_service(uuid(settings_service::SERVICE_UUID));
+        let settings = service.lock().create_characteristic(
+            uuid(settings_service::SETTINGS_UUID),
+            NimbleProperties::READ | NimbleProperties::WRITE | NimbleProperties::NOTIFY,
+        );
+        let gesture = service.lock().create_characteristic(
+            uuid(settings_service::GESTURE_UUID),
+            NimbleProperties::READ | NimbleProperties::NOTIFY,
+        );
+        settings.lock().set_value(&current.encode());
+
+        settings
+            .lock()
+            .on_write(move |args| match BandSettings::parse(args.recv_data()) {
+                Ok(received) => match writes.try_send(received) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(_)) => warn!("settings writes backed up; one dropped"),
+                    Err(TrySendError::Disconnected(_)) => warn!("settings owner is gone"),
+                },
+                Err(err) => {
+                    warn!("settings write refused: {err}");
+                    args.reject();
+                }
+            });
+
+        self.advertise_service_in_scan_response(settings_service::SERVICE_UUID)?;
+        Ok(SettingsService { settings, gesture })
+    }
+
+    fn advertise_service_in_scan_response(&mut self, service: &str) -> Result<()> {
+        let mut scan_response = [0u8; 18];
+        scan_response[0] = 17;
+        scan_response[1] = COMPLETE_LIST_OF_128_BIT_SERVICE_UUIDS;
+        scan_response[2..].copy_from_slice(&link_bench::uuid_bytes_little_endian(service));
+        self.advertising
+            .context("BLE advertising handle is unavailable")?
+            .lock()
+            .set_raw_scan_response_data(&scan_response)
+            .context("setting the scan response")?;
+        Ok(())
+    }
+}
+
+impl SettingsService {
+    /// Store the settings the band now runs with and tell subscribers.
+    pub fn publish_settings(&self, settings: &BandSettings) {
+        self.settings.lock().set_value(&settings.encode()).notify();
+    }
+
+    /// Tell subscribers a gesture committed. Nothing subscribed is not an
+    /// error: the app is optional, and the HID key is what the wearer wants.
+    pub fn publish_gesture(&self, event: &GestureEvent) {
+        self.gesture.lock().set_value(&event.encode()).notify();
     }
 }
 

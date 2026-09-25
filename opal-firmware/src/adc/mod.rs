@@ -47,16 +47,6 @@ pub(crate) use convert::MICROVOLTS_PER_WIRE_COUNT;
 
 use registers::Register;
 
-/// Registers in one chip's map, which is how long a provenance snapshot is.
-pub(crate) const REGISTER_COUNT: usize = Register::ALL.len();
-
-/// The name and address of the register at `index` in a snapshot, so
-/// [`crate::provenance`] can label the bytes without owning the register map.
-pub(crate) fn register_identity(index: usize) -> (&'static str, u8) {
-    let register = Register::ALL[index];
-    (register.name(), register.addr())
-}
-
 use anyhow::{Context, Result};
 use esp_idf_svc::hal::delay::FreeRtos;
 use esp_idf_svc::hal::gpio::{AnyInputPin, AnyOutputPin, Output, PinDriver, Pull};
@@ -301,11 +291,18 @@ pub(crate) fn bring_up<SpiA: SpiAnyPins + 'static, SpiB: SpiAnyPins + 'static>(
             );
         }
 
-        // The whole map, off the chip, last thing before the stream starts: this
-        // is the acquisition setup a recorded session is stored against, and it
-        // has to be taken after the test-signal muxing above or it would describe
-        // a chip that is not the one converting.
-        crate::provenance::record_front_end(index, chip.device.read_all_registers());
+        // The whole map, off the chip, after the test-signal muxing above, so the
+        // log describes the chip that is converting.
+        let snapshot = chip.device.read_all_registers();
+        let registers: Vec<String> = Register::ALL
+            .iter()
+            .zip(snapshot)
+            .map(|(register, value)| match value {
+                Some(value) => format!("{}={value:02x}", register.name()),
+                None => format!("{}=??", register.name()),
+            })
+            .collect();
+        info!("ADS1298 chip {index} registers: {}", registers.join(" "));
 
         chip.device.read_data_continuous()?;
         chip.start_conversion()?;

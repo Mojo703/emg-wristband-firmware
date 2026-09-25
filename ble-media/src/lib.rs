@@ -16,6 +16,7 @@ pub mod hid;
 pub mod link_bench;
 pub mod phone;
 pub mod session;
+pub mod settings_service;
 
 #[cfg(target_os = "espidf")]
 pub mod console;

@@ -1,22 +1,23 @@
-//! Recovery of one logical resident and one candidate/scratch over two slots.
+//! Recovery of one logical resident and one candidate or scratch slot over the
+//! two physical calibration slots, from their validated metadata alone.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum PhysicalSlot {
+pub enum PhysicalSlot {
     First,
     Second,
 }
 
 impl PhysicalSlot {
-    pub(crate) const ALL: [Self; 2] = [Self::First, Self::Second];
+    pub const ALL: [Self; 2] = [Self::First, Self::Second];
 
-    pub(crate) const fn index(self) -> usize {
+    pub const fn index(self) -> usize {
         match self {
             Self::First => 0,
             Self::Second => 1,
         }
     }
 
-    pub(crate) const fn other(self) -> Self {
+    pub const fn other(self) -> Self {
         match self {
             Self::First => Self::Second,
             Self::Second => Self::First,
@@ -25,7 +26,7 @@ impl PhysicalSlot {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct StoredIdentity {
+pub struct StoredIdentity {
     pub physical: PhysicalSlot,
     pub generation: u32,
     pub crc: u32,
@@ -33,21 +34,21 @@ pub(crate) struct StoredIdentity {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StoredRole {
+pub enum StoredRole {
     Resident,
     ExportableCandidate,
     Inactive,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ResidentIdentity {
+pub struct ResidentIdentity {
     pub physical: PhysicalSlot,
     pub generation: u32,
     pub crc: u32,
 }
 
 impl ResidentIdentity {
-    pub(crate) const fn from_stored(stored: StoredIdentity) -> Self {
+    pub const fn from_stored(stored: StoredIdentity) -> Self {
         Self {
             physical: stored.physical,
             generation: stored.generation,
@@ -57,12 +58,12 @@ impl ResidentIdentity {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SelectorPersistenceCapability {
+pub enum SelectorPersistenceCapability {
     SlotSequenceAndCrc,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct StoreSelector {
+pub struct StoreSelector {
     resident: Option<ResidentIdentity>,
     writable: WritableSlot,
 }
@@ -74,7 +75,7 @@ enum WritableSlot {
 }
 
 impl StoreSelector {
-    pub(crate) fn recover(slots: [Option<StoredIdentity>; 2]) -> Self {
+    pub fn recover(slots: [Option<StoredIdentity>; 2]) -> Self {
         let newest_state = slots
             .into_iter()
             .flatten()
@@ -104,29 +105,29 @@ impl StoreSelector {
         Self { resident, writable }
     }
 
-    pub(crate) const fn resident(&self) -> Option<ResidentIdentity> {
+    pub const fn resident(&self) -> Option<ResidentIdentity> {
         self.resident
     }
 
-    pub(crate) const fn exportable(&self) -> Option<StoredIdentity> {
+    pub const fn exportable(&self) -> Option<StoredIdentity> {
         match self.writable {
             WritableSlot::Scratch(_) => None,
             WritableSlot::ExportableCandidate(candidate) => Some(candidate),
         }
     }
 
-    pub(crate) const fn scratch(&self) -> Option<PhysicalSlot> {
+    pub const fn scratch(&self) -> Option<PhysicalSlot> {
         match self.writable {
             WritableSlot::Scratch(slot) => Some(slot),
             WritableSlot::ExportableCandidate(_) => None,
         }
     }
 
-    pub(crate) const fn classification_enabled(&self) -> bool {
+    pub const fn classification_enabled(&self) -> bool {
         self.resident.is_some()
     }
 
-    pub(crate) const fn persistence_capability(&self) -> SelectorPersistenceCapability {
+    pub const fn persistence_capability(&self) -> SelectorPersistenceCapability {
         SelectorPersistenceCapability::SlotSequenceAndCrc
     }
 }

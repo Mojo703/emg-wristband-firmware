@@ -4,8 +4,8 @@
 //! Parsing lives here rather than in the firmware so that every rule this file
 //! states — a torn slot is dead, a slot built against another prior is dead,
 //! an unwritten region is an absence and not a fault, is provable on the host.
-//! `opal-firmware/src/calibration/training_rows.rs` owns the mapping, erase, and
-//! writes; it owns no layout knowledge.
+//! `opal-firmware/src/resident.rs` maps the partition and reads the resident;
+//! it owns no layout knowledge.
 //!
 //! `firmware-bench/FLASH-FORMATS.md` is the authority on every offset below,
 //! and the tests at the bottom pin this file against it.
@@ -926,19 +926,12 @@ pub fn next_sequence<const COUNT: usize>(sequences: [Option<u32>; COUNT]) -> Opt
         .filter(|sequence| *sequence != SEQUENCE_ERASED)
 }
 
-// Compile the firmware's real selector into host flash-image tests. This keeps
-// torn-write coverage from reimplementing the most important recovery choice
-// in a test-only approximation.
-#[cfg(test)]
-#[path = "../../opal-firmware/src/calibration/resident_selector.rs"]
-mod production_resident_selector;
-
 #[cfg(test)]
 mod tests {
-    use super::production_resident_selector::{
+    use super::*;
+    use crate::resident_selector::{
         PhysicalSlot, SelectorPersistenceCapability, StoreSelector, StoredIdentity, StoredRole,
     };
-    use super::*;
 
     fn write_f32s(image: &mut Vec<u8>, values: &[f32]) {
         for value in values {

@@ -97,6 +97,7 @@ label {
   color: var(--muted);
 }
 
+select,
 input[type='number'] {
   font: inherit;
   width: 7em;

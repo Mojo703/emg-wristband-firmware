@@ -491,10 +491,8 @@ impl Ads1298Device {
         })
     }
 
-    /// Every register as the chip holds it, address order, for the provenance a
-    /// session records. SDATAC only, before RDATAC starts the stream. A register
-    /// whose read fails stays `None` — a snapshot that quietly reported the intended
-    /// byte would defeat the point of reading the chip at all.
+    /// Every register as the chip holds it, address order. SDATAC only, before
+    /// RDATAC starts the stream. A register whose read fails stays `None`.
     pub(super) fn read_all_registers(&mut self) -> [Option<u8>; Register::ALL.len()] {
         let mut values = [None; Register::ALL.len()];
         for (slot, register) in values.iter_mut().zip(Register::ALL) {

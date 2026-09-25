@@ -72,7 +72,7 @@ pub(super) enum Register {
 }
 
 impl Register {
-    /// The whole map in address order — what a provenance snapshot walks.
+    /// The whole map in address order — what the boot register snapshot walks.
     pub(super) const ALL: [Register; 26] = [
         Register::Id,
         Register::Config1,

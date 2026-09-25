@@ -1,7 +1,4 @@
-#[path = "../../opal-firmware/src/calibration/resident_selector.rs"]
-mod resident_selector;
-
-use resident_selector::{
+use emg_runtime::resident_selector::{
     PhysicalSlot, ResidentIdentity, SelectorPersistenceCapability, StoreSelector, StoredIdentity,
     StoredRole,
 };

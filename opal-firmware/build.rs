@@ -7,8 +7,8 @@ fn main() {
 }
 
 /// Stamp the build's git commit, working-tree state, and time into the binary as
-/// environment variables `src/provenance.rs` reads. A device reports these on
-/// connect, so a recorded session names the build that produced it.
+/// environment variables the boot log prints, so a log names the build that
+/// wrote it.
 fn emit_build_identity() {
     let repository = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap())
         .parent()
@@ -38,6 +38,7 @@ fn emit_build_identity() {
             "opal-firmware",
             "protocol",
             "emg-runtime",
+            "ble-media",
         ],
     )
     .is_some_and(|changes| !changes.is_empty());

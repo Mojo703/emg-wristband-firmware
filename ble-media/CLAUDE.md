@@ -29,6 +29,15 @@ Agent notes:
   protocol.ts` mirrors them by hand; change both. `NimbleRadio::attach_link_bench`
   must run before advertising starts, and it puts the service UUID in the scan
   response so the primary advertisement iOS bonds against is unchanged.
+- `src/settings_service.rs` is the third host-tested module. It holds the byte
+  layouts of the settings record (sensitivity and gesture-to-key bindings) and
+  the gesture notification. `opal-firmware` serves them, and
+  `phone-app/src/lib/band/protocol.ts` mirrors them by hand; change both.
+  `NimbleRadio::attach_settings_service` must also run before advertising
+  starts. It puts its own UUID in the scan response, so a firmware attaches
+  either the settings service or the bench, never both.
+- `Phone::tick` retries a refused advertising start every `ADVERTISING_RETRY`.
+  The band has no toggle, so nothing else would retry it.
 - Firmware otherwise: the example runs on hardware and cannot run on this host.
 - `Phone::press` / `Phone::tick` are the seam the wearer firmware calls from its
   feedback thread. Keep those stable. `tick` must be called unconditionally, not

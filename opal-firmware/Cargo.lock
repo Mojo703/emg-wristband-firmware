@@ -1131,12 +1131,9 @@ dependencies = [
  "emg-runtime",
  "esp-idf-svc",
  "feedback-vocabulary",
- "heapless 0.9.3",
  "log",
  "protocol",
  "serde",
- "serde_bytes",
- "toml-cfg",
 ]
 
 [[package]]

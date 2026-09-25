@@ -11,67 +11,47 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="$ENV{PROJECT_DIR}/partitions.csv"
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=240
 
-# Bluetooth HID uses the NimBLE host only. The stack is brought up before the
-# model, wifi, ADC, and feedback drivers so its largest allocation sees the fresh
-# boot heap; advertising remains off until a runtime SetPhone control arrives.
+# Bluetooth: the NimBLE host only, brought up before the ADC and feedback
+# drivers so its largest allocation sees the fresh boot heap. Bonding keys
+# persist in NVS so the phone stays paired across reboots.
 CONFIG_BT_ENABLED=y
 CONFIG_BT_NIMBLE_ENABLED=y
 CONFIG_BT_BLUEDROID_ENABLED=n
 CONFIG_BT_NIMBLE_NVS_PERSIST=y
-
-# One bonded HID peripheral needs one host connection and one controller slot
-# each for advertising and the active connection. Central and observer roles
-# only reserve memory for behavior this firmware never performs.
 CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
 CONFIG_BT_NIMBLE_ROLE_BROADCASTER=y
 CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
 CONFIG_BT_NIMBLE_ROLE_OBSERVER=n
-CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
-CONFIG_BT_CTRL_BLE_MAX_ACT=2
+# Room for a second central, so the band keeps advertising while a phone holds
+# it: iOS reclaims a bonded band as HID the moment it advertises, and the phone
+# app can only find a band that is still on the air. These match the link
+# bench (ble-media), where the behaviour was verified on an iPhone.
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=3
+# One subscription record per notifying characteristic per bonded peer. NimBLE
+# answers an overflow by unpairing the oldest peer.
+CONFIG_BT_NIMBLE_MAX_CCCDS=24
+CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=517
+# At info level NimBLE prints two lines per notification from inside the
+# notify call; measured on the link bench, that held every notification ~10 ms.
+CONFIG_BT_NIMBLE_LOG_LEVEL_WARNING=y
 
-# The core plan lives in src/cores.rs; these pin the tasks that sdkconfig owns.
-# Main and wifi are the esp-idf defaults, stated so the plan does not rest on
-# them staying default; lwIP floats by default and is pinned to core 0 here to
-# keep networking off the acquisition core (measured: no cost on the serial
-# bench, and it removes the one task that could wander onto core 1 under load).
+# The core plan lives in src/cores.rs; this pins the task that sdkconfig owns.
 CONFIG_ESP_MAIN_TASK_AFFINITY_CPU0=y
-CONFIG_ESP_WIFI_TASK_PINNED_TO_CORE_0=y
-CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0=y
 
-# The Rust main task runs inference + framing. `App::new` returns a boxed owner from
-# a non-inlined constructor so its startup frame cannot remain beneath the permanent
+# The Rust main task runs inference. `App::new` returns a boxed owner from a
+# non-inlined constructor so its startup frame cannot remain beneath the permanent
 # run loop: retaining both frames overflowed this stack into the adjacent esp_timer
-# TCB. The release loop measured 7,088 bytes untouched after its first serial poll.
-# Every KB here is contiguous internal RAM the heap needs back, so keep the measured
-# margin rather than raising this to hide another by-value frame regression.
+# TCB. Every KB here is contiguous internal RAM the heap needs back.
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=20000
 CONFIG_FREERTOS_HZ=1000
 
-# TCP throughput to the dashboard. The lwIP default send buffer (5760 B, 4 segments)
-# caps the stream well below one EMG window per window period: each ~8.5 KB frame
-# needed several buffer-drain round trips, the writer fell behind, and the transport
-# queue dropped half the windows. 16 KB holds a whole window plus slack in flight.
-# Heap is tight (the model + a 16 KB window blob live alongside): 32 KB send buffer
-# and 64 dynamic TX buffers ran the device out of memory, so don't raise these
-# without watching free heap.
-CONFIG_LWIP_TCP_SND_BUF_DEFAULT=16384
-CONFIG_LWIP_TCP_WND_DEFAULT=8960
-CONFIG_LWIP_TCP_RECVMBOX_SIZE=16
-
-# A wider TX block-ack window so the radio can aggregate the burst instead of
-# trickling it out; buffer counts stay at the defaults for heap headroom.
-CONFIG_ESP_WIFI_TX_BA_WIN=16
-
-# lwIP hot path in IRAM (~13 KB of IRAM for a solid throughput bump).
-CONFIG_LWIP_IRAM_OPTIMIZATION=y
-
-# No text console: the USB-Serial-JTAG CDC channel carries the framed CBOR dashboard
-# link (src/transport.rs), and logs ride the protocol as Frame::Log (src/logger.rs).
-# Secondary console off too, or ESP-IDF would put one right back on the CDC.
-CONFIG_ESP_CONSOLE_NONE=y
+# Console on the USB port: logs go to the USB-Serial-JTAG monitor. This
+# board's UART0 pins go nowhere.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_UART_DEFAULT=n
 CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
 
-# A hung task must reboot the chip, not print an (invisible, console-less) warning.
-# The main loop subscribes itself to the task watchdog and feeds it every window
-# (src/main.rs); the boot log's reset reason then names the hang.
+# A hung task must reboot the chip, not print a warning. The main loop
+# subscribes itself to the task watchdog and feeds it every pass (src/main.rs);
+# the boot log's reset reason then names the hang.
 CONFIG_ESP_TASK_WDT_PANIC=y

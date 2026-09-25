@@ -1,21 +1,26 @@
 # opal-firmware
 
-Firmware for the Opal EMG wristband (ESP32-S3): two ADS1298s sample EMG, a
-wearer-calibrated 12-class linear model scores 64 filter-bank log-power features,
-and the reject pipeline smooths the five command classes into a wake-gate
-decision, and the frames stream to the dashboard over USB serial. BLE HID sends
-committed media keys when the dashboard enables Phone BLE. Wi-Fi remains dormant
-until a future explicit wireless-mode transition selects it.
+Firmware for the Opal EMG wristband (ESP32-S3). Two ADS1298s sample 16 EMG
+channels. At boot the firmware reads the wearer's calibrated model from the
+`training` partition. The model scores 64 filter-bank log-power features per
+window, and the reject pipeline decides when a gesture commits. Each commit
+reaches the phone twice: as a BLE HID media key and as a notification on the
+band's settings service. The `phone-app` page uses that service to remap
+gestures and set sensitivity. Logs go to the USB-Serial-JTAG console.
 `src/main.rs` has the module-level docs.
+
+This build has no dashboard link and no calibration flow. To calibrate, flash a
+dashboard build (the commit before the `demo-ble-firmware` branch) and run the
+guided calibration. The saved slot survives reflashing this build, since
+espflash writes only the bootloader, the partition table and the app.
 
 The feature pipeline wants 16 channels and the front end carries two 8-channel ADS1298 boards.
 "The two-device architecture" below records how they are clocked, started, and
 recovered, and why.
 
 The ADCs are the only live source of EMG. If they do not come up, the firmware
-keeps its links available for diagnostics but has no acquisition source. A
-`playback` build can substitute recorded input on a bare board. `BRINGUP.md` is
-the bench procedure for new hardware.
+keeps the phone link and the LED up and logs why. `BRINGUP.md` is the bench
+procedure for new hardware.
 
 ## The two-device architecture
 
@@ -111,15 +116,9 @@ exports first:
 cargo run    # builds, flashes over USB-Serial-JTAG, opens the serial monitor
 ```
 
-Compile-time defaults (wifi credentials, server address) come from `cfg.toml`,
-which stays out of version control; copy `cfg.toml.example` and fill it in.
-Values the dashboard persists to NVS override it. The file is optional for
-recording because the current product path starts on USB serial regardless of
-stored Wi-Fi credentials.
-
 ## On-device tests
 
-The unit tests (`links::policy`, `feedback`, and the ADC decode, lead-off, conversion
+The unit tests (`config`, `feedback`, and the ADC decode, lead-off, conversion
 and preprocessing modules) run on the device, because the crate only builds for
 Xtensa:
 
@@ -131,11 +130,8 @@ The former fixed TDS model and its Xtensa SIMD checks remain in `emg-runtime` as
 historical research code, but `opal-firmware` no longer embeds or executes that model.
 
 This is an alias (see `.cargo/config.toml`) for `cargo test` with
-`ESP_IDF_SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.test"`. The override
-matters: the normal firmware disables the console because the USB channel carries
-the framed CBOR dashboard link, so a plain `cargo test` runs the tests but shows
-no output. `sdkconfig.test` re-enables the USB-Serial-JTAG console for the libtest
-report.
+`ESP_IDF_SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.test"`. The test
+config gives the libtest threads a larger stack.
 
 What to expect:
 

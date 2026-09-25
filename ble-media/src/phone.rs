@@ -34,6 +34,11 @@ use crate::hid;
 /// How long a key is held before its release report goes out.
 pub const KEY_HOLD: Duration = Duration::from_millis(20);
 
+/// How long a refused advertising start waits before the tick tries again.
+/// NimBLE refuses while it is still closing a connection, which takes a few
+/// connection intervals.
+pub const ADVERTISING_RETRY: Duration = Duration::from_secs(1);
+
 /// The half of the peripheral that touches the BLE stack.
 ///
 /// Deliberately small and deliberately dumb: it starts and stops advertising,
@@ -168,6 +173,12 @@ pub enum PhoneLink {
     /// Enabling was asked for and refused, with the stack still up. Retryable,
     /// which is what separates it from [`Phone::Unavailable`].
     Refused(String),
+    /// Advertising is wanted and the stack refused to start it. The tick
+    /// tries again once `retry_in` has run down.
+    AdvertisingRefused {
+        reason: String,
+        retry_in: Duration,
+    },
 }
 
 /// The gap between a press report and its release, as a deadline the caller's
@@ -313,7 +324,7 @@ impl<R: Radio> Phone<R> {
         match self {
             Phone::Unavailable(_)
             | Phone::Ready {
-                link: PhoneLink::Refused(_),
+                link: PhoneLink::Refused(_) | PhoneLink::AdvertisingRefused { .. },
                 ..
             } => PhoneState::Unavailable,
             Phone::Ready {
@@ -342,7 +353,7 @@ impl<R: Radio> Phone<R> {
         match self {
             Phone::Unavailable(reason)
             | Phone::Ready {
-                link: PhoneLink::Refused(reason),
+                link: PhoneLink::Refused(reason) | PhoneLink::AdvertisingRefused { reason, .. },
                 ..
             } => Some(reason),
             Phone::Ready { .. } => None,
@@ -435,13 +446,17 @@ impl<R: Radio> Phone<R> {
         // room for another central: iOS reclaims a bonded band as a HID device
         // the moment it advertises, and a band that then goes silent can never
         // be found by the phone's own app, which discovers by scanning.
-        if matches!(link, PhoneLink::Advertising)
-            && radio.accepts_another_connection()
-            && !radio.is_advertising()
-        {
-            if let Err(err) = radio.start_advertising() {
-                *link = PhoneLink::Refused(reason(&err));
+        match link {
+            PhoneLink::Advertising
+                if radio.accepts_another_connection() && !radio.is_advertising() =>
+            {
+                *link = advertise(radio);
             }
+            PhoneLink::AdvertisingRefused { retry_in, .. } => match retry_in.checked_sub(elapsed) {
+                Some(left) if !left.is_zero() => *retry_in = left,
+                _ => *link = advertise(radio),
+            },
+            _ => {}
         }
     }
 
@@ -495,10 +510,7 @@ impl<R: Radio> Phone<R> {
             );
             return;
         }
-        *link = match radio.start_advertising() {
-            Ok(()) => PhoneLink::Advertising,
-            Err(err) => PhoneLink::Refused(reason(&err)),
-        };
+        *link = advertise(radio);
     }
 
     fn disable(&mut self) {
@@ -530,6 +542,20 @@ impl<R: Radio> Phone<R> {
 }
 
 /// Flatten an error chain into the one line the panel has room for.
+/// Start advertising unless the band already is, and say what came of it.
+fn advertise<R: Radio>(radio: &mut R) -> PhoneLink {
+    if radio.is_advertising() {
+        return PhoneLink::Advertising;
+    }
+    match radio.start_advertising() {
+        Ok(()) => PhoneLink::Advertising,
+        Err(err) => PhoneLink::AdvertisingRefused {
+            reason: reason(&err),
+            retry_in: ADVERTISING_RETRY,
+        },
+    }
+}
+
 fn reason(err: &anyhow::Error) -> String {
     format!("{err:#}")
 }
@@ -604,6 +630,9 @@ mod tests {
         fn start_advertising(&mut self) -> anyhow::Result<()> {
             if self.bench.refuse_advertising.get() {
                 anyhow::bail!("advertising busy");
+            }
+            if self.bench.advertising.get() {
+                anyhow::bail!("already advertising");
             }
             self.bench.advertising.set(true);
             Ok(())
@@ -1097,6 +1126,55 @@ mod tests {
 
         assert_eq!(phone.state(), PhoneState::Unavailable);
         assert!(phone.reason().unwrap().contains("advertising busy"));
+    }
+
+    /// A band with no toggle has nobody to press it again, so a refused
+    /// restart is retried on the tick until the band is back on the air.
+    #[test]
+    fn a_refused_restart_is_retried_until_the_band_is_back_on_the_air() {
+        let (mut phone, bench) = paired();
+        bench.phone_leaves();
+        bench.refuse_advertising.set(true);
+        phone.tick(Duration::from_millis(5));
+        assert_eq!(phone.state(), PhoneState::Unavailable);
+
+        bench.refuse_advertising.set(false);
+        phone.tick(Duration::from_millis(5));
+        assert_eq!(
+            phone.state(),
+            PhoneState::Unavailable,
+            "retried before the backoff elapsed"
+        );
+
+        phone.tick(ADVERTISING_RETRY);
+        assert!(bench.advertising.get());
+        assert_eq!(phone.state(), PhoneState::Advertising);
+    }
+
+    /// The same for a refusal at enable: the stack is busy with the peer the
+    /// band just hung up on, and it will not be for long.
+    #[test]
+    fn a_refused_enable_is_retried_without_another_toggle() {
+        let (mut phone, bench) = booted();
+        bench.refuse_advertising.set(true);
+        phone.set_enabled(true, RadioClaim::Free);
+        assert_eq!(phone.state(), PhoneState::Unavailable);
+
+        bench.refuse_advertising.set(false);
+        phone.tick(ADVERTISING_RETRY);
+
+        assert_eq!(phone.state(), PhoneState::Advertising);
+    }
+
+    /// NimBLE refuses a second start while advertising. Enabling a band that
+    /// is already on the air is not a refusal.
+    #[test]
+    fn enabling_while_already_advertising_stays_advertising() {
+        let (mut phone, _bench) = booted();
+        phone.set_enabled(true, RadioClaim::Free);
+        phone.set_enabled(true, RadioClaim::Free);
+
+        assert_eq!(phone.state(), PhoneState::Advertising);
     }
 
     /// A connected phone does not make the band go silent. Its own HID stack
