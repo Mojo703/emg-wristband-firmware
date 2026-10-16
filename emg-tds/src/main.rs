@@ -10,11 +10,13 @@
 //! GPU: build `--features cuda` and set `CUDARC_CUDA_VERSION=13020`.
 
 mod augment;
+mod calibrate;
 mod data;
 mod export;
 mod model;
 
 use anyhow::Result;
+use calibrate::{CalibrateArgs, CalibrationMode};
 use candle_core::{DType, Device, Tensor, D};
 use candle_nn::{AdamW, Optimizer, ParamsAdamW, VarBuilder, VarMap};
 use clap::{Parser, Subcommand};
@@ -142,6 +144,36 @@ enum Command {
         /// when the negative classes dwarf the per-command counts.
         #[arg(long)]
         balance: bool,
+    },
+    /// Calibrate a pretrained classifier on one wear's first cues and score its
+    /// remaining cues. Reads calibration_x|y.npy and test_x|y.npy.
+    Calibrate {
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Pretrained checkpoint; ignored by `--mode scratch`.
+        #[arg(long)]
+        init: Option<PathBuf>,
+        #[arg(long, value_enum)]
+        mode: CalibrationMode,
+        #[arg(long, default_value_t = 100)]
+        epochs: usize,
+        #[arg(long, default_value_t = 32)]
+        batch_size: usize,
+        #[arg(long, default_value_t = 1e-3)]
+        learning_rate: f64,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+        #[arg(long, default_value_t = 5)]
+        num_classes: usize,
+        /// Test-window logits, float32 `[windows, num_classes]`.
+        #[arg(long)]
+        logits_out: PathBuf,
+        /// Run on the CPU even when CUDA is available (for timing).
+        #[arg(long)]
+        cpu: bool,
+        /// Re-estimate BatchNorm statistics on the calibration windows first.
+        #[arg(long)]
+        adapt_batch_norm: bool,
     },
 }
 
@@ -758,5 +790,30 @@ fn main() -> Result<()> {
             n_commands,
             balance,
         ),
+        Command::Calibrate {
+            data_dir,
+            init,
+            mode,
+            epochs,
+            batch_size,
+            learning_rate,
+            seed,
+            num_classes,
+            logits_out,
+            cpu,
+            adapt_batch_norm,
+        } => calibrate::run(CalibrateArgs {
+            data_dir,
+            init,
+            mode,
+            epochs,
+            batch_size,
+            learning_rate,
+            seed,
+            num_classes,
+            logits_out,
+            cpu,
+            adapt_batch_norm,
+        }),
     }
 }

@@ -92,10 +92,24 @@ impl DepthwiseSeparableBlock {
 
     fn forward(&self, input: &Tensor, training: bool) -> Result<Tensor> {
         let output = self.depthwise.forward(input)?;
-        let output = self.pointwise.forward(&output)?;
+        let output = pointwise(&self.pointwise, &output)?;
         let output = self.batch_norm.forward_t(&output, training)?;
         Ok(output.relu()?)
     }
+}
+
+/// The 1×1 convolution as a channel matmul: [out,in] × [B,in,T] → [B,out,T].
+/// Candle 0.10's conv1d backward passes a transposed gradient in as the
+/// kernel, and conv1d misreads a non-contiguous kernel, so the kernel gradient
+/// of any conv with more than one output channel per group is wrong on every
+/// backend. The matmul's gradient is correct (see `gradient_tests`).
+fn pointwise(convolution: &Conv1d, input: &Tensor) -> Result<Tensor> {
+    let weight = convolution.weight().squeeze(2)?;
+    let output = weight.broadcast_matmul(input)?;
+    Ok(match convolution.bias() {
+        Some(bias) => output.broadcast_add(&bias.reshape((1, (), 1))?)?,
+        None => output,
+    })
 }
 
 /// Builds the shared encoder blocks, named `block{i}`. Both nets build them this
@@ -170,8 +184,26 @@ impl TdsNet {
     /// Classification logits [B,num_classes]. `training` toggles BatchNorm
     /// running-stat updates. Encoder blocks → global average pool over time → head.
     pub(crate) fn forward(&self, input: &Tensor, training: bool) -> Result<Tensor> {
-        let mut hidden = input.squeeze(1)?; // [B,C,T]
-        for block in &self.blocks {
+        self.tail(&input.squeeze(1)?, 0, training)
+    }
+
+    pub(crate) fn block_count(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// Blocks `[0, end)` with BatchNorm in inference mode: [B,1,C,T] → [B,C',T'].
+    pub(crate) fn frozen_trunk(&self, input: &Tensor, end: usize) -> Result<Tensor> {
+        let mut hidden = input.squeeze(1)?;
+        for block in &self.blocks[..end] {
+            hidden = block.forward(&hidden, false)?;
+        }
+        Ok(hidden)
+    }
+
+    /// Blocks `[start, ..)`, global average pool, head: [B,C',T'] → logits.
+    pub(crate) fn tail(&self, hidden: &Tensor, start: usize, training: bool) -> Result<Tensor> {
+        let mut hidden = hidden.clone();
+        for block in &self.blocks[start..] {
             hidden = block.forward(&hidden, training)?;
         }
         let features = hidden.mean(D::Minus1)?; // [B,d]
@@ -192,12 +224,169 @@ impl TdsNet {
         for block in &self.blocks {
             hidden = block.depthwise.forward(&hidden)?;
             out.push(hidden.clone());
-            hidden = block.pointwise.forward(&hidden)?;
+            hidden = pointwise(&block.pointwise, &hidden)?;
             hidden = block.batch_norm.forward_t(&hidden, training)?;
             hidden = hidden.relu()?;
             out.push(hidden.clone());
         }
         out.push(hidden.mean(D::Minus1)?);
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod gradient_tests {
+    use super::*;
+    use candle_core::{DType, Device, Var};
+    use candle_nn::VarMap;
+    use rand::{Rng, SeedableRng};
+
+    fn seeded(shape: &[usize], scale: f64, rng: &mut rand::rngs::StdRng) -> Result<Tensor> {
+        let count = shape.iter().product();
+        let values: Vec<f64> = (0..count)
+            .map(|_| scale * (2.0 * rng.gen::<f64>() - 1.0))
+            .collect();
+        Ok(Tensor::from_vec(values, shape, &Device::Cpu)?)
+    }
+
+    fn loss_of(model: &TdsNet, input: &Tensor, labels: &Tensor) -> Result<Tensor> {
+        Ok(candle_nn::loss::cross_entropy(
+            &model.forward(input, true)?,
+            labels,
+        )?)
+    }
+
+    fn build(device: &Device, dtype: DType) -> Result<(VarMap, TdsNet)> {
+        let var_map = VarMap::new();
+        let model = TdsNet::new(
+            Config::classify(16, 5),
+            VarBuilder::from_varmap(&var_map, dtype, device),
+        )?;
+        Ok((var_map, model))
+    }
+
+    fn sorted_vars(var_map: &VarMap) -> Vec<(String, Var)> {
+        let mut vars: Vec<(String, Var)> = var_map
+            .data()
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(name, var)| (name.clone(), var.clone()))
+            .collect();
+        vars.sort_by(|a, b| a.0.cmp(&b.0));
+        vars
+    }
+
+    /// Autograd against central differences in f64, a few elements per weight.
+    #[test]
+    fn cpu_gradients_match_finite_differences() -> Result<()> {
+        let device = Device::Cpu;
+        let (var_map, model) = build(&device, DType::F64)?;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        for (name, var) in sorted_vars(&var_map) {
+            if !name.contains("running") {
+                let offset = if name.ends_with("bn.weight") {
+                    1.0
+                } else {
+                    0.0
+                };
+                var.set(&(seeded(var.dims(), 0.3, &mut rng)? + offset)?)?;
+            }
+        }
+        let input = seeded(&[4, 1, 16, 500], 1.0, &mut rng)?;
+        let labels = Tensor::new(&[0u32, 1, 2, 3], &device)?;
+        let gradients = loss_of(&model, &input, &labels)?.backward()?;
+        let mut worst = Vec::new();
+        for (name, var) in sorted_vars(&var_map) {
+            if name.contains("running") {
+                continue;
+            }
+            let Some(gradient) = gradients.get(&var) else {
+                worst.push(format!("{name}: no gradient"));
+                continue;
+            };
+            let analytic = gradient.flatten_all()?.to_vec1::<f64>()?;
+            let original = var.as_tensor().flatten_all()?.to_vec1::<f64>()?;
+            let mut errors = Vec::new();
+            for step in 0..6 {
+                let index = step * (original.len() - 1) / 5;
+                let epsilon = 1e-5;
+                let mut values = original.clone();
+                values[index] += epsilon;
+                var.set(&Tensor::from_vec(values.clone(), var.shape(), &device)?)?;
+                let plus = loss_of(&model, &input, &labels)?.to_scalar::<f64>()?;
+                values[index] -= 2.0 * epsilon;
+                var.set(&Tensor::from_vec(values, var.shape(), &device)?)?;
+                let minus = loss_of(&model, &input, &labels)?.to_scalar::<f64>()?;
+                var.set(&Tensor::from_vec(original.clone(), var.shape(), &device)?)?;
+                let numeric = (plus - minus) / (2.0 * epsilon);
+                let error = (numeric - analytic[index]).abs()
+                    / numeric.abs().max(analytic[index].abs()).max(1e-4);
+                errors.push(error);
+            }
+            errors.sort_by(f64::total_cmp);
+            let median = errors[errors.len() / 2];
+            println!("{name:<24} median relative error {median:.2e}");
+            // One element near a kink can miss; a wrong gradient misses most of them.
+            if median > 1e-2 {
+                worst.push(format!("{name}: {median:.2e}"));
+            }
+        }
+        assert!(worst.is_empty(), "gradient mismatches: {worst:?}");
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_gradients_match_cpu() -> Result<()> {
+        let cpu = Device::Cpu;
+        let cuda = Device::new_cuda(0)?;
+        let (cpu_map, cpu_model) = build(&cpu, DType::F32)?;
+        let (cuda_map, cuda_model) = build(&cuda, DType::F32)?;
+        let cpu_vars = sorted_vars(&cpu_map);
+        let cuda_vars = sorted_vars(&cuda_map);
+        for ((_, from), (_, to)) in cpu_vars.iter().zip(&cuda_vars) {
+            to.set(&from.as_tensor().to_device(&cuda)?)?;
+        }
+        let input = Tensor::randn(0f32, 1f32, (4, 1, 16, 500), &cpu)?;
+        let labels = Tensor::new(&[0u32, 1, 2, 3], &cpu)?;
+        let cpu_gradients = loss_of(&cpu_model, &input, &labels)?.backward()?;
+        let cuda_gradients = loss_of(
+            &cuda_model,
+            &input.to_device(&cuda)?,
+            &labels.to_device(&cuda)?,
+        )?
+        .backward()?;
+        let mut mismatches = Vec::new();
+        for ((name, cpu_var), (_, cuda_var)) in cpu_vars.iter().zip(&cuda_vars) {
+            // BatchNorm cancels the conv biases ahead of it, so their gradient is rounding noise.
+            if name.ends_with("dw.bias") || name.ends_with("pw.bias") {
+                continue;
+            }
+            let (Some(a), Some(b)) = (cpu_gradients.get(cpu_var), cuda_gradients.get(cuda_var))
+            else {
+                continue;
+            };
+            let a = a.flatten_all()?.to_vec1::<f32>()?;
+            let b = b.to_device(&cpu)?.flatten_all()?.to_vec1::<f32>()?;
+            let scale = a.iter().map(|value| value.abs()).fold(1e-12f32, f32::max);
+            let difference = a
+                .iter()
+                .zip(&b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0f32, f32::max);
+            println!(
+                "{name:<24} cpu-vs-cuda max diff / max |grad| = {:.2e}",
+                difference / scale
+            );
+            if difference / scale > 1e-3 {
+                mismatches.push(name.clone());
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "cpu and cuda disagree on {mismatches:?}"
+        );
+        Ok(())
     }
 }
