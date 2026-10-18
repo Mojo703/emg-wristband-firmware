@@ -1,9 +1,22 @@
 # phone-app
 
-The phone side of the band, as a website. Today it holds one screen, the link
-bench, which drives `ble-media`'s `ble-gatt-bench` firmware over Web Bluetooth
-and reports what the phone's radio stack grants. The setup, calibration, and
-collection screens land here later.
+The phone side of the band, as a website: a splash screen ("Opal"), a main
+menu showing whether the band is connected over BLE, a Calibration screen
+(empty for now), and a Gesture Configuration screen. The link bench that used
+to be the only screen is still here, reachable from the menu's "Link bench"
+link; it drives `ble-media`'s `ble-gatt-bench` firmware over Web Bluetooth and
+reports what the phone's radio stack grants.
+
+Gesture Configuration is a UI mockup today, not wired to the band: it shows
+one empty box per media command (Play/Pause, Next/Previous Track, Volume
+up/down) and a scrollable tray of placeholder gesture chips below. Dragging a
+chip onto a box assigns it (tap a filled box to clear it back to the tray);
+this is in-memory component state only, reset on reload, with no BLE write
+and no persistence. There is also no BLE characteristic on the band yet for
+writing a gesture keymap — the real firmware only exposes BLE HID output —
+so wiring this up is future work. `src/lib/bench/keymap.ts` has groundwork
+for that next step (gesture-name validation, a `localStorage` draft, and a
+stub `applyKeymap`) but nothing in the UI calls it yet.
 
 ## Run
 

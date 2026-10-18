@@ -8,6 +8,8 @@
   --accent-text: #ffffff;
   --good: #1a7f37;
   --bad: #c62828;
+  --navy: #16235c;
+  --navy-tint: #e3e7f7;
   color-scheme: light dark;
   font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
   font-size: 16px;
@@ -25,6 +27,8 @@
     --accent-text: #0b1220;
     --good: #3fb950;
     --bad: #f85149;
+    --navy: #5b74e6;
+    --navy-tint: #232c57;
   }
 }
 
@@ -39,11 +43,20 @@ body {
 }
 
 main {
-  max-width: 720px;
   margin: 0 auto;
   padding: 16px;
   display: grid;
   gap: 16px;
+}
+
+main.bench {
+  max-width: 720px;
+}
+
+main.shell {
+  max-width: 420px;
+  min-height: 100vh;
+  align-content: start;
 }
 
 h1 {
@@ -159,4 +172,188 @@ pre.log {
   overflow: auto;
   font-size: 0.8rem;
   white-space: pre-wrap;
+}
+
+/* Splash */
+
+.splash {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  background: var(--background);
+  cursor: pointer;
+}
+
+.splash-word {
+  font-size: 5rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--navy);
+}
+
+/* Shell screens: splash, menu, calibration, gesture config */
+
+.title {
+  font-size: 1.5rem;
+  margin: 0;
+  text-align: center;
+}
+
+.screen-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+/* Connection status pill */
+
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  justify-self: center;
+  padding: 8px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--text);
+  min-height: 36px;
+}
+
+.status-pill .dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--bad);
+}
+
+.status-pill.connected .dot {
+  background: var(--good);
+}
+
+.status-pill.disconnected {
+  color: var(--muted);
+}
+
+/* Main menu buttons */
+
+.menu-buttons {
+  display: grid;
+  gap: 16px;
+  margin-top: 24px;
+}
+
+.oval-button {
+  min-height: 64px;
+  border-radius: 999px;
+  font-size: 1.1rem;
+  font-weight: 500;
+  background: var(--navy);
+  border-color: var(--navy);
+  color: #ffffff;
+}
+
+.link-bench-entry {
+  justify-self: center;
+  margin-top: 24px;
+  border: none;
+  background: none;
+  color: var(--muted);
+  text-decoration: underline;
+  min-height: auto;
+  padding: 8px;
+}
+
+/* Gesture configuration */
+
+.gesture-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+  margin-top: 8px;
+}
+
+.gesture-tile {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+}
+
+.gesture-box {
+  width: 100%;
+  aspect-ratio: 1;
+  display: grid;
+  place-items: center;
+  border-radius: 14px;
+  border: 2px dashed var(--line);
+  background: var(--surface);
+  color: var(--navy);
+  font-weight: 500;
+  font-size: 0.8rem;
+  text-align: center;
+  padding: 6px;
+  cursor: default;
+}
+
+.gesture-box.filled {
+  border-style: solid;
+  border-color: var(--navy);
+  background: var(--navy-tint);
+  cursor: pointer;
+}
+
+.gesture-box.hover-target {
+  border-color: var(--good);
+  border-style: solid;
+  background: var(--navy-tint);
+}
+
+.gesture-tile-label {
+  margin: 0;
+  text-align: center;
+  font-size: 0.85rem;
+  font-weight: 500;
+  color: var(--text);
+}
+
+/* Gesture tray: a horizontal, swipeable strip of unplaced gestures */
+
+.gesture-tray {
+  display: flex;
+  gap: 10px;
+  overflow-x: auto;
+  margin-top: 16px;
+  padding: 12px 4px;
+  border-top: 1px solid var(--line);
+}
+
+.gesture-chip {
+  flex: 0 0 auto;
+  min-width: 72px;
+  padding: 10px 14px;
+  border-radius: 12px;
+  border: 2px solid var(--navy);
+  background: var(--navy-tint);
+  color: var(--navy);
+  font-weight: 500;
+  font-size: 0.85rem;
+  min-height: auto;
+  touch-action: none;
+  cursor: grab;
+}
+
+.drag-ghost {
+  position: fixed;
+  z-index: 1000;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+  padding: 10px 14px;
+  border-radius: 12px;
+  border: 2px solid var(--navy);
+  background: var(--navy-tint);
+  color: var(--navy);
+  font-weight: 500;
+  font-size: 0.85rem;
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.25);
 }
