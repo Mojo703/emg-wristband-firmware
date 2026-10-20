@@ -199,6 +199,10 @@ pre.log {
   text-align: center;
 }
 
+.brand-title {
+  color: var(--navy);
+}
+
 .screen-header {
   display: flex;
   align-items: center;
@@ -253,17 +257,6 @@ pre.log {
   color: #ffffff;
 }
 
-.link-bench-entry {
-  justify-self: center;
-  margin-top: 24px;
-  border: none;
-  background: none;
-  color: var(--muted);
-  text-decoration: underline;
-  min-height: auto;
-  padding: 8px;
-}
-
 /* Gesture configuration */
 
 .gesture-grid {
@@ -300,7 +293,8 @@ pre.log {
   border-style: solid;
   border-color: var(--navy);
   background: var(--navy-tint);
-  cursor: pointer;
+  cursor: grab;
+  touch-action: none;
 }
 
 .gesture-box.hover-target {

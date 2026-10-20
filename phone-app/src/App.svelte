@@ -3,9 +3,8 @@
   import Menu from './lib/screens/Menu.svelte';
   import Calibration from './lib/screens/Calibration.svelte';
   import GestureConfig from './lib/screens/GestureConfig.svelte';
-  import LinkBench from './lib/screens/LinkBench.svelte';
 
-  type Screen = 'splash' | 'menu' | 'calibration' | 'gesture-config' | 'bench';
+  type Screen = 'splash' | 'menu' | 'calibration' | 'gesture-config';
 
   let screen = $state<Screen>('splash');
 
@@ -21,11 +20,9 @@
 {#if screen === 'splash'}
   <Splash onDone={() => go('menu')} />
 {:else if screen === 'menu'}
-  <Menu onCalibration={() => go('calibration')} onGestureConfig={() => go('gesture-config')} onBench={() => go('bench')} />
+  <Menu onCalibration={() => go('calibration')} onGestureConfig={() => go('gesture-config')} />
 {:else if screen === 'calibration'}
   <Calibration back={backToMenu} />
-{:else if screen === 'gesture-config'}
-  <GestureConfig back={backToMenu} />
 {:else}
-  <LinkBench back={backToMenu} />
+  <GestureConfig back={backToMenu} />
 {/if}

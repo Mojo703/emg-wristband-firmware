@@ -2,21 +2,47 @@
 
 The phone side of the band, as a website: a splash screen ("Opal"), a main
 menu showing whether the band is connected over BLE, a Calibration screen
-(empty for now), and a Gesture Configuration screen. The link bench that used
-to be the only screen is still here, reachable from the menu's "Link bench"
-link; it drives `ble-media`'s `ble-gatt-bench` firmware over Web Bluetooth and
-reports what the phone's radio stack grants.
+(empty for now), and a Gesture Configuration screen.
 
-Gesture Configuration is a UI mockup today, not wired to the band: it shows
-one empty box per media command (Play/Pause, Next/Previous Track, Volume
-up/down) and a scrollable tray of placeholder gesture chips below. Dragging a
-chip onto a box assigns it (tap a filled box to clear it back to the tray);
-this is in-memory component state only, reset on reload, with no BLE write
-and no persistence. There is also no BLE characteristic on the band yet for
-writing a gesture keymap — the real firmware only exposes BLE HID output —
-so wiring this up is future work. `src/lib/bench/keymap.ts` has groundwork
-for that next step (gesture-name validation, a `localStorage` draft, and a
-stub `applyKeymap`) but nothing in the UI calls it yet.
+Gesture Configuration writes for real: it shows one box per media command
+(Play/Pause, Next/Previous Track, Volume up/down) and a scrollable tray of
+the band's five gesture classes below. Dragging a chip onto a box assigns it
+(tap a filled box to clear it back to the tray, or drag it to another box).
+Opening the screen while connected loads whatever mapping the band already
+reports; **Save** writes the whole mapping to the band's settings
+characteristic and the boxes update again once the band echoes back what it
+kept — there is no local draft or `localStorage` involved, the boxes always
+reflect the band's own state. This talks to the real BLE "settings service"
+in `src/lib/band/{protocol.ts,link.ts}` (ported from a teammate's
+`demo-ble-firmware` branch — see that branch's `ble-media/src/settings_service.rs`
+for the device side), **not** the same firmware as the link bench below.
+
+To test this against real hardware, flash `demo-ble-firmware`'s firmware
+(a stripped-down demo build — it does not include calibration, playback, or
+the dashboard's USB-serial link) onto a bare ESP32-S3, e.g. from a separate
+worktree so this checkout is undisturbed:
+
+```sh
+git worktree add ../emg-wristband-firmware-demo-ble demo-ble-firmware
+cd ../emg-wristband-firmware-demo-ble/opal-firmware
+. ~/export-esp.sh
+cargo run
+```
+
+Then run `phone-app` as usual (`pnpm run dev`, connect from the Menu screen)
+against that board. Connecting from a laptop over `localhost` works fine for
+this — Web Bluetooth only needs a secure origin, which `localhost` already
+is, and the connection itself is a direct Bluetooth link to the board, not
+something that goes over Wi-Fi.
+
+The link bench that used to be the only screen in this app is no longer
+reachable from the menu — it talks to a different firmware image
+(`ble-gatt-bench`, see below) than the one Gesture Configuration now uses,
+and isn't something an actual user of the band needs. Its code
+(`src/lib/screens/LinkBench.svelte`, `src/lib/bench/*`) is untouched and
+still fully working; it's just not wired into `App.svelte`'s navigation
+today. Re-adding a way to reach it (e.g. its own menu entry) is a small
+change if it's needed again.
 
 ## Run
 
