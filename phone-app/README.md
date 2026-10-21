@@ -6,16 +6,24 @@ menu showing whether the band is connected over BLE, a Calibration screen
 
 Gesture Configuration writes for real: it shows one box per media command
 (Play/Pause, Next/Previous Track, Volume up/down) and a scrollable tray of
-the band's five gesture classes below. Dragging a chip onto a box assigns it
-(tap a filled box to clear it back to the tray, or drag it to another box).
-Opening the screen while connected loads whatever mapping the band already
-reports; **Save** writes the whole mapping to the band's settings
-characteristic and the boxes update again once the band echoes back what it
-kept — there is no local draft or `localStorage` involved, the boxes always
-reflect the band's own state. This talks to the real BLE "settings service"
-in `src/lib/band/{protocol.ts,link.ts}` (ported from a teammate's
+gesture chips below. Dragging a chip onto a box assigns it (tap a filled box
+to clear it back to the tray, or drag it to another box). Opening the screen
+while connected loads whatever mapping the band already reports; **Save**
+writes the whole mapping to the band's settings characteristic and the boxes
+update again once the band echoes back what it kept — there is no local
+draft or `localStorage` involved, the boxes always reflect the band's own
+state. This talks to the real BLE "settings service" in
+`src/lib/band/{protocol.ts,link.ts}` (ported from a teammate's
 `demo-ble-firmware` branch — see that branch's `ble-media/src/settings_service.rs`
 for the device side), **not** the same firmware as the link bench below.
+
+The tray only offers the 2 gestures the band actually recognizes today
+(Radial deviation, Ulnar deviation) — the protocol and `collection.json`
+define 5, but the band's `calibration-flow::ACTIVE_CALIBRATION_GESTURES`
+only trains/accepts these 2 so far. Offering the other 3 would look like a
+working feature that silently does nothing on save, which is worse than not
+offering them. `GestureConfig.svelte` has a `TODO` at the gesture list
+marking exactly what to change once the band supports more.
 
 To test this against real hardware, flash `demo-ble-firmware`'s firmware
 (a stripped-down demo build — it does not include calibration, playback, or

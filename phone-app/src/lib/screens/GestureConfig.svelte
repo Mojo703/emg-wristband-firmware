@@ -25,8 +25,14 @@
     usage: key.usage,
   }));
 
-  const GESTURE_COUNT = 5;
-  const GESTURES = Array.from({ length: GESTURE_COUNT }, (_, index) => index);
+  // TODO: the band only recognizes these 2 of the 5 protocol gestures today
+  // (`calibration-flow::ACTIVE_CALIBRATION_GESTURES` in
+  // calibration-flow/src/anchored_recipe.rs is still [WristRadialDeviation,
+  // WristUlnarDeviation] — a binding for any other gesture index is silently
+  // dropped on save). When that list is widened, add the new gesture indices
+  // here too (indices match `CalibrationGesture::ALL`'s order: 0 Pronation,
+  // 1 Supination, 2 Radial deviation, 3 Ulnar deviation, 4 Tip center).
+  const GESTURES = [2, 3];
 
   let assignment = $state<Record<string, number | null>>(Object.fromEntries(TILES.map((tile) => [tile.id, null])));
   let dragging = $state<{ gesture: number; x: number; y: number } | null>(null);
