@@ -35,6 +35,7 @@
 //! [`WINDOW_QUEUE_DEPTH`] documents the heap that stops it. Overflow past it is
 //! counted, not absorbed.
 
+use crate::handoff::Handoff;
 use anyhow::Result;
 use emg_runtime::alignment::GridAligner;
 use emg_runtime::band_features::CHANNEL_COUNT;
@@ -71,17 +72,12 @@ const WINDOW_QUEUE_DEPTH: usize = 1;
 /// the combiner itself is wedged.
 const EVENT_QUEUE_DEPTH: usize = 64;
 
-/// Spent window buffers waiting to be reused (see [`AdcSource::recycle`]). One is
-/// enough for the steady cycle — the main loop returns a set as each window ships,
-/// and the combiner takes it back for the next — so in steady state every window
-/// reuses pooled buffers and the window path performs no recurring multi-kilobyte
-/// allocation. Each pooled set parks ~24 KB of capacity, and heap headroom (the
-/// link threads need two 8 KB contiguous stacks at dial time) outranks covering the
-/// rare cold-start pool miss, which falls back to a fresh allocation. A window
+/// Spent window buffers waiting to be reused (see [`AdcSource::recycle`]). Every
+/// set is reserved at boot, so the window path performs no recurring
+/// multi-kilobyte allocation, and each set parks ~24 KB of capacity. A window
 /// rejected by the output queue is reclaimed directly by the combiner instead
-/// of being freed and reallocated; calibration makes that overflow path common
-/// enough for large-buffer churn to fragment the heap.
-const RECYCLE_POOL_DEPTH: usize = 1;
+/// of being freed and reallocated.
+const RECYCLE_POOL_DEPTH: usize = 2;
 
 /// Empty chip-frame batches returned from the combiner to each chip pipeline.
 /// One returned batch plus the pipeline's active batch forms a steady double
@@ -135,6 +131,8 @@ pub(crate) struct AcquisitionBuffers {
     packed_wire: Vec<u8>,
     building_missing: Vec<u8>,
     next_missing: Vec<u8>,
+    second_packed_wire: Vec<u8>,
+    second_missing: Vec<u8>,
 }
 
 impl AcquisitionBuffers {
@@ -146,6 +144,10 @@ impl AcquisitionBuffers {
             packed_wire: Vec::with_capacity(protocol::max_packed_sample_bytes(samples_per_window)),
             building_missing: vec![0; missing_mask_len],
             next_missing: vec![0; missing_mask_len],
+            second_packed_wire: Vec::with_capacity(protocol::max_packed_sample_bytes(
+                samples_per_window,
+            )),
+            second_missing: vec![0; missing_mask_len],
         }
     }
 
@@ -154,6 +156,8 @@ impl AcquisitionBuffers {
             + self.packed_wire.capacity()
             + self.building_missing.capacity()
             + self.next_missing.capacity()
+            + self.second_packed_wire.capacity()
+            + self.second_missing.capacity()
     }
 }
 
@@ -195,7 +199,7 @@ pub(super) struct HealthCounters {
 pub(crate) struct AdcSource {
     windows: Receiver<AcquiredWindow>,
     /// Returns spent window buffers to the combiner. See [`Self::recycle`].
-    recycled: SyncSender<(Vec<u8>, Vec<u8>)>,
+    recycled: Handoff<(Vec<u8>, Vec<u8>)>,
     counters: Arc<HealthCounters>,
     window_length: usize,
 }
@@ -265,7 +269,20 @@ impl AdcSource {
     /// reuse after they are reclaimed from the sent frame. Fire-and-forget: a full pool just lets the buffers
     /// drop, so this can never block the main loop.
     pub(crate) fn recycle(&self, packed_wire: Vec<u8>, missing: Vec<u8>) {
-        let _ = self.recycled.try_send((packed_wire, missing));
+        let _ = self.recycled.offer((packed_wire, missing));
+    }
+
+    pub(crate) fn recycler(&self) -> WindowRecycler {
+        WindowRecycler(self.recycled.clone())
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct WindowRecycler(Handoff<(Vec<u8>, Vec<u8>)>);
+
+impl WindowRecycler {
+    pub(crate) fn recycle(&self, packed_wire: Vec<u8>, missing: Vec<u8>) {
+        let _ = self.0.offer((packed_wire, missing));
     }
 }
 
@@ -275,20 +292,24 @@ impl AdcSource {
 pub(crate) fn start(
     front_ends: FrontEnds,
     window_length: usize,
-    buffers: AcquisitionBuffers,
+    mut buffers: AcquisitionBuffers,
 ) -> Result<AdcSource> {
     let (window_sender, windows) = sync_channel::<AcquiredWindow>(WINDOW_QUEUE_DEPTH);
     let (event_sender, events) = sync_channel::<(usize, ChipEvent)>(EVENT_QUEUE_DEPTH);
-    let (chip0_batch_sender, chip0_batches) = sync_channel(BATCH_RECYCLE_DEPTH);
-    let (chip1_batch_sender, chip1_batches) = sync_channel(BATCH_RECYCLE_DEPTH);
-    for sender in [&chip0_batch_sender, &chip1_batch_sender] {
-        sender
-            .try_send(Vec::with_capacity(pipeline::FRAMES_PER_BATCH))
+    let batch_recyclers: [Handoff<Vec<(u64, Sample)>>; DEVICE_COUNT] =
+        std::array::from_fn(|_| Handoff::with_capacity(BATCH_RECYCLE_DEPTH));
+    for recycler in &batch_recyclers {
+        recycler
+            .offer(Vec::with_capacity(pipeline::FRAMES_PER_BATCH))
             .expect("a new batch recycler has room for its initial spare");
     }
-    let batch_senders = [chip0_batch_sender, chip1_batch_sender];
-    let mut batch_receivers = [Some(chip0_batches), Some(chip1_batches)];
-    let (recycle_sender, recycled) = sync_channel::<(Vec<u8>, Vec<u8>)>(RECYCLE_POOL_DEPTH);
+    let recycled = Handoff::<(Vec<u8>, Vec<u8>)>::with_capacity(RECYCLE_POOL_DEPTH);
+    recycled
+        .offer((
+            std::mem::take(&mut buffers.second_packed_wire),
+            std::mem::take(&mut buffers.second_missing),
+        ))
+        .expect("a new recycle pool has room for its second set");
     let counters = Arc::new(HealthCounters::default());
 
     let FrontEnds {
@@ -312,9 +333,7 @@ pub(crate) fn start(
             },
             pipeline::ThreadChannels {
                 events: event_sender.clone(),
-                recycled_batches: batch_receivers[index]
-                    .take()
-                    .expect("each chip owns one batch recycler"),
+                recycled_batches: batch_recyclers[index].clone(),
                 counters: counters.clone(),
             },
         )?;
@@ -322,6 +341,7 @@ pub(crate) fn start(
     drop(event_sender); // the pipelines hold the only senders now
 
     let combiner_counters = counters.clone();
+    let combiner_recycled = recycled.clone();
     crate::cores::spawn_pinned(crate::cores::COMBINER_CORE, || {
         std::thread::Builder::new()
             .name("adc-combine".into())
@@ -331,9 +351,9 @@ pub(crate) fn start(
                 info!("combiner running");
                 Combiner {
                     events,
-                    batch_recyclers: batch_senders,
+                    batch_recyclers,
                     window_sender,
-                    recycled,
+                    recycled: combiner_recycled,
                     counters: combiner_counters,
                     window_length,
                     buffers,
@@ -344,7 +364,7 @@ pub(crate) fn start(
 
     Ok(AdcSource {
         windows,
-        recycled: recycle_sender,
+        recycled,
         counters,
         window_length,
     })
@@ -355,9 +375,9 @@ pub(crate) fn start(
 /// window send disconnects).
 struct Combiner {
     events: Receiver<(usize, ChipEvent)>,
-    batch_recyclers: [SyncSender<Vec<(u64, Sample)>>; DEVICE_COUNT],
+    batch_recyclers: [Handoff<Vec<(u64, Sample)>>; DEVICE_COUNT],
     window_sender: SyncSender<AcquiredWindow>,
-    recycled: Receiver<(Vec<u8>, Vec<u8>)>,
+    recycled: Handoff<(Vec<u8>, Vec<u8>)>,
     counters: Arc<HealthCounters>,
     window_length: usize,
     buffers: AcquisitionBuffers,
@@ -381,6 +401,7 @@ impl Combiner {
             packed_wire,
             mut building_missing,
             next_missing,
+            ..
         } = buffers;
         // The window's missing-mask bit planes (`Frame::Emg::missing`), set in
         // lockstep with the buffers above and zeroed whenever they are cleared.
@@ -414,7 +435,7 @@ impl Combiner {
                     }
                     let mut frames = frames;
                     frames.clear();
-                    let _ = batch_recyclers[chip].try_send(frames);
+                    let _ = batch_recyclers[chip].offer(frames);
                     while let Some(step) = aligner.poll() {
                         // Skipped ticks mean the emitted timeline has a hole (every
                         // present source gapped at once); a window must not span it.
@@ -442,8 +463,7 @@ impl Combiner {
                             // Both outgoing buffers cycle through the pool: whatever the
                             // main loop has returned is reused. A rejected output is
                             // reclaimed locally; only cold start costs fresh allocations.
-                            let available =
-                                spare_buffers.take().or_else(|| recycled.try_recv().ok());
+                            let available = spare_buffers.take().or_else(|| recycled.take());
                             let Some((mut packed_wire, mut next_missing)) = available else {
                                 counters.dropped.fetch_add(1, Ordering::Relaxed);
                                 building_wire.clear();

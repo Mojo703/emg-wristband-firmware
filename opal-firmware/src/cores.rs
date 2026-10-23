@@ -77,6 +77,8 @@ pub(crate) const FEEDBACK_THREAD_PRIORITY: u8 = 5;
 /// Above the blocking main loop so key release timing is independent of link writes.
 pub(crate) const BLE_SESSION_THREAD_PRIORITY: u8 = 5;
 
+pub(crate) const EMG_SEND_THREAD_PRIORITY: u8 = 1;
+
 /// Raises the calling thread's FreeRTOS priority.
 pub(crate) fn set_current_thread_priority(priority: u8) {
     unsafe {

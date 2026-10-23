@@ -40,7 +40,11 @@ Agent notes:
   characteristic in the settings service, one acquisition window per sequence
   number, chunked across notifications of at most 244 bytes.
   `phone-app/src/lib/band/emgStream.ts` mirrors it by hand; change both.
-  `EmgStream::send_window` blocks the caller until every chunk is accepted.
+  `EmgStream::send_window` blocks its caller for up to the window's budget, so
+  opal-firmware calls it from its own thread and never from the main loop. It
+  notifies through `ble_gatts_notify_custom` with an mbuf it builds itself:
+  esp32-nimble's `notify_with` falls back to reading the attribute when
+  NimBLE has no mbuf free, and that read takes a lock the caller holds.
 - `Phone::tick` retries a refused advertising start every `ADVERTISING_RETRY`.
   The band has no toggle, so nothing else would retry it.
 - Firmware otherwise: the example runs on hardware and cannot run on this host.

@@ -1,0 +1,8 @@
+name = "emg-collection"
+main = "src/index.ts"
+compatibility_date = "2026-09-01"
+routes = [{ pattern = "collect.underfloor.ca", custom_domain = true }]
+
+[[r2_buckets]]
+binding = "STORE"
+bucket_name = "emg-collection"

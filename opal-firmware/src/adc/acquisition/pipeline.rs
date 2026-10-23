@@ -24,11 +24,12 @@
 //! recovery through the driver, and reopens it. `frame_reader` states that
 //! ownership contract in full.
 
+use crate::handoff::Handoff;
 use esp_idf_svc::hal::delay::FreeRtos;
 use esp_idf_svc::hal::gpio::{Output, PinDriver};
 use log::{info, warn};
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::{Receiver, SyncSender, TryRecvError};
+use std::sync::mpsc::SyncSender;
 use std::sync::Arc;
 
 use crate::device_now_us as now_us;
@@ -266,7 +267,7 @@ struct Pipeline {
     reader: FrameReader,
     chip: Ads1298FrontEnd,
     events: SyncSender<(usize, ChipEvent)>,
-    recycled_batches: Receiver<Vec<(u64, Sample)>>,
+    recycled_batches: Handoff<Vec<(u64, Sample)>>,
     counters: Arc<HealthCounters>,
     /// Device-clock time the last frame was drained. Seeded with the thread's
     /// start so a chip that never produces a first frame is declared dead by the
@@ -315,16 +316,12 @@ impl Pipeline {
         if self.batch.is_empty() {
             return Ok(());
         }
-        let mut next = match self.recycled_batches.try_recv() {
-            Ok(batch) => batch,
-            Err(TryRecvError::Empty) => {
-                self.backpressure_dropped_frames = self
-                    .backpressure_dropped_frames
-                    .saturating_add(self.batch.len() as u32);
-                self.batch.clear();
-                return Ok(());
-            }
-            Err(TryRecvError::Disconnected) => return Err(PipelineStopped),
+        let Some(mut next) = self.recycled_batches.take() else {
+            self.backpressure_dropped_frames = self
+                .backpressure_dropped_frames
+                .saturating_add(self.batch.len() as u32);
+            self.batch.clear();
+            return Ok(());
         };
         next.clear();
         let batch = std::mem::replace(&mut self.batch, next);
@@ -668,7 +665,7 @@ pub(super) struct ThreadHardware {
 /// The complete channel boundary between one chip thread and the combiner.
 pub(super) struct ThreadChannels {
     pub(super) events: SyncSender<(usize, ChipEvent)>,
-    pub(super) recycled_batches: Receiver<Vec<(u64, Sample)>>,
+    pub(super) recycled_batches: Handoff<Vec<(u64, Sample)>>,
     pub(super) counters: Arc<HealthCounters>,
 }
 

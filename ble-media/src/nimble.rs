@@ -419,13 +419,15 @@ pub struct SettingsService {
 }
 
 const NO_SUBSCRIBER: u32 = u32::MAX;
+const UNRESOLVED_HANDLE: u32 = u32::MAX;
 
 const EMG_STALL_BACKOFF: Duration = Duration::from_millis(2);
+const EMG_CHUNK_SPACING: Duration = Duration::from_millis(1);
 
 #[derive(Clone)]
 pub struct EmgStream {
-    characteristic: Arc<Mutex<BLECharacteristic>>,
     subscriber: Arc<AtomicU32>,
+    value_handle: Arc<AtomicU32>,
 }
 
 impl NimbleRadio {
@@ -495,8 +497,8 @@ impl NimbleRadio {
             settings,
             gesture,
             emg: EmgStream {
-                characteristic: emg,
                 subscriber,
+                value_handle: Arc::new(AtomicU32::new(UNRESOLVED_HANDLE)),
             },
         })
     }
@@ -534,12 +536,29 @@ impl SettingsService {
 
 impl EmgStream {
     pub fn subscriber(&self) -> Option<u16> {
-        let handle = u16::try_from(self.subscriber.load(Ordering::Relaxed)).ok()?;
-        BLEDevice::take()
-            .get_server()
-            .connections()
-            .any(|desc| desc.conn_handle() == handle)
-            .then_some(handle)
+        u16::try_from(self.subscriber.load(Ordering::Relaxed)).ok()
+    }
+
+    fn value_handle(&self) -> Result<u16> {
+        if let Ok(handle) = u16::try_from(self.value_handle.load(Ordering::Relaxed)) {
+            return Ok(handle);
+        }
+        let service: sys::ble_uuid_any_t = uuid(settings_service::SERVICE_UUID).into();
+        let characteristic: sys::ble_uuid_any_t = uuid(emg_stream::EMG_UUID).into();
+        let mut handle = 0u16;
+        // SAFETY: both UUIDs outlive the call, and a ble_uuid_any_t begins with its ble_uuid_t.
+        let rc = unsafe {
+            sys::ble_gatts_find_chr(
+                (&service as *const sys::ble_uuid_any_t).cast(),
+                (&characteristic as *const sys::ble_uuid_any_t).cast(),
+                std::ptr::null_mut(),
+                &mut handle,
+            )
+        };
+        anyhow::ensure!(rc == 0, "ble_gatts_find_chr returned {rc}");
+        self.value_handle
+            .store(u32::from(handle), Ordering::Relaxed);
+        Ok(handle)
     }
 
     pub fn send_window(
@@ -555,27 +574,35 @@ impl EmgStream {
             .saturating_sub(ATT_NOTIFICATION_HEADER_LEN)
             .min(emg_stream::MAX_NOTIFICATION_LEN);
         let count = record.chunk_count(notification_len)?;
+        let handle = self.value_handle()?;
         let mut buffer = [0u8; emg_stream::MAX_NOTIFICATION_LEN];
         for index in 0..count {
             let used = record.write_chunk(sequence, index, count, notification_len, &mut buffer);
             let chunk = &buffer[..used];
-            while {
-                let mut characteristic = self.characteristic.lock();
-                characteristic.set_value(chunk);
-                characteristic.notify_with(chunk, connection).is_err()
-            } {
+            while !notify_from_flat(connection, handle, chunk) {
                 anyhow::ensure!(
                     Instant::now() < deadline,
                     "sent {index} of {count} chunks within {budget:?}"
                 );
                 std::thread::sleep(EMG_STALL_BACKOFF);
             }
+            std::thread::sleep(EMG_CHUNK_SPACING);
         }
         Ok(())
     }
 }
 
 const ATT_NOTIFICATION_HEADER_LEN: usize = 3;
+
+fn notify_from_flat(connection: u16, handle: u16, value: &[u8]) -> bool {
+    // SAFETY: NimBLE copies `value` into the mbuf before returning.
+    let packet = unsafe { sys::ble_hs_mbuf_from_flat(value.as_ptr().cast(), value.len() as u16) };
+    if packet.is_null() {
+        return false;
+    }
+    // SAFETY: the packet is a live mbuf, and NimBLE consumes it whatever the outcome.
+    unsafe { sys::ble_gatts_notify_custom(connection, handle, packet) == 0 }
+}
 
 impl LinkBench {
     /// The characteristic the stream thread drives.

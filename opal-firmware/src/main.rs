@@ -13,13 +13,13 @@ mod config;
 mod cores;
 mod features;
 mod feedback;
+mod handoff;
 mod radio;
 mod resident;
 mod telemetry;
 
 use adc::acquisition::{AcquiredWindow, AdcSource};
 use adc::Channel;
-use ble_media::emg_stream::WindowRecord;
 use calibration_flow::active_gesture_from_index;
 use config::{Settings, Store};
 use emg_runtime::band_features::{FEATURE_COUNT, WINDOW_SAMPLES};
@@ -33,7 +33,7 @@ use feedback::{DeviceState, Feedback, FeedbackWiring, FrontEnd};
 use feedback_vocabulary::{ActiveLink, Phone as FeedbackPhone};
 use log::{error, info, warn};
 use protocol::{MediaKey, WakeState};
-use radio::{Commit, PhoneLink};
+use radio::{Commit, EmgSender, OutboundWindow, PhoneLink};
 use std::time::Instant;
 
 const DEVICE_NAME: &str = "EMG Wristband";
@@ -108,13 +108,17 @@ struct App {
     /// The command class the wake gate has latched, if any.
     committed: Option<u8>,
     recording: Recording,
+    emg_sender: Option<EmgSender>,
 }
 
 #[derive(Default)]
 struct Recording {
     connection: Option<u16>,
     sequence: u16,
-    failures: u32,
+    skipped_while_busy: u32,
+    undelivered_at_start: u32,
+    dropped_at_start: u32,
+    recoveries_at_start: u32,
 }
 
 impl App {
@@ -291,6 +295,16 @@ impl App {
             esp_idf_svc::sys::esp_task_wdt_add(std::ptr::null_mut());
         }
 
+        let emg_sender = match (phone.as_ref(), source.as_ref()) {
+            (Some(phone), Some(source)) => EmgSender::start(
+                phone.emg_stream(),
+                source.recycler(),
+                WINDOW_SAMPLES as u16,
+                WINDOW_PERIOD,
+            ),
+            _ => None,
+        };
+
         let front_end = if source.is_some() {
             FrontEnd::Running
         } else {
@@ -312,6 +326,7 @@ impl App {
             config_generation: 0,
             committed: None,
             recording: Recording::default(),
+            emg_sender,
         }))
     }
 
@@ -377,54 +392,63 @@ impl App {
             .classifier
             .as_mut()
             .and_then(|classifier| classifier.features.push_window(&packed_wire));
-        self.record_window(&WindowRecord {
-            first_step_micros: first_step_us,
-            steps_per_channel: WINDOW_SAMPLES as u16,
-            missing: &missing,
-            packed_samples: &packed_wire,
-        });
-        let source = self
-            .source
-            .as_ref()
-            .expect("a window requires an ADC source");
-        source.recycle(packed_wire, missing);
+        self.forward_window(packed_wire, missing, first_step_us);
         if let Some(features) = features {
             self.classify(&features, started_at);
         }
         self.publish_feedback_state();
     }
 
-    fn record_window(&mut self, record: &WindowRecord) {
+    fn forward_window(&mut self, packed_wire: Vec<u8>, missing: Vec<u8>, first_step_us: u64) {
         let connection = self
             .phone
             .as_ref()
             .and_then(PhoneLink::recording_connection);
+        let undelivered = self.emg_sender.as_ref().map_or(0, EmgSender::undelivered);
+        let source = self
+            .source
+            .as_ref()
+            .expect("a window requires an ADC source");
         if connection != self.recording.connection {
             match connection {
                 Some(handle) => info!("recording to connection {handle}"),
                 None => info!(
-                    "recording stopped after {} windows, {} not delivered",
-                    self.recording.sequence, self.recording.failures
+                    "recording stopped after {} windows: {} skipped while the link was busy, {} not delivered, {} dropped by acquisition, {} front-end recoveries",
+                    self.recording.sequence,
+                    self.recording.skipped_while_busy,
+                    undelivered.wrapping_sub(self.recording.undelivered_at_start),
+                    source
+                        .dropped_windows()
+                        .wrapping_sub(self.recording.dropped_at_start),
+                    source
+                        .recoveries()
+                        .wrapping_sub(self.recording.recoveries_at_start)
                 ),
             }
             self.recording = Recording {
                 connection,
+                undelivered_at_start: undelivered,
+                dropped_at_start: source.dropped_windows(),
+                recoveries_at_start: source.recoveries(),
                 ..Recording::default()
             };
         }
-        let (Some(connection), Some(phone)) = (connection, self.phone.as_ref()) else {
+        let (Some(connection), Some(sender)) = (connection, self.emg_sender.as_ref()) else {
+            source.recycle(packed_wire, missing);
             return;
         };
-        if let Err(error) =
-            phone.send_window(connection, self.recording.sequence, record, WINDOW_PERIOD)
-        {
-            self.recording.failures += 1;
-            warn!(
-                "EMG window {} not delivered: {error:#}",
-                self.recording.sequence
-            );
-        }
+        let window = OutboundWindow {
+            packed_wire,
+            missing,
+            first_step_us,
+            connection,
+            sequence: self.recording.sequence,
+        };
         self.recording.sequence = self.recording.sequence.wrapping_add(1);
+        if let Err(window) = sender.forward(window) {
+            self.recording.skipped_while_busy += 1;
+            source.recycle(window.packed_wire, window.missing);
+        }
     }
 
     fn note_front_end_recovery(&mut self) {

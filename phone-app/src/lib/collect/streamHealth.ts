@@ -1,6 +1,8 @@
 import { STEP_MICROS, windowsSkipped, type EmgWindow } from '../band/emgStream.ts';
+import { offGrid } from './session.ts';
 
 const RATE_SPAN_MILLIS = 4000;
+const STARTUP_WINDOWS = 12;
 
 export interface StreamSummary {
   readonly windows: number;
@@ -18,7 +20,14 @@ export class StreamHealth {
   #recent: { readonly at: number; readonly bytes: number }[] = [];
 
   add(window: EmgWindow, arrivedAt: number): void {
-    if (this.#previous !== null) this.#skipped += windowsSkipped(this.#previous, window);
+    const previous = this.#previous;
+    if (previous !== null && this.#windows <= STARTUP_WINDOWS && offGrid(previous, window) !== 0) {
+      this.#first = null;
+      this.#windows = 0;
+      this.#skipped = 0;
+    } else if (previous !== null) {
+      this.#skipped += windowsSkipped(previous, window);
+    }
     this.#first ??= window;
     this.#previous = window;
     this.#windows += 1;
