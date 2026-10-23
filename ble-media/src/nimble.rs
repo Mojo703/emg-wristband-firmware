@@ -8,17 +8,19 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{Sender, SyncSender, TrySendError};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use esp32_nimble::{
     enums::{AuthReq, SecurityIOCap},
     utilities::{mutex::Mutex, BleUuid},
     BLEAdvertisementData, BLEAdvertising, BLECharacteristic, BLEConnDesc, BLEDevice, BLEHIDDevice,
-    NimbleProperties,
+    NimbleProperties, NimbleSub,
 };
 use esp_idf_svc::sys;
 use log::{error, info, warn};
 
+use crate::emg_stream::{self, WindowRecord};
 use crate::hid;
 use crate::link_bench::{self, BenchCommand, ConnectionParameters, LinkStatus, MediaOutcome, Phy};
 use crate::phone::{Peer, Radio};
@@ -408,11 +410,22 @@ impl NimbleRadio {
     }
 }
 
-/// The settings service's two characteristics, held by whoever publishes to
-/// them once the radio has moved into a `Phone`.
+/// The settings service's characteristics, held by whoever publishes to them
+/// once the radio has moved into a `Phone`.
 pub struct SettingsService {
     settings: Arc<Mutex<BLECharacteristic>>,
     gesture: Arc<Mutex<BLECharacteristic>>,
+    emg: EmgStream,
+}
+
+const NO_SUBSCRIBER: u32 = u32::MAX;
+
+const EMG_STALL_BACKOFF: Duration = Duration::from_millis(2);
+
+#[derive(Clone)]
+pub struct EmgStream {
+    characteristic: Arc<Mutex<BLECharacteristic>>,
+    subscriber: Arc<AtomicU32>,
 }
 
 impl NimbleRadio {
@@ -442,7 +455,26 @@ impl NimbleRadio {
             uuid(settings_service::GESTURE_UUID),
             NimbleProperties::READ | NimbleProperties::NOTIFY,
         );
+        let emg = service
+            .lock()
+            .create_characteristic(uuid(emg_stream::EMG_UUID), NimbleProperties::NOTIFY);
         settings.lock().set_value(&current.encode());
+
+        let subscriber = Arc::new(AtomicU32::new(NO_SUBSCRIBER));
+        let watched = Arc::clone(&subscriber);
+        emg.lock()
+            .on_subscribe(move |_characteristic, desc, flags| {
+                let handle = u32::from(desc.conn_handle());
+                if flags.contains(NimbleSub::NOTIFY) {
+                    info!("EMG stream subscribed by connection {handle}");
+                    watched.store(handle, Ordering::Relaxed);
+                } else if watched
+                    .compare_exchange(handle, NO_SUBSCRIBER, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    info!("EMG stream unsubscribed by connection {handle}");
+                }
+            });
 
         settings
             .lock()
@@ -459,7 +491,14 @@ impl NimbleRadio {
             });
 
         self.advertise_service_in_scan_response(settings_service::SERVICE_UUID)?;
-        Ok(SettingsService { settings, gesture })
+        Ok(SettingsService {
+            settings,
+            gesture,
+            emg: EmgStream {
+                characteristic: emg,
+                subscriber,
+            },
+        })
     }
 
     fn advertise_service_in_scan_response(&mut self, service: &str) -> Result<()> {
@@ -487,7 +526,56 @@ impl SettingsService {
     pub fn publish_gesture(&self, event: &GestureEvent) {
         self.gesture.lock().set_value(&event.encode()).notify();
     }
+
+    pub fn emg_stream(&self) -> EmgStream {
+        self.emg.clone()
+    }
 }
+
+impl EmgStream {
+    pub fn subscriber(&self) -> Option<u16> {
+        let handle = u16::try_from(self.subscriber.load(Ordering::Relaxed)).ok()?;
+        BLEDevice::take()
+            .get_server()
+            .connections()
+            .any(|desc| desc.conn_handle() == handle)
+            .then_some(handle)
+    }
+
+    pub fn send_window(
+        &self,
+        connection: u16,
+        sequence: u16,
+        record: &WindowRecord,
+        budget: Duration,
+    ) -> Result<()> {
+        let deadline = Instant::now() + budget;
+        let mtu = usize::from(unsafe { sys::ble_att_mtu(connection) });
+        let notification_len = mtu
+            .saturating_sub(ATT_NOTIFICATION_HEADER_LEN)
+            .min(emg_stream::MAX_NOTIFICATION_LEN);
+        let count = record.chunk_count(notification_len)?;
+        let mut buffer = [0u8; emg_stream::MAX_NOTIFICATION_LEN];
+        for index in 0..count {
+            let used = record.write_chunk(sequence, index, count, notification_len, &mut buffer);
+            let chunk = &buffer[..used];
+            while {
+                let mut characteristic = self.characteristic.lock();
+                characteristic.set_value(chunk);
+                characteristic.notify_with(chunk, connection).is_err()
+            } {
+                anyhow::ensure!(
+                    Instant::now() < deadline,
+                    "sent {index} of {count} chunks within {budget:?}"
+                );
+                std::thread::sleep(EMG_STALL_BACKOFF);
+            }
+        }
+        Ok(())
+    }
+}
+
+const ATT_NOTIFICATION_HEADER_LEN: usize = 3;
 
 impl LinkBench {
     /// The characteristic the stream thread drives.

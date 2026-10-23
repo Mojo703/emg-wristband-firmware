@@ -2,13 +2,13 @@
 //! a supervised thread that ticks independently of inference.
 //!
 //! The band advertises from boot and never stops; there is no toggle. The
-//! serve loop hands commits in and takes settings writes out, and nothing it
-//! does waits on the radio.
+//! serve loop hands commits in and takes settings writes out.
 
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::time::Instant;
 
-use ble_media::nimble::{NimbleRadio, SettingsService};
+use ble_media::emg_stream::WindowRecord;
+use ble_media::nimble::{EmgStream, NimbleRadio, SettingsService};
 use ble_media::phone::{Delivery, Phone, RadioClaim};
 use ble_media::session::SESSION_TICK;
 use ble_media::settings_service::{BandSettings, GestureEvent};
@@ -39,6 +39,7 @@ pub(crate) struct PhoneLink {
     settings_writes: Receiver<BandSettings>,
     states: Receiver<PhoneStatus>,
     status: PhoneStatus,
+    emg: EmgStream,
 }
 
 impl PhoneLink {
@@ -61,6 +62,7 @@ impl PhoneLink {
                 return None;
             }
         };
+        let emg = service.emg_stream();
         let (outbound, inbox) = mpsc::sync_channel(COMMIT_CAPACITY);
         let (state_sender, states) = mpsc::sync_channel(1);
         let phone = Phone::new(radio);
@@ -86,6 +88,7 @@ impl PhoneLink {
             settings_writes,
             states,
             status: PhoneStatus::Dormant,
+            emg,
         })
     }
 
@@ -97,6 +100,20 @@ impl PhoneLink {
     /// Store the settings the band now runs with and tell the phone.
     pub(crate) fn publish_settings(&self, settings: BandSettings) {
         self.send(Outbound::Settings(settings));
+    }
+
+    pub(crate) fn recording_connection(&self) -> Option<u16> {
+        self.emg.subscriber()
+    }
+
+    pub(crate) fn send_window(
+        &self,
+        connection: u16,
+        sequence: u16,
+        record: &WindowRecord,
+        budget: std::time::Duration,
+    ) -> anyhow::Result<()> {
+        self.emg.send_window(connection, sequence, record, budget)
     }
 
     pub(crate) fn take_settings_write(&self) -> Option<BandSettings> {

@@ -36,6 +36,11 @@ Agent notes:
   `NimbleRadio::attach_settings_service` must also run before advertising
   starts. It puts its own UUID in the scan response, so a firmware attaches
   either the settings service or the bench, never both.
+- `src/emg_stream.rs` is the fourth host-tested module: the layout of the EMG
+  characteristic in the settings service, one acquisition window per sequence
+  number, chunked across notifications of at most 244 bytes.
+  `phone-app/src/lib/band/emgStream.ts` mirrors it by hand; change both.
+  `EmgStream::send_window` blocks the caller until every chunk is accepted.
 - `Phone::tick` retries a refused advertising start every `ADVERTISING_RETRY`.
   The band has no toggle, so nothing else would retry it.
 - Firmware otherwise: the example runs on hardware and cannot run on this host.

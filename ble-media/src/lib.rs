@@ -12,6 +12,7 @@
 
 pub mod command;
 pub mod config;
+pub mod emg_stream;
 pub mod hid;
 pub mod link_bench;
 pub mod phone;

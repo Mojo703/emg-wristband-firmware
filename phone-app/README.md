@@ -2,7 +2,8 @@
 
 The phone side of the band, as a website. The main page connects to a band
 running `opal-firmware`. It maps each gesture to a media key, sets sensitivity,
-and shows the last gesture the band committed. The link bench lives at
+and shows the last gesture the band committed. Data collection lives at
+`#collect`. The link bench lives at
 `#bench`. It drives the `ble-gatt-bench` example in `ble-media` and reports
 what the phone's radio stack grants.
 

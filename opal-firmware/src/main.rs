@@ -19,6 +19,7 @@ mod telemetry;
 
 use adc::acquisition::{AcquiredWindow, AdcSource};
 use adc::Channel;
+use ble_media::emg_stream::WindowRecord;
 use calibration_flow::active_gesture_from_index;
 use config::{Settings, Store};
 use emg_runtime::band_features::{FEATURE_COUNT, WINDOW_SAMPLES};
@@ -67,6 +68,10 @@ const IDLE_POLL_MS: u32 = 5;
 /// How long the front end may stay silent before the loop says so.
 const STALL_WARNING_MS: u128 = 1000;
 
+const WINDOW_PERIOD: std::time::Duration = std::time::Duration::from_micros(
+    WINDOW_SAMPLES as u64 * 1_000_000 / adc::ads1298::SAMPLE_RATE_HZ as u64,
+);
+
 /// How long windows must arrive unbroken before a stalled front end counts as
 /// running again. The front end flaps (~2 warm recoveries per second on the
 /// bench), and each edge buzzes the wearer.
@@ -102,6 +107,14 @@ struct App {
     config_generation: u32,
     /// The command class the wake gate has latched, if any.
     committed: Option<u8>,
+    recording: Recording,
+}
+
+#[derive(Default)]
+struct Recording {
+    connection: Option<u16>,
+    sequence: u16,
+    failures: u32,
 }
 
 impl App {
@@ -298,6 +311,7 @@ impl App {
             steady_since: None,
             config_generation: 0,
             committed: None,
+            recording: Recording::default(),
         }))
     }
 
@@ -357,12 +371,18 @@ impl App {
         let AcquiredWindow {
             packed_wire,
             missing,
-            ..
+            first_step_us,
         } = window;
         let features = self
             .classifier
             .as_mut()
             .and_then(|classifier| classifier.features.push_window(&packed_wire));
+        self.record_window(&WindowRecord {
+            first_step_micros: first_step_us,
+            steps_per_channel: WINDOW_SAMPLES as u16,
+            missing: &missing,
+            packed_samples: &packed_wire,
+        });
         let source = self
             .source
             .as_ref()
@@ -372,6 +392,39 @@ impl App {
             self.classify(&features, started_at);
         }
         self.publish_feedback_state();
+    }
+
+    fn record_window(&mut self, record: &WindowRecord) {
+        let connection = self
+            .phone
+            .as_ref()
+            .and_then(PhoneLink::recording_connection);
+        if connection != self.recording.connection {
+            match connection {
+                Some(handle) => info!("recording to connection {handle}"),
+                None => info!(
+                    "recording stopped after {} windows, {} not delivered",
+                    self.recording.sequence, self.recording.failures
+                ),
+            }
+            self.recording = Recording {
+                connection,
+                ..Recording::default()
+            };
+        }
+        let (Some(connection), Some(phone)) = (connection, self.phone.as_ref()) else {
+            return;
+        };
+        if let Err(error) =
+            phone.send_window(connection, self.recording.sequence, record, WINDOW_PERIOD)
+        {
+            self.recording.failures += 1;
+            warn!(
+                "EMG window {} not delivered: {error:#}",
+                self.recording.sequence
+            );
+        }
+        self.recording.sequence = self.recording.sequence.wrapping_add(1);
     }
 
     fn note_front_end_recovery(&mut self) {
@@ -428,6 +481,10 @@ impl App {
             return;
         };
         let key = self.settings.key_for(class);
+        if self.recording.connection.is_some() {
+            info!("commit while recording, kept off HID: {gesture:?}");
+            return;
+        }
         info!("commit: {gesture:?} -> {key:?}");
         if let Some(phone) = self.phone.as_ref() {
             phone.dispatch(Commit { gesture, key });

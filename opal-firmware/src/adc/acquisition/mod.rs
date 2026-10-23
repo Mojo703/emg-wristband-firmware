@@ -124,6 +124,7 @@ pub(crate) struct AcquiredWindow {
     /// the wire stream from measurements. The model input needs no equivalent:
     /// zero already means "no signal" there.
     pub(crate) missing: Vec<u8>,
+    pub(crate) first_step_us: u64,
 }
 
 /// All large acquisition buffers, reserved while the boot heap is still whole.
@@ -387,6 +388,7 @@ impl Combiner {
         let mut spare_buffers = Some((packed_wire, next_missing));
         // The previous emitted grid step, for spotting skipped stretches.
         let mut previous_step_us: Option<u64> = None;
+        let mut first_step_us: u64 = 0;
         let mut ticks_at_last_log: u64 = 0;
 
         loop {
@@ -424,6 +426,9 @@ impl Combiner {
                             building_missing.fill(0);
                         }
                         previous_step_us = Some(step.at_us);
+                        if building_wire.is_empty() {
+                            first_step_us = step.at_us;
+                        }
                         let step_index = building_wire.len() / CHANNEL_COUNT;
                         for (source, slot) in step.slots.iter().enumerate() {
                             if slot.is_none() {
@@ -462,6 +467,7 @@ impl Combiner {
                             let full = AcquiredWindow {
                                 packed_wire,
                                 missing: std::mem::replace(&mut building_missing, next_missing),
+                                first_step_us,
                             };
                             match windows.try_send(full) {
                                 Ok(()) => {}

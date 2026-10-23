@@ -10,6 +10,7 @@ import {
   type BandSettings,
   type GestureEvent,
 } from './protocol.ts';
+import { EMG_UUID, WindowAssembler, type EmgWindow } from './emgStream.ts';
 
 export type BandEvent =
   | { readonly kind: 'settings'; readonly settings: BandSettings }
@@ -23,6 +24,9 @@ export function bluetoothAvailable(): boolean {
 export class Band {
   #device: BluetoothDevice | null = null;
   #settings: BluetoothRemoteGATTCharacteristic | null = null;
+  #emg: BluetoothRemoteGATTCharacteristic | null = null;
+  #assembler = new WindowAssembler();
+  #onWindow: ((window: EmgWindow, arrivedAt: number) => void) | null = null;
   #listeners = new Set<(event: BandEvent) => void>();
 
   subscribe(listener: (event: BandEvent) => void): () => void {
@@ -51,6 +55,13 @@ export class Band {
     const settings = await service.getCharacteristic(SETTINGS_UUID);
     const gesture = await service.getCharacteristic(GESTURE_UUID);
     this.#settings = settings;
+    this.#emg = await service.getCharacteristic(EMG_UUID).catch(() => null);
+    this.#emg?.addEventListener('characteristicvaluechanged', (event) => {
+      const view = valueOf(event);
+      if (view === null || this.#onWindow === null) return;
+      const window = this.#assembler.push(view);
+      if (window !== null) this.#onWindow(window, performance.now());
+    });
 
     settings.addEventListener('characteristicvaluechanged', (event) => {
       const view = valueOf(event);
@@ -63,6 +74,27 @@ export class Band {
     await settings.startNotifications();
     await gesture.startNotifications();
     this.#emit({ kind: 'settings', settings: decodeSettings(await settings.readValue()) });
+  }
+
+  get streams(): boolean {
+    return this.#emg !== null;
+  }
+
+  get abandonedWindows(): number {
+    return this.#assembler.abandoned;
+  }
+
+  async startRecording(onWindow: (window: EmgWindow, arrivedAt: number) => void): Promise<void> {
+    const emg = this.#emg;
+    if (emg === null) throw new Error('this band firmware has no EMG stream');
+    this.#assembler = new WindowAssembler();
+    this.#onWindow = onWindow;
+    await emg.startNotifications();
+  }
+
+  async stopRecording(): Promise<void> {
+    this.#onWindow = null;
+    if (this.#device?.gatt?.connected) await this.#emg?.stopNotifications();
   }
 
   disconnect(): void {
