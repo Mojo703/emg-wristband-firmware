@@ -507,6 +507,7 @@ impl Combiner {
                     let ticks = aligner.ticks_emitted();
                     if ticks - ticks_at_last_log >= ALIGNER_REPORT_TICKS {
                         ticks_at_last_log = ticks;
+                        crate::health::note_stack(crate::health::Task::AdcCombine);
                         // The alignment accounting IS the measured clock behaviour:
                         // surplus on a healthy chip is its oscillator running fast
                         // against the grid, duplicates are it running slow, missing is

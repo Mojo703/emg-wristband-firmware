@@ -20,12 +20,37 @@
 //! byte 2      gesture (CalibrationGesture::index)
 //! bytes 3-4   media usage sent (u16 LE)
 //! ```
+//!
+//! Health record, read on demand. It carries this run and, when RTC memory
+//! survived the reset, the run before it, so a reboot says why it happened:
+//!
+//! ```text
+//! byte 0        version (HEALTH_VERSION)
+//! byte 1        reset reason of this boot (esp_reset_reason_t)
+//! byte 2        flags: bit 0 set when bytes 36-63 hold the previous run
+//! byte 3        zero
+//! bytes 4-7     boots since RTC memory was last lost (u32 LE)
+//! bytes 8-35    this run
+//! bytes 36-63   the previous run, zero unless flag bit 0
+//! ```
+//!
+//! Each run, as of its last update:
+//!
+//! ```text
+//! bytes 0-3     uptime, seconds (u32 LE)
+//! bytes 4-7     lowest free heap, bytes (u32 LE)
+//! bytes 8-9     disconnects (u16 LE, saturating)
+//! bytes 10-11   last disconnect reason, NimBLE status (u16 LE), 0 for none
+//! bytes 12-27   lowest free stack per task, bytes (u16 LE each, 0xFFFF not
+//!               yet measured), in MONITORED_TASKS order
+//! ```
 
 use protocol::{CalibrationGesture, MediaKey};
 
 pub const SERVICE_UUID: &str = "5c3e7a10-2f4b-4d8e-9b61-0f1e2d3c4c00";
 pub const SETTINGS_UUID: &str = "5c3e7a10-2f4b-4d8e-9b61-0f1e2d3c4c01";
 pub const GESTURE_UUID: &str = "5c3e7a10-2f4b-4d8e-9b61-0f1e2d3c4c02";
+pub const HEALTH_UUID: &str = "5c3e7a10-2f4b-4d8e-9b61-0f1e2d3c4c04";
 
 /// More bindings than the band has gestures is a malformed record.
 pub const MAX_BINDINGS: usize = CalibrationGesture::ALL.len();
@@ -34,6 +59,23 @@ const SETTINGS_HEADER: usize = 2;
 const BINDING_BYTES: usize = 3;
 pub const SETTINGS_MAX_LEN: usize = SETTINGS_HEADER + MAX_BINDINGS * BINDING_BYTES;
 pub const GESTURE_EVENT_LEN: usize = 5;
+
+pub const HEALTH_VERSION: u8 = 1;
+pub const MONITORED_TASKS: [&str; 8] = [
+    "main",
+    "nimble_host",
+    "ble-session",
+    "emg-send",
+    "adc0",
+    "adc1",
+    "adc-combine",
+    "feedback",
+];
+pub const STACK_NOT_MEASURED: u16 = u16::MAX;
+const HEALTH_HEADER: usize = 8;
+pub const RUN_HEALTH_LEN: usize = 12 + 2 * MONITORED_TASKS.len();
+pub const HEALTH_LEN: usize = HEALTH_HEADER + 2 * RUN_HEALTH_LEN;
+const PREVIOUS_RUN_PRESENT: u8 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sensitivity {
@@ -78,6 +120,83 @@ pub struct GestureEvent {
     pub sequence: u16,
     pub gesture: CalibrationGesture,
     pub key: MediaKey,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunHealth {
+    pub uptime_seconds: u32,
+    pub heap_free_minimum: u32,
+    pub disconnects: u16,
+    pub last_disconnect_reason: u16,
+    pub stack_free_minimum: [u16; MONITORED_TASKS.len()],
+}
+
+impl RunHealth {
+    pub const START: Self = Self {
+        uptime_seconds: 0,
+        heap_free_minimum: u32::MAX,
+        disconnects: 0,
+        last_disconnect_reason: 0,
+        stack_free_minimum: [STACK_NOT_MEASURED; MONITORED_TASKS.len()],
+    };
+
+    pub fn encode(&self) -> [u8; RUN_HEALTH_LEN] {
+        let mut out = [0u8; RUN_HEALTH_LEN];
+        self.encode_into(&mut out);
+        out
+    }
+
+    pub fn decode(bytes: &[u8; RUN_HEALTH_LEN]) -> Self {
+        let word = |at: usize| {
+            u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+        };
+        let half = |at: usize| u16::from_le_bytes([bytes[at], bytes[at + 1]]);
+        Self {
+            uptime_seconds: word(0),
+            heap_free_minimum: word(4),
+            disconnects: half(8),
+            last_disconnect_reason: half(10),
+            stack_free_minimum: core::array::from_fn(|task| half(12 + 2 * task)),
+        }
+    }
+
+    fn encode_into(&self, out: &mut [u8]) {
+        out[0..4].copy_from_slice(&self.uptime_seconds.to_le_bytes());
+        out[4..8].copy_from_slice(&self.heap_free_minimum.to_le_bytes());
+        out[8..10].copy_from_slice(&self.disconnects.to_le_bytes());
+        out[10..12].copy_from_slice(&self.last_disconnect_reason.to_le_bytes());
+        for (slot, free) in out[12..].chunks_exact_mut(2).zip(self.stack_free_minimum) {
+            slot.copy_from_slice(&free.to_le_bytes());
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BandHealth {
+    pub reset_reason: u8,
+    pub boot_count: u32,
+    pub current: RunHealth,
+    pub previous: Option<RunHealth>,
+}
+
+impl BandHealth {
+    pub fn encode(&self) -> [u8; HEALTH_LEN] {
+        let mut out = [0u8; HEALTH_LEN];
+        out[0] = HEALTH_VERSION;
+        out[1] = self.reset_reason;
+        out[2] = if self.previous.is_some() {
+            PREVIOUS_RUN_PRESENT
+        } else {
+            0
+        };
+        out[4..8].copy_from_slice(&self.boot_count.to_le_bytes());
+        let (current, previous) = out[HEALTH_HEADER..].split_at_mut(RUN_HEALTH_LEN);
+        self.current.encode_into(current);
+        if let Some(run) = &self.previous {
+            run.encode_into(previous);
+        }
+        out
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -262,5 +381,60 @@ mod tests {
             key: MediaKey::VolumeUp,
         };
         assert_eq!(event.encode(), [0x02, 0x01, 3, 0xE9, 0x00]);
+    }
+
+    /// `phone-app/src/lib/band/protocol.test.ts` decodes these same bytes.
+    #[test]
+    fn health_encodes_to_the_documented_layout() {
+        let health = BandHealth {
+            reset_reason: 4,
+            boot_count: 0x0102_0304,
+            current: RunHealth {
+                uptime_seconds: 0x11,
+                heap_free_minimum: 0x2233,
+                disconnects: 2,
+                last_disconnect_reason: 0x0208,
+                stack_free_minimum: [1, 2, 3, 4, 5, 6, 7, STACK_NOT_MEASURED],
+            },
+            previous: Some(RunHealth {
+                uptime_seconds: 0x0100,
+                stack_free_minimum: [0x0300; MONITORED_TASKS.len()],
+                ..RunHealth::START
+            }),
+        };
+        let mut expected = vec![1, 4, 1, 0, 0x04, 0x03, 0x02, 0x01];
+        expected.extend([0x11, 0, 0, 0, 0x33, 0x22, 0, 0, 2, 0, 0x08, 0x02]);
+        expected.extend([1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0, 7, 0, 0xFF, 0xFF]);
+        expected.extend([0, 1, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0]);
+        expected.extend([0, 3].repeat(MONITORED_TASKS.len()));
+        assert_eq!(health.encode().as_slice(), expected.as_slice());
+        assert_eq!(HEALTH_LEN, 64);
+    }
+
+    #[test]
+    fn a_run_survives_its_own_encoding() {
+        let run = RunHealth {
+            uptime_seconds: 86_400,
+            heap_free_minimum: 61_234,
+            disconnects: 3,
+            last_disconnect_reason: 0x0213,
+            stack_free_minimum: [900, 1200, 2048, 3000, 4000, 4100, 5000, STACK_NOT_MEASURED],
+        };
+        assert_eq!(RunHealth::decode(&run.encode()), run);
+    }
+
+    #[test]
+    fn a_lost_previous_run_encodes_as_zeros_with_the_flag_clear() {
+        let health = BandHealth {
+            reset_reason: 1,
+            boot_count: 1,
+            current: RunHealth::START,
+            previous: None,
+        };
+        let bytes = health.encode();
+        assert_eq!(bytes[2], 0);
+        assert!(bytes[HEALTH_HEADER + RUN_HEALTH_LEN..]
+            .iter()
+            .all(|&byte| byte == 0));
     }
 }

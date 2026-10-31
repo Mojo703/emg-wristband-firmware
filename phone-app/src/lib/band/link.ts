@@ -2,11 +2,14 @@
 
 import {
   GESTURE_UUID,
+  HEALTH_UUID,
   SERVICE_UUID,
   SETTINGS_UUID,
   decodeGestureEvent,
+  decodeHealth,
   decodeSettings,
   encodeSettings,
+  type BandHealth,
   type BandSettings,
   type GestureEvent,
 } from './protocol.ts';
@@ -25,6 +28,7 @@ export class Band {
   #device: BluetoothDevice | null = null;
   #settings: BluetoothRemoteGATTCharacteristic | null = null;
   #emg: BluetoothRemoteGATTCharacteristic | null = null;
+  #health: BluetoothRemoteGATTCharacteristic | null = null;
   #assembler = new WindowAssembler();
   #onWindow: ((window: EmgWindow, arrivedAt: number) => void) | null = null;
   #listeners = new Set<(event: BandEvent) => void>();
@@ -56,6 +60,7 @@ export class Band {
     const gesture = await service.getCharacteristic(GESTURE_UUID);
     this.#settings = settings;
     this.#emg = await service.getCharacteristic(EMG_UUID).catch(() => null);
+    this.#health = await service.getCharacteristic(HEALTH_UUID).catch(() => null);
     this.#emg?.addEventListener('characteristicvaluechanged', (event) => {
       const view = valueOf(event);
       if (view === null || this.#onWindow === null) return;
@@ -99,6 +104,13 @@ export class Band {
 
   disconnect(): void {
     this.#device?.gatt?.disconnect();
+  }
+
+  /** The band's health record: this run, and the run before the last reset. */
+  async readHealth(): Promise<BandHealth> {
+    const characteristic = this.#health;
+    if (characteristic === null) throw new Error('this band firmware has no health record');
+    return decodeHealth(await characteristic.readValue());
   }
 
   /** Write the whole record. The band answers with what it kept. */

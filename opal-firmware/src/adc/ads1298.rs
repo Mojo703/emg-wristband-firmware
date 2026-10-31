@@ -89,7 +89,7 @@ pub(crate) const SAMPLE_RATE_HZ: u32 = {
 /// default is `0x06` — low power at fMOD/1024 — which converts at 250 SPS, so a chip
 /// that has silently reverted is visible both in a readback and in the DRDY edge
 /// rate; acquisition's slow-period recovery trigger keys on exactly that.
-const fn device_config1() -> Config1 {
+pub(super) const fn device_config1() -> Config1 {
     Config1 {
         high_resolution: true,
         multiple_readback: true,
@@ -160,7 +160,7 @@ impl RightLegDriveMode {
     }
 
     /// The complete normal register recipe for a chip using this bias-drive mode.
-    fn expected_configuration(self) -> [(Register, u8); CONFIGURATION_REGISTER_COUNT] {
+    pub(super) fn expected_configuration(self) -> [(Register, u8); CONFIGURATION_REGISTER_COUNT] {
         let sense = self.sense_channels();
         [
             (Register::Config1, device_config1().to_byte()),

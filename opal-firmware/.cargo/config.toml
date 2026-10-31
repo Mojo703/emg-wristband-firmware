@@ -23,6 +23,8 @@ test-device = [
     "--config",
     'env.ESP_IDF_SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.test"',
 ]
+# Battery-life test for the XIAO motherboard; see examples/battery-test/main.rs.
+battery-test = ["run", "--release", "--example", "battery-test"]
 # The deep-sleep bench logs its wake cause over the console; the LED carries the
 # result when the console is gone.
 sleep-bench = [

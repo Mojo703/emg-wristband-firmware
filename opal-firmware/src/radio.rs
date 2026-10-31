@@ -13,7 +13,7 @@ use ble_media::emg_stream::WindowRecord;
 use ble_media::nimble::{EmgStream, NimbleRadio, SettingsService};
 use ble_media::phone::{Delivery, Phone, RadioClaim};
 use ble_media::session::SESSION_TICK;
-use ble_media::settings_service::{BandSettings, GestureEvent};
+use ble_media::settings_service::{BandHealth, BandSettings, GestureEvent};
 use esp_idf_svc::hal::delay::FreeRtos;
 use feedback_vocabulary::Phone as FeedbackPhone;
 use log::{error, info, warn};
@@ -22,12 +22,15 @@ use protocol::{CalibrationGesture, MediaKey, PhoneStatus};
 use crate::adc::acquisition::WindowRecycler;
 use crate::cores;
 use crate::handoff::Handoff;
+use crate::health;
 
 const BLE_THREAD_STACK_BYTES: usize = 8192;
 const COMMIT_CAPACITY: usize = 8;
 const SETTINGS_WRITE_CAPACITY: usize = 4;
 const EMG_SEND_THREAD_STACK_BYTES: usize = 6144;
 const UNDELIVERED_LOG_INTERVAL: u32 = 20;
+/// About once a second at the session tick.
+const STACK_CHECK_TICKS: u32 = 200;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Commit {
@@ -38,6 +41,7 @@ pub(crate) struct Commit {
 enum Outbound {
     Commit(Commit),
     Settings(BandSettings),
+    Health(BandHealth),
 }
 
 pub(crate) struct PhoneLink {
@@ -107,6 +111,12 @@ impl PhoneLink {
     /// Store the settings the band now runs with and tell the phone.
     pub(crate) fn publish_settings(&self, settings: BandSettings) {
         self.send(Outbound::Settings(settings));
+    }
+
+    /// Refresh the health record a phone reads. A full queue drops it; the
+    /// next one follows within a second.
+    pub(crate) fn publish_health(&self, health: BandHealth) {
+        let _ = self.outbound.offer(Outbound::Health(health));
     }
 
     pub(crate) fn recording_connection(&self) -> Option<u16> {
@@ -183,6 +193,7 @@ impl EmgSender {
                             }
                         }
                         recycler.recycle(window.packed_wire, window.missing);
+                        health::note_stack(health::Task::EmgSend);
                     }
                 })
         });
@@ -226,8 +237,13 @@ fn run(
     let mut pending_status: Option<PhoneStatus> = None;
     let mut sequence: u16 = 0;
     let mut last_tick = Instant::now();
+    let mut ticks: u32 = 0;
 
     loop {
+        ticks = ticks.wrapping_add(1);
+        if ticks % STACK_CHECK_TICKS == 0 {
+            health::note_stack(health::Task::BleSession);
+        }
         let now = Instant::now();
         phone.tick(now.saturating_duration_since(last_tick));
         last_tick = now;
@@ -250,6 +266,7 @@ fn run(
                     });
                 }
                 Some(Outbound::Settings(settings)) => service.publish_settings(&settings),
+                Some(Outbound::Health(health)) => service.publish_health(&health),
                 None => break,
             }
         }

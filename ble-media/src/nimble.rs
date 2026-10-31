@@ -23,8 +23,19 @@ use log::{error, info, warn};
 use crate::emg_stream::{self, WindowRecord};
 use crate::hid;
 use crate::link_bench::{self, BenchCommand, ConnectionParameters, LinkStatus, MediaOutcome, Phy};
-use crate::phone::{Peer, Radio};
-use crate::settings_service::{self, BandSettings, GestureEvent};
+use crate::phone::{EncryptedLinks, Peer, Radio, LINK_CAPACITY};
+use crate::settings_service::{self, BandHealth, BandSettings, GestureEvent};
+
+/// Disconnects since boot in the high half, saturating, and the last one's
+/// NimBLE status in the low half: one word, so a reader never sees a count
+/// from one disconnect beside the reason of another.
+static DISCONNECTS: AtomicU32 = AtomicU32::new(0);
+
+/// How many links have dropped since boot, and the NimBLE status of the last.
+pub fn disconnects() -> (u16, u16) {
+    let packed = DISCONNECTS.load(Ordering::Relaxed);
+    ((packed >> 16) as u16, packed as u16)
+}
 
 /// `0x03C1` = HID Keyboard. Presenting as a keyboard makes iOS treat us as a
 /// media-capable input device.
@@ -129,6 +140,11 @@ impl NimbleRadio {
             other => info!("pairing did not encrypt the link: {other:?}"),
         });
         server.on_disconnect(move |_desc, reason| {
+            let status = reason.err().map_or(0, |error| error.code() as u16);
+            let _ = DISCONNECTS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |packed| {
+                let count = (packed >> 16).saturating_add(1).min(u32::from(u16::MAX));
+                Some(count << 16 | u32::from(status))
+            });
             info!("host disconnected ({reason:?})");
         });
         // The peer coming back is the state machine's business: `Phone` decides
@@ -259,12 +275,14 @@ impl Radio for NimbleRadio {
         best
     }
 
-    fn encrypted_connection_count(&self) -> usize {
-        BLEDevice::take()
-            .get_server()
-            .connections()
-            .filter(|desc| desc.encrypted())
-            .count()
+    fn encrypted_links(&self) -> EncryptedLinks {
+        let mut links = [None; LINK_CAPACITY];
+        let server = BLEDevice::take().get_server();
+        let encrypted = server.connections().filter(|desc| desc.encrypted());
+        for (slot, desc) in links.iter_mut().zip(encrypted) {
+            *slot = Some(desc.conn_handle());
+        }
+        links
     }
 
     fn accepts_another_connection(&self) -> bool {
@@ -295,18 +313,8 @@ impl Radio for NimbleRadio {
             .is_some_and(|advertising| advertising.lock().is_advertising())
     }
 
-    fn request_fast_link(&mut self) -> Result<()> {
-        let encrypted: Vec<u16> = BLEDevice::take()
-            .get_server()
-            .connections()
-            .filter(|desc| desc.encrypted())
-            .map(|desc| desc.conn_handle())
-            .collect();
-        anyhow::ensure!(!encrypted.is_empty(), "no encrypted link to ask");
-        for handle in encrypted {
-            request_fast_link(handle)?;
-        }
-        Ok(())
+    fn request_fast_link(&mut self, connection: u16) -> Result<()> {
+        request_fast_link(connection)
     }
 }
 
@@ -415,6 +423,7 @@ impl NimbleRadio {
 pub struct SettingsService {
     settings: Arc<Mutex<BLECharacteristic>>,
     gesture: Arc<Mutex<BLECharacteristic>>,
+    health: Arc<Mutex<BLECharacteristic>>,
     emg: EmgStream,
 }
 
@@ -460,6 +469,9 @@ impl NimbleRadio {
         let emg = service
             .lock()
             .create_characteristic(uuid(emg_stream::EMG_UUID), NimbleProperties::NOTIFY);
+        let health = service
+            .lock()
+            .create_characteristic(uuid(settings_service::HEALTH_UUID), NimbleProperties::READ);
         settings.lock().set_value(&current.encode());
 
         let subscriber = Arc::new(AtomicU32::new(NO_SUBSCRIBER));
@@ -496,6 +508,7 @@ impl NimbleRadio {
         Ok(SettingsService {
             settings,
             gesture,
+            health,
             emg: EmgStream {
                 subscriber,
                 value_handle: Arc::new(AtomicU32::new(UNRESOLVED_HANDLE)),
@@ -527,6 +540,12 @@ impl SettingsService {
     /// error: the app is optional, and the HID key is what the wearer wants.
     pub fn publish_gesture(&self, event: &GestureEvent) {
         self.gesture.lock().set_value(&event.encode()).notify();
+    }
+
+    /// Replace what a read of the health record returns. Read only, never
+    /// notified, so it costs the link nothing until the phone asks.
+    pub fn publish_health(&self, health: &BandHealth) {
+        self.health.lock().set_value(&health.encode());
     }
 
     pub fn emg_stream(&self) -> EmgStream {

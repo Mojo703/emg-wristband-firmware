@@ -17,6 +17,11 @@ investigations. It does not mark the latter for deletion.
   import it.
 - `verify_front_end_fix.py` compares new recordings against the fixed pre-change
   criteria. `firmware-bench` also imports its frequency-band definition.
+- `demo_replay.py` replays the band's fitter, reject spine and pair grammar on
+  the phone sessions behind `UNATTENDED-DEMO-PLAN.md`. It reads features that
+  emg-runtime's `band_session_features` and `covariance_session_features`
+  examples export into `data_demo_replay/`. `fitter_replay.py` uses it for
+  build step 1 of that plan.
 
 ## Historical investigations
 

@@ -14,6 +14,7 @@ mod cores;
 mod features;
 mod feedback;
 mod handoff;
+mod health;
 mod radio;
 mod resident;
 mod telemetry;
@@ -24,7 +25,7 @@ use calibration_flow::active_gesture_from_index;
 use config::{Settings, Store};
 use emg_runtime::band_features::{FEATURE_COUNT, WINDOW_SAMPLES};
 use emg_runtime::calibration::CalibrationModel;
-use emg_runtime::RejectPipeline;
+use emg_runtime::{Admission, CommitGate, RejectPipeline, WindowHealth};
 use esp_idf_svc::hal::delay::FreeRtos;
 use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
@@ -96,6 +97,8 @@ struct App {
     settings: Settings,
     phone: Option<PhoneLink>,
     pipeline: RejectPipeline,
+    gate: CommitGate,
+    health: health::Health,
     classifier: Option<Box<Classifier>>,
     feedback: Feedback,
     source: Option<AdcSource>,
@@ -143,6 +146,7 @@ impl App {
             env!("FIRMWARE_BUILT_AT"),
             reset_reason()
         );
+        let health = health::Health::boot();
 
         let store = Store::open(EspDefaultNvsPartition::take()?)?;
         let settings = store.load();
@@ -312,6 +316,11 @@ impl App {
         };
         Ok(Box::new(Self {
             pipeline: RejectPipeline::new(COMMAND_CLASSES, settings.sensitivity.tau()),
+            gate: CommitGate::new(
+                WINDOW_PERIOD.as_micros() as u64,
+                1_000_000 / adc::ads1298::SAMPLE_RATE_HZ as u64,
+            ),
+            health,
             store,
             settings,
             phone,
@@ -337,6 +346,9 @@ impl App {
                 esp_idf_svc::sys::esp_task_wdt_reset();
             }
             self.apply_settings_writes();
+            if let (Some(record), Some(phone)) = (self.health.update(), self.phone.as_ref()) {
+                phone.publish_health(record);
+            }
             match self.source.as_ref().and_then(AdcSource::poll_window) {
                 Some(window) => self.process_window(window),
                 None => self.handle_idle_iteration(),
@@ -388,13 +400,20 @@ impl App {
             missing,
             first_step_us,
         } = window;
+        let admission = self.gate.admit(WindowHealth {
+            first_step_us,
+            any_missing: missing.iter().any(|&bits| bits != 0),
+            recoveries: self.source.as_ref().map_or(0, AdcSource::recoveries),
+        });
         let features = self
             .classifier
             .as_mut()
             .and_then(|classifier| classifier.features.push_window(&packed_wire));
         self.forward_window(packed_wire, missing, first_step_us);
-        if let Some(features) = features {
-            self.classify(&features, started_at);
+        match (admission, features) {
+            (Admission::Score, Some(features)) => self.classify(&features, started_at),
+            (Admission::Hold { reset: true }, _) => self.pipeline.reset(),
+            _ => {}
         }
         self.publish_feedback_state();
     }

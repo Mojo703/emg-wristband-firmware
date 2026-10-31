@@ -63,6 +63,11 @@ impl RejectPipeline {
         }
     }
 
+    /// Drop any vote in progress, as after a stretch of data the model never saw.
+    pub fn reset(&mut self) {
+        self.vote = VoteState::Idle;
+    }
+
     pub fn step(&mut self, softmax: &[f32]) -> Decision {
         let commands = &softmax[..self.num_commands.min(softmax.len())];
         let (argmax, reject_score) = commands.iter().copied().enumerate().fold(
@@ -121,6 +126,72 @@ impl RejectPipeline {
     }
 }
 
+/// What the front end reports about one window, for [`CommitGate::admit`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowHealth {
+    pub first_step_us: u64,
+    /// Any sample in the window is an aligner placeholder rather than data.
+    pub any_missing: bool,
+    /// Front-end recoveries since boot, cumulative.
+    pub recoveries: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admission {
+    Score,
+    /// Keep the features flowing but neither score nor commit. `reset` asks the
+    /// caller to drop the reject pipeline's vote.
+    Hold {
+        reset: bool,
+    },
+}
+
+/// Keeps commits off data the model cannot trust: a window with placeholder
+/// samples, a front-end recovery, a hole in the timeline, or the first window
+/// after boot. Any of these holds the next [`CommitGate::HOLD_WINDOWS`] clean
+/// windows too, so the feature filters settle before a vote can start.
+pub struct CommitGate {
+    window_period_us: u64,
+    step_period_us: u64,
+    expected_first_step_us: Option<u64>,
+    recoveries_seen: Option<u32>,
+    clean_windows_to_hold: u8,
+}
+
+impl CommitGate {
+    pub const HOLD_WINDOWS: u8 = 4;
+
+    pub fn new(window_period_us: u64, step_period_us: u64) -> Self {
+        Self {
+            window_period_us,
+            step_period_us,
+            expected_first_step_us: None,
+            recoveries_seen: None,
+            clean_windows_to_hold: Self::HOLD_WINDOWS,
+        }
+    }
+
+    pub fn admit(&mut self, health: WindowHealth) -> Admission {
+        let contiguous = self
+            .expected_first_step_us
+            .is_some_and(|expected| health.first_step_us.abs_diff(expected) < self.step_period_us);
+        let recovered = self.recoveries_seen != Some(health.recoveries);
+        self.expected_first_step_us =
+            Some(health.first_step_us.saturating_add(self.window_period_us));
+        self.recoveries_seen = Some(health.recoveries);
+
+        if health.any_missing || recovered || !contiguous {
+            self.clean_windows_to_hold = Self::HOLD_WINDOWS;
+            return Admission::Hold { reset: true };
+        }
+        if self.clean_windows_to_hold > 0 {
+            self.clean_windows_to_hold -= 1;
+            return Admission::Hold { reset: false };
+        }
+        Admission::Score
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,5 +237,143 @@ mod tests {
         let rejected = step(&mut pipeline, 2, 0.7);
         assert_eq!((rejected.wake_state, rejected.streak), (WakeState::Idle, 0));
         assert!(!rejected.accepted);
+    }
+
+    const WINDOW_US: u64 = 250_000;
+    const STEP_US: u64 = 500;
+
+    fn clean(window: u64) -> WindowHealth {
+        WindowHealth {
+            first_step_us: 1_000_000 + window * WINDOW_US,
+            any_missing: false,
+            recoveries: 0,
+        }
+    }
+
+    fn admissions(
+        gate: &mut CommitGate,
+        windows: impl IntoIterator<Item = WindowHealth>,
+    ) -> Vec<Admission> {
+        windows
+            .into_iter()
+            .map(|health| gate.admit(health))
+            .collect()
+    }
+
+    const HELD: usize = CommitGate::HOLD_WINDOWS as usize;
+
+    #[test]
+    fn the_first_windows_after_boot_are_held_then_scored() {
+        let mut gate = CommitGate::new(WINDOW_US, STEP_US);
+        let seen = admissions(&mut gate, (0..8).map(clean));
+        assert_eq!(seen[0], Admission::Hold { reset: true });
+        assert!(seen[1..=HELD]
+            .iter()
+            .all(|&admission| admission == Admission::Hold { reset: false }));
+        assert!(seen[HELD + 1..]
+            .iter()
+            .all(|&admission| admission == Admission::Score));
+    }
+
+    fn settled_gate() -> CommitGate {
+        let mut gate = CommitGate::new(WINDOW_US, STEP_US);
+        admissions(&mut gate, (0..=HELD as u64).map(clean));
+        assert_eq!(gate.admit(clean(HELD as u64 + 1)), Admission::Score);
+        gate
+    }
+
+    fn assert_holds_after(degraded: WindowHealth, next: u64) {
+        let mut gate = settled_gate();
+        assert_eq!(gate.admit(degraded), Admission::Hold { reset: true });
+        let after = admissions(&mut gate, (next..next + HELD as u64 + 1).map(clean));
+        assert!(after[..HELD]
+            .iter()
+            .all(|&admission| admission == Admission::Hold { reset: false }));
+        assert_eq!(after[HELD], Admission::Score);
+    }
+
+    #[test]
+    fn a_window_with_placeholder_samples_holds_commits() {
+        let start = HELD as u64 + 2;
+        assert_holds_after(
+            WindowHealth {
+                any_missing: true,
+                ..clean(start)
+            },
+            start + 1,
+        );
+    }
+
+    #[test]
+    fn a_front_end_recovery_holds_commits() {
+        let start = HELD as u64 + 2;
+        let recovered = |window| WindowHealth {
+            recoveries: 1,
+            ..clean(window)
+        };
+        let mut gate = settled_gate();
+        assert_eq!(
+            gate.admit(recovered(start)),
+            Admission::Hold { reset: true }
+        );
+        let after = admissions(
+            &mut gate,
+            (start + 1..start + HELD as u64 + 2).map(recovered),
+        );
+        assert_eq!(after[HELD], Admission::Score);
+    }
+
+    #[test]
+    fn a_dropped_window_holds_commits() {
+        let start = HELD as u64 + 3;
+        assert_holds_after(clean(start), start + 1);
+    }
+
+    #[test]
+    fn grid_jitter_under_one_step_is_not_a_gap() {
+        let mut gate = settled_gate();
+        let next = clean(HELD as u64 + 2);
+        let jittered = WindowHealth {
+            first_step_us: next.first_step_us + STEP_US - 1,
+            ..next
+        };
+        assert_eq!(gate.admit(jittered), Admission::Score);
+    }
+
+    #[test]
+    fn a_degraded_window_inside_a_hold_restarts_it() {
+        let mut gate = settled_gate();
+        let start = HELD as u64 + 2;
+        assert_eq!(
+            gate.admit(WindowHealth {
+                any_missing: true,
+                ..clean(start)
+            }),
+            Admission::Hold { reset: true }
+        );
+        gate.admit(clean(start + 1));
+        assert_eq!(
+            gate.admit(WindowHealth {
+                any_missing: true,
+                ..clean(start + 2)
+            }),
+            Admission::Hold { reset: true }
+        );
+        let after = admissions(&mut gate, (start + 3..start + 4 + HELD as u64).map(clean));
+        assert!(after[..HELD]
+            .iter()
+            .all(|&admission| admission != Admission::Score));
+        assert_eq!(after[HELD], Admission::Score);
+    }
+
+    #[test]
+    fn reset_drops_a_latched_vote() {
+        let mut pipeline = RejectPipeline::new(3, 0.8);
+        for _ in 0..3 {
+            step(&mut pipeline, 1, 0.9);
+        }
+        pipeline.reset();
+        let after = step(&mut pipeline, 1, 0.9);
+        assert_eq!((after.wake_state, after.streak), (WakeState::Arming, 1));
     }
 }

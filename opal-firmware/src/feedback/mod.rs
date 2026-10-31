@@ -35,6 +35,7 @@ use haptics::{Haptics, Playback};
 use led::{Color, IndicatorLed, Shape};
 use log::{info, warn};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// How often the thread does its one pass.
 ///
@@ -52,6 +53,7 @@ const TICK_MILLISECONDS: u32 = 5;
 /// The pass rate between pulses, which is most of the time. Nothing to dither and
 /// nothing to animate then, so only the haptics poll still has an opinion.
 const IDLE_TICK_MILLISECONDS: u32 = 20;
+const STACK_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// How often the device says it is alive. Dark alone is ambiguous — healthy and dead
 /// look identical — so the pulse is what makes "off" mean something. The gap is long
@@ -245,7 +247,12 @@ fn run(mailbox: Arc<Mutex<Mailbox>>, wiring: FeedbackWiring) {
     let mut was_playing = false;
     // What the counters above advance by: how long the last pass slept.
     let mut tick = TICK_MILLISECONDS;
+    let mut stack_checked_at = Instant::now();
     loop {
+        if stack_checked_at.elapsed() >= STACK_CHECK_INTERVAL {
+            stack_checked_at = Instant::now();
+            crate::health::note_stack(crate::health::Task::Feedback);
+        }
         let (state, cue) = match mailbox.lock() {
             Ok(mut mailbox) => (mailbox.state.take(), mailbox.pending_cue.take()),
             Err(_) => (None, None),

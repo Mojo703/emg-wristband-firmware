@@ -69,10 +69,11 @@ pub trait Radio {
     /// cannot go stale between the host task and the thread that acts on it.
     fn peer(&self) -> Peer;
 
-    /// How many centrals hold an encrypted link. A change is a new arrival
-    /// to ask for the band's link settings; counting unencrypted links too
-    /// would ask before a newcomer can be asked and then never again.
-    fn encrypted_connection_count(&self) -> usize;
+    /// The connection handles of every encrypted link. A handle not seen
+    /// before is a new arrival to ask for the band's link settings; listing
+    /// unencrypted links too would ask before a newcomer can be asked and
+    /// then never again.
+    fn encrypted_links(&self) -> EncryptedLinks;
 
     /// Whether the stack has room for one more central.
     fn accepts_another_connection(&self) -> bool;
@@ -80,12 +81,19 @@ pub trait Radio {
     /// Notify the consumer-control input report.
     fn notify(&self, report: [u8; 2]) -> anyhow::Result<()>;
 
-    /// Ask the central for the link the band wants: the 2M PHY, the longest
+    /// Ask one central for the link the band wants: the 2M PHY, the longest
     /// link-layer packets, and a 15 to 30 ms interval. The central decides,
     /// and every one of these dies with the connection, which is why
-    /// [`Phone::tick`] asks again on each encrypted link.
-    fn request_fast_link(&mut self) -> anyhow::Result<()>;
+    /// [`Phone::tick`] asks each new encrypted link once and leaves the
+    /// others alone.
+    fn request_fast_link(&mut self, connection: u16) -> anyhow::Result<()>;
 }
+
+/// More than the band's connection limit, so every encrypted link fits.
+pub const LINK_CAPACITY: usize = 4;
+
+/// Connection handles, filled from the front, `None` past the last.
+pub type EncryptedLinks = [Option<u16>; LINK_CAPACITY];
 
 /// What the connection callbacks have seen. Raw observation, no judgement.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -144,10 +152,11 @@ pub enum Phone<R> {
         radio: R,
         link: PhoneLink,
         hold: KeyHold,
-        /// The encrypted connection count when the link settings were last
-        /// asked for. Asked once per arrival: a central that refused will
-        /// refuse again, and one that granted needs no reminder.
-        fast_link_asked_at: usize,
+        /// The encrypted links already asked for the link settings. Asked once
+        /// per link: a central that refused will refuse again, one that
+        /// granted needs no reminder, and a link already streaming must not
+        /// have its settings renegotiated because another central arrived.
+        fast_link_asked: EncryptedLinks,
     },
     /// The stack refused at boot. Terminal for this boot and deliberately so:
     /// this value owns no radio to retry. A lifecycle owner may construct a new
@@ -295,7 +304,7 @@ impl<R: Radio> Phone<R> {
             radio,
             link: PhoneLink::Dormant,
             hold: KeyHold::idle(),
-            fast_link_asked_at: 0,
+            fast_link_asked: [None; LINK_CAPACITY],
         }
     }
 
@@ -415,7 +424,7 @@ impl<R: Radio> Phone<R> {
             radio,
             link,
             hold,
-            fast_link_asked_at,
+            fast_link_asked,
         } = self
         else {
             return;
@@ -428,14 +437,20 @@ impl<R: Radio> Phone<R> {
         // the request waits for encryption rather than the connect callback;
         // a refusal is the central's to make and is not retried on this link.
         // A changed encrypted count is a new arrival to ask again for.
-        let encrypted = radio.encrypted_connection_count();
-        match radio.peer() {
-            Peer::Encrypted if encrypted != *fast_link_asked_at => {
-                *fast_link_asked_at = encrypted;
-                let _ = radio.request_fast_link();
+        let encrypted = radio.encrypted_links();
+        for asked in fast_link_asked.iter_mut() {
+            if asked.is_some_and(|handle| !encrypted.contains(&Some(handle))) {
+                *asked = None;
             }
-            Peer::Absent => *fast_link_asked_at = 0,
-            _ => {}
+        }
+        for handle in encrypted.into_iter().flatten() {
+            if fast_link_asked.contains(&Some(handle)) {
+                continue;
+            }
+            if let Some(slot) = fast_link_asked.iter_mut().find(|slot| slot.is_none()) {
+                *slot = Some(handle);
+                let _ = radio.request_fast_link(handle);
+            }
         }
 
         // Accepting a connection stops advertising, and nothing else turns it
@@ -584,6 +599,7 @@ mod tests {
         refuse_stop: Cell<bool>,
         refuse_disconnect: Cell<bool>,
         refuse_notify: Cell<bool>,
+        fast_links: RefCell<Vec<u16>>,
     }
 
     impl Bench {
@@ -672,12 +688,17 @@ mod tests {
             self.bench.peer.get()
         }
 
-        fn encrypted_connection_count(&self) -> usize {
+        fn encrypted_links(&self) -> EncryptedLinks {
+            let mut links = [None; LINK_CAPACITY];
             if self.bench.peer.get() == Peer::Encrypted {
-                self.bench.connections.get()
-            } else {
-                0
+                for (slot, handle) in links
+                    .iter_mut()
+                    .zip(1..=self.bench.connections.get() as u16)
+                {
+                    *slot = Some(handle);
+                }
             }
+            links
         }
 
         fn accepts_another_connection(&self) -> bool {
@@ -700,8 +721,9 @@ mod tests {
             Ok(())
         }
 
-        fn request_fast_link(&mut self) -> anyhow::Result<()> {
+        fn request_fast_link(&mut self, connection: u16) -> anyhow::Result<()> {
             self.bench.operations.borrow_mut().push("fast link");
+            self.bench.fast_links.borrow_mut().push(connection);
             Ok(())
         }
     }
@@ -1264,6 +1286,11 @@ mod tests {
         phone.tick(SESSION_TICK);
         phone.tick(SESSION_TICK);
         assert_eq!(bench.fast_link_requests(), 2, "a second arrival is asked");
+        assert_eq!(
+            *bench.fast_links.borrow(),
+            [1, 2],
+            "the first link, perhaps mid-stream, is not asked again"
+        );
 
         bench.phone_leaves();
         phone.tick(SESSION_TICK);
@@ -1271,5 +1298,6 @@ mod tests {
         bench.phone_pairs();
         phone.tick(SESSION_TICK);
         assert_eq!(bench.fast_link_requests(), 3, "a fresh link is asked again");
+        assert_eq!(*bench.fast_links.borrow(), [1, 2, 1]);
     }
 }

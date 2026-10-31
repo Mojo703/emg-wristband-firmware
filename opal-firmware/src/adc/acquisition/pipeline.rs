@@ -515,6 +515,7 @@ impl Pipeline {
 
     /// Emits this chip's telemetry when enough frames have gone by.
     fn report(&mut self) {
+        crate::health::note_stack(crate::health::Task::adc(self.index));
         let Some(report) = self.timing.summary() else {
             return;
         };

@@ -34,6 +34,9 @@ CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=517
 # At info level NimBLE prints two lines per notification from inside the
 # notify call; measured on the link bench, that held every notification ~10 ms.
 CONFIG_BT_NIMBLE_LOG_LEVEL_WARNING=y
+# The host task runs esp32-nimble's Rust callbacks, their log formatting, and
+# Secure Connections pairing; the 4 KB default left no measured headroom.
+CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=8192
 
 # The core plan lives in src/cores.rs; this pins the task that sdkconfig owns.
 CONFIG_ESP_MAIN_TASK_AFFINITY_CPU0=y
@@ -41,8 +44,10 @@ CONFIG_ESP_MAIN_TASK_AFFINITY_CPU0=y
 # The Rust main task runs inference. `App::new` returns a boxed owner from a
 # non-inlined constructor so its startup frame cannot remain beneath the permanent
 # run loop: retaining both frames overflowed this stack into the adjacent esp_timer
-# TCB. Every KB here is contiguous internal RAM the heap needs back.
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=20000
+# TCB. Every KB here is contiguous internal RAM the heap needs back. At 20000
+# the health record measured 16 bytes left after a failed ADC bring-up, and the
+# next boot overflowed; the heap's low-water mark was 145 KB.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=24576
 CONFIG_FREERTOS_HZ=1000
 
 # Console on the USB port: logs go to the USB-Serial-JTAG monitor. This
