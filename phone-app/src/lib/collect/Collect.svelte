@@ -7,7 +7,9 @@
   import { listTracks, loadTrack, uploadSession, type ServerAccess, type TrackSummary } from './server.ts';
   import { SessionRecording, type SessionFiles } from './session.ts';
   import { deleteSession, listSessions, saveSession, type StoredSession } from './store.ts';
+  import ElectrodeCheck from './ElectrodeCheck.svelte';
   import { ScreenAwake } from './screenAwake.ts';
+  import { SignalQualityMonitor, type QualityReport } from './signalQuality.ts';
   import { StreamHealth, type StreamSummary } from './streamHealth.ts';
 
   const ACTIVITIES = ['Seated', 'Standing', 'Post workout', 'Arm swinging'];
@@ -22,6 +24,7 @@
   let streaming = $state(false);
   let summary = $state<StreamSummary | null>(null);
   let abandoned = $state(0);
+  let quality = $state.raw<QualityReport | null>(null);
 
   let baseUrl = $state(remembered('collect.baseUrl', 'https://collect.underfloor.ca'));
   let token = $state(remembered('collect.token', ''));
@@ -99,13 +102,16 @@
 
   async function startStream(): Promise<void> {
     const health = new StreamHealth();
+    const monitor = new SignalQualityMonitor();
     summary = null;
     abandoned = 0;
+    quality = null;
     try {
       await band.startRecording((window, arrivedAt) => {
         health.add(window, arrivedAt);
         summary = health.summary();
         abandoned = band.abandonedWindows;
+        quality = monitor.add(window, arrivedAt) ?? quality;
       });
       streaming = true;
     } catch (error) {
@@ -281,6 +287,9 @@
             <dt>Coverage</dt>
             <dd class={summary.coverage < 0.99 ? 'bad' : 'good'}>{(summary.coverage * 100).toFixed(1)}%</dd>
           </dl>
+        {/if}
+        {#if quality !== null}
+          <ElectrodeCheck report={quality} />
         {/if}
       </section>
     {/if}

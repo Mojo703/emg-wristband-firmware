@@ -116,7 +116,7 @@ const BAND_BITS: [[[u32; 5]; BAND_SECTIONS]; BAND_COUNT] = [
 
 /// One second-order section, applied as direct form II transposed.
 #[derive(Clone, Copy, Debug)]
-struct Biquad {
+pub(crate) struct Biquad {
     b0: f32,
     b1: f32,
     b2: f32,
@@ -125,7 +125,7 @@ struct Biquad {
 }
 
 impl Biquad {
-    fn from_bits(words: [u32; 5]) -> Self {
+    pub(crate) fn from_bits(words: [u32; 5]) -> Self {
         Self {
             b0: f32::from_bits(words[0]),
             b1: f32::from_bits(words[1]),
@@ -138,12 +138,135 @@ impl Biquad {
     /// Advances one sample. The three statements are the pinned operation order;
     /// reassociating any of them breaks bit parity with the host simulation.
     #[inline(always)]
-    fn step(&self, sample: f32, state: &mut [f32; 2]) -> f32 {
+    pub(crate) fn step(&self, sample: f32, state: &mut [f32; 2]) -> f32 {
         let value = self.b0 * sample + state[0];
         state[0] = self.b1 * sample - self.a1 * value + state[1];
         state[1] = self.b2 * sample - self.a2 * value;
         value
     }
+
+    #[inline(always)]
+    pub(crate) fn step_channels(
+        &self,
+        values: &mut [f32; CHANNEL_COUNT],
+        states: &mut ChannelStates,
+    ) {
+        let groups = values
+            .chunks_exact_mut(INTERLEAVED_LANES)
+            .zip(states.first.chunks_exact_mut(INTERLEAVED_LANES))
+            .zip(states.second.chunks_exact_mut(INTERLEAVED_LANES));
+        for ((values, firsts), seconds) in groups {
+            let samples: [f32; INTERLEAVED_LANES] = core::array::from_fn(|lane| values[lane]);
+            let outputs: [f32; INTERLEAVED_LANES] =
+                core::array::from_fn(|lane| self.b0 * samples[lane] + firsts[lane]);
+            for lane in 0..INTERLEAVED_LANES {
+                firsts[lane] = self.b1 * samples[lane] - self.a1 * outputs[lane] + seconds[lane];
+            }
+            for lane in 0..INTERLEAVED_LANES {
+                seconds[lane] = self.b2 * samples[lane] - self.a2 * outputs[lane];
+            }
+            values.copy_from_slice(&outputs);
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn step_channels_fused(
+        &self,
+        values: &mut [f32; CHANNEL_COUNT],
+        states: &mut ChannelStates,
+    ) {
+        let groups = values
+            .chunks_exact_mut(INTERLEAVED_LANES)
+            .zip(states.first.chunks_exact_mut(INTERLEAVED_LANES))
+            .zip(states.second.chunks_exact_mut(INTERLEAVED_LANES));
+        for ((values, firsts), seconds) in groups {
+            let samples: [f32; INTERLEAVED_LANES] = core::array::from_fn(|lane| values[lane]);
+            let outputs: [f32; INTERLEAVED_LANES] = core::array::from_fn(|lane| {
+                fused_multiply_add(firsts[lane], self.b0, samples[lane])
+            });
+            let partials: [f32; INTERLEAVED_LANES] = core::array::from_fn(|lane| {
+                fused_multiply_add(seconds[lane], self.b1, samples[lane])
+            });
+            let products: [f32; INTERLEAVED_LANES] =
+                core::array::from_fn(|lane| self.b2 * samples[lane]);
+            for lane in 0..INTERLEAVED_LANES {
+                firsts[lane] = fused_multiply_subtract(partials[lane], self.a1, outputs[lane]);
+            }
+            for lane in 0..INTERLEAVED_LANES {
+                seconds[lane] = fused_multiply_subtract(products[lane], self.a2, outputs[lane]);
+            }
+            values.copy_from_slice(&outputs);
+        }
+    }
+}
+
+const INTERLEAVED_LANES: usize = 4;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FilterLayout {
+    #[default]
+    ChannelMajor,
+    SectionMajor,
+    SectionMajorFused,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ChannelStates {
+    first: [f32; CHANNEL_COUNT],
+    second: [f32; CHANNEL_COUNT],
+}
+
+impl ChannelStates {
+    pub(crate) const ZERO: Self = Self {
+        first: [0.0; CHANNEL_COUNT],
+        second: [0.0; CHANNEL_COUNT],
+    };
+}
+
+#[cfg(target_arch = "xtensa")]
+#[inline(always)]
+pub(crate) fn fused_multiply_add(addend: f32, left: f32, right: f32) -> f32 {
+    let mut result = addend;
+    // SAFETY: madd.s reads and writes only the three float registers named here.
+    unsafe {
+        core::arch::asm!(
+            "madd.s {result}, {left}, {right}",
+            result = inout(freg) result,
+            left = in(freg) left,
+            right = in(freg) right,
+            options(pure, nomem, nostack),
+        );
+    }
+    result
+}
+
+#[cfg(target_arch = "xtensa")]
+#[inline(always)]
+pub(crate) fn fused_multiply_subtract(minuend: f32, left: f32, right: f32) -> f32 {
+    let mut result = minuend;
+    // SAFETY: msub.s reads and writes only the three float registers named here.
+    unsafe {
+        core::arch::asm!(
+            "msub.s {result}, {left}, {right}",
+            result = inout(freg) result,
+            left = in(freg) left,
+            right = in(freg) right,
+            options(pure, nomem, nostack),
+        );
+    }
+    result
+}
+
+#[cfg(not(target_arch = "xtensa"))]
+#[inline(always)]
+pub(crate) fn fused_multiply_add(addend: f32, left: f32, right: f32) -> f32 {
+    libm::fmaf(left, right, addend)
+}
+
+#[cfg(not(target_arch = "xtensa"))]
+#[inline(always)]
+pub(crate) fn fused_multiply_subtract(minuend: f32, left: f32, right: f32) -> f32 {
+    libm::fmaf(-left, right, minuend)
 }
 
 /// Streaming state for the whole feature path: scale, fixed-gain per-chip
@@ -157,6 +280,9 @@ pub struct BandFeaturePipeline {
     band: [[Biquad; BAND_SECTIONS]; BAND_COUNT],
     notch_state: [[[f32; 2]; NOTCH_COUNT]; CHANNEL_COUNT],
     band_state: [[[[f32; 2]; BAND_SECTIONS]; BAND_COUNT]; CHANNEL_COUNT],
+    filter_layout: FilterLayout,
+    notch_states: [ChannelStates; NOTCH_COUNT],
+    band_states: [[ChannelStates; BAND_SECTIONS]; BAND_COUNT],
     /// Sum of squares within the current quarter, channel-major.
     power: [[f32; BAND_COUNT]; CHANNEL_COUNT],
     /// Running sum of the quarter logarithms, same layout as `power`.
@@ -200,6 +326,9 @@ impl BandFeaturePipeline {
             band: BAND_BITS.map(|sections| sections.map(Biquad::from_bits)),
             notch_state: [[[0.0; 2]; NOTCH_COUNT]; CHANNEL_COUNT],
             band_state: [[[[0.0; 2]; BAND_SECTIONS]; BAND_COUNT]; CHANNEL_COUNT],
+            filter_layout: FilterLayout::default(),
+            notch_states: [ChannelStates::ZERO; NOTCH_COUNT],
+            band_states: [[ChannelStates::ZERO; BAND_SECTIONS]; BAND_COUNT],
             power: [[0.0; BAND_COUNT]; CHANNEL_COUNT],
             log_total: [[0.0; BAND_COUNT]; CHANNEL_COUNT],
             quarter_logs: [[[0.0; BAND_COUNT]; CHANNEL_COUNT]; SUB_WINDOWS],
@@ -282,7 +411,50 @@ impl BandFeaturePipeline {
 
     /// The notch chain then the four parallel bandpass cascades, accumulating
     /// each band's squared output into the current quarter.
+    pub fn with_filter_layout(mut self, filter_layout: FilterLayout) -> Self {
+        self.filter_layout = filter_layout;
+        self
+    }
+
     fn filter(&mut self, referenced: &[f32; CHANNEL_COUNT]) {
+        match self.filter_layout {
+            FilterLayout::ChannelMajor => self.filter_channel_major(referenced),
+            FilterLayout::SectionMajor => {
+                self.filter_section_major(referenced, Biquad::step_channels)
+            }
+            FilterLayout::SectionMajorFused => {
+                self.filter_section_major(referenced, Biquad::step_channels_fused)
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn filter_section_major(
+        &mut self,
+        referenced: &[f32; CHANNEL_COUNT],
+        step: impl Fn(&Biquad, &mut [f32; CHANNEL_COUNT], &mut ChannelStates),
+    ) {
+        let mut notched = *referenced;
+        for (section, states) in self.notch.iter().zip(self.notch_states.iter_mut()) {
+            step(section, &mut notched, states);
+        }
+        let cascades = self
+            .band
+            .iter()
+            .zip(self.band_states.iter_mut())
+            .enumerate();
+        for (band, (sections, section_states)) in cascades {
+            let mut banded = notched;
+            for (section, states) in sections.iter().zip(section_states.iter_mut()) {
+                step(section, &mut banded, states);
+            }
+            for (accumulators, &value) in self.power.iter_mut().zip(banded.iter()) {
+                accumulators[band] += value * value;
+            }
+        }
+    }
+
+    fn filter_channel_major(&mut self, referenced: &[f32; CHANNEL_COUNT]) {
         let Self {
             notch,
             band,
@@ -515,8 +687,13 @@ mod tests {
 
         /// Every window this case produces, in order.
         fn run(&self) -> alloc::vec::Vec<[f32; FEATURE_COUNT]> {
+            self.run_with(FilterLayout::default())
+        }
+
+        fn run_with(&self, filter_layout: FilterLayout) -> alloc::vec::Vec<[f32; FEATURE_COUNT]> {
             let mut pipeline =
-                BandFeaturePipeline::new(self.microvolts_per_count, self.reference_gains);
+                BandFeaturePipeline::new(self.microvolts_per_count, self.reference_gains)
+                    .with_filter_layout(filter_layout);
             self.raw
                 .iter()
                 .filter_map(|sample| pipeline.push(sample))
@@ -864,6 +1041,53 @@ mod tests {
         std::println!(
             "features compared {compared}, differing {differing}, worst {worst_ulps} ulp"
         );
+    }
+
+    #[test]
+    fn the_section_major_layout_is_bit_identical_to_the_channel_major_one() {
+        for case in Case::all() {
+            let channel_major = case.run_with(FilterLayout::ChannelMajor);
+            let section_major = case.run_with(FilterLayout::SectionMajor);
+            assert_eq!(channel_major.len(), section_major.len());
+            for (one, other) in channel_major.iter().zip(section_major.iter()) {
+                for (&left, &right) in one.iter().zip(other.iter()) {
+                    assert_eq!(left.to_bits(), right.to_bits(), "{}", case.name);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_fused_layout_stays_within_the_float64_tolerance() {
+        let mut compared = 0usize;
+        let mut differing = 0usize;
+        let mut worst_ulps = 0u32;
+        let mut float64_differences = alloc::vec::Vec::new();
+        for case in Case::all() {
+            let windows = case.run_with(FilterLayout::SectionMajorFused);
+            for (position, &index) in case.kept_windows.iter().enumerate() {
+                for (&produced, &bits) in windows[index]
+                    .iter()
+                    .zip(case.features_libc[position].iter())
+                {
+                    compared += 1;
+                    let ulps = produced.to_bits().abs_diff(bits);
+                    differing += usize::from(ulps != 0);
+                    worst_ulps = worst_ulps.max(ulps);
+                }
+            }
+            for (window, expected) in windows.iter().zip(case.features_float64.iter()) {
+                for (&produced, &exact) in window.iter().zip(expected.iter()) {
+                    float64_differences.push((produced as f64 - exact).abs());
+                }
+            }
+        }
+        let (root_mean_square, percentile, worst) = difference_statistics(&mut float64_differences);
+        std::println!(
+            "fused: against float32 {differing}/{compared} differ, worst {worst_ulps} ulp; \
+             against float64 rms {root_mean_square:e}, p99.9 {percentile:e}, max {worst:e}"
+        );
+        assert!(worst < TOLERATED_WORST_FEATURE, "worst feature {worst:e}");
     }
 
     /// numpy's log10 and glibc's log10f are a third and fourth rounding of the

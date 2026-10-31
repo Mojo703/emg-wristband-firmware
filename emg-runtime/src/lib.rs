@@ -18,6 +18,7 @@ extern crate alloc;
 pub mod alignment;
 pub mod band_features;
 pub mod calibration;
+pub mod covariance_features;
 pub mod flash_image;
 #[cfg(feature = "tds")]
 pub mod layers;
@@ -33,7 +34,7 @@ pub mod tensor;
 
 #[cfg(feature = "tds")]
 pub use model::{ForwardResult, Model, ModelBufferSizes, ModelBuffers, VerifyBatch, VerifyWindow};
-pub use pipeline::{softmax, Decision, RejectPipeline};
+pub use pipeline::{softmax, Admission, CommitGate, Decision, RejectPipeline, WindowHealth};
 
 #[cfg(test)]
 mod test_alloc {

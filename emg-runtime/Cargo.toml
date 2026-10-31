@@ -44,3 +44,6 @@ esp-idf-svc = { version = "0.52", optional = true }
 
 [build-dependencies]
 embuild = { version = "0.33", features = ["espidf"] }
+
+[[package.metadata.esp-idf-sys.extra_components]]
+remote_component = { name = "espressif/esp-dsp", version = "^1.4.0" }

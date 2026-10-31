@@ -6,6 +6,9 @@ import { StreamHealth } from './streamHealth.ts';
 const ARMED_PREFIX_MS = 3_000;
 const ANCHOR_SETTLE_MS = 3_000;
 const STREAM_SILENCE_MS = 2_000;
+const STREAM_START_LIMIT_MS = 8_000;
+const WINDOWS_BEFORE_MUSIC = 4;
+const SONG_END_SLACK_SECONDS = 1;
 
 export type RunPhase = 'armed' | 'playing' | 'finished';
 
@@ -22,7 +25,8 @@ export class CollectionRun {
   #nextNegative = 0;
   #onFinish: (files: SessionFiles, completed: boolean, reason: string) => void;
   #lastWindowAt: number | null = null;
-  #startTimer: ReturnType<typeof setTimeout> | null = null;
+  #musicTimer: ReturnType<typeof setTimeout> | null = null;
+  #startLimitTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(
     band: Band,
@@ -39,21 +43,32 @@ export class CollectionRun {
   }
 
   async start(): Promise<void> {
+    const armedAt = epochMillis();
+    let windows = 0;
     await this.#band.startRecording((window, arrivedAt) => {
       const at = performance.timeOrigin + arrivedAt;
       this.#recording.addWindow(window, at);
       this.#lastWindowAt = at;
       this.health.add(window, arrivedAt);
+      windows += 1;
+      if (windows === WINDOWS_BEFORE_MUSIC && this.phase === 'armed') {
+        const wait = Math.max(0, armedAt + ARMED_PREFIX_MS - epochMillis());
+        this.#musicTimer = setTimeout(() => {
+          void this.#audio.play().catch(() => this.stop(false, 'audio did not start'));
+        }, wait);
+      }
     });
     this.#audio.addEventListener('ended', () => {
       if (this.phase === 'playing') this.stop(true, 'song ended');
     });
     this.#audio.addEventListener('pause', () => {
-      if (this.phase === 'playing' && !this.#audio.ended) this.stop(false, 'audio paused');
+      if (this.phase !== 'playing') return;
+      const atEnd = this.#audio.ended || this.#audio.duration - this.#audio.currentTime < SONG_END_SLACK_SECONDS;
+      this.stop(atEnd, atEnd ? 'song ended' : 'audio paused');
     });
-    this.#startTimer = setTimeout(() => {
-      void this.#audio.play().catch(() => this.stop(false, 'audio did not start'));
-    }, ARMED_PREFIX_MS);
+    this.#startLimitTimer = setTimeout(() => {
+      if (windows < WINDOWS_BEFORE_MUSIC) this.stop(false, 'EMG stream did not start');
+    }, STREAM_START_LIMIT_MS);
   }
 
   get positionMs(): number | null {
@@ -115,7 +130,8 @@ export class CollectionRun {
 
   stop(completed: boolean, reason: string): void {
     if (this.phase === 'finished') return;
-    if (this.#startTimer !== null) clearTimeout(this.#startTimer);
+    if (this.#musicTimer !== null) clearTimeout(this.#musicTimer);
+    if (this.#startLimitTimer !== null) clearTimeout(this.#startLimitTimer);
     const now = epochMillis();
     const covered = Math.min(now, this.#lastWindowAt ?? this.#recording.created);
     if (this.#anchor === null) {

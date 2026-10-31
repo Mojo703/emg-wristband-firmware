@@ -24,6 +24,8 @@ SAMPLE_RATE_HZ = 2000.0
 WINDOW_SAMPLES = 500
 CUE_STRIDE = 125
 REST_STRIDE = 250
+GAP_AFTER_RELEASE_MILLISECONDS = 1000.0
+GAP_BEFORE_CUE_MILLISECONDS = 500.0
 DIRECT_CURRENT_CORNER_HZ = 0.5
 AMPLITUDE_TIME_CONSTANT_SECONDS = 20.0
 AMPLITUDE_WARM_UP_SECONDS = 0.5
@@ -67,7 +69,21 @@ def rest_spans(directory, to_sample):
     return spans
 
 
-def export_session(name, class_ids):
+def gap_spans(cues, to_sample, rests):
+    ordered = sorted(cues, key=lambda cue: cue["at"])
+    spans = []
+    for previous, following in zip(ordered, ordered[1:]):
+        start = to_sample(previous["release"] + GAP_AFTER_RELEASE_MILLISECONDS)
+        stop = to_sample(following["at"] - GAP_BEFORE_CUE_MILLISECONDS)
+        if start is None or stop is None or stop <= start:
+            continue
+        if any(start < rest_stop and rest_start < stop for rest_start, rest_stop in rests):
+            continue
+        spans.append((int(start), int(stop)))
+    return spans
+
+
+def export_session(name, class_ids, gap_negatives=False):
     directory = SESSIONS / name
     manifest, samples, host, device, cues, count = load_session(directory)
     if manifest["class_ids"] != class_ids:
@@ -92,19 +108,23 @@ def export_session(name, class_ids):
         start, stop = to_sample(cue["at"]), to_sample(cue["release"])
         if label is not None and start is not None and stop is not None:
             cut(int(start), int(stop), label, cue_id, CUE_STRIDE)
-    for start, stop in rest_spans(directory, to_sample):
+    rests = rest_spans(directory, to_sample)
+    for start, stop in rests:
         cut(start, stop, negative, -1, REST_STRIDE)
+    if gap_negatives:
+        for start, stop in gap_spans(cues, to_sample, rests):
+            cut(start, stop, negative, -1, REST_STRIDE)
 
     return windows, labels, meta
 
 
-def calibration_split(name, cues_per_class):
+def calibration_split(name, cues_per_class, gap_negatives=False):
     """One session split the way the product calibrates: the first
     `cues_per_class` cues of each class train, the rest test. Rest windows all
     train (the prefix precedes every cue)."""
     manifest = json.load((SESSIONS / name / "session.json").open())
     class_ids = manifest["class_ids"]
-    windows, labels, meta = export_session(name, class_ids)
+    windows, labels, meta = export_session(name, class_ids, gap_negatives)
     seen = {}
     train_cues = set()
     for label, cue_id in ((l, m[2]) for l, m in zip(labels, meta) if m[2] >= 0):
@@ -137,6 +157,7 @@ def main():
     parser.add_argument("--val", nargs="+")
     parser.add_argument("--calibrate", help="single session, calibration split")
     parser.add_argument("--cues", type=int, default=10)
+    parser.add_argument("--gap-negatives", action="store_true")
     parser.add_argument("--out", default=str(Path(__file__).resolve().parent.parent / "data_band"))
     arguments = parser.parse_args()
 
@@ -144,7 +165,7 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
 
     if arguments.calibrate:
-        split, class_ids = calibration_split(arguments.calibrate, arguments.cues)
+        split, class_ids = calibration_split(arguments.calibrate, arguments.cues, arguments.gap_negatives)
         for part in ("train", "test"):
             write_split(out, part, *split[part], len(class_ids))
         (out / "class_ids.json").write_text(json.dumps(class_ids))
@@ -155,7 +176,7 @@ def main():
     for split, names in (("train", arguments.train), ("test", arguments.val)):
         windows, labels, meta = [], [], []
         for name in names:
-            w, l, m = export_session(name, class_ids)
+            w, l, m = export_session(name, class_ids, arguments.gap_negatives)
             windows += w
             labels += l
             meta += m
