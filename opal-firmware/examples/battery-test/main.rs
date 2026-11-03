@@ -72,11 +72,14 @@ fn main() -> anyhow::Result<()> {
 
     let peripherals = Peripherals::take()?;
     let pins = peripherals.pins;
-    // Pads 39-42 come out of reset owned by JTAG; gpio_config hands DRDY1 (40)
-    // and PWDN (42) to the GPIO matrix.
+    // Pads 39-42 come out of reset owned by JTAG and 43-44 by UART0, and
+    // PinDriver leaves IO_MUX alone; gpio_config hands DRDY1 (40), PWDN (42)
+    // and START (44) to the GPIO matrix. Without it START floats high on the
+    // UART pull-up and the chips free-run out of phase.
     for (pin, mode) in [
         (40, sys::gpio_mode_t_GPIO_MODE_INPUT),
         (42, sys::gpio_mode_t_GPIO_MODE_OUTPUT),
+        (44, sys::gpio_mode_t_GPIO_MODE_OUTPUT),
     ] {
         let config = sys::gpio_config_t {
             pin_bit_mask: 1u64 << pin,
