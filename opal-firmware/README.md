@@ -105,6 +105,10 @@ haptics breakout on GP16 (I2C data) and GP15 (I2C clock), and the Zero's onboard
 addressable LED on GP21. Both are optional at run time — a device with neither
 attached logs the failure and runs the same.
 
+The IMU (a MinIMU-9 v6 motion gate, magnetometer powered down) is brought up on
+the XIAO motherboard's D4/D5 by `examples/imu-check.rs`, and is not yet part of
+the firmware image; see [`IMU-BRINGUP.md`](IMU-BRINGUP.md).
+
 ## Building and flashing
 
 This crate targets Xtensa and needs the esp toolchain; follow the one-time setup
@@ -125,6 +129,9 @@ Xtensa:
 ```sh
 cargo test-device
 ```
+
+The IMU's tests (`src/motion`) belong to its example instead:
+`cargo test-device --example imu-check`.
 
 The former fixed TDS model and its Xtensa SIMD checks remain in `emg-runtime` as
 historical research code, but `opal-firmware` no longer embeds or executes that model.

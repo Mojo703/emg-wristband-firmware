@@ -25,6 +25,8 @@ test-device = [
 ]
 # Battery-life test for the XIAO motherboard; see examples/battery-test/main.rs.
 battery-test = ["run", "--release", "--example", "battery-test"]
+# MinIMU-9 v6 bring-up on the XIAO's D4/D5; see examples/imu-check.rs.
+imu-check = ["run", "--example", "imu-check"]
 # The deep-sleep bench logs its wake cause over the console; the LED carries the
 # result when the console is gone.
 sleep-bench = [
