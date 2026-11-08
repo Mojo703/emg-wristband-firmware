@@ -381,6 +381,29 @@ mod tests {
         GyroscopeRange::TwoThousandDegreesPerSecond,
     ];
 
+    /// In code order, `0b0001` to `0b1000`.
+    const OUTPUT_DATA_RATES: [OutputDataRate; 8] = [
+        OutputDataRate::Hertz12Point5,
+        OutputDataRate::Hertz26,
+        OutputDataRate::Hertz52,
+        OutputDataRate::Hertz104,
+        OutputDataRate::Hertz208,
+        OutputDataRate::Hertz416,
+        OutputDataRate::Hertz833,
+        OutputDataRate::Hertz1660,
+    ];
+
+    #[test]
+    fn each_data_rate_code_doubles_the_rate() {
+        for pair in OUTPUT_DATA_RATES.windows(2) {
+            let (previous, next) = (pair[0], pair[1]);
+            assert_eq!(next.bits(), previous.bits() + 1, "{previous:?} to {next:?}");
+            // The datasheet's rates are rounded, so the doubling is only close.
+            let ratio = next.hertz() / previous.hertz();
+            assert!((1.95..2.1).contains(&ratio), "{previous:?} to {next:?}: {ratio}");
+        }
+    }
+
     #[test]
     fn the_shipped_configuration_writes_the_datasheet_bytes() {
         // 104 Hz (0100) and ±8 g (11): 0100_1100.

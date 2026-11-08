@@ -109,6 +109,20 @@ mod tests {
     }
 
     #[test]
+    fn a_board_upside_down_flips_y_and_z() {
+        // A half turn about X.
+        let mounting = Mounting {
+            axes: [
+                SignedAxis::PositiveX,
+                SignedAxis::NegativeY,
+                SignedAxis::NegativeZ,
+            ],
+        };
+        assert_eq!(mounting.to_band([1.0, 2.0, 3.0]), [1.0, -2.0, -3.0]);
+        assert!(mounting.uses_each_axis_once());
+    }
+
+    #[test]
     fn a_repeated_axis_is_rejected() {
         let mounting = Mounting {
             axes: [
