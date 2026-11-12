@@ -60,3 +60,15 @@ CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
 # subscribes itself to the task watchdog and feeds it every pass (src/main.rs);
 # the boot log's reset reason then names the hang.
 CONFIG_ESP_TASK_WDT_PANIC=y
+
+# The XIAO ESP32-S3's 8 MB octal PSRAM holds calibration rows and nothing else:
+# with caps allocation, only a request for MALLOC_CAP_SPIRAM lands there, so
+# every other allocation and the acquisition path stay in internal RAM. A board
+# without PSRAM still boots; calibration then reports that it has no memory.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_CAPS_ALLOC=y
+CONFIG_SPIRAM_IGNORE_NOTFOUND=y
+# The boot-time PSRAM test costs about 440 ms on every boot and every wake.
+CONFIG_SPIRAM_MEMTEST=n

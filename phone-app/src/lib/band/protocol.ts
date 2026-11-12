@@ -9,13 +9,19 @@
 // status u16, and the lowest free stack u16 per task in MONITORED_TASKS order.
 // Lead-off snapshot: version, frames per chip u16 LE, each channel's excitation
 // tone amplitude in microvolts (u32 LE, 16 of them), then each channel's percent
-// of frames at a rail (16 bytes).
+// of frames at a rail (16 bytes). Calibration command: 1 begin, 2 then a class
+// index for a cue start, 3 cue end, 4 fit, 5 save, 6 cancel. Calibration
+// status: version, phase, progress percent, failure, class count C, then rows
+// per class (u16 LE, C of them) and accuracy percent per class (C bytes, 255
+// before a fit).
 
 export const SERVICE_UUID = '5c3e7a10-2f4b-4d8e-9b61-0f1e2d3c4c00';
 export const SETTINGS_UUID = '5c3e7a10-2f4b-4d8e-9b61-0f1e2d3c4c01';
 export const GESTURE_UUID = '5c3e7a10-2f4b-4d8e-9b61-0f1e2d3c4c02';
 export const HEALTH_UUID = '5c3e7a10-2f4b-4d8e-9b61-0f1e2d3c4c04';
 export const LEAD_OFF_UUID = '5c3e7a10-2f4b-4d8e-9b61-0f1e2d3c4c05';
+export const CALIBRATION_COMMAND_UUID = '5c3e7a10-2f4b-4d8e-9b61-0f1e2d3c4c06';
+export const CALIBRATION_STATUS_UUID = '5c3e7a10-2f4b-4d8e-9b61-0f1e2d3c4c07';
 
 const LEAD_OFF_VERSION = 2;
 const LEAD_OFF_CHANNELS = 16;
@@ -202,5 +208,98 @@ export function decodeHealth(view: DataView): BandHealth {
     bootCount: view.getUint32(4, true),
     current: decodeRun(view, HEALTH_HEADER),
     previous: hasPrevious ? decodeRun(view, HEALTH_HEADER + RUN_HEALTH_LENGTH) : null,
+  };
+}
+
+/** The band's calibration classes: the two command gestures, then everything
+ * else. */
+export const CALIBRATION_CLASS_LABELS = ['Tip forward', 'Tip back', 'Other movement'] as const;
+export const CALIBRATION_NEGATIVE_CLASS = 2;
+export const ACCURACY_NOT_MEASURED = 255;
+
+export type CalibrationCommand =
+  | { readonly kind: 'begin' }
+  | { readonly kind: 'cueStart'; readonly calibrationClass: number }
+  | { readonly kind: 'cueEnd' }
+  | { readonly kind: 'fit' }
+  | { readonly kind: 'save' }
+  | { readonly kind: 'cancel' };
+
+export function encodeCalibrationCommand(command: CalibrationCommand): Uint8Array {
+  switch (command.kind) {
+    case 'begin':
+      return new Uint8Array([1]);
+    case 'cueStart':
+      return new Uint8Array([2, command.calibrationClass]);
+    case 'cueEnd':
+      return new Uint8Array([3]);
+    case 'fit':
+      return new Uint8Array([4]);
+    case 'save':
+      return new Uint8Array([5]);
+    case 'cancel':
+      return new Uint8Array([6]);
+  }
+}
+
+export const CALIBRATION_PHASES = [
+  'idle',
+  'settling',
+  'collecting',
+  'fitting',
+  'fitted',
+  'saved',
+  'failed',
+] as const;
+export type CalibrationPhase = (typeof CALIBRATION_PHASES)[number];
+
+export const CALIBRATION_FAILURES = [
+  'none',
+  'tooFewRows',
+  'noFrontEnd',
+  'noMemory',
+  'fitFailed',
+  'saveFailed',
+  'outOfOrder',
+] as const;
+export type CalibrationFailure = (typeof CALIBRATION_FAILURES)[number];
+
+export interface CalibrationStatus {
+  readonly phase: CalibrationPhase;
+  readonly progressPercent: number;
+  readonly failure: CalibrationFailure;
+  readonly rows: readonly number[];
+  /** Percent of each class's own rows the model gets right; `null` before a fit. */
+  readonly accuracyPercent: readonly (number | null)[];
+}
+
+const CALIBRATION_STATUS_VERSION = 1;
+const CALIBRATION_STATUS_HEADER = 5;
+
+export function decodeCalibrationStatus(view: DataView): CalibrationStatus {
+  if (view.byteLength < CALIBRATION_STATUS_HEADER) {
+    throw new Error(`calibration status is ${view.byteLength} bytes`);
+  }
+  const version = view.getUint8(0);
+  if (version !== CALIBRATION_STATUS_VERSION) {
+    throw new Error(`calibration status version ${version} is not ${CALIBRATION_STATUS_VERSION}`);
+  }
+  const classes = view.getUint8(4);
+  if (view.byteLength < CALIBRATION_STATUS_HEADER + 3 * classes) {
+    throw new Error(`calibration status is ${view.byteLength} bytes for ${classes} classes`);
+  }
+  const rows: number[] = [];
+  const accuracyPercent: (number | null)[] = [];
+  for (let index = 0; index < classes; index += 1) {
+    rows.push(view.getUint16(CALIBRATION_STATUS_HEADER + 2 * index, true));
+    const accuracy = view.getUint8(CALIBRATION_STATUS_HEADER + 2 * classes + index);
+    accuracyPercent.push(accuracy === ACCURACY_NOT_MEASURED ? null : accuracy);
+  }
+  return {
+    phase: CALIBRATION_PHASES[view.getUint8(1)] ?? 'failed',
+    progressPercent: view.getUint8(2),
+    failure: CALIBRATION_FAILURES[view.getUint8(3)] ?? 'none',
+    rows,
+    accuracyPercent,
   };
 }

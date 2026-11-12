@@ -203,6 +203,7 @@ impl Biquad {
 const INTERLEAVED_LANES: usize = 4;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
 pub enum FilterLayout {
     #[default]
     ChannelMajor,
@@ -336,6 +337,56 @@ impl BandFeaturePipeline {
             sub_window_position: 0,
             sub_window_index: 0,
         }
+    }
+
+    /// [`Self::new`], built on the heap directly. The pipeline is about 8 KB,
+    /// and a device task stack has no room for it as a temporary.
+    pub fn new_boxed(
+        microvolts_per_count: f32,
+        reference_gains: [f32; CHANNEL_COUNT],
+    ) -> alloc::boxed::Box<Self> {
+        // SAFETY: every field is f32s, integers, or `FilterLayout`, whose zero
+        // discriminant is `ChannelMajor`, so all-zero bits are a valid value;
+        // `reset` then overwrites every field.
+        let mut pipeline = unsafe { alloc::boxed::Box::<Self>::new_zeroed().assume_init() };
+        pipeline.reset(microvolts_per_count, reference_gains);
+        pipeline
+    }
+
+    /// Return to the state [`Self::new`] builds, at `reference_gains`, in place.
+    pub fn reset(&mut self, microvolts_per_count: f32, reference_gains: [f32; CHANNEL_COUNT]) {
+        self.microvolts_per_count = microvolts_per_count;
+        self.reference_gains = reference_gains;
+        for (biquad, bits) in self.notch.iter_mut().zip(NOTCH_BITS) {
+            *biquad = Biquad::from_bits(bits);
+        }
+        for (sections, bits) in self.band.iter_mut().zip(BAND_BITS) {
+            for (biquad, section) in sections.iter_mut().zip(bits) {
+                *biquad = Biquad::from_bits(section);
+            }
+        }
+        for state in self.notch_state.iter_mut().flatten() {
+            *state = [0.0; 2];
+        }
+        for state in self.band_state.iter_mut().flatten().flatten() {
+            *state = [0.0; 2];
+        }
+        self.filter_layout = FilterLayout::default();
+        self.notch_states.fill(ChannelStates::ZERO);
+        for sections in self.band_states.iter_mut() {
+            sections.fill(ChannelStates::ZERO);
+        }
+        for row in self.power.iter_mut().chain(self.log_total.iter_mut()) {
+            row.fill(0.0);
+        }
+        for quarter in self.quarter_logs.iter_mut() {
+            for row in quarter.iter_mut() {
+                row.fill(0.0);
+            }
+        }
+        self.quarters_closed = 0;
+        self.sub_window_position = 0;
+        self.sub_window_index = 0;
     }
 
     /// Push one 16-channel sample of raw wire counts; returns the 64 features
@@ -1459,5 +1510,33 @@ mod tests {
         }
         assert_eq!(windows, 1200);
         std::println!("600k samples, {windows} windows, largest feature magnitude {extreme}");
+    }
+
+    #[test]
+    fn a_boxed_or_reset_pipeline_matches_a_new_one() {
+        let gains = core::array::from_fn(|slot| 0.75 + slot as f32 / 64.0);
+        let mut fresh = BandFeaturePipeline::new(0.5, gains);
+        let mut boxed = BandFeaturePipeline::new_boxed(0.5, gains);
+        let mut reset = BandFeaturePipeline::new(2.0, [0.0; CHANNEL_COUNT]);
+        let sample = |index: usize| {
+            core::array::from_fn(|slot| ((index * 37 + slot * 101) % 4001) as i16 - 2000)
+        };
+        for index in 0..700 {
+            reset.push(&sample(index));
+        }
+        reset.reset(0.5, gains);
+        for index in 0..3 * WINDOW_SAMPLES {
+            let expected = fresh.push(&sample(index));
+            assert_eq!(
+                boxed.push(&sample(index)),
+                expected,
+                "boxed, sample {index}"
+            );
+            assert_eq!(
+                reset.push(&sample(index)),
+                expected,
+                "reset, sample {index}"
+            );
+        }
     }
 }

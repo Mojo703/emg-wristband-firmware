@@ -24,7 +24,10 @@ use crate::emg_stream::{self, WindowRecord};
 use crate::hid;
 use crate::link_bench::{self, BenchCommand, ConnectionParameters, LinkStatus, MediaOutcome, Phy};
 use crate::phone::{EncryptedLinks, Peer, Radio, LINK_CAPACITY};
-use crate::settings_service::{self, BandHealth, BandSettings, GestureEvent, LeadOffSnapshot};
+use crate::settings_service::{
+    self, BandHealth, BandSettings, CalibrationCommand, CalibrationStatus, GestureEvent,
+    LeadOffSnapshot,
+};
 
 /// Disconnects since boot in the high half, saturating, and the last one's
 /// NimBLE status in the low half: one word, so a reader never sees a count
@@ -425,7 +428,17 @@ pub struct SettingsService {
     gesture: Arc<Mutex<BLECharacteristic>>,
     health: Arc<Mutex<BLECharacteristic>>,
     lead_off: Arc<Mutex<BLECharacteristic>>,
+    calibration_status: Arc<Mutex<BLECharacteristic>>,
     emg: EmgStream,
+}
+
+/// A calibration command and when it arrived, in `esp_timer` microseconds: the
+/// clock acquisition stamps windows with, so a cue edge and a window compare
+/// directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimedCalibrationCommand {
+    pub command: CalibrationCommand,
+    pub received_at_us: u64,
 }
 
 const NO_SUBSCRIBER: u32 = u32::MAX;
@@ -451,12 +464,15 @@ impl NimbleRadio {
     /// [`SettingsService::publish_settings`] with what it kept. Any write to the
     /// lead-off characteristic is a snapshot request, handed to
     /// `lead_off_requests`; the owner answers with
-    /// [`SettingsService::publish_lead_off`].
+    /// [`SettingsService::publish_lead_off`]. A well-formed calibration
+    /// command goes to `calibration_commands` stamped with its arrival time;
+    /// the owner reports through [`SettingsService::publish_calibration`].
     pub fn attach_settings_service(
         &mut self,
         current: &BandSettings,
         writes: SyncSender<BandSettings>,
         lead_off_requests: SyncSender<()>,
+        calibration_commands: SyncSender<TimedCalibrationCommand>,
     ) -> Result<SettingsService> {
         let server = self
             .server
@@ -481,6 +497,36 @@ impl NimbleRadio {
             uuid(settings_service::LEAD_OFF_UUID),
             NimbleProperties::READ | NimbleProperties::WRITE | NimbleProperties::NOTIFY,
         );
+        let calibration_command = service.lock().create_characteristic(
+            uuid(settings_service::CALIBRATION_COMMAND_UUID),
+            NimbleProperties::WRITE,
+        );
+        let calibration_status = service.lock().create_characteristic(
+            uuid(settings_service::CALIBRATION_STATUS_UUID),
+            NimbleProperties::READ | NimbleProperties::NOTIFY,
+        );
+        calibration_status
+            .lock()
+            .set_value(&CalibrationStatus::default().encode());
+        calibration_command.lock().on_write(move |args| {
+            // SAFETY: reads the monotonic timer; no preconditions.
+            let received_at_us = unsafe { sys::esp_timer_get_time() } as u64;
+            match CalibrationCommand::parse(args.recv_data()) {
+                Ok(command) => {
+                    let timed = TimedCalibrationCommand {
+                        command,
+                        received_at_us,
+                    };
+                    if calibration_commands.try_send(timed).is_err() {
+                        warn!("calibration commands backed up; {command:?} dropped");
+                    }
+                }
+                Err(err) => {
+                    warn!("calibration command refused: {err}");
+                    args.reject();
+                }
+            }
+        });
         settings.lock().set_value(&current.encode());
         lead_off.lock().on_write(move |_args| {
             if let Err(TrySendError::Full(())) = lead_off_requests.try_send(()) {
@@ -524,6 +570,7 @@ impl NimbleRadio {
             gesture,
             health,
             lead_off,
+            calibration_status,
             emg: EmgStream {
                 subscriber,
                 value_handle: Arc::new(AtomicU32::new(UNRESOLVED_HANDLE)),
@@ -566,6 +613,13 @@ impl SettingsService {
     /// Store a lead-off snapshot and tell subscribers.
     pub fn publish_lead_off(&self, snapshot: &LeadOffSnapshot) {
         self.lead_off.lock().set_value(&snapshot.encode()).notify();
+    }
+
+    pub fn publish_calibration(&self, status: &CalibrationStatus) {
+        self.calibration_status
+            .lock()
+            .set_value(&status.encode())
+            .notify();
     }
 
     pub fn emg_stream(&self) -> EmgStream {

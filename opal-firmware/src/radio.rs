@@ -10,10 +10,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ble_media::emg_stream::WindowRecord;
-use ble_media::nimble::{EmgStream, NimbleRadio, SettingsService};
+use ble_media::nimble::{EmgStream, NimbleRadio, SettingsService, TimedCalibrationCommand};
 use ble_media::phone::{Delivery, Phone, RadioClaim};
 use ble_media::session::SESSION_TICK;
-use ble_media::settings_service::{BandHealth, BandSettings, GestureEvent, LeadOffSnapshot};
+use ble_media::settings_service::{
+    BandHealth, BandSettings, CalibrationStatus, GestureEvent, LeadOffSnapshot,
+};
 use esp_idf_svc::hal::delay::FreeRtos;
 use feedback_vocabulary::Phone as FeedbackPhone;
 use log::{error, info, warn};
@@ -27,6 +29,9 @@ use crate::health;
 const BLE_THREAD_STACK_BYTES: usize = 8192;
 const COMMIT_CAPACITY: usize = 8;
 const SETTINGS_WRITE_CAPACITY: usize = 4;
+/// A cue start and its end, several times over: the serve loop drains these
+/// every pass, so this only has to cover a fit or a slow window.
+const CALIBRATION_COMMAND_CAPACITY: usize = 16;
 const EMG_SEND_THREAD_STACK_BYTES: usize = 6144;
 const UNDELIVERED_LOG_INTERVAL: u32 = 20;
 /// About once a second at the session tick.
@@ -43,12 +48,14 @@ enum Outbound {
     Settings(BandSettings),
     Health(BandHealth),
     LeadOff(LeadOffSnapshot),
+    Calibration(CalibrationStatus),
 }
 
 pub(crate) struct PhoneLink {
     outbound: Handoff<Outbound>,
     settings_writes: Receiver<BandSettings>,
     lead_off_requests: Receiver<()>,
+    calibration_commands: Receiver<TimedCalibrationCommand>,
     states: Receiver<PhoneStatus>,
     status: PhoneStatus,
     emg: EmgStream,
@@ -61,6 +68,8 @@ impl PhoneLink {
     pub(crate) fn start(device_name: &str, current: &BandSettings) -> Option<Self> {
         let (writes, settings_writes) = mpsc::sync_channel(SETTINGS_WRITE_CAPACITY);
         let (lead_off_request_sender, lead_off_requests) = mpsc::sync_channel(1);
+        let (calibration_command_sender, calibration_commands) =
+            mpsc::sync_channel(CALIBRATION_COMMAND_CAPACITY);
         let mut radio = match NimbleRadio::bring_up(device_name) {
             Ok(radio) => radio,
             Err(error) => {
@@ -68,8 +77,12 @@ impl PhoneLink {
                 return None;
             }
         };
-        let service = match radio.attach_settings_service(current, writes, lead_off_request_sender)
-        {
+        let service = match radio.attach_settings_service(
+            current,
+            writes,
+            lead_off_request_sender,
+            calibration_command_sender,
+        ) {
             Ok(service) => service,
             Err(error) => {
                 error!("settings service refused: {error:#}");
@@ -102,6 +115,7 @@ impl PhoneLink {
             outbound,
             settings_writes,
             lead_off_requests,
+            calibration_commands,
             states,
             status: PhoneStatus::Dormant,
             emg,
@@ -143,6 +157,14 @@ impl PhoneLink {
 
     pub(crate) fn publish_lead_off(&self, snapshot: LeadOffSnapshot) {
         self.send(Outbound::LeadOff(snapshot));
+    }
+
+    pub(crate) fn take_calibration_command(&self) -> Option<TimedCalibrationCommand> {
+        self.calibration_commands.try_recv().ok()
+    }
+
+    pub(crate) fn publish_calibration(&self, status: CalibrationStatus) {
+        self.send(Outbound::Calibration(status));
     }
 
     pub(crate) fn feedback_phone(&mut self) -> FeedbackPhone {
@@ -294,6 +316,7 @@ fn run(
                 Some(Outbound::Settings(settings)) => service.publish_settings(&settings),
                 Some(Outbound::Health(health)) => service.publish_health(&health),
                 Some(Outbound::LeadOff(snapshot)) => service.publish_lead_off(&snapshot),
+                Some(Outbound::Calibration(status)) => service.publish_calibration(&status),
                 None => break,
             }
         }

@@ -63,10 +63,13 @@ pub struct HeapSnapshot {
 
 pub fn heap_snapshot() -> HeapSnapshot {
     HeapSnapshot {
-        free_bytes: unsafe { esp_idf_svc::sys::esp_get_free_heap_size() },
+        free_bytes: unsafe {
+            esp_idf_svc::sys::heap_caps_get_free_size(esp_idf_svc::sys::MALLOC_CAP_INTERNAL)
+        } as u32,
         largest_free_block_bytes: unsafe {
-            esp_idf_svc::sys::heap_caps_get_largest_free_block(esp_idf_svc::sys::MALLOC_CAP_8BIT)
-                as u32
+            esp_idf_svc::sys::heap_caps_get_largest_free_block(
+                esp_idf_svc::sys::MALLOC_CAP_INTERNAL | esp_idf_svc::sys::MALLOC_CAP_8BIT,
+            ) as u32
         },
     }
 }

@@ -1,17 +1,23 @@
 // The band over Web Bluetooth: its settings record and gesture notifications.
 
 import {
+  CALIBRATION_COMMAND_UUID,
+  CALIBRATION_STATUS_UUID,
   GESTURE_UUID,
   HEALTH_UUID,
   LEAD_OFF_UUID,
   SERVICE_UUID,
   SETTINGS_UUID,
+  decodeCalibrationStatus,
   decodeGestureEvent,
   decodeHealth,
   decodeLeadOffSnapshot,
   decodeSettings,
+  encodeCalibrationCommand,
   encodeSettings,
   type BandHealth,
+  type CalibrationCommand,
+  type CalibrationStatus,
   type BandSettings,
   type GestureEvent,
   type LeadOffSnapshot,
@@ -22,6 +28,7 @@ export type BandEvent =
   | { readonly kind: 'settings'; readonly settings: BandSettings }
   | { readonly kind: 'gesture'; readonly event: GestureEvent }
   | { readonly kind: 'leadOff'; readonly snapshot: LeadOffSnapshot }
+  | { readonly kind: 'calibration'; readonly status: CalibrationStatus }
   | { readonly kind: 'disconnected' };
 
 export function bluetoothAvailable(): boolean {
@@ -34,6 +41,8 @@ export class Band {
   #emg: BluetoothRemoteGATTCharacteristic | null = null;
   #health: BluetoothRemoteGATTCharacteristic | null = null;
   #leadOff: BluetoothRemoteGATTCharacteristic | null = null;
+  #calibrationCommand: BluetoothRemoteGATTCharacteristic | null = null;
+  #calibrationStatus: BluetoothRemoteGATTCharacteristic | null = null;
   #assembler = new WindowAssembler();
   #onWindow: ((window: EmgWindow, arrivedAt: number) => void) | null = null;
   #listeners = new Set<(event: BandEvent) => void>();
@@ -75,6 +84,16 @@ export class Band {
         .then((view) => this.#emit({ kind: 'leadOff', snapshot: decodeLeadOffSnapshot(view) }));
     });
     await this.#leadOff?.startNotifications();
+    this.#calibrationCommand = await service.getCharacteristic(CALIBRATION_COMMAND_UUID).catch(() => null);
+    this.#calibrationStatus = await service.getCharacteristic(CALIBRATION_STATUS_UUID).catch(() => null);
+    this.#calibrationStatus?.addEventListener('characteristicvaluechanged', (event) => {
+      const view = valueOf(event);
+      if (view !== null) this.#emit({ kind: 'calibration', status: decodeCalibrationStatus(view) });
+    });
+    await this.#calibrationStatus?.startNotifications();
+    if (this.#calibrationStatus !== null) {
+      this.#emit({ kind: 'calibration', status: decodeCalibrationStatus(await this.#calibrationStatus.readValue()) });
+    }
     this.#emg?.addEventListener('characteristicvaluechanged', (event) => {
       const view = valueOf(event);
       if (view === null || this.#onWindow === null) return;
@@ -125,6 +144,16 @@ export class Band {
     const characteristic = this.#health;
     if (characteristic === null) throw new Error('this band firmware has no health record');
     return decodeHealth(await characteristic.readValue());
+  }
+
+  get calibrates(): boolean {
+    return this.#calibrationCommand !== null;
+  }
+
+  async sendCalibration(command: CalibrationCommand): Promise<void> {
+    const characteristic = this.#calibrationCommand;
+    if (characteristic === null) throw new Error('this band firmware does not calibrate');
+    await characteristic.writeValueWithResponse(encodeCalibrationCommand(command) as BufferSource);
   }
 
   get takesLeadOffSnapshots(): boolean {

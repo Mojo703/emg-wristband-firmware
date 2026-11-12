@@ -9,6 +9,7 @@
 
 mod adc;
 mod allocation;
+mod calibration;
 mod config;
 mod cores;
 mod features;
@@ -16,12 +17,16 @@ mod feedback;
 mod handoff;
 mod health;
 mod power;
+mod psram;
 mod radio;
 mod resident;
 mod telemetry;
+mod wearer_model;
 
 use adc::acquisition::{AcquiredWindow, AdcSource};
 use adc::Channel;
+use ble_media::settings_service::{CalibrationCommand, CalibrationFailure, CalibrationStatus};
+use calibration::Calibration;
 use calibration_flow::active_gesture_from_index;
 use config::{Settings, Store};
 use emg_runtime::band_features::{FEATURE_COUNT, WINDOW_SAMPLES};
@@ -32,11 +37,12 @@ use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use features::WearerFeatures;
 use feedback::{DeviceState, Feedback, FeedbackWiring, FrontEnd};
-use feedback_vocabulary::{ActiveLink, Phone as FeedbackPhone};
+use feedback_vocabulary::{ActiveLink, Calibrating, Phone as FeedbackPhone};
 use log::{error, info, warn};
 use protocol::{MediaKey, WakeState};
 use radio::{Commit, EmgSender, OutboundWindow, PhoneLink};
 use std::time::Instant;
+use wearer_model::{WearerModel, WearerModelStore};
 
 const DEVICE_NAME: &str = "EMG Wristband";
 
@@ -113,6 +119,12 @@ struct App {
     committed: Option<u8>,
     recording: Recording,
     emg_sender: Option<EmgSender>,
+    wearer_models: Option<WearerModelStore>,
+    calibration: Option<Box<Calibration>>,
+    published_calibration: Option<CalibrationStatus>,
+    /// Set for one feedback observation after a save, so the light plays the
+    /// calibration-complete cue.
+    calibration_just_saved: bool,
 }
 
 #[derive(Default)]
@@ -150,7 +162,15 @@ impl App {
         );
         let health = health::Health::boot();
 
-        let store = Store::open(EspDefaultNvsPartition::take()?)?;
+        let nvs = EspDefaultNvsPartition::take()?;
+        let store = Store::open(nvs.clone())?;
+        let wearer_models = match WearerModelStore::open(nvs) {
+            Ok(models) => Some(models),
+            Err(error) => {
+                error!("wearer model store unavailable: {error:#}");
+                None
+            }
+        };
         let settings = store.load();
 
         // The LED before NimBLE, so a wake press is answered ~100 ms after reset
@@ -173,26 +193,7 @@ impl App {
             acquisition_buffers.reserved_bytes()
         );
 
-        let classifier = match resident::load() {
-            Ok(Some(resident)) => {
-                info!(
-                    "resident calibration: slot {} sequence {}",
-                    resident.slot, resident.sequence
-                );
-                Some(Box::new(Classifier {
-                    model: resident.model,
-                    features: WearerFeatures::new(resident.gains),
-                }))
-            }
-            Ok(None) => {
-                warn!("no resident calibration; gestures will not be classified");
-                None
-            }
-            Err(error) => {
-                error!("resident calibration unusable: {error:#}");
-                None
-            }
-        };
+        let classifier = load_classifier(wearer_models.as_ref());
         let heap = allocation::heap_snapshot();
         info!(
             "boot allocations done: heap {} free, largest block {}",
@@ -322,6 +323,10 @@ impl App {
             committed: None,
             recording: Recording::default(),
             emg_sender,
+            wearer_models,
+            calibration: None,
+            published_calibration: None,
+            calibration_just_saved: false,
         }))
     }
 
@@ -333,6 +338,7 @@ impl App {
             }
             self.apply_settings_writes();
             self.relay_lead_off();
+            self.handle_calibration();
             if let (Some(record), Some(phone)) = (self.health.update(), self.phone.as_ref()) {
                 phone.publish_health(record);
             }
@@ -405,6 +411,13 @@ impl App {
             any_missing: missing.iter().any(|&bits| bits != 0),
             recoveries: self.source.as_ref().map_or(0, AdcSource::recoveries),
         });
+        if let Some(calibration) = self.calibration.as_mut() {
+            calibration.push_window(&packed_wire, first_step_us, now_microseconds());
+            self.forward_window(packed_wire, missing, first_step_us);
+            self.publish_calibration_status();
+            self.publish_feedback_state();
+            return;
+        }
         let features = self
             .classifier
             .as_mut()
@@ -545,9 +558,213 @@ impl App {
             link: ActiveLink::None,
             committed,
             config_generation: self.config_generation,
-            calibration: None,
+            calibration: self.feedback_calibration(),
             phone,
         });
+        self.calibration_just_saved = false;
+    }
+
+    /// The session as the light's vocabulary knows calibration: settling,
+    /// rounds while collecting, install while fitting, complete once saved.
+    fn feedback_calibration(&self) -> Option<Calibrating> {
+        use ble_media::settings_service::CalibrationPhase as Session;
+        use protocol::CalibrationPhase as Shown;
+        let shown = if self.calibration_just_saved {
+            Shown::Complete
+        } else {
+            match self.calibration.as_ref()?.phase() {
+                Session::Settling => Shown::Settling,
+                Session::Collecting => Shown::ThumbUpRounds,
+                Session::Fitting | Session::Fitted => Shown::Install,
+                Session::Idle | Session::Saved | Session::Failed => return None,
+            }
+        };
+        Some(Calibrating {
+            phase: shown,
+            prompt: None,
+            prompt_generation: 0,
+            notice: None,
+            notice_generation: 0,
+        })
+    }
+
+    fn handle_calibration(&mut self) {
+        while let Some(timed) = self
+            .phone
+            .as_ref()
+            .and_then(PhoneLink::take_calibration_command)
+        {
+            info!("calibration command {:?}", timed.command);
+            match timed.command {
+                CalibrationCommand::Begin => self.begin_calibration(),
+                CalibrationCommand::CueStart { class } => {
+                    if let Some(calibration) = self.calibration.as_mut() {
+                        calibration.cue_start(class, timed.received_at_us);
+                    }
+                }
+                CalibrationCommand::CueEnd => {
+                    if let Some(calibration) = self.calibration.as_mut() {
+                        calibration.cue_end(timed.received_at_us);
+                    }
+                }
+                CalibrationCommand::Fit => self.fit_calibration(),
+                CalibrationCommand::Save => self.save_calibration(),
+                CalibrationCommand::Cancel => self.cancel_calibration(),
+            }
+        }
+        if let Some(calibration) = self.calibration.as_mut() {
+            calibration.label_settled(now_microseconds());
+        }
+        self.publish_calibration_status();
+    }
+
+    fn begin_calibration(&mut self) {
+        self.calibration = None;
+        if self.source.is_none() || self.front_end != FrontEnd::Running {
+            self.report_calibration_failure(CalibrationFailure::NoFrontEnd);
+            return;
+        }
+        // The running model's window buffer goes first, so the session's can
+        // take its place.
+        self.classifier = None;
+        self.committed = None;
+        self.pipeline.reset();
+        match Calibration::begin(WINDOW_PERIOD.as_micros() as u64) {
+            Ok(session) => self.calibration = Some(session),
+            Err(failure) => {
+                self.classifier = load_classifier(self.wearer_models.as_ref());
+                self.report_calibration_failure(failure);
+            }
+        }
+    }
+
+    fn fit_calibration(&mut self) {
+        let Some(mut session) = self.calibration.take() else {
+            self.report_calibration_failure(CalibrationFailure::OutOfOrder);
+            return;
+        };
+        let phone = self.phone.as_ref();
+        session.fit(|pass, status| {
+            // SAFETY: feeds the task watchdog for the current task only.
+            unsafe {
+                esp_idf_svc::sys::esp_task_wdt_reset();
+            }
+            if pass % FIT_PROGRESS_PASSES == 0 {
+                if let Some(phone) = phone {
+                    phone.publish_calibration(*status);
+                }
+            }
+            // Lets the radio and the idle task run between passes.
+            FreeRtos::delay_ms(1);
+        });
+        self.calibration = Some(session);
+        self.pipeline.reset();
+    }
+
+    fn save_calibration(&mut self) {
+        let Some(session) = self.calibration.as_mut() else {
+            self.report_calibration_failure(CalibrationFailure::OutOfOrder);
+            return;
+        };
+        let Some((model, gains)) = session.take_fitted() else {
+            session.fail(CalibrationFailure::OutOfOrder);
+            return;
+        };
+        let wearer = WearerModel { model, gains };
+        let saved = self.wearer_models.as_ref().map(|store| store.save(&wearer));
+        match saved {
+            Some(Ok(())) => {
+                session.mark_saved();
+                self.publish_calibration_status();
+                self.calibration = None;
+                info!("calibration saved; the wearer's model runs from now on");
+                self.classifier = Some(Box::new(Classifier {
+                    features: WearerFeatures::new(wearer.gains),
+                    model: wearer.model,
+                }));
+                self.committed = None;
+                self.pipeline.reset();
+                self.calibration_just_saved = true;
+            }
+            Some(Err(error)) => {
+                error!("calibration save failed: {error:#}");
+                session.fail(CalibrationFailure::SaveFailed);
+            }
+            None => session.fail(CalibrationFailure::SaveFailed),
+        }
+    }
+
+    fn cancel_calibration(&mut self) {
+        if self.calibration.take().is_some() {
+            info!("calibration cancelled");
+            self.classifier = load_classifier(self.wearer_models.as_ref());
+        }
+        self.publish_status(CalibrationStatus::default());
+    }
+
+    fn report_calibration_failure(&mut self, failure: CalibrationFailure) {
+        warn!("calibration refused: {failure:?}");
+        self.publish_status(CalibrationStatus {
+            phase: ble_media::settings_service::CalibrationPhase::Failed,
+            failure,
+            ..CalibrationStatus::default()
+        });
+    }
+
+    fn publish_calibration_status(&mut self) {
+        if let Some(status) = self.calibration.as_ref().map(|session| session.status()) {
+            self.publish_status(status);
+        }
+    }
+
+    fn publish_status(&mut self, status: CalibrationStatus) {
+        if self.published_calibration == Some(status) {
+            return;
+        }
+        if let Some(phone) = self.phone.as_ref() {
+            phone.publish_calibration(status);
+        }
+        self.published_calibration = Some(status);
+    }
+}
+
+/// Passes between progress reports while fitting.
+const FIT_PROGRESS_PASSES: usize = 10;
+
+fn now_microseconds() -> u64 {
+    // SAFETY: reads the monotonic timer; no preconditions.
+    unsafe { esp_idf_svc::sys::esp_timer_get_time() as u64 }
+}
+
+/// The wearer's model fitted on the band, or else a resident model from the
+/// training partition, or nothing.
+fn load_classifier(wearer_models: Option<&WearerModelStore>) -> Option<Box<Classifier>> {
+    if let Some(wearer) = wearer_models.and_then(WearerModelStore::load) {
+        info!("wearer model loaded from NVS");
+        return Some(Box::new(Classifier {
+            features: WearerFeatures::new(wearer.gains),
+            model: wearer.model,
+        }));
+    }
+    match resident::load() {
+        Ok(Some(resident)) => {
+            info!(
+                "resident calibration: slot {} sequence {}",
+                resident.slot, resident.sequence
+            );
+            Some(Box::new(Classifier {
+                model: resident.model,
+                features: WearerFeatures::new(resident.gains),
+            }))
+        }
+        Ok(None) => {
+            warn!("no calibration; gestures will not be classified");
+            None
+        }
+        Err(error) => {
+            error!("resident calibration unusable: {error:#}");
+            None
+        }
     }
 }
 

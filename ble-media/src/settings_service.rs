@@ -21,6 +21,25 @@
 //! bytes 3-4   media usage sent (u16 LE)
 //! ```
 //!
+//! Calibration command, written with response. One byte of command, and a
+//! class index after a cue start:
+//!
+//! ```text
+//! 1 begin   2 class: cue start   3 cue end   4 fit   5 save   6 cancel
+//! ```
+//!
+//! Calibration status, read and notified on change (CALIBRATION_STATUS_LEN):
+//!
+//! ```text
+//! byte 0      version (CALIBRATION_STATUS_VERSION)
+//! byte 1      phase (CalibrationPhase)
+//! byte 2      progress percent
+//! byte 3      failure (CalibrationFailure)
+//! byte 4      class count C: the command gestures, then the negative class
+//! C x 2 bytes rows labeled per class (u16 LE)
+//! C bytes     accuracy on the class's own rows, percent; 255 before a fit
+//! ```
+//!
 //! Health record, read on demand. It carries this run and, when RTC memory
 //! survived the reset, the run before it, so a reboot says why it happened:
 //!
@@ -63,6 +82,16 @@ pub const SETTINGS_UUID: &str = "5c3e7a10-2f4b-4d8e-9b61-0f1e2d3c4c01";
 pub const GESTURE_UUID: &str = "5c3e7a10-2f4b-4d8e-9b61-0f1e2d3c4c02";
 pub const HEALTH_UUID: &str = "5c3e7a10-2f4b-4d8e-9b61-0f1e2d3c4c04";
 pub const LEAD_OFF_UUID: &str = "5c3e7a10-2f4b-4d8e-9b61-0f1e2d3c4c05";
+pub const CALIBRATION_COMMAND_UUID: &str = "5c3e7a10-2f4b-4d8e-9b61-0f1e2d3c4c06";
+pub const CALIBRATION_STATUS_UUID: &str = "5c3e7a10-2f4b-4d8e-9b61-0f1e2d3c4c07";
+
+pub const CALIBRATION_STATUS_VERSION: u8 = 1;
+/// Classes a calibration status reports: the command gestures, then one
+/// negative class.
+pub const CALIBRATION_STATUS_CLASSES: usize = 3;
+pub const CALIBRATION_STATUS_LEN: usize = 5 + 3 * CALIBRATION_STATUS_CLASSES;
+/// An accuracy slot with nothing to report.
+pub const ACCURACY_NOT_MEASURED: u8 = u8::MAX;
 
 pub const LEAD_OFF_VERSION: u8 = 2;
 pub const LEAD_OFF_CHANNELS: usize = 16;
@@ -245,6 +274,7 @@ pub enum SettingsError {
     TooManyBindings(u8),
     UnknownGesture(u8),
     UnknownMediaUsage(u16),
+    BadCalibrationCommand,
 }
 
 impl core::fmt::Display for SettingsError {
@@ -261,6 +291,7 @@ impl core::fmt::Display for SettingsError {
             Self::UnknownMediaUsage(usage) => {
                 write!(formatter, "no media key has usage {usage:#06x}")
             }
+            Self::BadCalibrationCommand => write!(formatter, "not a calibration command"),
         }
     }
 }
@@ -335,6 +366,113 @@ fn media_key(usage: u16) -> Result<MediaKey, SettingsError> {
         .into_iter()
         .find(|key| key.usage() == usage)
         .ok_or(SettingsError::UnknownMediaUsage(usage))
+}
+
+/// One write to the calibration command characteristic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CalibrationCommand {
+    /// Start a session: the band estimates reference gains while the wearer
+    /// holds still, then collects rows.
+    Begin,
+    /// The cue for `class` is showing from now on.
+    CueStart {
+        class: u8,
+    },
+    /// The showing cue has ended.
+    CueEnd,
+    Fit,
+    /// Store the fitted model and run it.
+    Save,
+    /// Drop the session and go back to the stored model.
+    Cancel,
+}
+
+impl CalibrationCommand {
+    pub fn parse(bytes: &[u8]) -> Result<Self, SettingsError> {
+        match bytes {
+            [1] => Ok(Self::Begin),
+            [2, class] if usize::from(*class) < CALIBRATION_STATUS_CLASSES => {
+                Ok(Self::CueStart { class: *class })
+            }
+            [3] => Ok(Self::CueEnd),
+            [4] => Ok(Self::Fit),
+            [5] => Ok(Self::Save),
+            [6] => Ok(Self::Cancel),
+            _ => Err(SettingsError::BadCalibrationCommand),
+        }
+    }
+
+    pub fn encode(&self) -> ([u8; 2], usize) {
+        match *self {
+            Self::Begin => ([1, 0], 1),
+            Self::CueStart { class } => ([2, class], 2),
+            Self::CueEnd => ([3, 0], 1),
+            Self::Fit => ([4, 0], 1),
+            Self::Save => ([5, 0], 1),
+            Self::Cancel => ([6, 0], 1),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum CalibrationPhase {
+    #[default]
+    Idle = 0,
+    Settling = 1,
+    Collecting = 2,
+    Fitting = 3,
+    Fitted = 4,
+    Saved = 5,
+    Failed = 6,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum CalibrationFailure {
+    #[default]
+    None = 0,
+    /// A class has fewer rows than the fit needs.
+    TooFewRows = 1,
+    /// The front end is not running, so there is nothing to label.
+    NoFrontEnd = 2,
+    /// The row store could not be allocated.
+    NoMemory = 3,
+    /// The fit produced no usable model.
+    FitFailed = 4,
+    SaveFailed = 5,
+    /// A command arrived in a phase that cannot take it.
+    OutOfOrder = 6,
+}
+
+/// What the band reports about a calibration session, notified on change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CalibrationStatus {
+    pub phase: CalibrationPhase,
+    /// Through the gain estimate while settling, through the passes while
+    /// fitting.
+    pub progress_percent: u8,
+    pub failure: CalibrationFailure,
+    pub rows: [u16; CALIBRATION_STATUS_CLASSES],
+    /// The fitted model scored on its own rows, per class.
+    pub accuracy_percent: [u8; CALIBRATION_STATUS_CLASSES],
+}
+
+impl CalibrationStatus {
+    pub fn encode(&self) -> [u8; CALIBRATION_STATUS_LEN] {
+        let mut out = [0u8; CALIBRATION_STATUS_LEN];
+        out[0] = CALIBRATION_STATUS_VERSION;
+        out[1] = self.phase as u8;
+        out[2] = self.progress_percent;
+        out[3] = self.failure as u8;
+        out[4] = CALIBRATION_STATUS_CLASSES as u8;
+        for (class, rows) in self.rows.iter().enumerate() {
+            out[5 + 2 * class..7 + 2 * class].copy_from_slice(&rows.to_le_bytes());
+        }
+        let accuracy = 5 + 2 * CALIBRATION_STATUS_CLASSES;
+        out[accuracy..].copy_from_slice(&self.accuracy_percent);
+        out
+    }
 }
 
 #[cfg(test)]
@@ -495,5 +633,64 @@ mod tests {
         assert!(bytes[HEALTH_HEADER + RUN_HEALTH_LEN..]
             .iter()
             .all(|&byte| byte == 0));
+    }
+
+    #[test]
+    fn calibration_commands_round_trip() {
+        for command in [
+            CalibrationCommand::Begin,
+            CalibrationCommand::CueStart { class: 0 },
+            CalibrationCommand::CueStart { class: 2 },
+            CalibrationCommand::CueEnd,
+            CalibrationCommand::Fit,
+            CalibrationCommand::Save,
+            CalibrationCommand::Cancel,
+        ] {
+            let (bytes, length) = command.encode();
+            assert_eq!(CalibrationCommand::parse(&bytes[..length]), Ok(command));
+        }
+    }
+
+    #[test]
+    fn a_cue_for_a_class_past_the_status_is_refused() {
+        assert_eq!(
+            CalibrationCommand::parse(&[2, CALIBRATION_STATUS_CLASSES as u8]),
+            Err(SettingsError::BadCalibrationCommand)
+        );
+        assert_eq!(
+            CalibrationCommand::parse(&[]),
+            Err(SettingsError::BadCalibrationCommand)
+        );
+    }
+
+    #[test]
+    fn a_calibration_status_encodes_to_the_documented_layout() {
+        let bytes = CalibrationStatus {
+            phase: CalibrationPhase::Fitted,
+            progress_percent: 100,
+            failure: CalibrationFailure::None,
+            rows: [12, 300, 0x0102],
+            accuracy_percent: [91, 88, ACCURACY_NOT_MEASURED],
+        }
+        .encode();
+        assert_eq!(
+            bytes,
+            [
+                CALIBRATION_STATUS_VERSION,
+                4,
+                100,
+                0,
+                3,
+                12,
+                0,
+                44,
+                1,
+                2,
+                1,
+                91,
+                88,
+                255
+            ]
+        );
     }
 }

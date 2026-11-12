@@ -3,10 +3,12 @@ import test from 'node:test';
 
 import {
   STACK_NOT_MEASURED,
+  decodeCalibrationStatus,
   decodeGestureEvent,
   decodeHealth,
   decodeLeadOffSnapshot,
   decodeSettings,
+  encodeCalibrationCommand,
   encodeSettings,
   resetReasonLabel,
 } from './protocol.ts';
@@ -104,4 +106,29 @@ test('a lead-off snapshot decodes the layout ble-media writes', () => {
   assert.equal(snapshot.amplitudeMicrovolts[15], 11_456);
   assert.equal(snapshot.railedPercent[15], 37);
   assert.equal(snapshot.railedPercent.length, 16);
+});
+
+test('calibration commands encode to the bytes the band parses', () => {
+  assert.deepEqual([...encodeCalibrationCommand({ kind: 'begin' })], [1]);
+  assert.deepEqual([...encodeCalibrationCommand({ kind: 'cueStart', calibrationClass: 2 })], [2, 2]);
+  assert.deepEqual([...encodeCalibrationCommand({ kind: 'cueEnd' })], [3]);
+  assert.deepEqual([...encodeCalibrationCommand({ kind: 'fit' })], [4]);
+  assert.deepEqual([...encodeCalibrationCommand({ kind: 'save' })], [5]);
+  assert.deepEqual([...encodeCalibrationCommand({ kind: 'cancel' })], [6]);
+});
+
+test('a calibration status decodes the layout ble-media writes', () => {
+  // The bytes `a_calibration_status_encodes_to_the_documented_layout` pins.
+  const bytes = new Uint8Array([1, 4, 100, 0, 3, 12, 0, 44, 1, 2, 1, 91, 88, 255]);
+  const status = decodeCalibrationStatus(new DataView(bytes.buffer));
+  assert.equal(status.phase, 'fitted');
+  assert.equal(status.progressPercent, 100);
+  assert.equal(status.failure, 'none');
+  assert.deepEqual(status.rows, [12, 300, 0x0102]);
+  assert.deepEqual(status.accuracyPercent, [91, 88, null]);
+});
+
+test('a short or unknown calibration status is refused', () => {
+  assert.throws(() => decodeCalibrationStatus(new DataView(new Uint8Array([1, 0, 0]).buffer)));
+  assert.throws(() => decodeCalibrationStatus(new DataView(new Uint8Array([9, 0, 0, 0, 0]).buffer)));
 });
