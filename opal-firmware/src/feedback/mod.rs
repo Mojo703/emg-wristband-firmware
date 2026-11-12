@@ -1,7 +1,11 @@
-//! Telling the wearer what the device is doing, through the motor and the LED.
+//! Telling the wearer what the device is doing, through the motor and the LED, and
+//! listening to the power button.
 //!
 //! The serve loop's whole involvement is one [`Feedback::observe`] per iteration. It
 //! never decides what a buzz means, never waits for one, and never touches a bus.
+//! The power button is read here because its answer is the light: what the light
+//! shows is [`feedback_vocabulary::Indicator`]'s decision, sampled each pass, and
+//! the band goes to sleep from this thread once the vocabulary's fade has run.
 //!
 //! The thread exists because a haptic pattern runs on the chip for up to half a
 //! second. It sits on core 0 and constructs both drivers itself, since esp-idf
@@ -9,17 +13,10 @@
 //! core 1 is the ADS1298 read path; [`crate::cores`] has the map.
 //!
 //! One pass every [`TICK_MILLISECONDS`]: take the pending cue, start a pattern,
-//! notice a finished one, update the LED. A healthy pass is well under a millisecond
+//! notice a finished one, read the button, update the LED. A healthy pass is well under a millisecond
 //! (the RMT write is ~30 µs). A bus that stops answering is the one thing that
 //! stretches it — at most three transactions, each bounded by [`haptics`]'s timeout,
 //! before the motor is given up on for the boot.
-//!
-//! The indicator pulses rather than glows, once every
-//! [`HEARTBEAT_PERIOD_MILLISECONDS`], in the colour of whatever is currently true.
-//! Not for power — averaged, the difference is tenths of a milliamp against the
-//! ~1 mA the LED's controller draws regardless — but because dark between pulses is
-//! what makes a cue visible: against a lit indicator, a flash in the colour already
-//! showing is no change.
 
 mod haptics;
 mod led;
@@ -27,17 +24,18 @@ mod led;
 pub(crate) use feedback_vocabulary::{DeviceState, FrontEnd};
 
 use crate::cores;
+use crate::power::ButtonPin;
 use esp_idf_svc::hal::delay::FreeRtos;
-use esp_idf_svc::hal::gpio::{AnyIOPin, AnyOutputPin};
+use esp_idf_svc::hal::gpio::{AnyIOPin, AnyOutputPin, Gpio6};
 use esp_idf_svc::hal::i2c::I2C0;
-use feedback_vocabulary::Cue;
+use feedback_vocabulary::{Cue, Indicator, Power, PowerButton};
 use haptics::{Haptics, Playback};
-use led::{Color, IndicatorLed, Shape};
+use led::{Color, IndicatorLed};
 use log::{info, warn};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// How often the thread does its one pass.
+/// How often the thread does its one pass, always: the ready breath never stops.
 ///
 /// The indicator sets it; nothing else here needs better than tens of milliseconds.
 /// The dither only alternates between neighbouring steps (`DUTY_QUANTUM` says why),
@@ -50,20 +48,7 @@ use std::time::{Duration, Instant};
 /// `InferencePerformance` with the indicator absent before treating this as settled.
 const TICK_MILLISECONDS: u32 = 5;
 
-/// The pass rate between pulses, which is most of the time. Nothing to dither and
-/// nothing to animate then, so only the haptics poll still has an opinion.
-const IDLE_TICK_MILLISECONDS: u32 = 20;
 const STACK_CHECK_INTERVAL: Duration = Duration::from_secs(1);
-
-/// How often the device says it is alive. Dark alone is ambiguous — healthy and dead
-/// look identical — so the pulse is what makes "off" mean something. The gap is long
-/// enough that the light is furniture rather than a distraction.
-const HEARTBEAT_PERIOD_MILLISECONDS: u32 = 8000;
-
-/// The heartbeat for a state someone should do something about. The colour says what
-/// is wrong, the rate says how much it wants you, and [`DeviceState::indicator_shape`]
-/// drops the easing so it reads as an alarm.
-const ATTENTION_HEARTBEAT_PERIOD_MILLISECONDS: u32 = 500;
 
 /// How often the haptics chip is asked whether its pattern has finished. Decoupled
 /// from the tick: polling I2C at 200 Hz for something that changes every few hundred
@@ -76,7 +61,7 @@ const HAPTICS_POLL_MILLISECONDS: u32 = 20;
 /// [`cores::log_stack_headroom`] prints what was actually used.
 const THREAD_STACK_BYTES: usize = 8192;
 
-/// Which pins the two outputs are on.
+/// Which pins the two outputs and the power button are on.
 ///
 /// The authoritative pin map is the block in `main.rs`; this is how it gets here.
 pub(crate) struct FeedbackWiring {
@@ -84,6 +69,7 @@ pub(crate) struct FeedbackWiring {
     pub haptics_data: AnyIOPin<'static>,
     pub haptics_clock: AnyIOPin<'static>,
     pub indicator: AnyOutputPin<'static>,
+    pub power_button: Gpio6<'static>,
 }
 
 /// The serve loop's handle on the feedback outputs. Holds `previous` so the loop
@@ -209,7 +195,22 @@ fn run(mailbox: Arc<Mutex<Mailbox>>, wiring: FeedbackWiring) {
         haptics_data,
         haptics_clock,
         indicator,
+        power_button,
     } = wiring;
+    let mut led = match IndicatorLed::bring_up(indicator) {
+        Ok(led) => Some(led),
+        Err(error) => {
+            warn!("indicator LED unavailable ({error:#})");
+            None
+        }
+    };
+    let button = match ButtonPin::bring_up(power_button) {
+        Ok(button) => Some(button),
+        Err(error) => {
+            warn!("power button unavailable ({error:#}); the band cannot sleep this boot");
+            None
+        }
+    };
     let mut haptics = match Haptics::bring_up(bus, haptics_data, haptics_clock) {
         Ok(haptics) => Some(haptics),
         Err(error) => {
@@ -217,38 +218,25 @@ fn run(mailbox: Arc<Mutex<Mailbox>>, wiring: FeedbackWiring) {
             None
         }
     };
-    let mut indicator = match IndicatorLed::bring_up(indicator) {
-        Ok(led) => Some(led),
-        Err(error) => {
-            warn!("indicator LED unavailable ({error:#})");
-            None
-        }
-    };
     info!(
-        "feedback ready: haptics {}, indicator {}",
+        "feedback ready: haptics {}, indicator {}, power button {}",
         present(haptics.is_some()),
-        present(indicator.is_some()),
+        present(led.is_some()),
+        present(button.is_some()),
     );
-    // Past both driver installs, which is as deep as this thread goes.
+    // Past every driver install, which is as deep as this thread goes.
     cores::log_stack_headroom("feedback thread");
 
+    let started = Instant::now();
     let mut current = DeviceState::BOOTING;
-    /// A cue's light, and how far into its shape it has got.
-    struct Flash {
-        color: Color,
-        shape: Shape,
-        elapsed: u32,
-    }
-    let mut flash: Option<Flash> = None;
-    // Milliseconds, not ticks, so the tick rate can move for the dither's sake
-    // without restyling every shape.
-    let mut into_heartbeat = 0;
+    let mut indicator = Indicator::new();
+    let mut power_button = PowerButton::new();
+    let mut previous_power = power_button.power();
     let mut since_haptics_poll = 0;
     let mut was_playing = false;
-    // What the counters above advance by: how long the last pass slept.
-    let mut tick = TICK_MILLISECONDS;
     let mut stack_checked_at = Instant::now();
     loop {
+        let now = started.elapsed().as_millis() as u32;
         if stack_checked_at.elapsed() >= STACK_CHECK_INTERVAL {
             stack_checked_at = Instant::now();
             crate::health::note_stack(crate::health::Task::Feedback);
@@ -258,30 +246,19 @@ fn run(mailbox: Arc<Mutex<Mailbox>>, wiring: FeedbackWiring) {
             Err(_) => (None, None),
         };
         if let Some(state) = state {
-            // A fault should not wait out the slow cadence it arrived during.
-            if state.needs_attention() != current.needs_attention() {
-                into_heartbeat = 0;
-            }
             current = state;
         }
         if let Some(cue) = cue {
-            let response = cue.response();
-            if let (Some(steps), Some(haptics)) = (response.haptic, haptics.as_mut()) {
+            if let (Some(steps), Some(haptics)) = (cue.response().haptic, haptics.as_mut()) {
                 haptics.play(steps);
                 // Here, not at the poll below: the shortest patterns finish inside
                 // one poll interval and would have their fault flags go unread.
                 was_playing = true;
             }
-            if let Some(color) = response.flash {
-                flash = Some(Flash {
-                    color,
-                    shape: response.shape,
-                    elapsed: 0,
-                });
-            }
+            indicator.play(cue, now);
         }
 
-        since_haptics_poll += tick;
+        since_haptics_poll += TICK_MILLISECONDS;
         if since_haptics_poll >= HAPTICS_POLL_MILLISECONDS {
             since_haptics_poll = 0;
             if let Some(haptics) = haptics.as_mut() {
@@ -302,55 +279,38 @@ fn run(mailbox: Arc<Mutex<Mailbox>>, wiring: FeedbackWiring) {
             }
         }
 
-        // Dark by default. A cue owns the light for as long as its shape runs;
-        // otherwise the state pulses once per period.
-        let heartbeat_period = if current.needs_attention() {
-            ATTENTION_HEARTBEAT_PERIOD_MILLISECONDS
-        } else {
-            HEARTBEAT_PERIOD_MILLISECONDS
-        };
-        into_heartbeat = (into_heartbeat + tick) % heartbeat_period;
-        let (color, level) = match flash.take() {
-            Some(Flash {
-                color,
-                shape,
-                elapsed,
-            }) => {
-                let duration = shape.duration_milliseconds();
-                let level = shape.level(elapsed, duration);
-                let elapsed = elapsed + tick;
-                flash = (elapsed < duration).then_some(Flash {
-                    color,
-                    shape,
-                    elapsed,
-                });
-                (color, level)
-            }
-            None => {
-                let shape = current.indicator_shape();
-                let level = shape.level(into_heartbeat, shape.duration_milliseconds());
-                // Scaled in perceived units, which keeps the eased shape intact
-                // rather than flattening its dim end away.
-                let level =
-                    (level as u32 * current.indicator_peak_level() as u32 / u8::MAX as u32) as u8;
-                (current.indicator_color(), level)
-            }
-        };
-        if let Some(led) = indicator.as_mut() {
-            if let Err(error) = led.show(color, level) {
+        let pressed = button.as_ref().is_some_and(ButtonPin::is_pressed);
+        let power = power_button.sample(pressed, now);
+        if power != previous_power {
+            log_power(previous_power, power);
+            previous_power = power;
+        }
+        let light = indicator.light(&current, power, now);
+        if let Some(led) = led.as_mut() {
+            if let Err(error) = led.show(light.color, light.level) {
                 warn!("indicator write failed ({error:#})");
             }
         }
+        if power == Power::Asleep {
+            if let Some(led) = led.as_mut() {
+                // The fade ends at black, but the dither may still owe a step.
+                let _ = led.show(Color::OFF, 0);
+            }
+            if let Some(button) = button {
+                button.deep_sleep();
+            }
+        }
+        FreeRtos::delay_ms(TICK_MILLISECONDS);
+    }
+}
 
-        // Fast only while there is a fade to keep smooth; a pulse starting one idle
-        // tick late is invisible against a rise measured in seconds.
-        let pulse_running = into_heartbeat < current.indicator_shape().duration_milliseconds();
-        tick = if flash.is_some() || pulse_running {
-            TICK_MILLISECONDS
-        } else {
-            IDLE_TICK_MILLISECONDS
-        };
-        FreeRtos::delay_ms(tick);
+fn log_power(previous: Power, now: Power) {
+    match (previous, now) {
+        (_, Power::Holding { .. }) => info!("power button down"),
+        (Power::Holding { .. }, Power::Awake) => info!("power button up before the hold"),
+        (_, Power::PoweringDown { .. }) => info!("power button released after the hold; fading"),
+        (_, Power::Asleep) => info!("sleeping"),
+        _ => {}
     }
 }
 

@@ -101,12 +101,13 @@ breaking out to J11. The pin map block in `src/main.rs` is the authoritative
 wiring table.
 
 The feedback outputs sit on the pins the front end leaves free: the DRV2605L
-haptics breakout on GP16 (I2C data) and GP15 (I2C clock), and the Zero's onboard
-addressable LED on GP21. Both are optional at run time — a device with neither
+haptics breakout on GP16 (I2C data) and GP15 (I2C clock), and a WS2812B-2020 on
+GP5 (the XIAO's D4). Holding the power button on GP6 (D5) for 3 s puts the band
+into deep sleep; any press wakes it. The haptics and LED are optional at run time — a device with neither
 attached logs the failure and runs the same.
 
 The IMU (a MinIMU-9 v6 motion gate, magnetometer powered down) is brought up on
-the XIAO motherboard's D4/D5 by `examples/imu-check.rs`, and is not yet part of
+the XIAO's MTCK/MTDI back pads by `examples/imu-check.rs`, and is not yet part of
 the firmware image; see [`IMU-BRINGUP.md`](IMU-BRINGUP.md).
 
 ## Building and flashing

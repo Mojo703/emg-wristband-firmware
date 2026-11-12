@@ -6,16 +6,16 @@
 //! and the latest acceleration on the band's axes for checking the mounting. The
 //! gate only observes; nothing here acts on it.
 //!
-//! Wiring, XIAO pad to IMU pin. D4 and D5 are unused on the motherboard (pin map
-//! in `examples/battery-test/main.rs`).
+//! Wiring, XIAO pad to IMU pin. MTCK and MTDI are the XIAO's back pads; nothing on
+//! the motherboard uses them.
 //!
-//! | XIAO      | IMU                                           |
-//! |-----------|-----------------------------------------------|
-//! | 3V3       | VDD. VIN stays unconnected; never power both  |
-//! | GND       | GND                                           |
-//! | D4, GPIO5 | SDA                                           |
-//! | D5, GPIO6 | SCL                                           |
-//! | none      | SA0 floating, pulled high on the carrier      |
+//! | XIAO         | IMU                                           |
+//! |--------------|-----------------------------------------------|
+//! | 3V3          | VDD. VIN stays unconnected; never power both  |
+//! | GND          | GND                                           |
+//! | MTCK, GPIO39 | SDA                                           |
+//! | MTDI, GPIO41 | SCL                                           |
+//! | none         | SA0 floating, pulled high on the carrier      |
 //!
 //! Every setting is in `src/motion/config.rs`. Run with `cargo imu-check`; the
 //! hardware-free tests run with `cargo test-device --example imu-check`.
@@ -49,11 +49,11 @@ fn main() -> Result<()> {
 
     let config = MotionConfig::DEFAULT;
     let peripherals = Peripherals::take()?;
-    info!("=== IMU check: I2C1, SDA GPIO5 (D4), SCL GPIO6 (D5) ===");
+    info!("=== IMU check: I2C1, SDA GPIO39 (MTCK), SCL GPIO41 (MTDI) ===");
     let mut imu = motion::bring_up(
         peripherals.i2c1,
-        peripherals.pins.gpio5,
-        peripherals.pins.gpio6,
+        peripherals.pins.gpio39,
+        peripherals.pins.gpio41,
         &config,
     )?;
     info!(

@@ -20,6 +20,13 @@
 
 extern crate alloc;
 
+mod indicator;
+
+pub use indicator::{
+    rhythm_for, Indicator, Light, Power, PowerButton, Rhythm, BREATH_PERIOD_MILLISECONDS,
+    POWER_DOWN_MILLISECONDS, SLEEP_HOLD_MILLISECONDS,
+};
+
 use drv2605l::{LibraryEffect, SequenceStep};
 use protocol::{CalibrationGesture, CalibrationPhase, MediaKey, PhoneStatus};
 
@@ -148,8 +155,13 @@ impl Color {
     pub const OFF: Self = Self::new(0, 0, 0);
     pub const WHITE: Self = Self::new(255, 255, 255);
     pub const RED: Self = Self::new(255, 0, 0);
+    /// Talking to nobody. Red-led, against [`Self::BLUE`]'s blue-led: the pixel
+    /// is driven at a few duty steps, where a colour's minor channels round to
+    /// nothing, so two hues that share a dominant channel look the same. These
+    /// two do not.
     pub const AMBER: Self = Self::new(255, 140, 0);
     pub const GREEN: Self = Self::new(0, 255, 0);
+    /// Talking to someone: a paired phone, or a dashboard link.
     pub const BLUE: Self = Self::new(0, 60, 255);
     /// Calibration's hue, and nothing else's. Full green against [`Self::BLUE`]'s
     /// sixty is what keeps the two apart on a diffused pixel; being a hue with no
@@ -157,16 +169,6 @@ impl Color {
     /// colour they have never seen it wear.
     pub const CYAN: Self = Self::new(0, 255, 255);
     pub const VIOLET: Self = Self::new(160, 0, 255);
-    /// Phone mode's hue, and nothing else's — the same trick [`Self::CYAN`] plays
-    /// for calibration: a hue with no prior meaning is what lets a wearer read
-    /// "the band is talking to my phone" off a colour they have never seen it wear.
-    ///
-    /// Red-dominant on purpose. True magenta would put blue at full and sit on top
-    /// of [`Self::VIOLET`] on a diffused pixel; holding blue near half keeps the
-    /// two apart while staying clear of [`Self::RED`], which has no blue at all.
-    /// This is the tightest pair in the palette and the one worth confirming on a
-    /// real pixel rather than in a hex triple.
-    pub const MAGENTA: Self = Self::new(255, 0, 144);
 
     pub const fn new(red: u8, green: u8, blue: u8) -> Self {
         Self { red, green, blue }
@@ -421,18 +423,6 @@ impl DeviceState {
         }
     }
 
-    /// Whether the phone is what the indicator is currently reporting.
-    ///
-    /// Checked in one place because the colour and the shape both read it and a
-    /// disagreement between them would be a cue in its own right: a cyan stutter
-    /// is "that rep did not count", so a phone waiting to pair during a
-    /// calibration must not be allowed to stutter the run's own hue.
-    fn phone_owns_indicator(&self) -> bool {
-        matches!(self.front_end, FrontEnd::Running)
-            && !self.is_calibrating()
-            && matches!(self.phone, Phone::Listening | Phone::Paired)
-    }
-
     /// Whether a calibration run is under way, which is what the indicator holds
     /// its own level for.
     pub fn is_calibrating(&self) -> bool {
@@ -455,57 +445,36 @@ impl DeviceState {
         matches!(self.front_end, FrontEnd::Failed | FrontEnd::Stalled)
     }
 
-    /// How bright the repeating status pulse may get. Half a cue's apparent
-    /// brightness, so the thing showing when nobody asked is easy to ignore; a fault
-    /// is exempt because being noticed is its job.
-    pub fn indicator_peak_level(&self) -> u8 {
-        if self.needs_attention() {
-            u8::MAX
-        } else {
-            u8::MAX / 2
-        }
-    }
-
-    /// A healthy device breathes, a broken one blinks — so a fault reads as one
-    /// across a room, without resolving the colour.
+    /// The hue: who the band is talking to. The rhythm, which says what it is
+    /// doing, is [`rhythm_for`]'s.
     ///
-    /// A phone that has not arrived yet stutters instead. Waiting and paired share
-    /// a hue, so the shape is the only thing left to carry the difference, and it
-    /// is the difference the wearer is standing there watching for. Guarded by
-    /// [`Self::phone_owns_indicator`] so the stutter can never land on a colour
-    /// that already means something else with it.
-    pub fn indicator_shape(&self) -> Shape {
-        if self.needs_attention() {
-            Shape::Snap
-        } else if self.phone_owns_indicator() && matches!(self.phone, Phone::Listening) {
-            Shape::Stutter
-        } else {
-            Shape::Swell
-        }
-    }
-
     /// Health outranks calibration outranks the phone outranks the link: a dead
     /// front end is not helped by being told the wifi is fine, and neither is a
     /// wearer halfway through a calibration — the run continues standalone when the
     /// link drops, so a colour change there would report something they cannot act
     /// on and hide the thing they can.
     ///
-    /// The phone sits above the link for the same reason it does among the cues,
-    /// and more so on a held level than on an edge: in phone mode the dashboard
-    /// link is a bench fact, while whether a phone is listening is the whole of
-    /// what the band is for. [`Phone::Off`] and [`Phone::Unavailable`] hold no
-    /// level at all — both mean "no phone here", the light says that by showing
-    /// the link instead, and which of the two it is belongs on the panel that
-    /// asked.
+    /// Blue is someone: a paired phone or a dashboard link. Amber is nobody: a
+    /// phone still pairing, switched off or refused is nobody yet. The two differ
+    /// in rhythm as well ([`Self::talks_to_nobody`]), so they stay apart in
+    /// sunlight and for a wearer who cannot tell the hues apart.
     pub fn indicator_color(&self) -> Color {
         match self.front_end {
             FrontEnd::Starting => Color::WHITE,
             FrontEnd::Failed | FrontEnd::Stalled => Color::RED,
             FrontEnd::Running if self.is_calibrating() => Color::CYAN,
-            FrontEnd::Running if self.phone_owns_indicator() => Color::MAGENTA,
-            FrontEnd::Running if self.link.is_connected() => Color::BLUE,
-            FrontEnd::Running => Color::AMBER,
+            FrontEnd::Running if self.talks_to_nobody() => Color::AMBER,
+            FrontEnd::Running => Color::BLUE,
         }
+    }
+
+    /// A ready band with no phone and no link, outside a calibration run. The
+    /// one state that wears amber and the waiting rhythm.
+    pub fn talks_to_nobody(&self) -> bool {
+        self.front_end == FrontEnd::Running
+            && !self.is_calibrating()
+            && self.phone != Phone::Paired
+            && !self.link.is_connected()
     }
 }
 
@@ -633,22 +602,22 @@ impl Cue {
                 shape: Shape::Swell,
             },
 
-            // The phone, in one hue, the same way calibration is — and for the
-            // same reason: it is a mode the wearer is inside rather than a thing
-            // that happened. The shape says which of three moments this is, and
-            // the rhythms are the only place in this vocabulary that mix a click
-            // with a tick, so nothing about a phone can be confused for a command
-            // (clicks or ticks alone) or for a calibration (bump-led).
+            // Each phone cue flashes the hue of the state it leaves the band in:
+            // blue for a phone that arrived, amber for waiting on one. The shape
+            // says which of three moments this is, and the rhythms are the only
+            // place in this vocabulary that mix a click with a tick, so nothing
+            // about a phone can be confused for a command (clicks or ticks
+            // alone) or for a calibration (bump-led).
             Cue::PhoneListening => CueResponse {
                 haptic: Some(patterns::TICK_THEN_CLICK),
-                flash: Some(Color::MAGENTA),
+                flash: Some(Color::AMBER),
                 shape: Shape::Swell,
             },
             // A snap, because unlike the rest of this family it happened at an
             // instant: the wearer was waiting and now they are not.
             Cue::PhonePaired => CueResponse {
                 haptic: Some(patterns::CLICK_TICK_CLICK),
-                flash: Some(Color::MAGENTA),
+                flash: Some(Color::BLUE),
                 shape: Shape::Snap,
             },
             // The reverse of the rhythm that opened the window, the way
@@ -657,7 +626,7 @@ impl Cue {
             // what they do about it is identical.
             Cue::PhoneLost => CueResponse {
                 haptic: Some(patterns::CLICK_THEN_TICK),
-                flash: Some(Color::MAGENTA),
+                flash: Some(Color::AMBER),
                 shape: Shape::Swell,
             },
             // No buzz, like `ConfigChanged` and for the same reason: the wearer
@@ -667,7 +636,7 @@ impl Cue {
             // "that did not take" reads as here.
             Cue::PhoneUnavailable => CueResponse {
                 haptic: None,
-                flash: Some(Color::MAGENTA),
+                flash: Some(Color::AMBER),
                 shape: Shape::Stutter,
             },
         }
@@ -989,6 +958,14 @@ mod tests {
         // So is the phone, for the same reason and under the same obligation —
         // `phone_mode_is_readable_on_the_indicator_alone` is what holds it.
         if cue.is_phone() && other.is_phone() {
+            return true;
+        }
+        // A phone and a link are both someone to talk to, and each cue wears the
+        // hue of who is left: blue arriving, amber gone. The motor separates them;
+        // `no_two_kinds_of_cue_feel_alike` holds that.
+        let is_connection =
+            |cue: Cue| cue.is_phone() || matches!(cue, Cue::LinkEstablished | Cue::LinkLost);
+        if is_connection(cue) && is_connection(other) {
             return true;
         }
         // Finishing a calibration *is* "you can use this now", and a wearer
@@ -1363,8 +1340,8 @@ mod tests {
         // phone that cannot hear anything.
         assert_ne!(Phone::from(&PhoneStatus::Connecting), Phone::Paired);
         assert_eq!(
-            with_phone(Phone::from(&PhoneStatus::Connecting)).indicator_shape(),
-            Shape::Stutter,
+            with_phone(Phone::from(&PhoneStatus::Connecting)).indicator_color(),
+            with_phone(Phone::Listening).indicator_color(),
             "a half-open link should still read as waiting"
         );
     }
@@ -1460,7 +1437,8 @@ mod tests {
             phone: Phone::Paired,
             ..linked
         };
-        assert_eq!(paired.indicator_color(), Color::MAGENTA);
+        assert_eq!(paired.indicator_color(), Color::BLUE);
+        assert_eq!(with_phone(Phone::Paired).indicator_color(), Color::BLUE);
         // Calibration still outranks it, and health still outranks that.
         let paired_mid_run = DeviceState {
             calibration: calibrating(CalibrationPhase::ThumbUpRounds).calibration,
@@ -1481,13 +1459,15 @@ mod tests {
 
     #[test]
     fn waiting_for_a_phone_reads_differently_from_having_one() {
-        // The two states a wearer has to tell apart with the light alone, and the
-        // hue is the same for both — so the shape has to carry it.
+        // The two states a wearer has to tell apart with the light alone, so
+        // they differ twice: in hue, and in rhythm for sunlight and for a
+        // wearer who cannot tell the hues apart.
         let listening = with_phone(Phone::Listening);
         let paired = with_phone(Phone::Paired);
-        assert_eq!(listening.indicator_color(), Color::MAGENTA);
-        assert_eq!(paired.indicator_color(), Color::MAGENTA);
-        assert_ne!(listening.indicator_shape(), paired.indicator_shape());
+        assert_eq!(listening.indicator_color(), Color::AMBER);
+        assert_eq!(paired.indicator_color(), Color::BLUE);
+        assert_eq!(rhythm_for(&listening, Power::Awake, 0), Rhythm::Waiting);
+        assert_eq!(rhythm_for(&paired, Power::Awake, 0), Rhythm::Breath);
     }
 
     #[test]
@@ -1502,7 +1482,10 @@ mod tests {
             ..running()
         };
         assert_eq!(listening_mid_run.indicator_color(), Color::CYAN);
-        assert_eq!(listening_mid_run.indicator_shape(), Shape::Swell);
+        assert_eq!(
+            rhythm_for(&listening_mid_run, Power::Awake, 0),
+            Rhythm::Breath
+        );
         // Same guard on the other side: a stalled front end owns the light, and a
         // waiting phone must not restyle a fault into something softer.
         let listening_while_stalled = DeviceState {
@@ -1511,7 +1494,10 @@ mod tests {
             ..running()
         };
         assert_eq!(listening_while_stalled.indicator_color(), Color::RED);
-        assert_eq!(listening_while_stalled.indicator_shape(), Shape::Snap);
+        assert_eq!(
+            rhythm_for(&listening_while_stalled, Power::Awake, 0),
+            Rhythm::Blink
+        );
     }
 
     #[test]
@@ -1575,9 +1561,10 @@ mod tests {
     #[test]
     fn phone_cues_stay_out_of_the_shipped_hues() {
         // Same rule the calibration family is held to: red is hardware faults,
-        // amber is the link, violet is config, cyan is a calibration run.
+        // violet is config, cyan is a calibration run. Blue and amber are who the
+        // band is talking to, which is what a phone cue is about.
         for cue in EVERY_KIND_OF_CUE.iter().filter(|cue| cue.is_phone()) {
-            for forbidden in [Color::RED, Color::AMBER, Color::VIOLET, Color::CYAN] {
+            for forbidden in [Color::RED, Color::VIOLET, Color::CYAN] {
                 assert_ne!(
                     cue.response().flash,
                     Some(forbidden),

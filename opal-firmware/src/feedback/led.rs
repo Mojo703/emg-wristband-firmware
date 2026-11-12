@@ -1,6 +1,6 @@
-//! The ESP32-S3-Zero's onboard addressable LED, driven over RMT.
+//! The band's addressable LED, driven over RMT.
 //!
-//! One WS2812 on GPIO21. The part wants a self-clocked bit stream with sub-microsecond
+//! One WS2812B-2020 on GPIO5. The part wants a self-clocked bit stream with sub-microsecond
 //! pulse widths; the RMT encoder produces it in hardware, so the CPU spends one call
 //! per colour change and nothing while a colour holds.
 //!
@@ -141,24 +141,22 @@ impl Dither {
     }
 }
 
-pub(crate) use feedback_vocabulary::{Color, Shape};
+pub(crate) use feedback_vocabulary::Color;
 
 /// The duty each channel of `color` wants at perceived brightness `level`, in
 /// [`DUTY_FRACTION_BITS`] fixed point and still owing [`Dither`] a visit. Hue and
 /// `level` are both perceptual, so they combine by plain multiplication.
 ///
 /// Here rather than on [`Color`] itself: the colour is vocabulary and this is
-/// what this particular part does with it. Red-green-blue order, worth stating
-/// because the famous ordering for this class of part is green-red-blue.
-/// Measured on the board, not taken from a datasheet: an amber test colour came
-/// out yellow-green and a cyan one lavender, which is what green-red-blue bytes
-/// look like read as red-green-blue.
+/// what this particular part does with it. Green-red-blue order, the WS2812B's
+/// own. The S3-Zero's onboard pixel took red-green-blue, so a part swap can
+/// swap red and green; a green ready swell showing red is the sign.
 fn duty(color: Color, level: u8) -> [u32; 3] {
     let channel =
         |value: u8| PERCEIVED_TO_DUTY[(value as u16 * level as u16 / u8::MAX as u16) as usize];
     [
-        channel(color.red),
         channel(color.green),
+        channel(color.red),
         channel(color.blue),
     ]
 }
@@ -262,11 +260,11 @@ mod tests {
     }
 
     #[test]
-    fn wire_order_is_red_green_blue() {
+    fn wire_order_is_green_red_blue() {
         // Three different channels cannot be permuted without one of these moving.
-        let duty = duty(Color::new(255, 128, 32), u8::MAX);
-        assert!(duty[0] > duty[1], "red must lead");
-        assert!(duty[1] > duty[2], "green must sit between");
+        let duty = duty(Color::new(128, 255, 32), u8::MAX);
+        assert!(duty[0] > duty[1], "green must lead");
+        assert!(duty[1] > duty[2], "red must sit between");
     }
 
     #[test]

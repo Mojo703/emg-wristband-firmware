@@ -15,18 +15,19 @@ step assumes the one before it passed.
 
 Wire the carrier to the XIAO:
 
-| XIAO      | IMU                                               |
-|-----------|---------------------------------------------------|
-| 3V3       | VDD                                               |
-| GND       | GND                                               |
-| D4, GPIO5 | SDA                                               |
-| D5, GPIO6 | SCL                                               |
-| none      | VIN: leave unconnected                            |
-| none      | SA0: leave floating, it is pulled high on board   |
+| XIAO         | IMU                                            |
+|--------------|------------------------------------------------|
+| 3V3          | VDD                                            |
+| GND          | GND                                            |
+| MTCK, GPIO39 | SDA                                            |
+| MTDI, GPIO41 | SCL                                            |
+| none         | VIN: leave unconnected                         |
+| none         | SA0: leave floating, it is pulled high on board|
 
 Feed 3.3 V into VDD, not VIN. Pololu's rule is never to power both, and with VIN
-open the bus runs at 3.3 V, which is what the ESP32-S3 pins want. D4 and D5 are
-unused on the motherboard (pin map in `examples/battery-test/main.rs`).
+open the bus runs at 3.3 V, which is what the ESP32-S3 pins want. MTCK and MTDI
+are the XIAO's back pads, which nothing on the motherboard uses; D4 and D5 carry
+the LED and the power button.
 
 Every setting is in `src/motion/config.rs`: both I2C addresses, the data rate, the
 two ranges, the mounting, and the gate thresholds. The ranges and thresholds are
@@ -45,7 +46,7 @@ cargo imu-check
 Watch for these lines:
 
 ```
-=== IMU check: I2C1, SDA GPIO5 (D4), SCL GPIO6 (D5) ===
+=== IMU check: I2C1, SDA GPIO39 (MTCK), SCL GPIO41 (MTDI) ===
 LIS3MDL at 0x1e: powered down, mode read back
 LSM6DSO at 0x6b: ±8 g, ±1000 °/s, 104 Hz
 ```
