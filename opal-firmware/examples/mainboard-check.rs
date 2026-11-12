@@ -73,6 +73,7 @@ const INPUT_TEMPERATURE: u8 = 0b100;
 const INPUT_TEST_SIGNAL: u8 = 0b101;
 const CONFIG2_INTERNAL_TEST_SIGNAL: u8 = 1 << 4;
 const CONFIG3_FOUR_VOLT_REFERENCE: u8 = 1 << 5;
+const CONFIG4_LEAD_OFF_COMPARATORS: u8 = 1 << 1;
 const CONFIG3_RIGHT_LEG_DRIVE_MEASUREMENT: u8 = 1 << 4;
 
 const FULL_SCALE_CODE: f64 = 8_388_607.0;
@@ -112,6 +113,18 @@ impl Chip {
                     Register::Config1 => config1.to_byte(),
                     Register::Config2 => mode.config2(value),
                     Register::Config3 => mode.config3(value),
+                    Register::LoffSensP | Register::LoffSensN
+                        if matches!(mode, Mode::LeadOff | Mode::AlternatingLeadOff { .. }) =>
+                    {
+                        0xFF
+                    }
+                    Register::Loff => match mode {
+                        Mode::AlternatingLeadOff { loff } => loff,
+                        _ => value,
+                    },
+                    Register::Config4 if mode == Mode::LeadOff => {
+                        value | CONFIG4_LEAD_OFF_COMPARATORS
+                    }
                     _ => match channel_settings_index(register) {
                         Some(channel) => mode.channel_settings(channel),
                         None => value,
@@ -144,6 +157,13 @@ fn channel_name(channel: usize) -> String {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
     Product,
+    /// The product recipe with the 6 nA sources and comparators on every input.
+    LeadOff,
+    /// The product recipe with AC lead-off excitation at fDR / 4 on every input;
+    /// `loff` is the whole LOFF register.
+    AlternatingLeadOff {
+        loff: u8,
+    },
     Shorted,
     TestSignal,
     Supply,
@@ -154,7 +174,9 @@ enum Mode {
 impl Mode {
     fn channel_settings(self, channel: usize) -> u8 {
         match self {
-            Mode::Product => GAIN_SIX | INPUT_ELECTRODE,
+            Mode::Product | Mode::LeadOff | Mode::AlternatingLeadOff { .. } => {
+                GAIN_SIX | INPUT_ELECTRODE
+            }
             Mode::Shorted => GAIN_SIX | INPUT_SHORTED,
             Mode::TestSignal => GAIN_SIX | INPUT_TEST_SIGNAL,
             Mode::Supply => GAIN_ONE | INPUT_SUPPLY,
@@ -302,6 +324,10 @@ struct Board {
 
 #[derive(Default)]
 struct Capture {
+    /// Frames in which each input's lead-off comparator was set.
+    positive_lead_off: [u32; CHANNELS],
+    negative_lead_off: [u32; CHANNELS],
+    frames: u32,
     missed: u32,
     bad_status: [u32; 2],
     read_errors: u32,
@@ -503,9 +529,21 @@ impl Board {
                 match self.bus.read_frame(chip) {
                     Ok(raw) => {
                         let sample = parse_sample(&raw);
-                        if sample.status_word().is_none() {
-                            capture.bad_status[chip.index()] += 1;
-                            good = false;
+                        match sample.status_word() {
+                            Some(status) => {
+                                for channel in 0..8 {
+                                    let slot = chip.index() * 8 + channel;
+                                    let bit = 1 << channel;
+                                    capture.positive_lead_off[slot] +=
+                                        u32::from(status.positive_lead_off.bits() & bit != 0);
+                                    capture.negative_lead_off[slot] +=
+                                        u32::from(status.negative_lead_off.bits() & bit != 0);
+                                }
+                            }
+                            None => {
+                                capture.bad_status[chip.index()] += 1;
+                                good = false;
+                            }
                         }
                         values[chip.index() * 8..][..8].copy_from_slice(&sample.channels);
                     }
@@ -516,6 +554,7 @@ impl Board {
                 }
             }
             if good {
+                capture.frames += 1;
                 each(handled.wrapping_sub(ic1_start), &values);
             }
         }
@@ -879,6 +918,96 @@ fn note_right_leg_drive(board: &mut Board, report: &mut Report) -> Result<()> {
 
 const STREAM_SECONDS: u32 = 30;
 
+/// AC lead-off excites every input at fDR / 4, exactly four samples per period, so
+/// its amplitude is one DFT bin. Measured for both excitation sources, then the
+/// product recipe is read back to see whether the excitation left the inputs charged.
+fn note_alternating_lead_off(board: &mut Board, report: &mut Report) -> Result<()> {
+    const PHASE: [(i64, i64); 4] = [(1, 0), (0, -1), (-1, 0), (0, 1)];
+    for (name, loff) in [("6 nA source", 0x01u8), ("10 MOhm resistors", 0x11u8)] {
+        let mismatches = board.enter(Mode::AlternatingLeadOff { loff })?;
+        report.configuration("AC lead-off registers", mismatches);
+        let mut real = [0i64; CHANNELS];
+        let mut imaginary = [0i64; CHANNELS];
+        let mut saturated = [0u32; CHANNELS];
+        let mut count = 0i64;
+        let capture = board.capture(2 * SAMPLE_RATE_HZ, |index, values| {
+            let (cosine, sine) = PHASE[index as usize % 4];
+            for (channel, &value) in values.iter().enumerate() {
+                real[channel] += value as i64 * cosine;
+                imaginary[channel] += value as i64 * sine;
+                saturated[channel] += u32::from(value.abs() >= RAIL_CODE);
+            }
+            count += 1;
+        })?;
+        let mut amplitudes = Vec::new();
+        for channel in 0..CHANNELS {
+            let bin = ((real[channel] as f64).powi(2) + (imaginary[channel] as f64).powi(2)).sqrt();
+            let microvolts =
+                2.0 * bin / count.max(1) as f64 * Mode::Product.microvolts_per_code(channel);
+            amplitudes.push(format!(
+                "{} {:.0} uV ({:.0}% railed)",
+                channel_name(channel),
+                microvolts,
+                saturated[channel] as f64 * 100.0 / count.max(1) as f64
+            ));
+        }
+        report.note(&format!("AC lead-off tone, {name}"), amplitudes.join("; "));
+        report.note("AC lead-off capture", capture.summary());
+    }
+    board.enter(Mode::Product)?;
+    let (statistics, _) = collect(board, SAMPLE_RATE_HZ)?;
+    let means: Vec<String> = (0..CHANNELS)
+        .map(|channel| {
+            format!(
+                "{:+.0}",
+                statistics[channel].mean() * Mode::Product.microvolts_per_code(channel) / 1e3
+            )
+        })
+        .collect();
+    report.note(
+        "mV per channel 0.1 to 0.6 s after AC lead-off",
+        means.join(" "),
+    );
+    Ok(())
+}
+
+/// With no skin on the pads, the 6 nA sources pull every input to a rail, so every
+/// comparator should trip.
+fn check_lead_off(board: &mut Board, report: &mut Report) -> Result<()> {
+    let mismatches = board.enter(Mode::LeadOff)?;
+    report.configuration("lead-off registers", mismatches);
+    let (statistics, capture) = collect(board, 2 * SAMPLE_RATE_HZ)?;
+    let frames = capture.frames.max(1) as f64;
+    let mut clear = Vec::new();
+    for channel in 0..CHANNELS {
+        let positive = capture.positive_lead_off[channel] as f64 / frames;
+        let negative = capture.negative_lead_off[channel] as f64 / frames;
+        info!(
+            "  {}: P off {:5.1}%, N off {:5.1}% of frames, mean {:+8.1} mV",
+            channel_name(channel),
+            positive * 100.0,
+            negative * 100.0,
+            statistics[channel].mean() * Mode::Product.microvolts_per_code(channel) / 1e3
+        );
+        for (side, fraction) in [("P", positive), ("N", negative)] {
+            if fraction < 0.9 {
+                clear.push(format!("{} {side}", channel_name(channel)));
+            }
+        }
+    }
+    report.record(
+        "lead-off flags open inputs",
+        clear.is_empty(),
+        match clear.is_empty() {
+            true => {
+                "all 32 inputs flagged in at least 90% of frames with no skin contact".to_string()
+            }
+            false => format!("not flagged off: {}", clear.join(", ")),
+        },
+    );
+    Ok(())
+}
+
 fn check_product_stream(board: &mut Board, report: &mut Report) -> Result<()> {
     let mismatches = board.enter(Mode::Product)?;
     report.configuration("product registers", mismatches);
@@ -994,6 +1123,8 @@ fn run_checks(board: &mut Board, report: &mut Report) -> Result<()> {
     check_temperature(board, report)?;
     note_right_leg_drive(board, report)?;
     check_start_control(board, report)?;
+    note_alternating_lead_off(board, report)?;
+    check_lead_off(board, report)?;
     check_product_stream(board, report)?;
     Ok(())
 }

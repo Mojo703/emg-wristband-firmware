@@ -568,13 +568,14 @@ impl LeadOffCurrent {
     }
 }
 
-/// LOFF `FLEAD_OFF[1:0]` (bits 1:0) -- how lead-off is excited. `0b01` and `0b10` are
-/// not defined encodings and have no variants.
+/// LOFF `FLEAD_OFF[1:0]` (bits 1:0) -- how lead-off is excited (SBAS459K table 21).
+/// `0b00` is forbidden while any sense bit is set and `0b10` is "do not use", so
+/// neither has a variant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum LeadOffDetection {
-    /// Alternating-current detection at a quarter of the data rate.
-    #[cfg(test)]
-    AlternatingCurrent = 0b00,
+    /// Alternating-current excitation at a quarter of the data rate, measured in the
+    /// samples rather than by the comparators.
+    AlternatingCurrent = 0b01,
     /// Direct-current detection, which is what the driver uses: the comparators simply
     /// watch the electrode's DC level.
     DirectCurrent = 0b11,
@@ -584,7 +585,7 @@ impl LeadOffDetection {
     #[cfg(test)]
     const fn from_bits(bits: u8) -> Option<LeadOffDetection> {
         match bits {
-            0b00 => Some(LeadOffDetection::AlternatingCurrent),
+            0b01 => Some(LeadOffDetection::AlternatingCurrent),
             0b11 => Some(LeadOffDetection::DirectCurrent),
             _ => None,
         }
@@ -1170,8 +1171,14 @@ mod tests {
         assert!(Respiration::from_byte(0x00).is_none());
         // CHnSET GAIN = 0b111 is not a legal encoding.
         assert!(ChannelSettings::from_byte(0x70).is_none());
-        // FLEAD_OFF = 0b01 is not a defined encoding.
-        assert!(LeadOffControl::from_byte(0x11).is_none());
+        // FLEAD_OFF = 0b00 is forbidden with sensing on and 0b10 is "do not use";
+        // 0b01 is AC lead-off (SBAS459K table 21).
+        assert!(LeadOffControl::from_byte(0x10).is_none());
+        assert!(LeadOffControl::from_byte(0x12).is_none());
+        assert_eq!(
+            LeadOffControl::from_byte(0x11).map(|control| control.detection),
+            Some(LeadOffDetection::AlternatingCurrent)
+        );
     }
 
     #[test]

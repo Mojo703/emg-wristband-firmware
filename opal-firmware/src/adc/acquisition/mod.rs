@@ -1,23 +1,20 @@
 //! The combining stage: two per-chip sample streams onto one grid, through
 //! conditioning, into windows the main loop consumes.
 //!
-//! Acquisition is three threads and two interrupts. Each chip's frames are clocked
-//! out inside its DRDY interrupt ([`super::frame_reader`]); each chip then has a
-//! [`pipeline`] thread that drains that ring, owns the chip's health,
-//! and emits batches of timestamped 8-channel frames. This module's combiner drains both
-//! pipelines into an [`emg_runtime::alignment::GridAligner`], which places the two
-//! independently clocked streams onto one 2 kHz grid on the device clock, with the
-//! pairing policy and its accounting in one explicit, host-tested place. Each
-//! Emitted grid steps are accumulated directly into raw i16 wire windows for the
-//! wearer-calibrated filter-bank classifier and the telemetry stream.
+//! Acquisition is two threads and one interrupt. Both chips' frames are clocked out
+//! inside IC1's DRDY interrupt ([`super::frame_reader`]); the [`pipeline`] thread
+//! drains both rings, owns the pair's health, and emits batches of timestamped
+//! 8-channel frames per chip. This module's combiner places the two streams onto
+//! one 2 kHz grid on the device clock through an
+//! [`emg_runtime::alignment::GridAligner`], with the pairing policy and its
+//! accounting in one explicit, host-tested place. Emitted grid steps are
+//! accumulated directly into raw i16 wire windows for the wearer-calibrated
+//! filter-bank classifier and the telemetry stream.
 //!
-//! The aligner is where the dual-clock reality lives, measured instead of assumed:
-//! its per-source counters say exactly how many frames each chip's oscillator
-//! surplus (dropped), lagged (duplicated), or failed to deliver (missing), and the
+//! The chips share one clock, so the aligner's per-source counters should show no
+//! surplus or duplicated frames; what they report is measured, not assumed, and the
 //! combiner logs them periodically. The output timeline is grid-regular —
-//! consecutive windows sit exactly `window / 2000 Hz` apart on the device clock —
-//! so the wire's claimed sample rate is finally the truth rather than a nominal
-//! figure the oscillators miss by percents.
+//! consecutive windows sit exactly `window / 2000 Hz` apart on the device clock.
 //!
 //! Presence is the contract between the pipelines and the grid. A pipeline brackets
 //! every untrustworthy stretch (death, warm recovery, reference settling) with
@@ -25,7 +22,7 @@
 //! `Absent`, the combiner marks the aligner source absent (its slots read zero
 //! downstream) and discards the partial window — a window silently
 //! spanning a recovery would feed the model 250 ms that never happened on half its
-//! channels. The other chip streams through its peer's whole outage untouched.
+//! channels.
 //!
 //! The window channel is the handoff to the main loop, and the consumer drains it
 //! rather than keeping the newest, because the stream is recorded: a window that
@@ -47,10 +44,10 @@ use std::sync::Arc;
 mod pipeline;
 
 use super::ads1298::{self, SAMPLE_RATE_HZ};
-use super::channel::{Board, DEVICE_COUNT};
+use super::channel::DEVICE_COUNT;
 use super::decode::Sample;
 use super::preprocess::wire_time_step;
-use super::FrontEnds;
+use super::StreamingPair;
 use pipeline::ChipEvent;
 
 /// Windows the channel will hold.
@@ -79,9 +76,9 @@ const EVENT_QUEUE_DEPTH: usize = 64;
 /// of being freed and reallocated.
 const RECYCLE_POOL_DEPTH: usize = 2;
 
-/// Empty chip-frame batches returned from the combiner to each chip pipeline.
-/// One returned batch plus the pipeline's active batch forms a steady double
-/// buffer, removing the two pipelines' ~256 allocations per second.
+/// Empty chip-frame batches returned from the combiner to each chip's stream.
+/// One returned batch plus the stream's active batch forms a steady double
+/// buffer, removing ~256 allocations per second.
 const BATCH_RECYCLE_DEPTH: usize = 1;
 
 /// Stack for the combiner thread. The window buffers live on the heap; esp-idf's
@@ -176,7 +173,7 @@ pub(super) struct HealthCounters {
     /// chips. Each pipeline keeps its own count for its telemetry, since a
     /// device-wide sum cannot say which chip is failing.
     pub(super) bad_status: AtomicU32,
-    /// Times a chip was warm-recovered after its conversions died. The bring-up
+    /// Times the pair was warm-recovered after a chip's conversions died. The bring-up
     /// campaign (documentation/ads1298-bringup-2026-07-31/TEST-LOG.md) established
     /// the front end dies stochastically under multi-channel conversion; recovery
     /// restores it in a few milliseconds at the cost of a gap in that chip's stream.
@@ -195,9 +192,22 @@ pub(super) struct HealthCounters {
     pub(super) lead_off_channels: AtomicU32,
 }
 
+/// One AC lead-off snapshot, in model-slot order.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LeadOffTones {
+    /// Frames measured per chip.
+    pub(crate) frames: u16,
+    /// Input-referred amplitude of each channel's fDR / 4 excitation tone.
+    pub(crate) amplitude_microvolts: [u32; CHANNEL_COUNT],
+    /// Frames each channel spent at a rail.
+    pub(crate) railed: [u16; CHANNEL_COUNT],
+}
+
 /// The consumer side of acquisition.
 pub(crate) struct AdcSource {
     windows: Receiver<AcquiredWindow>,
+    lead_off_requests: SyncSender<()>,
+    lead_off_snapshots: Receiver<LeadOffTones>,
     /// Returns spent window buffers to the combiner. See [`Self::recycle`].
     recycled: Handoff<(Vec<u8>, Vec<u8>)>,
     counters: Arc<HealthCounters>,
@@ -226,10 +236,10 @@ impl AdcSource {
         self.counters.bad_status.load(Ordering::Relaxed)
     }
 
-    /// Times a chip died and was warm-recovered, cumulative since boot, both chips.
-    /// Each one costs the detection timeout, ~3 ms of reset-and-rewrite, and then a
-    /// reference-settling discard window for that chip — during which its eight
-    /// slots read zero while the other chip's stream continues.
+    /// Times the pair was warm-recovered after a chip died, cumulative since boot.
+    /// Each one costs the detection timeout, ~10 ms of reset-and-rewrite, and then a
+    /// reference-settling discard window on both chips, during which all sixteen
+    /// slots read zero.
     pub(crate) fn recoveries(&self) -> u32 {
         self.counters.recoveries.load(Ordering::Relaxed)
     }
@@ -241,11 +251,20 @@ impl AdcSource {
     /// status bits read zero forever, and zero is exactly what a seated band
     /// looks like — so a bare `u16` would tell a wearer every electrode is fine
     /// on a device that cannot tell. `None` says "no answer"; nothing
-    /// downstream may read it as good news. See [`ads1298::LEAD_OFF_ENABLED`],
-    /// which is off until the block earns its bench experiment.
+    /// downstream may read it as good news. See [`ads1298::LEAD_OFF_ENABLED`].
     pub(crate) fn lead_off_channels(&self) -> Option<u16> {
         ads1298::LEAD_OFF_ENABLED
             .then(|| self.counters.lead_off_channels.load(Ordering::Relaxed) as u16)
+    }
+
+    /// Asks the pipeline for a lead-off snapshot. Windows stop for its duration.
+    /// A request while one is pending is dropped.
+    pub(crate) fn request_lead_off_snapshot(&self) {
+        let _ = self.lead_off_requests.try_send(());
+    }
+
+    pub(crate) fn take_lead_off_snapshot(&self) -> Option<LeadOffTones> {
+        self.lead_off_snapshots.try_recv().ok()
     }
 
     /// The next complete window without allocating a temporary backlog vector.
@@ -286,11 +305,9 @@ impl WindowRecycler {
     }
 }
 
-/// Spawns one pipeline thread per chip and the combiner, returning the consumer
-/// handle.
-///
+/// Spawns the pipeline thread and the combiner, returning the consumer handle.
 pub(crate) fn start(
-    front_ends: FrontEnds,
+    streaming: StreamingPair,
     window_length: usize,
     mut buffers: AcquisitionBuffers,
 ) -> Result<AdcSource> {
@@ -312,33 +329,19 @@ pub(crate) fn start(
         .expect("a new recycle pool has room for its second set");
     let counters = Arc::new(HealthCounters::default());
 
-    let FrontEnds {
-        chips,
-        readers,
-        _power_down: power_down,
-    } = front_ends;
-    for (((chip, reader), power_down), board) in chips
-        .into_iter()
-        .zip(readers)
-        .zip(power_down)
-        .zip(Board::ALL)
-    {
-        let index = board.device_index();
-        pipeline::spawn(
-            pipeline::ThreadHardware {
-                board,
-                chip,
-                reader,
-                power_down,
-            },
-            pipeline::ThreadChannels {
-                events: event_sender.clone(),
-                recycled_batches: batch_recyclers[index].clone(),
-                counters: counters.clone(),
-            },
-        )?;
-    }
-    drop(event_sender); // the pipelines hold the only senders now
+    let (lead_off_requests, lead_off_inbox) = sync_channel::<()>(1);
+    let (lead_off_results, lead_off_snapshots) = sync_channel::<LeadOffTones>(1);
+    let StreamingPair { pair, reader } = streaming;
+    pipeline::spawn(
+        pipeline::ThreadHardware { pair, reader },
+        pipeline::ThreadChannels {
+            lead_off_requests: lead_off_inbox,
+            lead_off_results,
+            events: event_sender,
+            recycled_batches: batch_recyclers.clone(),
+            counters: counters.clone(),
+        },
+    )?;
 
     let combiner_counters = counters.clone();
     let combiner_recycled = recycled.clone();
@@ -364,6 +367,8 @@ pub(crate) fn start(
 
     Ok(AdcSource {
         windows,
+        lead_off_requests,
+        lead_off_snapshots,
         recycled,
         counters,
         window_length,
@@ -416,7 +421,7 @@ impl Combiner {
             let (chip, event) = match events.recv() {
                 Ok(received) => received,
                 Err(_) => {
-                    info!("every chip pipeline is gone; combining stopping");
+                    info!("the pair pipeline is gone; combining stopping");
                     return;
                 }
             };

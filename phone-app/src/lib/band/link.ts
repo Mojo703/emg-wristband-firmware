@@ -3,21 +3,25 @@
 import {
   GESTURE_UUID,
   HEALTH_UUID,
+  LEAD_OFF_UUID,
   SERVICE_UUID,
   SETTINGS_UUID,
   decodeGestureEvent,
   decodeHealth,
+  decodeLeadOffSnapshot,
   decodeSettings,
   encodeSettings,
   type BandHealth,
   type BandSettings,
   type GestureEvent,
+  type LeadOffSnapshot,
 } from './protocol.ts';
 import { EMG_UUID, WindowAssembler, type EmgWindow } from './emgStream.ts';
 
 export type BandEvent =
   | { readonly kind: 'settings'; readonly settings: BandSettings }
   | { readonly kind: 'gesture'; readonly event: GestureEvent }
+  | { readonly kind: 'leadOff'; readonly snapshot: LeadOffSnapshot }
   | { readonly kind: 'disconnected' };
 
 export function bluetoothAvailable(): boolean {
@@ -29,6 +33,7 @@ export class Band {
   #settings: BluetoothRemoteGATTCharacteristic | null = null;
   #emg: BluetoothRemoteGATTCharacteristic | null = null;
   #health: BluetoothRemoteGATTCharacteristic | null = null;
+  #leadOff: BluetoothRemoteGATTCharacteristic | null = null;
   #assembler = new WindowAssembler();
   #onWindow: ((window: EmgWindow, arrivedAt: number) => void) | null = null;
   #listeners = new Set<(event: BandEvent) => void>();
@@ -61,6 +66,15 @@ export class Band {
     this.#settings = settings;
     this.#emg = await service.getCharacteristic(EMG_UUID).catch(() => null);
     this.#health = await service.getCharacteristic(HEALTH_UUID).catch(() => null);
+    this.#leadOff = await service.getCharacteristic(LEAD_OFF_UUID).catch(() => null);
+    // The record can outgrow a notification on a small MTU, so the notification
+    // is only the signal and the value is read back whole.
+    this.#leadOff?.addEventListener('characteristicvaluechanged', () => {
+      void this.#leadOff
+        ?.readValue()
+        .then((view) => this.#emit({ kind: 'leadOff', snapshot: decodeLeadOffSnapshot(view) }));
+    });
+    await this.#leadOff?.startNotifications();
     this.#emg?.addEventListener('characteristicvaluechanged', (event) => {
       const view = valueOf(event);
       if (view === null || this.#onWindow === null) return;
@@ -111,6 +125,18 @@ export class Band {
     const characteristic = this.#health;
     if (characteristic === null) throw new Error('this band firmware has no health record');
     return decodeHealth(await characteristic.readValue());
+  }
+
+  get takesLeadOffSnapshots(): boolean {
+    return this.#leadOff !== null;
+  }
+
+  /** Ask for a lead-off snapshot. The band stops streaming for about three
+   * seconds and answers with a `leadOff` event. */
+  async requestLeadOffSnapshot(): Promise<void> {
+    const characteristic = this.#leadOff;
+    if (characteristic === null) throw new Error('this band firmware takes no lead-off snapshots');
+    await characteristic.writeValueWithResponse(new Uint8Array([1]) as BufferSource);
   }
 
   /** Write the whole record. The band answers with what it kept. */

@@ -8,19 +8,11 @@
 //! # The two boards and synchronisation
 //!
 //! [`wire_time_step`] takes one frame per device and [`model_slot`] owns the
-//! sixteen-slot layout. The devices self-clock from independent internal
-//! oscillators (CLKSEL at 3V3), so the inter-device offset is *not* fixed: it
-//! wanders continuously within one sample period (≤500 µs). The grid aligner
-//! ([`emg_runtime::alignment`]) is what pairs the two streams: each device's frame
-//! nearest to the grid tick fills its slots, surplus frames from the faster
-//! oscillator are dropped and counted, and the accounting the combiner logs is the
-//! measured inter-device rate difference. The layout stays honest on two grounds:
-//! the wandering skew is bounded to under one sample, and data collected for
-//! training runs through this same path, so whatever skew statistics the hardware
-//! produces are in-distribution by construction. Each device has its own START
-//! line and is warm-recovered independently, which avoids restarting a healthy
-//! chip into the front-loaded post-START death hazard the bring-up campaign
-//! measured.
+//! sixteen-slot layout. Both devices convert on one clock (IC2's oscillator, driven
+//! to IC1 over CLK) and start on one START edge, so their conversions land within a
+//! few microseconds of each other and the grid aligner
+//! ([`emg_runtime::alignment`]) pairs frame for frame. Data collected for training
+//! runs through this same path, so the pairing is in-distribution by construction.
 
 use super::channel::{model_slot, Channel, CHANNELS_PER_DEVICE, DEVICE_COUNT};
 #[cfg(test)]

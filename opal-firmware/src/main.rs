@@ -15,6 +15,7 @@ mod features;
 mod feedback;
 mod handoff;
 mod health;
+mod power;
 mod radio;
 mod resident;
 mod telemetry;
@@ -128,6 +129,7 @@ impl App {
     #[inline(never)]
     fn new() -> anyhow::Result<Box<Self>> {
         esp_idf_svc::sys::link_patches();
+        power::release_sleep_holds();
         esp_idf_svc::log::EspLogger::initialize_default();
         // esp32-nimble warns on every notify it cannot buffer; a gesture
         // notification with no app subscribed is not worth a line.
@@ -151,7 +153,19 @@ impl App {
         let store = Store::open(EspDefaultNvsPartition::take()?)?;
         let settings = store.load();
 
-        // NimBLE first, so its largest allocation sees the fresh boot heap.
+        // The LED before NimBLE, so a wake press is answered ~100 ms after reset
+        // rather than after the radio. Its driver and thread stack are small and
+        // permanent, so NimBLE's large allocation still lands on unfragmented heap.
+        let peripherals = Peripherals::take()?;
+        let feedback = Feedback::start(FeedbackWiring {
+            bus: peripherals.i2c0,
+            haptics_data: peripherals.pins.gpio16.into(),
+            haptics_clock: peripherals.pins.gpio15.into(),
+            indicator: peripherals.pins.gpio5.into(),
+            power_button: peripherals.pins.gpio6,
+        });
+
+        // NimBLE next, so its largest allocation sees a fresh boot heap.
         let phone = PhoneLink::start(DEVICE_NAME, &settings.to_band());
         let acquisition_buffers = adc::acquisition::AcquisitionBuffers::reserve(WINDOW_SAMPLES);
         info!(
@@ -185,93 +199,65 @@ impl App {
             heap.free_bytes, heap.largest_free_block_bytes
         );
 
-        let peripherals = Peripherals::take()?;
+        // ---------------------------------------------------------------------------
+        // ADS1298 wiring on the XIAO ESP32-S3 motherboard. This block is the pin map:
+        // if the board disagrees with the firmware, this is the only place that needs
+        // editing. From the Motherboard PCB schematic (XIAO pad, GPIO):
+        //
+        //   SCLK D6 43   MOSI D10 9   MISO D1 2   START D7 44   RESET D9 8
+        //   PWDN MTMS 42   IC1: CS D2 3, DRDY MTDO 40   IC2: CS D8 7, DRDY D0 1
+        //
+        // Wired off the board: battery divider D3 4, LED data D4 5, power button
+        // D5 6 to 3V3, IMU SDA MTCK 39 and SCL MTDI 41. USB-Serial-JTAG claims
+        // GPIO 19 and 20.
+        // ---------------------------------------------------------------------------
+        // Pads 39-42 come out of reset owned by JTAG and 43-44 by UART0, and
+        // PinDriver calls only gpio_set_direction, which leaves IO_MUX alone;
+        // gpio_config claims each pad for the GPIO matrix. Without it START (44)
+        // floats high on the UART pull-up and the chips free-run from reset. The SPI
+        // driver claims SCLK (43) itself.
+        for (pad, mode) in [
+            (40, esp_idf_svc::sys::gpio_mode_t_GPIO_MODE_INPUT),
+            (42, esp_idf_svc::sys::gpio_mode_t_GPIO_MODE_OUTPUT),
+            (44, esp_idf_svc::sys::gpio_mode_t_GPIO_MODE_OUTPUT),
+        ] {
+            let pad_reclaim = esp_idf_svc::sys::gpio_config_t {
+                pin_bit_mask: 1u64 << pad,
+                mode,
+                pull_up_en: esp_idf_svc::sys::gpio_pullup_t_GPIO_PULLUP_DISABLE,
+                pull_down_en: esp_idf_svc::sys::gpio_pulldown_t_GPIO_PULLDOWN_DISABLE,
+                intr_type: esp_idf_svc::sys::gpio_int_type_t_GPIO_INTR_DISABLE,
+            };
+            // SAFETY: the config struct is fully initialized and outlives the call.
+            esp_idf_svc::sys::esp!(unsafe { esp_idf_svc::sys::gpio_config(&pad_reclaim) })?;
+        }
 
-        // ---------------------------------------------------------------------------
-        // ADS1298 wiring for the two-board harness on the ESP32-S3-Zero. This block is
-        // the pin map: if the harness disagrees with the firmware, this is the only
-        // place that needs editing.
-        //
-        // Two fully independent SPI buses — SBAS459K §9.4.1.2: a rising SCLK edge
-        // pulls DRDY high regardless of CS, so a shared SCLK would toggle the idle
-        // chip's DRDY on every read of its peer. Both ribbons run J3 in reverse
-        // header order (J3.9 first: DRDY, MISO, DAISY_IN, SCLK, CS, START, CLK,
-        // RESET, MOSI) with the same two lane changes: the DAISY_IN lane carries no
-        // wire because J3.7 ties to GND at the board, and the CLK lane carries PWDN
-        // instead, peeling to J11. There is no clock wire: CLKSEL (J10) is strapped
-        // to 3V3 on both boards and each chip runs its internal 2.048 MHz oscillator.
-        //
-        // Board A runs down the Zero's right column, shifted one pin below TX after
-        // the TX castellation joint failed open (2026-08-03): TX unused, RX(44)=DRDY,
-        // 13=MISO, 12=SCLK, 11=CS, 10=START, 9=PWDN, 8=RESET, 7=MOSI. Board B runs
-        // down the left column and onto the rear-pad extension wires: 1=DRDY,
-        // 2=MISO, GP3 empty, 4=SCLK, 5=CS, 6=START, 42=PWDN, 41=RESET, 40=MOSI.
-        //
-        // GP3/GP43/GP39 are spare; GP45 (strapping) and GP38 stay unused by design.
-        // USB-Serial-JTAG claims GPIO 19 and 20. The feedback outputs take GP16/GP15
-        // (haptics I2C data and clock) and GP21 (the onboard addressable LED).
-        // ---------------------------------------------------------------------------
-        // Pads 39-42 come out of reset owned by JTAG. PinDriver calls only
-        // gpio_set_direction, which leaves IO_MUX alone; gpio_config claims the pad
-        // for the GPIO matrix. Without this, board B's RESET (41) and PWDN (42) are
-        // undriven and its chip never enumerates. MOSI (40) is claimed by the SPI
-        // driver itself.
-        let jtag_pad_reclaim = esp_idf_svc::sys::gpio_config_t {
-            pin_bit_mask: (1u64 << 41) | (1u64 << 42),
-            mode: esp_idf_svc::sys::gpio_mode_t_GPIO_MODE_OUTPUT,
-            pull_up_en: esp_idf_svc::sys::gpio_pullup_t_GPIO_PULLUP_DISABLE,
-            pull_down_en: esp_idf_svc::sys::gpio_pulldown_t_GPIO_PULLDOWN_DISABLE,
-            intr_type: esp_idf_svc::sys::gpio_int_type_t_GPIO_INTR_DISABLE,
+        let adc_wiring = adc::FrontEndWiring {
+            sclk: peripherals.pins.gpio43.into(),
+            data_in: peripherals.pins.gpio9.into(),
+            data_out: peripherals.pins.gpio2.into(),
+            power_down: peripherals.pins.gpio42.into(),
+            reset: peripherals.pins.gpio8.into(),
+            start: peripherals.pins.gpio44.into(),
+            chip_select: [peripherals.pins.gpio3.into(), peripherals.pins.gpio7.into()],
+            data_ready: [
+                peripherals.pins.gpio40.into(),
+                peripherals.pins.gpio1.into(),
+            ],
         };
-        // SAFETY: the config struct is fully initialized and outlives the call.
-        esp_idf_svc::sys::esp!(unsafe { esp_idf_svc::sys::gpio_config(&jtag_pad_reclaim) })?;
-
-        let adc_wiring = [
-            // Board A, right-column ribbon, on SPI2.
-            adc::AdcChipWiring {
-                sclk: peripherals.pins.gpio12.into(),
-                data_in: peripherals.pins.gpio7.into(),
-                data_out: peripherals.pins.gpio13.into(),
-                power_down: peripherals.pins.gpio9.into(),
-                chip_select: peripherals.pins.gpio11.into(),
-                start: peripherals.pins.gpio10.into(),
-                reset: peripherals.pins.gpio8.into(),
-                data_ready: peripherals.pins.gpio44.into(),
-            },
-            // Board B, left-column ribbon, on SPI3.
-            adc::AdcChipWiring {
-                sclk: peripherals.pins.gpio4.into(),
-                data_in: peripherals.pins.gpio40.into(),
-                data_out: peripherals.pins.gpio2.into(),
-                power_down: peripherals.pins.gpio42.into(),
-                chip_select: peripherals.pins.gpio5.into(),
-                start: peripherals.pins.gpio6.into(),
-                reset: peripherals.pins.gpio41.into(),
-                data_ready: peripherals.pins.gpio1.into(),
-            },
-        ];
-
-        // Before ADC bring-up's settling delays, so the LED is lit through them.
-        let feedback = Feedback::start(FeedbackWiring {
-            bus: peripherals.i2c0,
-            haptics_data: peripherals.pins.gpio16.into(),
-            haptics_clock: peripherals.pins.gpio15.into(),
-            indicator: peripherals.pins.gpio21.into(),
-        });
 
         // Bring-up blocks ~2.5 s on the ADS1298's settling delays, so it runs before
         // the task watchdog is armed. A failure degrades rather than exits: the
         // phone link and the LED still come up, and the log says why.
         let source = match adc::bring_up(
             peripherals.spi2,
-            peripherals.spi3,
             adc_wiring,
             ADC_COMMAND_SPI_BAUD_RATE_HZ,
             ADC_FRAME_SPI_BAUD_RATE_HZ,
             ADC_TEST_SIGNAL_CHANNEL,
         )
-        .and_then(|front_ends| {
-            adc::acquisition::start(front_ends, WINDOW_SAMPLES, acquisition_buffers)
+        .and_then(|streaming| {
+            adc::acquisition::start(streaming, WINDOW_SAMPLES, acquisition_buffers)
         }) {
             Ok(source) => Some(source),
             Err(error) => {
@@ -346,6 +332,7 @@ impl App {
                 esp_idf_svc::sys::esp_task_wdt_reset();
             }
             self.apply_settings_writes();
+            self.relay_lead_off();
             if let (Some(record), Some(phone)) = (self.health.update(), self.phone.as_ref()) {
                 phone.publish_health(record);
             }
@@ -368,6 +355,19 @@ impl App {
             let kept = self.settings.to_band();
             info!("settings changed: {kept:?}");
             phone.publish_settings(kept);
+        }
+    }
+
+    fn relay_lead_off(&self) {
+        let (Some(phone), Some(source)) = (self.phone.as_ref(), self.source.as_ref()) else {
+            return;
+        };
+        if phone.take_lead_off_request() {
+            info!("lead-off snapshot requested");
+            source.request_lead_off_snapshot();
+        }
+        if let Some(tones) = source.take_lead_off_snapshot() {
+            phone.publish_lead_off(radio::lead_off_snapshot(&tones));
         }
     }
 
@@ -700,6 +700,7 @@ fn reset_reason() -> &'static str {
         esp_idf_svc::sys::esp_reset_reason_t_ESP_RST_WDT => "other watchdog",
         esp_idf_svc::sys::esp_reset_reason_t_ESP_RST_BROWNOUT => "brownout",
         esp_idf_svc::sys::esp_reset_reason_t_ESP_RST_USB => "usb reset",
+        esp_idf_svc::sys::esp_reset_reason_t_ESP_RST_DEEPSLEEP => "wake from sleep",
         _ => "other",
     }
 }

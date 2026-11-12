@@ -1,17 +1,12 @@
-//! The EMG acquisition front end: two TI ADS1298 8-channel ADCs.
+//! The EMG acquisition front end: two TI ADS1298 8-channel ADCs on the XIAO
+//! motherboard.
 //!
-//! Each chip has its own complete SPI bus (SPI2 and SPI3 hosts), its own PWDN,
-//! chip select, START, RESET, and DRDY — the chips share nothing but ground.
-//! Separate buses are not a luxury: SBAS459K §9.4.1.2 says a rising SCLK edge
-//! pulls DRDY high *regardless of CS*, so a shared SCLK would toggle the idle
-//! chip's DRDY on every read of its peer, and the datasheet's own prescription
-//! for multi-device buses is to gate SCLK per chip. Independent buses also let
-//! the stochastic conversion deaths the bring-up campaign characterised be
-//! detected and warm-recovered per chip without restarting the healthy one.
-//!
-//! Both chips self-clock from their internal 2.048 MHz oscillators (CLKSEL
-//! strapped to 3V3). They are therefore *not* phase-locked; [`preprocess`] and
-//! [`acquisition`] document what that does to the sixteen-channel pairing.
+//! The chips share one SPI bus and the RESET, START, and PWDN lines; each has its
+//! own chip select and DRDY. IC2 (CLKSEL high) runs its internal 2.048 MHz
+//! oscillator and drives it out of CLK, and IC1 (CLKSEL low) converts on it, so
+//! the two convert in lockstep from one START edge. Every RESET clears IC2's
+//! clock output and stops IC1, which is why [`ChipPair`] resets and recovers the
+//! two together and in a fixed order.
 //!
 //! Layout. [`registers`] is the typed register map and [`ads1298`] the register-level
 //! driver; [`decode`]/[`status`]/[`convert`] are the hardware-free frame and signal
@@ -20,14 +15,13 @@
 //! configured, streaming pair.
 //!
 //! Threading. The frame read itself is not on a thread at all: [`frame_reader`]
-//! clocks each frame out inside the chip's DRDY interrupt, because a conversion
-//! not read within one ~487 µs period is gone and no scheduling policy can
-//! promise that. What the threads do is everything after the bytes are safe.
-//! [`acquisition::start`] spawns one [`acquisition::pipeline`] thread per chip — draining
-//! that chip's frame ring, validating it, and owning its health — plus a combiner
-//! thread that places both streams onto one time grid
-//! ([`emg_runtime::alignment`]) and builds raw-count windows. Everything
-//! here owns its peripherals at `'static` instead of borrowing them.
+//! clocks both chips' frames out inside IC1's DRDY interrupt, because a conversion
+//! not read within one ~500 µs period is gone and no scheduling policy can promise
+//! that. [`acquisition::start`] spawns one [`acquisition::pipeline`] thread that
+//! drains both frame rings, validates them, and owns the pair's health, plus a
+//! combiner thread that places both streams onto one time grid
+//! ([`emg_runtime::alignment`]) and builds raw-count windows. Everything here owns
+//! its peripherals at `'static` instead of borrowing them.
 
 pub(crate) mod acquisition;
 pub(crate) mod ads1298;
@@ -56,122 +50,185 @@ use esp_idf_svc::hal::units::FromValueType;
 use log::{info, warn};
 use std::sync::Arc;
 
-use ads1298::{Ads1298Device, Ads1298FrontEnd};
+use ads1298::Ads1298Device;
 
 /// The ADS1298 reports this in its ID register. Bring-up checks it so a dead bus fails
 /// loudly at boot instead of producing plausible-looking zeroes forever.
 const EXPECTED_DEVICE_ID: u8 = 0x92;
 
-/// The conversion clock each chip generates for itself: the internal oscillator's
-/// nominal 2.048 MHz (CLKSEL strapped to 3V3 on both boards). Accuracy is ±0.5%
-/// at 25 °C and ±2% over 0-70 °C (SBAS459K §7.5), and the two chips' oscillators
-/// are independent — nothing enforces a common rate or phase.
+/// The conversion clock: the clock source's internal oscillator, nominally
+/// 2.048 MHz. Accuracy is ±0.5% at 25 °C and ±2% over 0-70 °C (SBAS459K §7.5);
+/// both chips share whatever error it has.
 pub(crate) const INTERNAL_OSCILLATOR_HZ: u32 = 2_048_000;
 
-/// One chip's complete wiring: a full private SPI bus plus every control line.
-/// Nothing here is shared with the other chip.
-pub(crate) struct AdcChipWiring {
+/// The front end's wiring: one SPI bus, the shared control lines, and each
+/// chip's chip select and DRDY in device order (IC1, IC2).
+pub(crate) struct FrontEndWiring {
     pub(crate) sclk: AnyOutputPin<'static>,
     pub(crate) data_in: AnyOutputPin<'static>,
     pub(crate) data_out: AnyInputPin<'static>,
-    /// This chip's own PWDN. It only participates in cold-boot sequencing — warm
-    /// recovery is RESET-only — but per-chip lines keep the two boards fully
-    /// independent.
     pub(crate) power_down: AnyOutputPin<'static>,
-    pub(crate) chip_select: AnyOutputPin<'static>,
-    pub(crate) data_ready: AnyInputPin<'static>,
     pub(crate) reset: AnyOutputPin<'static>,
     pub(crate) start: AnyOutputPin<'static>,
+    pub(crate) chip_select: [AnyOutputPin<'static>; DEVICE_COUNT],
+    pub(crate) data_ready: [AnyInputPin<'static>; DEVICE_COUNT],
 }
 
-/// The configured, streaming pair, plus both PWDN lines kept alive (and high)
-/// for as long as the front end exists.
-pub(crate) struct FrontEnds {
-    /// Each chip's interrupt-side frame path, claimed and proven against the
-    /// driver path in [`bring_up`] but not yet enabled: the pipeline thread that
-    /// drains a ring is the thing that opens its interrupt window.
-    pub(super) readers: [frame_reader::FrameReader; DEVICE_COUNT],
-    pub(super) chips: [Ads1298FrontEnd; DEVICE_COUNT],
-    pub(super) _power_down: [PinDriver<'static, Output>; DEVICE_COUNT],
+/// The two chips and every line they share.
+pub(crate) struct ChipPair {
+    chips: [Ads1298Device; DEVICE_COUNT],
+    power_down: PinDriver<'static, Output>,
+    reset: PinDriver<'static, Output>,
+    start: PinDriver<'static, Output>,
 }
 
-/// Builds one chip's front end on its own private SPI host.
-///
-/// No hardware CS: the driver toggles CS as a GPIO, held low across each whole
-/// command — the mechanism the bring-up harness validated. The `Arc` keeps the
-/// device `'static` so it can move onto the acquisition thread.
-fn build_front_end<SPI: SpiAnyPins + 'static>(
-    spi: SPI,
-    wiring: AdcChipWiring,
-    right_leg_drive: ads1298::RightLegDriveMode,
-    command_config: &SpiConfig,
-    frame_config: &SpiConfig,
-) -> Result<(
-    Ads1298FrontEnd,
-    PinDriver<'static, Output>,
-    esp_idf_svc::sys::spi_host_device_t,
-)> {
-    let bus = Arc::new(
-        SpiDriver::new(
-            spi,
-            wiring.sclk,
-            wiring.data_in,
-            Some(wiring.data_out),
-            &SpiDriverConfig::new(),
-        )
-        .context("SPI bus init")?,
-    );
-    // Held low from construction: the chip stays in power-down until the shared
-    // sequencing in `bring_up` raises both boards together.
-    let mut power_down = PinDriver::output(wiring.power_down)?;
-    power_down.set_low()?;
-    // Two device handles on the one bus: the command path at its clock and the
-    // frame-read hot path at its own — esp-idf serialises them on the bus lock,
-    // and CS is a GPIO either way.
-    let device = Ads1298Device::new(
-        SpiDeviceDriver::new(bus.clone(), Option::<AnyOutputPin>::None, command_config)
-            .context("SPI command device")?,
-        SpiDeviceDriver::new(bus, Option::<AnyOutputPin>::None, frame_config)
-            .context("SPI frame device")?,
-        PinDriver::output(wiring.chip_select)?,
-        // DRDY is actively driven by the ADS1298, so no internal pull is needed.
-        PinDriver::input(wiring.data_ready, Pull::Floating)?,
-        PinDriver::output(wiring.reset)?,
-        right_leg_drive,
-    )
-    .context("ADC pin init")?;
-    Ok((
-        Ads1298FrontEnd::new(device, PinDriver::output(wiring.start)?),
-        power_down,
-        // Carried out with the front end rather than looked up later: the host
-        // is fixed by the peripheral this call consumed, and the interrupt-side
-        // reader addresses it by register base, which must not be able to name
-        // the wrong one.
-        <SPI as esp_idf_svc::hal::spi::Spi>::device(),
-    ))
+/// After a power-up the follower counts tPOR (2^18 tCLK, 128 ms) from the first
+/// clock edge it sees, which is the source's `CLK_EN` write.
+const COLD_CLOCK_SETTLE_MILLISECONDS: u32 = 250;
+/// After a warm RESET only the clock's restart needs covering.
+const WARM_CLOCK_SETTLE_MILLISECONDS: u32 = 5;
+/// How long bring-up waits for the first DRDY after START: several tSETTLE.
+const FIRST_CONVERSION_TIMEOUT_MICROSECONDS: u64 = 20_000;
+
+impl ChipPair {
+    fn index_of(&self, role: ads1298::ClockRole) -> usize {
+        self.chips
+            .iter()
+            .position(|chip| chip.clock_role() == role)
+            .expect("ads1298::CLOCK_ROLE names one source and one follower")
+    }
+
+    pub(super) fn start_conversion(&mut self) -> Result<()> {
+        self.start.set_high()?;
+        Ok(())
+    }
+
+    pub(super) fn stop_conversion(&mut self) -> Result<()> {
+        self.start.set_low()?;
+        Ok(())
+    }
+
+    /// Resets both chips, restores the clock, checks both identities, and writes
+    /// both register sets, leaving both in SDATAC.
+    ///
+    /// The shared RESET pulse clears the source's `CLK_EN`, so the source comes
+    /// back first and drives CLK again before the follower is reset by opcode —
+    /// the pulse itself reached an unclocked follower and cannot be trusted to
+    /// have done anything there. Both identities are read and reported before a
+    /// mismatch is fatal: the source failing points at the shared bus, the
+    /// follower alone failing points at the clock.
+    fn reset_and_configure(&mut self, clock_settle_milliseconds: u32) -> Result<()> {
+        self.reset.set_low()?;
+        FreeRtos::delay_ms(1);
+        self.reset.set_high()?;
+        // 18 tCLK after RESET rises before any command (SBAS459K §9.3.2.3).
+        FreeRtos::delay_ms(1);
+
+        let source = self.index_of(ads1298::ClockRole::Source);
+        let follower = self.index_of(ads1298::ClockRole::Follower);
+        let mut identities = [0u8; DEVICE_COUNT];
+        identities[source] = self.chips[source]
+            .probe_identity()
+            .with_context(|| format!("ADS1298 chip {source} identity probe"))?;
+        self.chips[source].write_config1()?;
+        FreeRtos::delay_ms(clock_settle_milliseconds);
+        self.chips[follower].reset_by_command()?;
+        identities[follower] = self.chips[follower]
+            .probe_identity()
+            .with_context(|| format!("ADS1298 chip {follower} identity probe"))?;
+
+        for (index, &id) in identities.iter().enumerate() {
+            if id == EXPECTED_DEVICE_ID {
+                info!("ADS1298 chip {index}: ID {id:#04x} as expected");
+            } else {
+                warn!(
+                    "ADS1298 chip {index}: ID {id:#04x}, expected {EXPECTED_DEVICE_ID:#04x} -- {}",
+                    match (id, index == follower) {
+                        (_, true) if identities[source] == EXPECTED_DEVICE_ID =>
+                            "the clock source answers, so suspect the CLK net or this \
+                             chip's CLKSEL strap",
+                        (0x00 | 0xFF, _) =>
+                            "bus reads all-zero or all-one, so this is wiring, \
+                             power, or chip select rather than a wrong part",
+                        _ =>
+                            "the bus responds but the byte is wrong: suspect SPI mode \
+                             or signal integrity on the shared bus",
+                    }
+                );
+            }
+        }
+        if identities.iter().any(|&id| id != EXPECTED_DEVICE_ID) {
+            anyhow::bail!(
+                "ADS1298 ID mismatch: chip 0 read {:#04x}, chip 1 read {:#04x}, both should \
+                 be {EXPECTED_DEVICE_ID:#04x}",
+                identities[0],
+                identities[1],
+            );
+        }
+
+        // The source first: its recipe keeps CLK_EN set, so the follower stays
+        // clocked through its own writes.
+        for index in [source, follower] {
+            self.chips[index]
+                .configure()
+                .with_context(|| format!("ADS1298 chip {index} configure"))?;
+        }
+        Ok(())
+    }
+
+    /// Turns lead-off detection on or off on both chips. Conversions stop for the
+    /// register writes and restart together on one START edge.
+    pub(super) fn set_lead_off(&mut self, on: bool) -> Result<()> {
+        self.stop_conversion()?;
+        for chip in &mut self.chips {
+            chip.stop_read_data_continuous()?;
+        }
+        FreeRtos::delay_ms(1);
+        for chip in &mut self.chips {
+            chip.set_lead_off(on)?;
+            chip.read_data_continuous()?;
+        }
+        self.start_conversion()
+    }
+
+    /// Warm-recovers both chips after either dies mid-session: conversions
+    /// stopped, the shared reset sequence, RDATAC, START again. The register work
+    /// takes ~10 ms; the true cost is the reference-settling discard window
+    /// acquisition applies afterwards, on both chips.
+    pub(super) fn warm_recover(&mut self) -> Result<()> {
+        self.stop_conversion()?;
+        self.reset_and_configure(WARM_CLOCK_SETTLE_MILLISECONDS)?;
+        for chip in &mut self.chips {
+            chip.read_data_continuous()?;
+        }
+        self.start_conversion()
+    }
+}
+
+/// The configured, streaming pair and its interrupt-side frame path, claimed and
+/// proven against the driver path in [`bring_up`] but not yet enabled: the
+/// pipeline thread that drains the rings opens the interrupt window.
+pub(crate) struct StreamingPair {
+    pub(super) pair: ChipPair,
+    pub(super) reader: frame_reader::FrameReader,
 }
 
 /// Brings both chips up and leaves them streaming in RDATAC mode.
 ///
-/// The chips self-clock (CLKSEL at 3V3), so no external clock has to be running
-/// first: the post-RESET lockout counts cycles of each chip's own oscillator.
-///
 /// `command_baud_rate_hz` clocks registers and opcodes — the bench-validated rate,
 /// nothing here is latency-sensitive. `frame_baud_rate_hz` clocks the RDATAC frame
-/// reads: one 27-byte frame per chip has to clear well inside the ~500 µs sample
-/// period, and every microsecond of transfer is edge-service budget, so this one
-/// wants to be as fast as the wiring proves clean.
-/// `test_signal_channel` is `Some(channel)` to drive each chip's internal square
-/// wave into that channel instead of the electrodes. See
-/// [`ads1298::Ads1298Device::enable_test_signal`].
-pub(crate) fn bring_up<SpiA: SpiAnyPins + 'static, SpiB: SpiAnyPins + 'static>(
-    spi_a: SpiA,
-    spi_b: SpiB,
-    wiring: [AdcChipWiring; DEVICE_COUNT],
+/// reads: both chips' frames have to clear well inside the ~500 µs sample period,
+/// and every microsecond of transfer is edge-service budget, so this one wants to be
+/// as fast as the wiring proves clean. `test_signal_channel` is `Some(channel)` to
+/// drive each chip's internal square wave into that channel instead of the
+/// electrodes. See [`ads1298::Ads1298Device::enable_test_signal`].
+pub(crate) fn bring_up<SPI: SpiAnyPins + 'static>(
+    spi: SPI,
+    wiring: FrontEndWiring,
     command_baud_rate_hz: u32,
     frame_baud_rate_hz: u32,
     test_signal_channel: Option<Channel>,
-) -> Result<FrontEnds> {
+) -> Result<StreamingPair> {
     // The ADS1298 samples DIN on the falling edge and shifts DOUT on the rising edge:
     // SPI mode 1 (CPOL=0, CPHA=1).
     //
@@ -190,101 +247,95 @@ pub(crate) fn bring_up<SpiA: SpiAnyPins + 'static, SpiB: SpiAnyPins + 'static>(
         .data_mode(MODE_1)
         .polling(false);
 
-    let [wiring_a, wiring_b] = wiring;
-    let [drive_a, drive_b] = ads1298::RIGHT_LEG_DRIVE_MODE;
-    let (front_end_a, power_down_a, spi_host_a) =
-        build_front_end(spi_a, wiring_a, drive_a, &command_config, &frame_config)?;
+    let FrontEndWiring {
+        sclk,
+        data_in,
+        data_out,
+        power_down,
+        reset,
+        start,
+        chip_select,
+        data_ready,
+    } = wiring;
+    // Low from construction: the chips stay powered down and in reset until the
+    // power sequence below.
+    let mut power_down = PinDriver::output(power_down)?;
+    power_down.set_low()?;
+    let mut reset = PinDriver::output(reset)?;
+    reset.set_low()?;
+    let mut start = PinDriver::output(start)?;
+    start.set_low()?;
+
+    let bus = Arc::new(
+        SpiDriver::new(spi, sclk, data_in, Some(data_out), &SpiDriverConfig::new())
+            .context("SPI bus init")?,
+    );
+    let spi_host = <SPI as esp_idf_svc::hal::spi::Spi>::device();
+    let [chip_select_0, chip_select_1] = chip_select;
+    let [data_ready_0, data_ready_1] = data_ready;
+    let build_chip = |index: usize,
+                      chip_select: AnyOutputPin<'static>,
+                      data_ready: AnyInputPin<'static>|
+     -> Result<Ads1298Device> {
+        // Two device handles per chip on the one bus: the command path at its
+        // clock and the frame-read hot path at its own. esp-idf serialises them
+        // on the bus lock, and CS is a GPIO either way, held low across each
+        // whole command — the mechanism the bring-up harness validated.
+        Ads1298Device::new(
+            SpiDeviceDriver::new(bus.clone(), Option::<AnyOutputPin>::None, &command_config)
+                .context("SPI command device")?,
+            SpiDeviceDriver::new(bus.clone(), Option::<AnyOutputPin>::None, &frame_config)
+                .context("SPI frame device")?,
+            PinDriver::output(chip_select)?,
+            // DRDY is actively driven by the ADS1298, so no internal pull is needed.
+            PinDriver::input(data_ready, Pull::Floating)?,
+            ads1298::RIGHT_LEG_DRIVE_MODE[index],
+            ads1298::CLOCK_ROLE[index],
+        )
+        .with_context(|| format!("ADS1298 chip {index} pin init"))
+    };
+    let chips = [
+        build_chip(0, chip_select_0, data_ready_0)?,
+        build_chip(1, chip_select_1, data_ready_1)?,
+    ];
+    let mut pair = ChipPair {
+        chips,
+        power_down,
+        reset,
+        start,
+    };
+
     // The GPIO interrupt dispatcher is installed from a thread pinned to core 1
     // because esp-idf allocates an interrupt on whichever core runs the
-    // allocating call, and that dispatcher is now the frame-read path for both
-    // chips: every DRDY edge is serviced there. Chip B's bus initialises in the
-    // same thread, which puts its (command-path only) completion interrupt on
-    // the same quiet core. See `crate::cores` for the whole plan.
-    let command_config_b = command_config.clone();
-    let frame_config_b = frame_config.clone();
-    let built_b =
-        crate::cores::spawn_pinned(crate::cores::GPIO_INTERRUPT_DISPATCHER_CORE, || {
-            std::thread::Builder::new()
-                .name("adc-init-b".into())
-                .stack_size(8192)
-                .spawn(move || {
-                    frame_reader::install_interrupt_dispatcher()?;
-                    build_front_end(spi_b, wiring_b, drive_b, &command_config_b, &frame_config_b)
-                })
-        })??
-        .join();
-    let (front_end_b, power_down_b, spi_host_b) =
-        built_b.map_err(|_| anyhow::anyhow!("chip B front-end init thread panicked"))??;
-    let mut chips = [front_end_a, front_end_b];
-    let mut power_down = [power_down_a, power_down_b];
-    let spi_hosts = [spi_host_a, spi_host_b];
+    // allocating call, and that dispatcher is the frame-read path for both chips.
+    // See `crate::cores` for the whole plan.
+    crate::cores::spawn_pinned(crate::cores::GPIO_INTERRUPT_DISPATCHER_CORE, || {
+        std::thread::Builder::new()
+            .name("adc-dispatch".into())
+            .stack_size(4096)
+            .spawn(frame_reader::install_interrupt_dispatcher)
+    })??
+    .join()
+    .map_err(|_| anyhow::anyhow!("DRDY dispatcher install thread panicked"))??;
 
-    // Shared power sequencing: minimum PWDN assertion, release, then the supply
-    // settling both chips wait out together. Roughly 2.5 s all told, which must stay
-    // ahead of the task watchdog registration in `main`.
+    // Minimum PWDN assertion, release, then the supply settling. Roughly 2.5 s all
+    // told, which must stay ahead of the task watchdog registration in `main`.
     info!("ADS1298 pair: powering up");
     FreeRtos::delay_ms(5);
-    for pin in &mut power_down {
-        pin.set_high()?;
-    }
-    for chip in &mut chips {
-        chip.device.release_reset()?;
-    }
+    pair.power_down.set_high()?;
+    pair.reset.set_high()?;
     FreeRtos::delay_ms(2000);
 
-    // Every chip is probed and reported before any mismatch is fatal. With two
-    // boards on independent buses the comparison between them is the diagnosis:
-    // both chips failing the same way points at something genuinely common (power,
-    // ground, firmware), one chip disagreeing points at that board's own wiring.
-    let mut identities = [0u8; DEVICE_COUNT];
-    for (index, chip) in chips.iter_mut().enumerate() {
-        let id = chip
-            .device
-            .probe_identity()
-            .with_context(|| format!("ADS1298 chip {index} identity probe"))?;
-        identities[index] = id;
-        if id == EXPECTED_DEVICE_ID {
-            info!("ADS1298 chip {index}: ID {id:#04x} as expected");
-        } else {
-            warn!(
-                "ADS1298 chip {index}: ID {id:#04x}, expected {EXPECTED_DEVICE_ID:#04x} -- {}",
-                match id {
-                    0x00 | 0xFF =>
-                        "bus reads all-zero or all-one, so this is wiring, \
-                                    power, or chip select rather than a wrong part",
-                    _ =>
-                        "the bus responds but the byte is wrong: suspect SPI mode, \
-                          a shifted or reversed ribbon, or a chip whose CLKSEL strap \
-                          is not actually at 3V3 (an unclocked chip cannot decode \
-                          commands)",
-                }
-            );
-        }
-    }
-    if identities.iter().any(|&id| id != EXPECTED_DEVICE_ID) {
-        anyhow::bail!(
-            "ADS1298 ID mismatch: chip 0 read {:#04x}, chip 1 read {:#04x}, both should \
-             be {EXPECTED_DEVICE_ID:#04x}",
-            identities[0],
-            identities[1],
-        );
-    }
-
-    for (index, chip) in chips.iter_mut().enumerate() {
-        chip.device
-            .initialize()
-            .with_context(|| format!("ADS1298 chip {index} initialise"))?;
-    }
+    pair.reset_and_configure(COLD_CLOCK_SETTLE_MILLISECONDS)?;
 
     // Internal reference settling: the datasheet's 150 ms start-up time with margin,
-    // after `configure` powers each reference buffer and before START. One wait
-    // covers both chips — their references started within milliseconds of each other.
+    // after `configure` powers each reference buffer and before START.
     FreeRtos::delay_ms(300);
 
-    for (index, chip) in chips.iter_mut().enumerate() {
+    for (index, chip) in pair.chips.iter_mut().enumerate() {
         if let Some(channel) = test_signal_channel {
             // Registers can only be written outside RDATAC.
-            chip.device.enable_test_signal(channel)?;
+            chip.enable_test_signal(channel)?;
             info!(
                 "ADS1298 chip {index}: internal test signal on channel {channel}; \
                  electrodes are NOT being read"
@@ -293,7 +344,7 @@ pub(crate) fn bring_up<SpiA: SpiAnyPins + 'static, SpiB: SpiAnyPins + 'static>(
 
         // The whole map, off the chip, after the test-signal muxing above, so the
         // log describes the chip that is converting.
-        let snapshot = chip.device.read_all_registers();
+        let snapshot = chip.read_all_registers();
         let registers: Vec<String> = Register::ALL
             .iter()
             .zip(snapshot)
@@ -304,83 +355,84 @@ pub(crate) fn bring_up<SpiA: SpiAnyPins + 'static, SpiB: SpiAnyPins + 'static>(
             .collect();
         info!("ADS1298 chip {index} registers: {}", registers.join(" "));
 
-        chip.device.read_data_continuous()?;
-        chip.start_conversion()?;
+        chip.read_data_continuous()?;
     }
+    pair.start_conversion()?;
     info!(
         "ADS1298 pair: streaming, frame reads at {frame_baud_rate_hz} Hz SPI, commands at {command_baud_rate_hz} Hz"
     );
 
-    let mut claimed = Vec::with_capacity(DEVICE_COUNT);
-    for (index, chip) in chips.iter_mut().enumerate() {
-        claimed.push(claim_frame_reader(index, chip, spi_hosts[index])?);
-    }
-    let readers: [frame_reader::FrameReader; DEVICE_COUNT] = claimed
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("one frame reader per chip"))?;
-
-    Ok(FrontEnds {
-        readers,
-        chips,
-        _power_down: power_down,
-    })
+    let reader = claim_frame_reader(&mut pair, spi_host)?;
+    Ok(StreamingPair { pair, reader })
 }
 
-/// Hands one streaming chip's SPI host over to its interrupt-side reader, and
+/// Hands the streaming pair's SPI host over to the interrupt-side reader, and
 /// proves the handover before anything depends on it.
 ///
-/// The driver reads one frame — which is also what leaves the host's registers
-/// holding the frame configuration the recipe is snapshotted from — and then the
-/// reader's own code path reads the next one, still in task context. Two
-/// consecutive frames off the same streaming chip: a recipe that clocks the
-/// wrong length, mode, or bit order cannot produce a second valid status marker
-/// by accident. The interrupt is attached but left disabled; the chip's pipeline
-/// thread opens the window once it is ready to drain.
+/// The driver reads one frame from each chip — which also leaves the host's
+/// registers holding the frame configuration the recipe is snapshotted from — and
+/// then the reader's own code path reads the next pair, still in task context.
+/// Consecutive frames off the same streaming chips: a recipe that clocks the wrong
+/// length, mode, or bit order cannot produce valid status markers by accident. The
+/// interrupts are attached but left disabled; the pipeline thread opens the window
+/// once it is ready to drain.
 fn claim_frame_reader(
-    index: usize,
-    chip: &mut Ads1298FrontEnd,
+    pair: &mut ChipPair,
     spi_host: esp_idf_svc::sys::spi_host_device_t,
 ) -> Result<frame_reader::FrameReader> {
     // A conversion has to have finished, or the read clocks out a frame the chip
-    // is still producing and both sides of the comparison are garbage.
-    FreeRtos::delay_ms(2);
-    let driver_frame = chip
-        .read_frame()
-        .with_context(|| format!("chip {index} driver frame read"))?;
-    if driver_frame.status_word().is_none() {
-        anyhow::bail!(
-            "chip {index} driver frame has no status marker ({:#08x})",
-            driver_frame.status
-        );
+    // is still producing and both sides of the comparison are garbage. The first
+    // one lands tSETTLE (4616 tCLK, ~2.3 ms) after START.
+    let deadline = crate::device_now_us() + FIRST_CONVERSION_TIMEOUT_MICROSECONDS;
+    while !pair.chips[0].data_is_ready() {
+        if crate::device_now_us() > deadline {
+            anyhow::bail!("chip 0 DRDY never fell after START");
+        }
+        FreeRtos::delay_ms(1);
     }
+    let mut driver_status = [0u32; DEVICE_COUNT];
+    for (index, chip) in pair.chips.iter_mut().enumerate() {
+        let frame = chip
+            .read_frame()
+            .with_context(|| format!("chip {index} driver frame read"))?;
+        if frame.status_word().is_none() {
+            anyhow::bail!(
+                "chip {index} driver frame has no status marker ({:#08x})",
+                frame.status
+            );
+        }
+        driver_status[index] = frame.status;
+    }
+    let [first, second] = &pair.chips;
     let reader = frame_reader::FrameReader::claim(
-        index,
         spi_host,
-        chip.device.frame_spi_handle(),
-        chip.device.chip_select_pin(),
-        chip.device.data_ready_pin(),
+        second.frame_spi_handle(),
+        [first.chip_select_pin(), second.chip_select_pin()],
+        [first.data_ready_pin(), second.data_ready_pin()],
     )?;
     FreeRtos::delay_ms(2);
-    let bytes = reader.validate().ok_or_else(|| {
+    let frames = reader.validate().ok_or_else(|| {
         anyhow::anyhow!(
-            "chip {index} interrupt-side frame path produced no frame: the SPI host did not \
-             complete the transfer"
+            "interrupt-side frame path produced no frames: the SPI host did not complete \
+             the transfer"
         )
     })?;
-    let frame = decode::parse_sample(&bytes);
-    if frame.status_word().is_none() {
-        anyhow::bail!(
-            "chip {index} interrupt-side frame has no status marker ({:#08x}); driver status \
-             was {:#08x}",
-            frame.status,
-            driver_frame.status
+    for (index, bytes) in frames.iter().enumerate() {
+        let frame = decode::parse_sample(bytes);
+        if frame.status_word().is_none() {
+            anyhow::bail!(
+                "chip {index} interrupt-side frame has no status marker ({:#08x}); driver \
+                 status was {:#08x}",
+                frame.status,
+                driver_status[index]
+            );
+        }
+        info!(
+            "chip {index} interrupt-side frame path verified: driver status {:#08x}, \
+             interrupt-path status {:#08x}",
+            driver_status[index], frame.status
         );
     }
-    info!(
-        "chip {index} interrupt-side frame path verified: driver status {:#08x}, \
-         interrupt-path status {:#08x}",
-        driver_frame.status, frame.status
-    );
     reader.attach()?;
     Ok(reader)
 }

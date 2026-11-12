@@ -3,61 +3,47 @@
 //! Core 1 is acquisition's real-time budget; core 0 carries everything else. The
 //! interrupt placements follow from where code runs, not from any configuration:
 //! esp-idf allocates an interrupt on the core executing the allocating call.
-//! That is why chip B's SPI bus setup and the GPIO dispatcher install run under
-//! [`spawn_pinned`] instead of on the main task.
+//! That is why the GPIO dispatcher install runs under [`spawn_pinned`] instead of
+//! on the main task.
 //!
-//! What the DRDY dispatcher does changed the weight of that placement. It no
-//! longer notifies a thread that then reads the frame; it *is* the read, for both
-//! chips (`adc::frame_reader`), at a measured 32 µs per edge and ~2 kHz per chip —
-//! about an eighth of one core, all of it deadline work, none of it interruptible
-//! by the scheduler. Core 1 therefore stays quiet by rule rather than by
-//! convenience, and the pipeline threads that drain the rings are ordinary
-//! consumers whose lateness costs latency instead of conversions.
+//! The DRDY dispatcher is the read itself, for both chips (`adc::frame_reader`):
+//! two 27-byte frames per edge at ~2 kHz, all of it deadline work and none of it
+//! interruptible by the scheduler. Core 1 therefore stays quiet by rule rather
+//! than by convenience, and the pipeline thread that drains the rings is an
+//! ordinary consumer whose lateness costs latency instead of conversions.
 //!
 //! The full map, including the placements sdkconfig.defaults owns:
 //!
 //! - **Core 0**: the main task (inference and link writes,
-//!   `CONFIG_ESP_MAIN_TASK_AFFINITY_CPU0`), chip A's pipeline thread, and
-//!   esp-idf's housekeeping tasks (timers, events), which default there.
-//! - **Core 0**, continued: the combiner (below the pipelines in priority), the
-//!   feedback and BLE session threads, and chip A's SPI host completion interrupt — allocated
-//!   wherever `build_front_end` runs, which for chip A is the main task.
-//! - **Core 1**: the shared GPIO interrupt dispatcher — both chips' frame reads —
-//!   plus chip B's pipeline thread and chip B's SPI host completion interrupt,
-//!   which now serves only command-path traffic (bring-up, warm recovery) and is
-//!   idle in steady state. Nothing else: the dispatcher's latency is both chips'
-//!   edge-service latency, so this core stays free of bulk work.
+//!   `CONFIG_ESP_MAIN_TASK_AFFINITY_CPU0`), the acquisition pipeline thread, the
+//!   combiner (below the pipeline in priority), the feedback and BLE session
+//!   threads, esp-idf's housekeeping tasks (timers, events), which default there,
+//!   and the SPI host's completion interrupt, allocated on the main task during
+//!   bring-up and used only by command traffic (bring-up, warm recovery).
+//! - **Core 1**: the GPIO interrupt dispatcher — both chips' frame reads.
+//!   Nothing else: the dispatcher's latency is the pair's edge-service latency,
+//!   so this core stays free of bulk work.
 
 use esp_idf_svc::hal::cpu::Core;
 use esp_idf_svc::hal::task::thread::ThreadSpawnConfiguration;
 
-use crate::adc::channel::Board;
+/// The pipeline thread drains and decodes both chips' rings. Its lateness costs
+/// latency, not conversions, so it shares core 0 with the other bulk work at a
+/// priority above it.
+pub(crate) const ACQUISITION_PIPELINE_CORE: Core = Core::Core0;
 
-/// The core one board's pipeline thread — and, for board B, its SPI host
-/// interrupt — lives on: A on core 0, B on core 1. The threads are drain and
-/// decode work now, not reads, so one per core is headroom rather than a
-/// requirement; they stay split because a burst on one chip has no reason to
-/// delay the other's frames reaching the combiner. Exhaustive, so wiring a new
-/// board forces a placement decision here.
-pub(crate) const fn front_end_core(board: Board) -> Core {
-    match board {
-        Board::A => Core::Core0,
-        Board::B => Core::Core1,
-    }
-}
-
-/// The combiner drains both pipelines and runs raw-window packing.
+/// The combiner drains the pipeline and runs raw-window packing.
 /// It lives on core 0 with the other bulk work: measured on core 1, its packing
 /// bursts and heap traffic roughly doubled both chips' miss rates by adding
 /// latency to the GPIO dispatcher that shares that core.
 pub(crate) const COMBINER_CORE: Core = Core::Core0;
 
-/// The shared GPIO interrupt dispatcher reads both chips' frames from board B's
-/// core, keeping the ~2 kHz-per-chip read load off the loaded one. Where it
+/// The GPIO interrupt dispatcher reads both chips' frames on the quiet core,
+/// keeping the ~2 kHz read load off the loaded one. Where it
 /// lands is decided by which core calls `gpio_install_isr_service`, so the ADC
 /// bring-up installs it from a thread pinned here. Whatever else is put on this
 /// core is added directly to both chips' edge-service latency.
-pub(crate) const GPIO_INTERRUPT_DISPATCHER_CORE: Core = front_end_core(Board::B);
+pub(crate) const GPIO_INTERRUPT_DISPATCHER_CORE: Core = Core::Core1;
 
 /// The haptics and indicator-LED outputs. Core 0 because the I2C and RMT drivers
 /// allocate their interrupts on whichever core constructs them, and core 1's budget

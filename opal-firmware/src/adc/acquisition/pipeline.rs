@@ -1,51 +1,51 @@
-//! One ADS1298's private stream: drain the frames its DRDY interrupt captured, keep
-//! the chip alive, and hand timestamped frames to the combiner.
+//! The pair's stream: drain the frames the DRDY interrupt captured from both chips,
+//! keep the pair alive, and hand timestamped frames to the combiner.
 //!
-//! Each chip gets one of these threads, and nothing in here knows the other chip
-//! exists. The read itself is not here — [`super::super::frame_reader`] clocks every frame
-//! out inside the DRDY interrupt, because the chip has no FIFO and a conversion left
-//! unread for one ~487 µs period is gone. What that buys this thread is the freedom
-//! to be late: frames sit in a lock-free ring roughly 32 ms deep, so a scheduling
-//! delay, a wifi burst, or a flash write costs latency here instead of conversions
-//! at the chip.
+//! The read itself is not here — [`super::super::frame_reader`] clocks both chips'
+//! frames out inside IC1's DRDY interrupt, because the chips have no FIFO and a
+//! conversion left unread for one ~500 µs period is gone. What that buys this thread
+//! is the freedom to be late: frames sit in lock-free rings roughly 32 ms deep, so a
+//! scheduling delay, a radio burst, or a flash write costs latency here instead of
+//! conversions at the chips.
 //!
-//! The thread owns everything about its chip's health: DRDY-staleness death
-//! detection, the silent-revert (slow period) detector, status-marker validation,
-//! warm recovery, and the post-recovery reference-settling discard. What leaves the
-//! thread is only what the combiner needs: batches of trustworthy timestamped
-//! frames, and [`ChipEvent::Absent`] / [`ChipEvent::Present`] transitions bracketing
-//! every stretch the chip cannot be believed. The absent/present contract matters
-//! beyond bookkeeping — the grid aligner downstream waits on every present source,
-//! so a chip that stops delivering MUST be marked absent within a bounded time, and
-//! the [`DATA_READY_TIMEOUT_MS`] death detection is that bound.
+//! One thread serves both chips because their health is no longer separable: they
+//! share RESET, START, and the clock, so any recovery restarts both. Detection stays
+//! per chip — DRDY staleness, the silent-revert (slow period) detector, status-marker
+//! validation, and a check that IC2's own DRDY still falls while IC1 converts — and
+//! each chip's stream brackets every stretch it cannot be believed with
+//! [`ChipEvent::Absent`] / [`ChipEvent::Present`]. The grid aligner downstream waits
+//! on every present source, so a chip that stops delivering MUST be marked absent
+//! within a bounded time, and [`DATA_READY_TIMEOUT_MS`] is that bound.
 //!
-//! The thread is also the only place that hands the chip's SPI host back to the
-//! esp-idf driver: [`Pipeline::recover`] closes the interrupt window, runs the
-//! recovery through the driver, and reopens it. `frame_reader` states that
-//! ownership contract in full.
+//! The thread is also the only place that hands the SPI host back to the esp-idf
+//! driver: [`Pipeline::recover`] closes the interrupt window, runs the recovery
+//! through the driver, and reopens it. `frame_reader` states that ownership
+//! contract in full.
 
 use crate::handoff::Handoff;
 use esp_idf_svc::hal::delay::FreeRtos;
-use esp_idf_svc::hal::gpio::{Output, PinDriver};
 use log::{info, warn};
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::SyncSender;
+use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::Arc;
 
 use crate::device_now_us as now_us;
 
-use super::super::ads1298::Ads1298FrontEnd;
-use super::super::channel::Board;
+use super::super::ads1298::SAMPLE_RATE_HZ;
+use super::super::channel::DEVICE_COUNT;
+use super::super::convert::MICROVOLTS_PER_CODE;
 use super::super::decode::{parse_sample, Sample};
-use super::super::frame_reader::FrameReader;
+use super::super::frame_reader::{CapturedFrame, FrameReader};
 use super::super::status::StatusWord;
-use super::HealthCounters;
+use super::super::ChipPair;
+use super::{HealthCounters, LeadOffTones};
+use emg_runtime::band_features::CHANNEL_COUNT;
 
 /// Lead-off bits one chip contributes to the device-wide word: its eight
 /// channels, placed at `index * CHIP_LEAD_OFF_BITS`.
 const CHIP_LEAD_OFF_BITS: usize = 8;
 
-/// Stack for a pipeline thread. It holds no large locals, but esp-idf's default is
+/// Stack for the pipeline thread. It holds no large locals, but esp-idf's default is
 /// tight, and a stack overflow here presents as an unexplained reboot rather than an
 /// error. The production link path must never rely on that timing.
 const THREAD_STACK_BYTES: usize = 8192;
@@ -61,7 +61,7 @@ const THREAD_PRIORITY: u8 = 10;
 pub(super) const FRAMES_PER_BATCH: usize = 16;
 
 /// How long the thread sleeps between drains. At the ~2 kHz conversion rate each
-/// wake finds about two frames, so the batch above still fills in ~8 ms. Sleeping
+/// wake finds about two frames per chip, so the batch above still fills in ~8 ms. Sleeping
 /// rather than waiting on a notification is the point of moving the read: the
 /// interrupt no longer needs to wake anything, so it makes no FreeRTOS call at all,
 /// and this thread's wake rate halves.
@@ -106,18 +106,40 @@ const SLOW_PERIOD_US: u64 = 1_500;
 /// (~2 per second was measured) describes itself without flooding the link.
 const RECOVERY_LOG_INTERVAL: u32 = 32;
 
+/// Chip 0 frames between checks that chip 1's DRDY still falls: about a second.
+/// Chip 0's edges drive every read, so a chip 1 that stops converting would
+/// otherwise go on handing over its last conversion with a valid status marker.
+const FRAMES_PER_COUNTED_EDGE_CHECK: u32 = SAMPLE_RATE_HZ;
+
+/// Chip 0 conversions a lead-off snapshot measures over: two seconds.
+const LEAD_OFF_SNAPSHOT_FRAMES: u16 = 2 * SAMPLE_RATE_HZ as u16;
+
+/// Conversions after START that belong to the digital filter's settling, skipped
+/// before a snapshot starts measuring.
+const LEAD_OFF_SETTLE_FRAMES: u32 = 10;
+
+/// A snapshot that has not filled in this long has lost its DRDY.
+const LEAD_OFF_SNAPSHOT_TIMEOUT_US: u64 = 4_000_000;
+
+/// How long frames are discarded after a snapshot. The AC excitation leaves no
+/// charge behind: on the bench every flex channel was back at its resting offset
+/// within 100 ms.
+const AFTER_LEAD_OFF_SETTLE_US: u64 = 200_000;
+
+/// A code this far toward either end of the 24-bit range counts as railed.
+const RAIL_CODE: u32 = 8_300_000;
+
 /// A transient command failure gets another full reset/configure attempt while
 /// DRDY remains disabled. Exhaustion leaves the source absent until reboot.
 const RECOVERY_ATTEMPTS: u32 = 3;
 
-/// How long after a warm recovery a chip's frames are read but discarded. The RESET
-/// pulse powers that chip's internal reference buffer down and `configure` powers it
+/// How long after a warm recovery the chips' frames are read but discarded. The
+/// RESET powers both internal reference buffers down and `configure` powers them
 /// back up, and the datasheet gives the reference a 150 ms start-up (the cold-boot
 /// path waits 300 ms before START for the same reason). Conversions during that
 /// window carry valid status markers but silently wrong amplitude — the one kind of
 /// bad data nothing downstream can detect. Discarding rather than sleeping keeps the
-/// interrupt reading and the death detectors live through the window; the other
-/// chip's pipeline never notices.
+/// interrupt reading and the death detectors live through the window.
 const REFERENCE_SETTLE_AFTER_RECOVERY_US: u64 = 300_000;
 
 /// How long after the cold-boot START a chip's frames are read but discarded.
@@ -135,8 +157,8 @@ pub(super) enum ChipEvent {
     /// clock as the DRDY interrupt read it for each frame — strictly monotonic,
     /// which the aligner requires.
     Frames(Vec<(u64, Sample)>),
-    /// The chip can no longer be believed: it died, is being warm-recovered, or is
-    /// waiting out a settling window. No frames until [`ChipEvent::Present`].
+    /// The chip can no longer be believed: the pair died, is being warm-recovered,
+    /// or is waiting out a settling window. No frames until [`ChipEvent::Present`].
     Absent,
     /// The settling window ended; trustworthy frames resume.
     Present,
@@ -260,15 +282,10 @@ struct EdgeTimingReport {
     service_delay_over_1ms: u32,
 }
 
-/// The thread's whole world: its chip, its frame ring, its health state, and its
-/// line to the combiner.
-struct Pipeline {
+/// One chip's side of the stream: its detectors, its batch, and its presence.
+struct ChipStream {
     index: usize,
-    reader: FrameReader,
-    chip: Ads1298FrontEnd,
-    events: SyncSender<(usize, ChipEvent)>,
     recycled_batches: Handoff<Vec<(u64, Sample)>>,
-    counters: Arc<HealthCounters>,
     /// Device-clock time the last frame was drained. Seeded with the thread's
     /// start so a chip that never produces a first frame is declared dead by the
     /// same staleness rule as one that stops.
@@ -298,21 +315,49 @@ struct Pipeline {
     backpressure_dropped_frames: u32,
 }
 
-/// This chip's pipeline must end: either the combiner hung up and there is
-/// nothing left to sample for, or the SPI host could not be handed back and
-/// carrying on would race the driver against the interrupt.
+/// The pipeline must end: either the combiner hung up and there is nothing left
+/// to sample for, or the SPI host could not be handed back and carrying on would
+/// race the driver against the interrupt.
 struct PipelineStopped;
 
-impl Pipeline {
+/// What one drained frame asks of the pipeline.
+enum Verdict {
+    Accepted,
+    /// The pair must be warm-recovered; the rest of the rings is stale.
+    Recover(&'static str),
+}
+
+type Events = SyncSender<(usize, ChipEvent)>;
+
+impl ChipStream {
+    fn new(index: usize, recycled_batches: Handoff<Vec<(u64, Sample)>>, now: u64) -> Self {
+        Self {
+            index,
+            recycled_batches,
+            last_frame_us: now,
+            settling_until_us: now + COLD_START_SETTLE_US,
+            previous_edge_us: None,
+            consecutive_bad_status: 0,
+            consecutive_slow_periods: 0,
+            last_status: 0,
+            timing: EdgeTiming::default(),
+            announced_present: false,
+            batch: Vec::with_capacity(FRAMES_PER_BATCH),
+            bad_status: 0,
+            reported_read_faults: 0,
+            backpressure_dropped_frames: 0,
+        }
+    }
+
     /// Sends `event`; the error means the combiner is gone and the thread must end.
-    fn send(&self, event: ChipEvent) -> Result<(), PipelineStopped> {
-        self.events
+    fn send(&self, events: &Events, event: ChipEvent) -> Result<(), PipelineStopped> {
+        events
             .send((self.index, event))
             .map_err(|_| PipelineStopped)
     }
 
     /// Hands over whatever the batch holds.
-    fn flush(&mut self) -> Result<(), PipelineStopped> {
+    fn flush(&mut self, events: &Events) -> Result<(), PipelineStopped> {
         if self.batch.is_empty() {
             return Ok(());
         }
@@ -325,105 +370,57 @@ impl Pipeline {
         };
         next.clear();
         let batch = std::mem::replace(&mut self.batch, next);
-        self.send(ChipEvent::Frames(batch))
+        self.send(events, ChipEvent::Frames(batch))
     }
 
-    /// Warm-recovers the chip and re-arms every detector. The in-flight batch is
-    /// discarded: the combiner throws away the partial window the moment it hears
-    /// `Absent`, so delivering frames destined for that window would be wasted
-    /// motion.
-    ///
-    /// This is the SPI host handover. The interrupt window closes first, so the
-    /// esp-idf driver owns the bus alone for the reset and reconfigure, and the
-    /// ring is emptied before it reopens — the frames in it were converted under
-    /// the configuration the reset just destroyed.
-    fn recover(&mut self, reason: &str) -> Result<(), PipelineStopped> {
-        let total = self.counters.recoveries.fetch_add(1, Ordering::Relaxed) + 1;
-        if total == 1 || total % RECOVERY_LOG_INTERVAL == 0 {
-            warn!(
-                "chip {} died ({reason}); warm recovery #{total}",
-                self.index
-            );
-        }
+    /// Discards the in-flight batch and tells the combiner this chip is gone. The
+    /// combiner throws away the partial window the moment it hears `Absent`, so
+    /// delivering frames destined for that window would be wasted motion.
+    fn go_absent(&mut self, events: &Events) -> Result<(), PipelineStopped> {
         self.batch.clear();
         if self.announced_present {
             self.announced_present = false;
-            self.send(ChipEvent::Absent)?;
+            self.send(events, ChipEvent::Absent)?;
         }
-        // The interrupt window closes before any driver call and there is no
-        // recovering without that: driver traffic racing a live handler on the
-        // same host is the one thing the ownership contract forbids, and a chip
-        // already announced absent is a better outcome than a corrupted bus.
-        if let Err(error) = self.reader.disable() {
-            warn!(
-                "chip {} could not close its interrupt window ({error}); stopping its \
-                 pipeline rather than running the recovery against a live interrupt",
-                self.index
-            );
-            return Err(PipelineStopped);
-        }
-        let mut recovered = false;
-        for attempt in 1..=RECOVERY_ATTEMPTS {
-            match self.chip.warm_recover() {
-                Ok(()) => {
-                    recovered = true;
-                    break;
-                }
-                Err(error) => warn!(
-                    "chip {} warm recovery attempt {attempt}/{RECOVERY_ATTEMPTS} failed: {error}",
-                    self.index
-                ),
-            }
-        }
-        if !recovered {
-            let _ = self.chip.stop_conversion();
-            warn!(
-                "chip {} recovery attempts exhausted; leaving it absent",
-                self.index
-            );
-            return Err(PipelineStopped);
-        }
-        self.reader.clear();
-        if let Err(error) = self.reader.enable() {
-            warn!(
-                "chip {} could not reopen its interrupt window: {error}; its pipeline is \
-                 stopping",
-                self.index
-            );
-            return Err(PipelineStopped);
-        }
-        let now = now_us();
+        Ok(())
+    }
+
+    /// Re-arms every detector after the pair restarts, discarding `settle_us` of
+    /// frames.
+    fn rearm(&mut self, now: u64, settle_us: u64) {
         self.consecutive_bad_status = 0;
         self.consecutive_slow_periods = 0;
         self.previous_edge_us = None;
         self.last_frame_us = now;
         self.timing = EdgeTiming::default();
-        self.settling_until_us = now + REFERENCE_SETTLE_AFTER_RECOVERY_US;
-        Ok(())
+        self.settling_until_us = now + settle_us;
     }
 
-    /// One drained frame's worth of work. `Ok(true)` means the chip was recovered
-    /// and the rest of the ring is stale.
+    /// One drained frame's worth of work.
     fn accept(
         &mut self,
-        edge_us: u64,
-        read_us: u32,
-        raw: [u8; super::super::decode::FRAME_BYTES],
-    ) -> Result<bool, PipelineStopped> {
+        frame: CapturedFrame,
+        events: &Events,
+        counters: &HealthCounters,
+    ) -> Result<Verdict, PipelineStopped> {
+        let CapturedFrame {
+            edge_us,
+            read_us,
+            bytes,
+        } = frame;
         let now = now_us();
         self.last_frame_us = now;
         self.timing.record(edge_us, read_us, now);
 
         // The silent-revert detector: a chip back at power-on defaults still
-        // converts, but four times slower. Sustained slow periods mean its
+        // converts, but eight times slower. Sustained slow periods mean its
         // configuration is gone even though frames keep coming. Measured on the
         // interrupt's own stamps, so a late drain cannot fake it.
         if let Some(previous) = self.previous_edge_us {
             if edge_us.saturating_sub(previous) > SLOW_PERIOD_US {
                 self.consecutive_slow_periods += 1;
                 if self.consecutive_slow_periods >= SLOW_PERIOD_RECOVERY_THRESHOLD {
-                    self.recover("sustained slow DRDY period")?;
-                    return Ok(true);
+                    return Ok(Verdict::Recover("sustained slow DRDY period"));
                 }
             } else {
                 self.consecutive_slow_periods = 0;
@@ -431,7 +428,7 @@ impl Pipeline {
         }
         self.previous_edge_us = Some(edge_us);
 
-        let frame = parse_sample(&raw);
+        let frame = parse_sample(&bytes);
         self.last_status = frame.status;
 
         // The transfer completed, but that only means the host clocked 27 bytes --
@@ -443,9 +440,7 @@ impl Pipeline {
         if let Some(status) = frame.status_word() {
             let flagged = status.positive_lead_off.bits() | status.negative_lead_off.bits();
             if flagged != 0 {
-                self.counters
-                    .lead_off_frames
-                    .fetch_add(1, Ordering::Relaxed);
+                counters.lead_off_frames.fetch_add(1, Ordering::Relaxed);
             }
             // The live per-channel state, this chip's eight bits placed in the
             // device-wide word and the other chip's left alone. Written every
@@ -455,13 +450,13 @@ impl Pipeline {
             let shift = self.index * CHIP_LEAD_OFF_BITS;
             let mask = 0xFFu32 << shift;
             let bits = (flagged as u32) << shift;
-            let mut current = self.counters.lead_off_channels.load(Ordering::Relaxed);
+            let mut current = counters.lead_off_channels.load(Ordering::Relaxed);
             loop {
                 let next = (current & !mask) | bits;
                 if current == next {
                     break;
                 }
-                match self.counters.lead_off_channels.compare_exchange_weak(
+                match counters.lead_off_channels.compare_exchange_weak(
                     current,
                     next,
                     Ordering::Relaxed,
@@ -474,7 +469,7 @@ impl Pipeline {
         }
         if frame.status_word().is_none() {
             self.bad_status += 1;
-            let total = self.counters.bad_status.fetch_add(1, Ordering::Relaxed) + 1;
+            let total = counters.bad_status.fetch_add(1, Ordering::Relaxed) + 1;
             if total % READ_ERROR_LOG_INTERVAL == 1 {
                 // A valid word is 0xCxxxxx; all-zero means the chip returned
                 // nothing, and a marker at the wrong bit offset means the read is
@@ -486,40 +481,38 @@ impl Pipeline {
             }
             self.consecutive_bad_status += 1;
             if self.consecutive_bad_status >= BAD_STATUS_RECOVERY_THRESHOLD {
-                self.recover("sustained bad status markers")?;
-                return Ok(true);
+                return Ok(Verdict::Recover("sustained bad status markers"));
             }
-            return Ok(false);
+            return Ok(Verdict::Accepted);
         }
         self.consecutive_bad_status = 0;
 
         // Settling frames are consumed (the detectors above keep seeing a live
         // stream) but never leave the thread.
         if now < self.settling_until_us {
-            return Ok(false);
+            return Ok(Verdict::Accepted);
         }
         // The first trustworthy frame after a settle ends the outage.
         if !self.announced_present {
             self.announced_present = true;
-            self.send(ChipEvent::Present)?;
+            self.send(events, ChipEvent::Present)?;
         }
         // The timestamp is the interrupt's, not this thread's: it is the DRDY edge
         // to within interrupt entry latency, and the aligner's grid is only as
         // honest as the stamps it places frames by.
         self.batch.push((edge_us, frame));
         if self.batch.len() >= FRAMES_PER_BATCH {
-            self.flush()?;
+            self.flush(events)?;
         }
-        Ok(false)
+        Ok(Verdict::Accepted)
     }
 
     /// Emits this chip's telemetry when enough frames have gone by.
-    fn report(&mut self) {
-        crate::health::note_stack(crate::health::Task::adc(self.index));
+    fn report(&mut self, reader: &FrameReader, counters: &HealthCounters) {
         let Some(report) = self.timing.summary() else {
             return;
         };
-        let interrupt = self.reader.counters();
+        let interrupt = reader.counters(self.index);
         // The status word rides along because the lead-off bits in it track
         // LOFF_SENSP/N, which `configure` sets and reset clears — a chip that
         // quietly reverts to its power-on defaults announces itself here,
@@ -557,7 +550,7 @@ impl Pipeline {
             metric("bad_status", self.bad_status as f64),
             metric(
                 "recoveries",
-                self.counters.recoveries.load(Ordering::Relaxed) as f64,
+                counters.recoveries.load(Ordering::Relaxed) as f64,
             ),
         ];
         match StatusWord::from_word(self.last_status) {
@@ -589,14 +582,14 @@ impl Pipeline {
 
     /// Folds the interrupt's read faults into the device-wide counter, and says so
     /// the first time and then rarely.
-    fn absorb_read_faults(&mut self) {
-        let faults = self.reader.counters().read_faults;
+    fn absorb_read_faults(&mut self, reader: &FrameReader, counters: &HealthCounters) {
+        let faults = reader.counters(self.index).read_faults;
         let new = faults.saturating_sub(self.reported_read_faults);
         if new == 0 {
             return;
         }
         self.reported_read_faults = faults;
-        let total = self.counters.read_errors.fetch_add(new, Ordering::Relaxed) + new;
+        let total = counters.read_errors.fetch_add(new, Ordering::Relaxed) + new;
         if total % READ_ERROR_LOG_INTERVAL < new {
             warn!(
                 "chip {} frame transfer did not complete ({total} so far)",
@@ -604,116 +597,315 @@ impl Pipeline {
             );
         }
     }
+}
 
-    fn run(mut self) {
-        if let Err(error) = self.reader.enable() {
-            warn!(
-                "could not open chip {} DRDY interrupt: {error}; its pipeline is stopping",
-                self.index
-            );
-            return;
+/// The thread's whole world: the pair, its frame rings, both chips' streams, and
+/// the line to the combiner.
+struct Pipeline {
+    pair: ChipPair,
+    reader: FrameReader,
+    streams: [ChipStream; DEVICE_COUNT],
+    events: Events,
+    counters: Arc<HealthCounters>,
+    lead_off_requests: Receiver<()>,
+    lead_off_results: SyncSender<LeadOffTones>,
+    /// Chip 1's DRDY count at the last check, and chip 0 frames drained since.
+    counted_edges_at_check: u32,
+    frames_since_counted_edge_check: u32,
+}
+
+impl Pipeline {
+    /// Warm-recovers the pair and re-arms every detector on both chips.
+    ///
+    /// This is the SPI host handover. The interrupt window closes first, so the
+    /// esp-idf driver owns the bus alone for the reset and reconfigure, and the
+    /// rings are emptied before it reopens — the frames in them were converted
+    /// under the configuration the reset just destroyed.
+    fn recover(&mut self, chip: usize, reason: &str) -> Result<(), PipelineStopped> {
+        let total = self.counters.recoveries.fetch_add(1, Ordering::Relaxed) + 1;
+        if total == 1 || total % RECOVERY_LOG_INTERVAL == 0 {
+            warn!("chip {chip} died ({reason}); warm recovery #{total} of the pair");
         }
-        info!("chip {} pipeline running", self.index);
+        for stream in &mut self.streams {
+            stream.go_absent(&self.events)?;
+        }
+        // The interrupt window closes before any driver call and there is no
+        // recovering without that: driver traffic racing a live handler on the
+        // same host is the one thing the ownership contract forbids, and chips
+        // already announced absent are a better outcome than a corrupted bus.
+        if let Err(error) = self.reader.disable() {
+            warn!(
+                "could not close the DRDY interrupt window ({error}); stopping the \
+                 pipeline rather than running the recovery against a live interrupt"
+            );
+            return Err(PipelineStopped);
+        }
+        let mut recovered = false;
+        for attempt in 1..=RECOVERY_ATTEMPTS {
+            match self.pair.warm_recover() {
+                Ok(()) => {
+                    recovered = true;
+                    break;
+                }
+                Err(error) => {
+                    warn!("warm recovery attempt {attempt}/{RECOVERY_ATTEMPTS} failed: {error:#}")
+                }
+            }
+        }
+        if !recovered {
+            let _ = self.pair.stop_conversion();
+            warn!("recovery attempts exhausted; leaving both chips absent");
+            return Err(PipelineStopped);
+        }
+        self.reader.clear();
+        if let Err(error) = self.reader.enable() {
+            warn!("could not reopen the DRDY interrupt window: {error}; the pipeline is stopping");
+            return Err(PipelineStopped);
+        }
+        let now = now_us();
+        for stream in &mut self.streams {
+            stream.rearm(now, REFERENCE_SETTLE_AFTER_RECOVERY_US);
+        }
+        self.counted_edges_at_check = self.reader.counted_edges();
+        self.frames_since_counted_edge_check = 0;
+        Ok(())
+    }
 
-        loop {
+    /// Runs AC lead-off excitation for [`LEAD_OFF_SNAPSHOT_FRAMES`] and hands back
+    /// each channel's tone amplitude. Both chips are absent for the whole snapshot:
+    /// the tone is millivolts against an EMG signal of tens of microvolts.
+    fn snapshot_lead_off(&mut self) -> Result<(), PipelineStopped> {
+        for stream in &mut self.streams {
+            stream.go_absent(&self.events)?;
+        }
+        if let Err(error) = self.reader.disable() {
+            warn!("could not close the DRDY interrupt window for a lead-off snapshot ({error})");
+            return Err(PipelineStopped);
+        }
+        let counted = self
+            .pair
+            .set_lead_off(true)
+            .and_then(|()| self.measure_lead_off());
+        if let Err(error) = self.reader.disable() {
+            warn!("could not close the DRDY interrupt window after a lead-off snapshot ({error})");
+            return Err(PipelineStopped);
+        }
+        let restored = self.pair.set_lead_off(false);
+        let counts = match (counted, restored) {
+            (Ok(counts), Ok(())) => counts,
+            (counted, restored) => {
+                warn!(
+                    "lead-off snapshot failed (counting: {:?}, restoring: {:?})",
+                    counted.err(),
+                    restored.err()
+                );
+                return self.recover(0, "lead-off snapshot failed");
+            }
+        };
+        self.reader.clear();
+        if let Err(error) = self.reader.enable() {
+            warn!("could not reopen the DRDY interrupt window: {error}; the pipeline is stopping");
+            return Err(PipelineStopped);
+        }
+        let now = now_us();
+        for stream in &mut self.streams {
+            stream.rearm(now, AFTER_LEAD_OFF_SETTLE_US);
+        }
+        self.counted_edges_at_check = self.reader.counted_edges();
+        self.frames_since_counted_edge_check = 0;
+        info!("lead-off snapshot over {} frames", counts.frames);
+        let _ = self.lead_off_results.try_send(counts);
+        Ok(())
+    }
+
+    /// Opens the interrupt window and measures each channel's excitation tone over a
+    /// snapshot. The tone sits at exactly a quarter of the sample rate, so its
+    /// amplitude is one DFT bin: the samples against 1, -j, -1, +j in turn.
+    fn measure_lead_off(&mut self) -> anyhow::Result<LeadOffTones> {
+        const PHASE: [(i64, i64); 4] = [(1, 0), (0, -1), (-1, 0), (0, 1)];
+        self.reader.clear();
+        self.reader.enable()?;
+        let mut real = [0i64; CHANNEL_COUNT];
+        let mut imaginary = [0i64; CHANNEL_COUNT];
+        let mut railed = [0u16; CHANNEL_COUNT];
+        let mut counted = [0u16; DEVICE_COUNT];
+        let mut seen = [0u32; DEVICE_COUNT];
+        let deadline = now_us() + LEAD_OFF_SNAPSHOT_TIMEOUT_US;
+        while counted[0] < LEAD_OFF_SNAPSHOT_FRAMES {
+            if now_us() > deadline {
+                anyhow::bail!("DRDY stopped after {} snapshot frames", counted[0]);
+            }
             let mut drained = false;
+            for index in 0..DEVICE_COUNT {
+                while let Some(frame) = self.reader.pop(index) {
+                    drained = true;
+                    seen[index] += 1;
+                    if seen[index] <= LEAD_OFF_SETTLE_FRAMES
+                        || counted[index] >= LEAD_OFF_SNAPSHOT_FRAMES
+                    {
+                        continue;
+                    }
+                    let sample = parse_sample(&frame.bytes);
+                    if sample.status_word().is_none() {
+                        continue;
+                    }
+                    let (cosine, sine) = PHASE[seen[index] as usize % PHASE.len()];
+                    for (channel, &code) in sample.channels.iter().enumerate() {
+                        let slot = index * CHIP_LEAD_OFF_BITS + channel;
+                        real[slot] += i64::from(code) * cosine;
+                        imaginary[slot] += i64::from(code) * sine;
+                        railed[slot] += u16::from(code.unsigned_abs() >= RAIL_CODE);
+                    }
+                    counted[index] += 1;
+                }
+            }
+            if !drained {
+                FreeRtos::delay_ms(DRAIN_POLL_MS);
+            }
+        }
+        let frames = counted[0];
+        let mut tones = LeadOffTones {
+            frames,
+            railed,
+            ..LeadOffTones::default()
+        };
+        for slot in 0..CHANNEL_COUNT {
+            let bin = (real[slot] as f32).hypot(imaginary[slot] as f32);
+            tones.amplitude_microvolts[slot] =
+                (2.0 * bin / f32::from(frames.max(1)) * MICROVOLTS_PER_CODE) as u32;
+        }
+        Ok(tones)
+    }
+
+    /// Drains both rings. `Ok(true)` means at least one frame came in.
+    fn drain(&mut self) -> Result<bool, PipelineStopped> {
+        let mut drained = false;
+        for index in 0..DEVICE_COUNT {
             // Bounded by the ring's capacity, so a chip converting faster than this
             // thread drains can lengthen a pass but not trap it.
-            while let Some(frame) = self.reader.pop() {
+            while let Some(frame) = self.reader.pop(index) {
                 drained = true;
-                match self.accept(frame.edge_us, frame.read_us, frame.bytes) {
-                    Ok(false) => {}
-                    // Recovered: everything else in the ring predates the reset.
-                    Ok(true) => break,
-                    Err(_) => {
-                        info!("chip {} pipeline stopping", self.index);
-                        return;
+                if index == 0 {
+                    self.frames_since_counted_edge_check += 1;
+                }
+                match self.streams[index].accept(frame, &self.events, &self.counters)? {
+                    Verdict::Accepted => {}
+                    Verdict::Recover(reason) => {
+                        // Everything else in the rings predates the reset.
+                        self.recover(index, reason)?;
+                        return Ok(true);
                     }
                 }
             }
-            self.report();
-            self.absorb_read_faults();
+        }
+        if self.frames_since_counted_edge_check >= FRAMES_PER_COUNTED_EDGE_CHECK {
+            let counted = self.reader.counted_edges();
+            if counted == self.counted_edges_at_check {
+                self.recover(1, "chip 1 DRDY stopped while chip 0 converts")?;
+                return Ok(true);
+            }
+            self.counted_edges_at_check = counted;
+            self.frames_since_counted_edge_check = 0;
+        }
+        Ok(drained)
+    }
 
-            if !drained {
-                // The batch should not sit on 8 ms of latency budget while the chip
-                // idles, and a stale stream means the chip is dead.
-                if self.flush().is_err() {
-                    info!("chip {} pipeline stopping", self.index);
-                    return;
-                }
-                if now_us().saturating_sub(self.last_frame_us) > DATA_READY_TIMEOUT_US
-                    && self.recover("no DRDY edge").is_err()
-                {
-                    info!("chip {} pipeline stopping", self.index);
-                    return;
-                }
+    fn run(mut self) {
+        if let Err(error) = self.reader.enable() {
+            warn!("could not open the DRDY interrupt: {error}; the pipeline is stopping");
+            return;
+        }
+        self.counted_edges_at_check = self.reader.counted_edges();
+        info!("pair pipeline running");
+
+        loop {
+            if self.step().is_err() {
+                info!("pair pipeline stopping");
+                return;
             }
             FreeRtos::delay_ms(DRAIN_POLL_MS);
         }
     }
+
+    fn step(&mut self) -> Result<(), PipelineStopped> {
+        if self.lead_off_requests.try_recv().is_ok() {
+            self.snapshot_lead_off()?;
+        }
+        let drained = self.drain()?;
+        crate::health::note_stack(crate::health::Task::adc(0));
+        for stream in &mut self.streams {
+            stream.report(&self.reader, &self.counters);
+            stream.absorb_read_faults(&self.reader, &self.counters);
+        }
+        if drained {
+            return Ok(());
+        }
+        // The batches should not sit on 8 ms of latency budget while the chips
+        // idle, and a stale stream means the pair is dead.
+        for stream in &mut self.streams {
+            stream.flush(&self.events)?;
+        }
+        let now = now_us();
+        let stale = self
+            .streams
+            .iter()
+            .position(|stream| now.saturating_sub(stream.last_frame_us) > DATA_READY_TIMEOUT_US);
+        if let Some(index) = stale {
+            self.recover(index, "no DRDY edge")?;
+        }
+        Ok(())
+    }
 }
 
-/// Hardware and scheduling resources owned for the lifetime of one chip's
-/// acquisition thread. Keeping these together prevents a call site from mixing
-/// one chip's front end, interrupt reader, or PWDN pin with another chip's thread.
+/// Hardware owned for the lifetime of the acquisition thread.
 pub(super) struct ThreadHardware {
-    pub(super) board: Board,
-    pub(super) chip: Ads1298FrontEnd,
+    pub(super) pair: ChipPair,
     pub(super) reader: FrameReader,
-    pub(super) power_down: PinDriver<'static, Output>,
 }
 
-/// The complete channel boundary between one chip thread and the combiner.
+/// The complete channel boundary between the pipeline thread and the combiner.
 pub(super) struct ThreadChannels {
+    pub(super) lead_off_requests: Receiver<()>,
+    pub(super) lead_off_results: SyncSender<LeadOffTones>,
     pub(super) events: SyncSender<(usize, ChipEvent)>,
-    pub(super) recycled_batches: Handoff<Vec<(u64, Sample)>>,
+    pub(super) recycled_batches: [Handoff<Vec<(u64, Sample)>>; DEVICE_COUNT],
     pub(super) counters: Arc<HealthCounters>,
 }
 
-/// Spawns the draining thread for one chip, pinned according to its board identity.
-/// The PWDN line is parked in the thread so it stays high for as long as the chip
-/// is being sampled.
+/// Spawns the draining thread. The pair, and with it the PWDN line, lives in the
+/// thread so the chips stay powered for as long as they are being sampled.
 pub(super) fn spawn(hardware: ThreadHardware, channels: ThreadChannels) -> anyhow::Result<()> {
-    let ThreadHardware {
-        board,
-        chip,
-        reader,
-        power_down,
-    } = hardware;
-    let index = board.device_index();
-    let core = crate::cores::front_end_core(board);
+    let ThreadHardware { pair, reader } = hardware;
     let ThreadChannels {
+        lead_off_requests,
+        lead_off_results,
         events,
         recycled_batches,
         counters,
     } = channels;
-    crate::cores::spawn_pinned(core, || {
+    crate::cores::spawn_pinned(crate::cores::ACQUISITION_PIPELINE_CORE, || {
         std::thread::Builder::new()
-            .name(format!("adc{index}"))
+            .name("adc".into())
             .stack_size(THREAD_STACK_BYTES)
             .spawn(move || {
                 crate::cores::set_current_thread_priority(THREAD_PRIORITY);
-                let _power_down = power_down;
                 let started_us = now_us();
+                let mut index = 0;
+                let streams = recycled_batches.map(|recycled| {
+                    let stream = ChipStream::new(index, recycled, started_us);
+                    index += 1;
+                    stream
+                });
                 Pipeline {
-                    index,
-                    chip,
+                    pair,
                     reader,
+                    streams,
                     events,
-                    recycled_batches,
                     counters,
-                    last_frame_us: started_us,
-                    settling_until_us: started_us + COLD_START_SETTLE_US,
-                    previous_edge_us: None,
-                    consecutive_bad_status: 0,
-                    consecutive_slow_periods: 0,
-                    last_status: 0,
-                    timing: EdgeTiming::default(),
-                    announced_present: false,
-                    bad_status: 0,
-                    reported_read_faults: 0,
-                    backpressure_dropped_frames: 0,
-                    batch: Vec::with_capacity(FRAMES_PER_BATCH),
+                    lead_off_requests,
+                    lead_off_results,
+                    counted_edges_at_check: 0,
+                    frames_since_counted_edge_check: 0,
                 }
                 .run();
             })

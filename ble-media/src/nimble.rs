@@ -24,7 +24,7 @@ use crate::emg_stream::{self, WindowRecord};
 use crate::hid;
 use crate::link_bench::{self, BenchCommand, ConnectionParameters, LinkStatus, MediaOutcome, Phy};
 use crate::phone::{EncryptedLinks, Peer, Radio, LINK_CAPACITY};
-use crate::settings_service::{self, BandHealth, BandSettings, GestureEvent};
+use crate::settings_service::{self, BandHealth, BandSettings, GestureEvent, LeadOffSnapshot};
 
 /// Disconnects since boot in the high half, saturating, and the last one's
 /// NimBLE status in the low half: one word, so a reader never sees a count
@@ -424,6 +424,7 @@ pub struct SettingsService {
     settings: Arc<Mutex<BLECharacteristic>>,
     gesture: Arc<Mutex<BLECharacteristic>>,
     health: Arc<Mutex<BLECharacteristic>>,
+    lead_off: Arc<Mutex<BLECharacteristic>>,
     emg: EmgStream,
 }
 
@@ -447,11 +448,15 @@ impl NimbleRadio {
     ///
     /// A well-formed write is handed to `writes` and not applied here: the
     /// owner of the settings validates, persists, and then calls
-    /// [`SettingsService::publish_settings`] with what it kept.
+    /// [`SettingsService::publish_settings`] with what it kept. Any write to the
+    /// lead-off characteristic is a snapshot request, handed to
+    /// `lead_off_requests`; the owner answers with
+    /// [`SettingsService::publish_lead_off`].
     pub fn attach_settings_service(
         &mut self,
         current: &BandSettings,
         writes: SyncSender<BandSettings>,
+        lead_off_requests: SyncSender<()>,
     ) -> Result<SettingsService> {
         let server = self
             .server
@@ -472,7 +477,16 @@ impl NimbleRadio {
         let health = service
             .lock()
             .create_characteristic(uuid(settings_service::HEALTH_UUID), NimbleProperties::READ);
+        let lead_off = service.lock().create_characteristic(
+            uuid(settings_service::LEAD_OFF_UUID),
+            NimbleProperties::READ | NimbleProperties::WRITE | NimbleProperties::NOTIFY,
+        );
         settings.lock().set_value(&current.encode());
+        lead_off.lock().on_write(move |_args| {
+            if let Err(TrySendError::Full(())) = lead_off_requests.try_send(()) {
+                warn!("lead-off snapshot already pending; request dropped");
+            }
+        });
 
         let subscriber = Arc::new(AtomicU32::new(NO_SUBSCRIBER));
         let watched = Arc::clone(&subscriber);
@@ -509,6 +523,7 @@ impl NimbleRadio {
             settings,
             gesture,
             health,
+            lead_off,
             emg: EmgStream {
                 subscriber,
                 value_handle: Arc::new(AtomicU32::new(UNRESOLVED_HANDLE)),
@@ -546,6 +561,11 @@ impl SettingsService {
     /// notified, so it costs the link nothing until the phone asks.
     pub fn publish_health(&self, health: &BandHealth) {
         self.health.lock().set_value(&health.encode());
+    }
+
+    /// Store a lead-off snapshot and tell subscribers.
+    pub fn publish_lead_off(&self, snapshot: &LeadOffSnapshot) {
+        self.lead_off.lock().set_value(&snapshot.encode()).notify();
     }
 
     pub fn emg_stream(&self) -> EmgStream {

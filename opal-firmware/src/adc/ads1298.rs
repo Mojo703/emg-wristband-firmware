@@ -2,11 +2,10 @@
 //!
 //! Datasheet: <https://www.ti.com/lit/ds/symlink/ads1298.pdf> (SBAS459K).
 //!
-//! Each chip runs on its own SPI bus and self-clocks from its internal 2.048 MHz
-//! oscillator (CLKSEL strapped to 3V3), and each has its own chip select, START,
-//! RESET, DRDY, and PWDN so one can be warm-recovered without touching the other.
-//! The rail sequencing lives in [`super::bring_up`]; this type owns everything
-//! per-chip.
+//! The two chips share one SPI bus and the RESET, START, and PWDN lines; each has
+//! its own chip select and DRDY. One chip's internal 2.048 MHz oscillator clocks
+//! both (see [`ClockRole`]). The shared lines and the sequencing live in
+//! [`super::ChipPair`]; this type owns everything per-chip.
 
 use anyhow::Result;
 use esp_idf_svc::hal::delay::{Ets, FreeRtos};
@@ -28,6 +27,7 @@ use super::registers::{
     TestSignalFrequency, WilsonCenterTerminalOneOff, WilsonCenterTerminalTwoOff,
 };
 
+const COMMAND_RESET: u8 = 0x06;
 const COMMAND_RDATAC: u8 = 0x10;
 const COMMAND_SDATAC: u8 = 0x11;
 const COMMAND_RREG_BASE: u8 = 0x20;
@@ -83,10 +83,8 @@ pub(crate) const SAMPLE_RATE_HZ: u32 = {
 };
 
 /// CONFIG1: high resolution at fMOD/256, which is where [`SAMPLE_RATE_HZ`] comes from.
-/// The clock output must stay off: with CLKSEL high the CLK pin is a disabled output
-/// (3-state) and nothing connects to it — driving the oscillator out of an
-/// unconnected pin would only add an aggressor to the board. The reset
-/// default is `0x06` — low power at fMOD/1024 — which converts at 250 SPS, so a chip
+/// The clock output is off here; [`ClockRole::Source`] turns it on for the one chip
+/// that drives CLK. The reset default is `0x06` — low power at fMOD/1024 — which converts at 250 SPS, so a chip
 /// that has silently reverted is visible both in a readback and in the DRDY edge
 /// rate; acquisition's slow-period recovery trigger keys on exactly that.
 pub(super) const fn device_config1() -> Config1 {
@@ -100,14 +98,14 @@ pub(super) const fn device_config1() -> Config1 {
 
 /// How a chip drives the subject bias reference.
 ///
-/// The drive is per chip, and exactly one chip may hold it. Each board carries its
-/// own amplifier, its own R1/C2 compensation network, and its own driven electrode
-/// on J5 pins 3 and 4. Two powered amplifiers are two closed loops on one arm, each
+/// The drive is per chip, and exactly one chip may hold it. Each chip has its own
+/// amplifier, its own compensation network (R1/C2 for IC1, R2/C11 for IC2), and its
+/// own driven electrode (BIAS_DRV1 on FPC2, BIAS_DRV2 on FPC4). Two powered amplifiers are two closed loops on one arm, each
 /// summing a different eight channels and each forcing the body toward its own
 /// RLDREF through its own electrode, so neither can see the other except as a
 /// disturbance. The datasheet's multi-device arrangement, master RLDOUT into slave
 /// RLDIN with the slave amplifier down, is not wired here: RLDOUT ties straight to
-/// RLDIN on each board and reaches no connector.
+/// RLDIN on each chip.
 ///
 /// One amplifier covers both chips because they share ground, so driving the arm
 /// toward that reference lowers common mode everywhere. The driving chip's
@@ -117,12 +115,8 @@ pub(super) const fn device_config1() -> Config1 {
 ///
 /// Either reference mode suits this board. AVDD is +2.5 V and AVSS is -2.5 V, so
 /// mid-supply is 0 V, and the grounded RLDREF pin presents exactly the reference the
-/// internal option would generate.
-///
-/// A powered amplifier needs its board's jumper from J4 pin 1 to the BIAS_DRV node,
-/// which closes the compensation network into RLDINV instead of padding the output
-/// (SBAS459K figure 94). Without it RLDINV floats, the loop is open, and the output
-/// sits at a rail. Engineering log 0019 carries the trace and the one-wire fix.
+/// internal option would generate. With no body on the electrodes the loop is open
+/// and the driving chip's output sits at a rail.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum RightLegDriveMode {
     /// Amplifier powered, reference taken from the RLDREF pin (`0xC6`). The pin is
@@ -202,9 +196,7 @@ impl RightLegDriveMode {
     }
 }
 
-/// Which chip drives, in chip order. Chip 0's board carries the jumper, so the
-/// boards are no longer interchangeable between the two positions: the jumpered one
-/// goes in the chip 0 socket or the drive runs open-loop into a rail.
+/// Which chip drives, in chip order: IC1 drives through BIAS_DRV1.
 ///
 /// TODO(bias drive): the powered loop is not bench-validated. Scope BIAS_DRV with the
 /// survival harness before trusting a session, since RLD load was never exonerated in
@@ -215,6 +207,43 @@ pub(super) const RIGHT_LEG_DRIVE_MODE: [RightLegDriveMode; DEVICE_COUNT] = [
     RightLegDriveMode::Disabled,
 ];
 
+/// Which end of the shared CLK net a chip sits on, fixed by its CLKSEL strap.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum ClockRole {
+    /// CLKSEL high: converts on its internal oscillator and drives it out of CLK
+    /// (CONFIG1 `CLK_EN`). A RESET clears `CLK_EN`, which stops the follower.
+    Source,
+    /// CLKSEL low: converts on the CLK pin and cannot decode a command without it.
+    Follower,
+}
+
+/// Chip 0 is IC1 (CLKSEL to GND), chip 1 is IC2 (CLKSEL to 3V3).
+pub(super) const CLOCK_ROLE: [ClockRole; DEVICE_COUNT] = [ClockRole::Follower, ClockRole::Source];
+
+impl ClockRole {
+    pub(super) const fn config1(self) -> Config1 {
+        Config1 {
+            output_clock_enabled: matches!(self, ClockRole::Source),
+            ..device_config1()
+        }
+    }
+}
+
+/// One chip's whole register recipe: its bias-drive mode's, with CONFIG1 set for its
+/// clock role.
+pub(super) fn chip_configuration(
+    right_leg_drive: RightLegDriveMode,
+    clock_role: ClockRole,
+) -> [(Register, u8); CONFIGURATION_REGISTER_COUNT] {
+    let mut configuration = right_leg_drive.expected_configuration();
+    for (register, value) in &mut configuration {
+        if *register == Register::Config1 {
+            *value = clock_role.config1().to_byte();
+        }
+    }
+    configuration
+}
+
 /// CONFIG2 with the internal test signal generator off, which is normal operation.
 const NORMAL_CONFIG2: Config2 = Config2 {
     chopping_frequency_constant: false,
@@ -223,11 +252,13 @@ const NORMAL_CONFIG2: Config2 = Config2 {
     test_signal_frequency: TestSignalFrequency::PulsedSlow,
 };
 
-/// LOFF: DC lead-off detection, comparators at the widest thresholds, in resistor mode
-/// so no excitation current is pushed into the electrode.
+/// LOFF: DC lead-off detection from the 6 nA current sources, comparators at the
+/// widest thresholds (SBAS459K table 21). The pull-resistor mode would put 10 MΩ to
+/// each rail across a dry electrode: up to 250 nA, and a quarter volt of offset per
+/// megaohm of skin. The current source costs 6 mV per megaohm.
 const LEAD_OFF_CONTROL: LeadOffControl = LeadOffControl {
     comparator_threshold: LeadOffComparatorThreshold::NinetyFive,
-    pull_resistor_mode: true,
+    pull_resistor_mode: false,
     current: LeadOffCurrent::Six,
     detection: LeadOffDetection::DirectCurrent,
 };
@@ -239,12 +270,9 @@ const NORMAL_CHANNEL_SETTINGS: ChannelSettings = ChannelSettings {
     input: ChannelInput::Electrode,
 };
 
-/// TODO(lead-off): detection is OFF. The bring-up campaign validated every stable
-/// operating point with the lead-off block unpowered, and the first firmware run with
-/// it on died ~35 times per second versus ~2 on the bench. Disconnected electrodes
-/// therefore rail their channels instead of being zeroed by `preprocess` — re-enable
-/// as its own bench experiment (flip LEAD_OFF_ENABLED) once the front end is stable
-/// enough to isolate its effect.
+/// Whether the streaming recipe watches for lead-off. It does not: against dry
+/// electrodes the 6 nA sources push most channels past full scale at gain 6, so
+/// lead-off runs only as an AC snapshot ([`Ads1298Device::set_lead_off`]).
 pub(crate) const LEAD_OFF_ENABLED: bool = false;
 
 /// CONFIG4: continuous conversion; lead-off comparators per [`LEAD_OFF_ENABLED`].
@@ -253,6 +281,16 @@ const CONFIG4: Config4 = Config4 {
     single_shot: false,
     wilson_center_terminal_to_right_leg_drive: false,
     lead_off_comparators_enabled: LEAD_OFF_ENABLED,
+};
+
+/// LOFF for a snapshot: the 10 MΩ pull resistors alternating at fDR / 4. On the
+/// bench they put a uniform 11.3 mV tone on every pad in free air (the flex's 1 nF
+/// filter capacitors set it) where the 6 nA sources gave an uneven 0.5 to 2.4 mV.
+/// The excitation averages to zero, so unlike DC it leaves no charge behind.
+const ALTERNATING_LEAD_OFF_CONTROL: LeadOffControl = LeadOffControl {
+    detection: LeadOffDetection::AlternatingCurrent,
+    pull_resistor_mode: true,
+    ..LEAD_OFF_CONTROL
 };
 
 /// LOFF_SENSP/N: which input halves the comparators watch.
@@ -312,10 +350,10 @@ pub(super) struct Ads1298Device {
     frame_spi: SpiDevice,
     chip_select: PinDriver<'static, Output>,
     drdy: PinDriver<'static, Input>,
-    reset_n: PinDriver<'static, Output>,
     /// This chip's entry in [`RIGHT_LEG_DRIVE_MODE`]. Only one chip may hold a
     /// powered mode; the reasoning is on that constant.
     right_leg_drive: RightLegDriveMode,
+    clock_role: ClockRole,
 }
 
 impl Ads1298Device {
@@ -328,30 +366,22 @@ impl Ads1298Device {
         frame_spi: SpiDevice,
         mut chip_select: PinDriver<'static, Output>,
         drdy: PinDriver<'static, Input>,
-        mut reset_n: PinDriver<'static, Output>,
         right_leg_drive: RightLegDriveMode,
+        clock_role: ClockRole,
     ) -> Result<Self> {
-        // Held in reset from construction until `bring_up` runs the shared power
-        // sequence and calls `initialize()`. The shared PWDN line lives there too.
-        reset_n.set_low()?;
         chip_select.set_high()?;
-
         Ok(Self {
             command_spi,
             frame_spi,
             chip_select,
             drdy,
-            reset_n,
             right_leg_drive,
+            clock_role,
         })
     }
 
-    /// Releases the RESET line after the shared PWDN has been raised, ahead of the
-    /// supply-settling wait `bring_up` owns. [`Self::initialize`] then runs the
-    /// per-chip sequence.
-    pub(super) fn release_reset(&mut self) -> Result<()> {
-        self.reset_n.set_high()?;
-        Ok(())
+    pub(super) fn clock_role(&self) -> ClockRole {
+        self.clock_role
     }
 
     /// Runs one transaction with CS low, raising CS afterwards even on failure so the
@@ -372,6 +402,11 @@ impl Ads1298Device {
         self.drdy.pin()
     }
 
+    /// Whether DRDY is low: a conversion is waiting to be read.
+    pub(super) fn data_is_ready(&self) -> bool {
+        self.drdy.is_low()
+    }
+
     /// This chip's CS pin number. The interrupt-side reader drives CS straight
     /// from the GPIO output registers; the driver holds this `PinDriver` so the
     /// pad stays configured as an output and nothing else can claim it.
@@ -379,28 +414,29 @@ impl Ads1298Device {
         self.chip_select.pin()
     }
 
-    pub(super) fn reset_pulse(&mut self) -> Result<()> {
-        self.reset_n.set_low()?;
+    /// Resets this chip alone by opcode, then waits out the 18 tCLK lockout
+    /// (SBAS459K §9.3.2.3). The shared RESET pin is [`super::ChipPair`]'s.
+    pub(super) fn reset_by_command(&mut self) -> Result<()> {
+        self.send_command(COMMAND_RESET)?;
         FreeRtos::delay_ms(1);
-        self.reset_n.set_high()?;
         Ok(())
     }
 
-    /// Warm recovery for a chip whose conversions have died mid-session: RESET pulse,
-    /// the post-reset lockout, SDATAC, full reconfigure. The rails have long since
-    /// settled so the cold-start supply wait is not repeated — but the RESET does
-    /// power-cycle the internal reference buffer, whose 150 ms start-up cannot be
-    /// skipped. Acquisition owns that: it discards the frames of the settling window
-    /// rather than stalling here (see `REFERENCE_SETTLE_AFTER_RECOVERY_US`).
-    pub(super) fn warm_reset(&mut self) -> Result<()> {
-        self.reset_pulse()?;
-        // 18 tCLK after RESET rises before any command (SBAS459K §9.3.2.3).
-        FreeRtos::delay_ms(1);
-        self.stop_read_data_continuous()?;
-        // Same post-SDATAC breather the proven cold-boot path takes before its first
-        // register access.
-        FreeRtos::delay_ms(1);
-        self.configure()
+    /// Switches AC lead-off excitation on every input on, or back to the streaming
+    /// recipe. SDATAC only.
+    pub(super) fn set_lead_off(&mut self, on: bool) -> Result<()> {
+        let (control, inputs) = match on {
+            true => (ALTERNATING_LEAD_OFF_CONTROL, ChannelMask::ALL),
+            false => (LEAD_OFF_CONTROL, lead_off_channels()),
+        };
+        self.write_register(control)?;
+        self.write_register(LeadOffSensePositive(inputs))?;
+        self.write_register(LeadOffSenseNegative(inputs))
+    }
+
+    /// Writes this chip's CONFIG1, which on the clock source starts CLK.
+    pub(super) fn write_config1(&mut self) -> Result<()> {
+        self.write_register(self.clock_role.config1())
     }
 
     /// Helper for sending SPI commands
@@ -507,7 +543,7 @@ impl Ads1298Device {
     // Writes and verifies this device's full register set. Must be called after
     // `stop_read_data_continuous()` (SDATAC), since registers can't be accessed while streaming.
     pub(super) fn configure(&mut self) -> Result<()> {
-        let expected = self.right_leg_drive.expected_configuration();
+        let expected = chip_configuration(self.right_leg_drive, self.clock_role);
         for &(register, value) in &expected {
             self.write_register_byte(register, value)?;
         }
@@ -524,33 +560,12 @@ impl Ads1298Device {
         Ok(())
     }
 
-    /// Resets this chip, leaves it in SDATAC, and returns whatever its ID register
-    /// says. Separate from [`Self::initialize`] so bring-up can probe every chip and
-    /// report all of them, rather than stopping at the first one that disagrees —
-    /// with two boards, whether the other chip reads the same wrong byte is what
-    /// separates a harness-wide fault (clock, bus) from one bad board.
+    /// Leaves a freshly reset chip in SDATAC and returns whatever its ID register says.
+    /// The caller has already reset it and waited out the 18 tCLK lockout.
     pub(super) fn probe_identity(&mut self) -> Result<u8> {
-        self.reset_pulse()?;
-
-        // 18 tCLK (~9 µs at fCLK = 2.048 MHz) are needed after RESET returns high for
-        // the device to finish initialising its registers, and no command may be sent
-        // during that window (SBAS459K §9.3.2.3, §11.1). This delay used to sit *after*
-        // the SDATAC below, which put that command inside the forbidden window.
-        FreeRtos::delay_ms(1);
-
         self.stop_read_data_continuous()?;
-
         FreeRtos::delay_ms(1);
-
         self.read_register(Register::Id)
-    }
-
-    /// Per-chip initialisation, after `bring_up` has raised the shared PWDN, released
-    /// both RESET lines, waited out the supply settling, and probed the identities.
-    /// Reference settling after `configure` is also shared and lives in `bring_up`.
-    /// The chip is already reset and in SDATAC from [`Self::probe_identity`].
-    pub(super) fn initialize(&mut self) -> Result<()> {
-        self.configure()
     }
 
     pub(super) fn enable_test_signal(&mut self, channel: Channel) -> Result<()> {
@@ -579,51 +594,6 @@ impl Ads1298Device {
     }
 }
 
-/// The front end: the one ADS1298 and the START line that gates its conversions.
-pub(crate) struct Ads1298FrontEnd {
-    pub(super) device: Ads1298Device,
-    start: PinDriver<'static, Output>,
-}
-
-impl Ads1298FrontEnd {
-    pub(super) fn new(device: Ads1298Device, start: PinDriver<'static, Output>) -> Self {
-        Self { device, start }
-    }
-
-    /// Pulls this chip's START pin high. START is per-chip so a warm recovery here
-    /// never restarts the other chip into the post-START death hazard.
-    pub(super) fn start_conversion(&mut self) -> Result<()> {
-        self.start.set_high()?;
-        Ok(())
-    }
-
-    /// Pulls this chip's START pin low. Used by [`Self::warm_recover`].
-    pub(super) fn stop_conversion(&mut self) -> Result<()> {
-        self.start.set_low()?;
-        Ok(())
-    }
-
-    /// Warm-recovers the front end after a mid-session death: conversions stopped,
-    /// RESET/SDATAC/reconfigure, RDATAC, START again. The bring-up campaign
-    /// (documentation/ads1298-bringup-2026-07-31/) established that the front end
-    /// dies stochastically under multi-channel conversion and that this recovery
-    /// restores it. The register work here takes a few milliseconds; the true cost
-    /// per recovery is the reference-settling discard window acquisition applies
-    /// afterwards.
-    pub(super) fn warm_recover(&mut self) -> Result<()> {
-        self.stop_conversion()?;
-        self.device.warm_reset()?;
-        self.device.read_data_continuous()?;
-        self.start_conversion()?;
-        Ok(())
-    }
-
-    /// Clocks out one frame. Only valid in RDATAC mode after DRDY falls.
-    pub(super) fn read_frame(&mut self) -> Result<Sample> {
-        self.device.read_frame()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -643,16 +613,15 @@ mod tests {
             );
         }
 
-        // CONFIG1: high resolution, per-chip readback, fMOD/256, clock output off —
-        // with CLKSEL at 3V3 the CLK pins are 3-stated and unconnected.
+        // CONFIG1: high resolution, per-chip readback, fMOD/256, clock output off.
         assert_eq!(device_config1().to_byte(), 0xC4);
 
         // CONFIG2: the internal test signal generator off.
         assert_eq!(NORMAL_CONFIG2.to_byte(), 0x00);
 
-        // CONFIG3: internal reference on, and the bias drive only where the board
-        // carries the jumper. Chip 0 drives, chip 1 does not, and both driving at
-        // once is the failure this pins against (see RIGHT_LEG_DRIVE_MODE).
+        // CONFIG3: internal reference on, and the bias drive on one chip. Chip 0
+        // drives, chip 1 does not, and both driving at once is the failure this
+        // pins against (see RIGHT_LEG_DRIVE_MODE).
         let [drive_zero, drive_one] = RIGHT_LEG_DRIVE_MODE;
         assert_eq!(drive_zero.config3().to_byte(), 0xC6);
         assert_eq!(drive_one.config3().to_byte(), 0xC0);
@@ -682,13 +651,13 @@ mod tests {
             0x00
         );
 
-        // LOFF: DC lead-off detection in resistor mode.
-        assert_eq!(LEAD_OFF_CONTROL.to_byte(), 0x13);
+        // LOFF: DC lead-off detection from the 6 nA current sources.
+        assert_eq!(LEAD_OFF_CONTROL.to_byte(), 0x03);
 
         // CH1SET..CH8SET: powered up, gain 6, on the electrode.
         assert_eq!(NORMAL_CHANNEL_SETTINGS.to_byte(), 0x00);
 
-        // LOFF_SENSP/N and LOFF_FLIP: nothing sensed while lead-off is off.
+        // LOFF_SENSP/N and LOFF_FLIP: nothing sensed while streaming.
         assert_eq!(LeadOffSensePositive(lead_off_channels()).to_byte(), 0x00);
         assert_eq!(LeadOffSenseNegative(lead_off_channels()).to_byte(), 0x00);
         assert_eq!(LeadOffFlip(ChannelMask::NONE).to_byte(), 0x00);
@@ -704,6 +673,28 @@ mod tests {
 
         // CONFIG4: continuous conversion, lead-off comparators off.
         assert_eq!(CONFIG4.to_byte(), 0x00);
+        assert_eq!(ALTERNATING_LEAD_OFF_CONTROL.to_byte(), 0x11);
+    }
+
+    /// Exactly one chip drives CLK, and each chip's recipe carries its own CONFIG1.
+    #[test]
+    fn only_the_clock_source_drives_clk() {
+        assert_eq!(ClockRole::Source.config1().to_byte(), 0xE4);
+        assert_eq!(ClockRole::Follower.config1().to_byte(), 0xC4);
+        assert_eq!(
+            CLOCK_ROLE
+                .iter()
+                .filter(|role| **role == ClockRole::Source)
+                .count(),
+            1
+        );
+        for (drive, clock) in RIGHT_LEG_DRIVE_MODE.into_iter().zip(CLOCK_ROLE) {
+            let configuration = chip_configuration(drive, clock);
+            assert_eq!(
+                configuration[0],
+                (Register::Config1, clock.config1().to_byte())
+            );
+        }
     }
 
     /// Every bias-drive mode's byte, pinned so switching the knob later cannot

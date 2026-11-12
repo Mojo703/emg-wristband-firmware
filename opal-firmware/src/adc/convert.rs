@@ -12,6 +12,10 @@ pub(super) const GAIN: f32 = 6.0;
 
 pub(super) const MICROVOLTS_PER_VOLT: f32 = 1_000_000.0;
 
+/// Input-referred microvolts per raw 24-bit code.
+pub(super) const MICROVOLTS_PER_CODE: f32 =
+    REFERENCE_VOLTS / GAIN / FULL_SCALE_CODE * MICROVOLTS_PER_VOLT;
+
 /// Bits dropped from a 24-bit code to make the `i16` the wire and the recordings
 /// carry.
 ///

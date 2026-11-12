@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { Band, bluetoothAvailable } from '$lib/band/link.ts';
+  import type { LeadOffSnapshot } from '$lib/band/protocol.ts';
   import Playfield from './Playfield.svelte';
   import { CollectionRun } from './run.ts';
   import { DEFAULT_PLAN, GESTURE_CLASSES, buildSchedule, type Schedule } from './schedule.ts';
@@ -25,6 +26,8 @@
   let summary = $state<StreamSummary | null>(null);
   let abandoned = $state(0);
   let quality = $state.raw<QualityReport | null>(null);
+  let leadOff = $state.raw<LeadOffSnapshot | null>(null);
+  let snapshotting = $state(false);
 
   let baseUrl = $state(remembered('collect.baseUrl', 'https://collect.underfloor.ca'));
   let token = $state(remembered('collect.token', ''));
@@ -77,9 +80,14 @@
     if (!available) status = 'This browser has no Web Bluetooth';
     void refreshSessions();
     return band.subscribe((event) => {
+      if (event.kind === 'leadOff') {
+        leadOff = event.snapshot;
+        snapshotting = false;
+      }
       if (event.kind === 'disconnected') {
         connected = false;
         streaming = false;
+        snapshotting = false;
         status = 'Not connected';
         run?.stop(false, 'band disconnected');
       }
@@ -115,6 +123,16 @@
       });
       streaming = true;
     } catch (error) {
+      status = message(error);
+    }
+  }
+
+  async function takeLeadOffSnapshot(): Promise<void> {
+    snapshotting = true;
+    try {
+      await band.requestLeadOffSnapshot();
+    } catch (error) {
+      snapshotting = false;
       status = message(error);
     }
   }
@@ -273,6 +291,11 @@
           {:else}
             <button onclick={startStream}>Start</button>
           {/if}
+          {#if band.takesLeadOffSnapshots}
+            <button disabled={snapshotting || run !== null} onclick={takeLeadOffSnapshot}>
+              {snapshotting ? 'Taking snapshot' : 'Lead-off snapshot'}
+            </button>
+          {/if}
         </div>
         {#if summary !== null}
           <dl>
@@ -289,7 +312,7 @@
           </dl>
         {/if}
         {#if quality !== null}
-          <ElectrodeCheck report={quality} />
+          <ElectrodeCheck report={quality} {leadOff} />
         {/if}
       </section>
     {/if}

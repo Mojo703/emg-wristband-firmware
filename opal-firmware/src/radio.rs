@@ -13,13 +13,13 @@ use ble_media::emg_stream::WindowRecord;
 use ble_media::nimble::{EmgStream, NimbleRadio, SettingsService};
 use ble_media::phone::{Delivery, Phone, RadioClaim};
 use ble_media::session::SESSION_TICK;
-use ble_media::settings_service::{BandHealth, BandSettings, GestureEvent};
+use ble_media::settings_service::{BandHealth, BandSettings, GestureEvent, LeadOffSnapshot};
 use esp_idf_svc::hal::delay::FreeRtos;
 use feedback_vocabulary::Phone as FeedbackPhone;
 use log::{error, info, warn};
 use protocol::{CalibrationGesture, MediaKey, PhoneStatus};
 
-use crate::adc::acquisition::WindowRecycler;
+use crate::adc::acquisition::{LeadOffTones, WindowRecycler};
 use crate::cores;
 use crate::handoff::Handoff;
 use crate::health;
@@ -42,11 +42,13 @@ enum Outbound {
     Commit(Commit),
     Settings(BandSettings),
     Health(BandHealth),
+    LeadOff(LeadOffSnapshot),
 }
 
 pub(crate) struct PhoneLink {
     outbound: Handoff<Outbound>,
     settings_writes: Receiver<BandSettings>,
+    lead_off_requests: Receiver<()>,
     states: Receiver<PhoneStatus>,
     status: PhoneStatus,
     emg: EmgStream,
@@ -58,6 +60,7 @@ impl PhoneLink {
     /// thread refused; the band then classifies with nowhere to send.
     pub(crate) fn start(device_name: &str, current: &BandSettings) -> Option<Self> {
         let (writes, settings_writes) = mpsc::sync_channel(SETTINGS_WRITE_CAPACITY);
+        let (lead_off_request_sender, lead_off_requests) = mpsc::sync_channel(1);
         let mut radio = match NimbleRadio::bring_up(device_name) {
             Ok(radio) => radio,
             Err(error) => {
@@ -65,7 +68,8 @@ impl PhoneLink {
                 return None;
             }
         };
-        let service = match radio.attach_settings_service(current, writes) {
+        let service = match radio.attach_settings_service(current, writes, lead_off_request_sender)
+        {
             Ok(service) => service,
             Err(error) => {
                 error!("settings service refused: {error:#}");
@@ -97,6 +101,7 @@ impl PhoneLink {
         Some(Self {
             outbound,
             settings_writes,
+            lead_off_requests,
             states,
             status: PhoneStatus::Dormant,
             emg,
@@ -131,6 +136,15 @@ impl PhoneLink {
         self.settings_writes.try_recv().ok()
     }
 
+    /// Whether the phone has asked for a lead-off snapshot since the last call.
+    pub(crate) fn take_lead_off_request(&self) -> bool {
+        self.lead_off_requests.try_recv().is_ok()
+    }
+
+    pub(crate) fn publish_lead_off(&self, snapshot: LeadOffSnapshot) {
+        self.send(Outbound::LeadOff(snapshot));
+    }
+
     pub(crate) fn feedback_phone(&mut self) -> FeedbackPhone {
         while let Ok(status) = self.states.try_recv() {
             self.status = status;
@@ -142,6 +156,18 @@ impl PhoneLink {
         if self.outbound.offer(message).is_err() {
             warn!("BLE queue full; dropped an outbound message");
         }
+    }
+}
+
+/// A snapshot's tones as the record the phone reads.
+pub(crate) fn lead_off_snapshot(tones: &LeadOffTones) -> LeadOffSnapshot {
+    let frames = u32::from(tones.frames.max(1));
+    LeadOffSnapshot {
+        frames: tones.frames,
+        amplitude_microvolts: tones.amplitude_microvolts,
+        railed_percent: tones
+            .railed
+            .map(|count| (u32::from(count) * 100 / frames).min(100) as u8),
     }
 }
 
@@ -267,6 +293,7 @@ fn run(
                 }
                 Some(Outbound::Settings(settings)) => service.publish_settings(&settings),
                 Some(Outbound::Health(health)) => service.publish_health(&health),
+                Some(Outbound::LeadOff(snapshot)) => service.publish_lead_off(&snapshot),
                 None => break,
             }
         }

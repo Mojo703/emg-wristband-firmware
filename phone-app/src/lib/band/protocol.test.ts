@@ -1,7 +1,15 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { STACK_NOT_MEASURED, decodeGestureEvent, decodeHealth, decodeSettings, encodeSettings, resetReasonLabel } from './protocol.ts';
+import {
+  STACK_NOT_MEASURED,
+  decodeGestureEvent,
+  decodeHealth,
+  decodeLeadOffSnapshot,
+  decodeSettings,
+  encodeSettings,
+  resetReasonLabel,
+} from './protocol.ts';
 
 // The same bytes `settings_service.rs` pins in its own tests.
 const DEMO_SETTINGS = [1, 2, 2, 0xcd, 0x00, 3, 0xb5, 0x00];
@@ -80,4 +88,20 @@ test('a short or unknown health record is refused', () => {
   const bytes = Uint8Array.from(DEMO_HEALTH);
   bytes[0] = 2;
   assert.throws(() => decodeHealth(new DataView(bytes.buffer)));
+});
+
+test('a lead-off snapshot decodes the layout ble-media writes', () => {
+  const bytes = new Uint8Array(83);
+  const view = new DataView(bytes.buffer);
+  view.setUint8(0, 2);
+  view.setUint16(1, 4000, true);
+  view.setUint32(3, 349_436, true);
+  view.setUint32(63, 11_456, true);
+  bytes[82] = 37;
+  const snapshot = decodeLeadOffSnapshot(view);
+  assert.equal(snapshot.frames, 4000);
+  assert.equal(snapshot.amplitudeMicrovolts[0], 349_436);
+  assert.equal(snapshot.amplitudeMicrovolts[15], 11_456);
+  assert.equal(snapshot.railedPercent[15], 37);
+  assert.equal(snapshot.railedPercent.length, 16);
 });

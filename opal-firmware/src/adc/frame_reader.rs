@@ -10,15 +10,24 @@
 //! ~487 µs period, and whatever the scheduler, the radio, or a
 //! flash-cache-disabled window is doing.
 //!
+//! # One edge, both chips
+//!
+//! The chips share SCLK and convert on one clock from one START edge, so a single
+//! interrupt on chip 0's DRDY reads chip 0 and then chip 1, back to back, under
+//! one timestamp. Chip 1's DRDY cannot carry its own read: a rising SCLK pulls
+//! DRDY high regardless of CS (SBAS459K §9.4.1.2), and its conversion is already
+//! complete by the time chip 0's read ends. Its falling edges are only counted, so
+//! the pipeline can tell when chip 1 stops converting while chip 0 carries on.
+//!
 //! # Bus ownership
 //!
-//! Each chip's SPI host has exactly one owner at any instant, and the handover
+//! The shared SPI host has exactly one owner at any instant, and the handover
 //! is explicit:
 //!
 //! - The esp-idf SPI master driver owns the host during bring-up, the
 //!   configuration readback, and warm recovery. It is not ISR-safe and must
 //!   never run while this module's interrupt can fire.
-//! - This module owns the host while the chip's DRDY interrupt is enabled. It
+//! - This module owns the host while the DRDY interrupt is enabled. It
 //!   drives the GPSPI registers directly, taking no driver lock and making no
 //!   driver call.
 //!
@@ -150,7 +159,8 @@ impl FrameSlot {
     };
 }
 
-/// One chip's frames crossing out of interrupt context.
+/// One chip's frames crossing out of interrupt context. Both rings fill from the
+/// same handler.
 ///
 /// Single producer (the handler), single consumer (the pipeline thread). The
 /// slot contents are ordinary memory; `write_index` is what publishes them, so
@@ -236,25 +246,51 @@ impl Recipe {
 /// DRAM and carries no pointer that could outlive what it points at. Written
 /// once, from task context, while the interrupt is disabled.
 #[derive(Clone, Copy)]
-struct ChipReader {
-    /// This chip's GPSPI host register base.
+struct HostReader {
+    /// The shared GPSPI host's register base.
     spi_base: u32,
-    /// The `GPIO_OUT*_W1TS`/`W1TC` pair and bit for this chip's chip select.
-    /// Driving CS from its registers rather than through `PinDriver` keeps the
-    /// handler clear of esp-idf-hal, which is not IRAM-resident.
-    chip_select_set: u32,
-    chip_select_clear: u32,
-    chip_select_mask: u32,
     recipe: Recipe,
+    chip_selects: [ChipSelect; DEVICE_COUNT],
 }
 
-impl ChipReader {
+/// The `GPIO_OUT*_W1TS`/`W1TC` pair and bit for one chip's chip select. Driving
+/// CS from its registers rather than through `PinDriver` keeps the handler clear
+/// of esp-idf-hal, which is not IRAM-resident.
+#[derive(Clone, Copy)]
+struct ChipSelect {
+    set: u32,
+    clear: u32,
+    mask: u32,
+}
+
+impl ChipSelect {
+    const EMPTY: Self = Self {
+        set: 0,
+        clear: 0,
+        mask: 0,
+    };
+
+    fn for_pin(pin: u8) -> Self {
+        // GPIO 0..31 live in `GPIO_OUT_W1TS/W1TC` at +0x08/+0x0C, 32..48 in the
+        // `GPIO_OUT1_*` pair at +0x14/+0x18.
+        let (set_offset, clear_offset, bit) = if pin < 32 {
+            (0x08, 0x0C, pin)
+        } else {
+            (0x14, 0x18, pin - 32)
+        };
+        Self {
+            set: DR_REG_GPIO_BASE + set_offset,
+            clear: DR_REG_GPIO_BASE + clear_offset,
+            mask: 1 << bit,
+        }
+    }
+}
+
+impl HostReader {
     const EMPTY: Self = Self {
         spi_base: 0,
-        chip_select_set: 0,
-        chip_select_clear: 0,
-        chip_select_mask: 0,
         recipe: Recipe::EMPTY,
+        chip_selects: [ChipSelect::EMPTY; DEVICE_COUNT],
     };
 }
 
@@ -263,14 +299,14 @@ impl ChipReader {
 struct InterruptShared<T>(UnsafeCell<T>);
 unsafe impl<T> Sync for InterruptShared<T> {}
 
-/// Per-chip state, in `.bss` so the handler reaches it with the flash cache
+/// Handler state, in `.bss` so the handler reaches it with the flash cache
 /// disabled and allocates nothing to do so.
-static READERS: InterruptShared<[ChipReader; DEVICE_COUNT]> =
-    InterruptShared(UnsafeCell::new([ChipReader::EMPTY; DEVICE_COUNT]));
+static READER: InterruptShared<HostReader> = InterruptShared(UnsafeCell::new(HostReader::EMPTY));
 static RINGS: [FrameRing; DEVICE_COUNT] = [FrameRing::new(), FrameRing::new()];
-static OWNERS: [AtomicU32; DEVICE_COUNT] =
-    [AtomicU32::new(OWNER_DRIVER), AtomicU32::new(OWNER_DRIVER)];
-static HANDLER_GATES: [AtomicU32; DEVICE_COUNT] = [AtomicU32::new(0), AtomicU32::new(0)];
+static OWNER: AtomicU32 = AtomicU32::new(OWNER_DRIVER);
+static HANDLER_GATE: AtomicU32 = AtomicU32::new(0);
+/// Falling edges on chip 1's DRDY, which the handler does not read on.
+static COUNTED_EDGES: AtomicU32 = AtomicU32::new(0);
 
 /// Writes one 32-bit peripheral register.
 ///
@@ -292,7 +328,8 @@ unsafe fn read_register(base: u32, word: usize) -> u32 {
     std::ptr::read_volatile((base as *const u32).add(word))
 }
 
-/// Clocks one frame out of chip `index` and publishes it to that chip's ring.
+/// Clocks one frame out of each chip, in chip order, and publishes each to that
+/// chip's ring under one edge stamp.
 ///
 /// Runs in interrupt context and from [`FrameReader::validate`] in task
 /// context; the two never overlap, because validation happens before the
@@ -301,21 +338,33 @@ unsafe fn read_register(base: u32, word: usize) -> u32 {
 ///
 /// # Safety
 ///
-/// Chip `index` must have been claimed, and the SPI host must be owned by this
-/// module (see the module's ownership contract).
+/// The host must have been claimed and be owned by this module (see the
+/// module's ownership contract).
+#[link_section = ".iram1.adc_read_frames"]
+unsafe fn read_frames_into_rings() {
+    let edge_us = esp_timer_get_time() as u64;
+    for index in 0..DEVICE_COUNT {
+        read_frame_into_ring(index, edge_us);
+    }
+}
+
+/// Clocks one frame out of chip `index` into its ring. `edge_us` is the DRDY
+/// edge both chips' frames are stamped with; `read_us` is measured from it, so
+/// chip 1's includes chip 0's read.
+///
+/// # Safety
+///
+/// As [`read_frames_into_rings`].
 #[link_section = ".iram1.adc_read_frame"]
-unsafe fn read_frame_into_ring(index: usize) {
-    let reader = *(*READERS.0.get()).get_unchecked(index);
+unsafe fn read_frame_into_ring(index: usize, edge_us: u64) {
+    let reader = &*READER.0.get();
+    let chip_select = *reader.chip_selects.get_unchecked(index);
     let ring = RINGS.get_unchecked(index);
     let base = reader.spi_base;
-    let edge_us = esp_timer_get_time() as u64;
 
     // CS low for the whole frame (SBAS459K §9.5.1.1), then the tUPDATE keep-out
     // before the first SCLK.
-    std::ptr::write_volatile(
-        reader.chip_select_clear as *mut u32,
-        reader.chip_select_mask,
-    );
+    std::ptr::write_volatile(chip_select.clear as *mut u32, chip_select.mask);
     esp_rom_delay_us(UPDATE_KEEP_OUT_MICROSECONDS);
 
     let recipe = &reader.recipe;
@@ -370,7 +419,7 @@ unsafe fn read_frame_into_ring(index: usize) {
     // words are latched, DOUT going high-impedance does not touch them, and
     // holding CS low for the copy would only lengthen the frame.
     esp_rom_delay_us(CHIP_SELECT_HOLD_MICROSECONDS);
-    std::ptr::write_volatile(reader.chip_select_set as *mut u32, reader.chip_select_mask);
+    std::ptr::write_volatile(chip_select.set as *mut u32, chip_select.mask);
 
     if faulted {
         ring.read_faults.fetch_add(1, Ordering::Relaxed);
@@ -395,14 +444,10 @@ unsafe fn read_frame_into_ring(index: usize) {
     ring.edges.fetch_add(1, Ordering::Relaxed);
 }
 
-/// The DRDY handler itself. `argument` carries the chip index.
+/// The handler on chip 0's DRDY: reads both chips.
 #[link_section = ".iram1.adc_data_ready"]
-unsafe extern "C" fn data_ready_handler(argument: *mut core::ffi::c_void) {
-    let index = argument as usize;
-    if index >= DEVICE_COUNT {
-        return;
-    }
-    let gate = &HANDLER_GATES[index];
+unsafe extern "C" fn data_ready_handler(_argument: *mut core::ffi::c_void) {
+    let gate = &HANDLER_GATE;
     let mut state = gate.load(Ordering::Acquire);
     loop {
         if state & HANDLER_GATE_OPEN == 0 {
@@ -418,8 +463,14 @@ unsafe extern "C" fn data_ready_handler(argument: *mut core::ffi::c_void) {
             Err(current) => state = current,
         }
     }
-    read_frame_into_ring(index);
+    read_frames_into_rings();
     gate.fetch_sub(HANDLER_ACTIVE_INCREMENT, Ordering::Release);
+}
+
+/// The handler on chip 1's DRDY: counts the edge and touches nothing else.
+#[link_section = ".iram1.adc_counted_edge"]
+unsafe extern "C" fn counted_edge_handler(_argument: *mut core::ffi::c_void) {
+    COUNTED_EDGES.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Installs the GPIO interrupt dispatcher the DRDY handlers hang off.
@@ -454,27 +505,27 @@ pub(super) fn install_interrupt_dispatcher() -> Result<()> {
     Ok(())
 }
 
-/// One chip's handle on its interrupt-side frame path.
+/// The front end's handle on its interrupt-side frame path.
 pub(crate) struct FrameReader {
-    index: usize,
-    data_ready_pin: u8,
+    /// Chip 0's DRDY, which carries the read, and chip 1's, which is counted.
+    data_ready_pins: [u8; DEVICE_COUNT],
     frame_device: usize,
     interrupt_enable: u32,
 }
 
 impl FrameReader {
     fn hand_back_to_driver(&self) -> Result<()> {
-        if OWNERS[self.index].load(Ordering::Acquire) != OWNER_RAW {
+        if OWNER.load(Ordering::Acquire) != OWNER_RAW {
             return Ok(());
         }
         let deadline = unsafe { esp_timer_get_time() } + HANDOFF_TIMEOUT_US;
-        while HANDLER_GATES[self.index].load(Ordering::Acquire) != 0 {
+        while HANDLER_GATE.load(Ordering::Acquire) != 0 {
             if unsafe { esp_timer_get_time() } >= deadline {
                 return Err(anyhow!("DRDY handler did not quiesce before SPI handoff"));
             }
             std::hint::spin_loop();
         }
-        let reader = unsafe { (*READERS.0.get())[self.index] };
+        let reader = unsafe { *READER.0.get() };
         while unsafe { read_register(reader.spi_base, CMD) } & (CMD_UPDATE | CMD_USR) != 0 {
             if unsafe { esp_timer_get_time() } >= deadline {
                 return Err(anyhow!(
@@ -484,44 +535,35 @@ impl FrameReader {
             std::hint::spin_loop();
         }
         unsafe {
-            std::ptr::write_volatile(reader.chip_select_set as *mut u32, reader.chip_select_mask);
+            for chip_select in reader.chip_selects {
+                std::ptr::write_volatile(chip_select.set as *mut u32, chip_select.mask);
+            }
             write_register(reader.spi_base, DMA_INT_CLR, TRANS_DONE_INT);
             write_register(reader.spi_base, DMA_INT_ENA, self.interrupt_enable);
             write_register(reader.spi_base, DMA_INT_SET, TRANS_DONE_INT);
             spi_device_release_bus(self.frame_device as spi_device_handle_t);
         }
-        OWNERS[self.index].store(OWNER_DRIVER, Ordering::Release);
+        OWNER.store(OWNER_DRIVER, Ordering::Release);
         Ok(())
     }
 
-    /// Takes ownership of chip `index`'s SPI host for interrupt-side reads.
+    /// Takes ownership of the shared SPI host for interrupt-side reads.
     ///
-    /// The chip must already be streaming (RDATAC, START high) and the SPI
-    /// driver must have just performed one frame read on this host at the frame
-    /// configuration — that read is what leaves the registers holding the
+    /// Both chips must already be streaming (RDATAC, START high) and the SPI
+    /// driver must have just performed a frame read on this host through
+    /// `frame_device` — that read is what leaves the registers holding the
     /// recipe this snapshots. The interrupt is not enabled here; the caller
     /// validates first ([`Self::validate`]) and then calls [`Self::enable`].
     pub(super) fn claim(
-        index: usize,
         spi_host: esp_idf_svc::sys::spi_host_device_t,
         frame_device: spi_device_handle_t,
-        chip_select_pin: u8,
-        data_ready_pin: u8,
+        chip_select_pins: [u8; DEVICE_COUNT],
+        data_ready_pins: [u8; DEVICE_COUNT],
     ) -> Result<Self> {
-        if index >= DEVICE_COUNT {
-            return Err(anyhow!("chip index {index} is outside the front end"));
-        }
         let spi_base = match spi_host {
             host if host == spi_host_device_t_SPI2_HOST => DR_REG_SPI2_BASE,
             host if host == spi_host_device_t_SPI3_HOST => DR_REG_SPI3_BASE,
             other => return Err(anyhow!("SPI host {other} has no known register base")),
-        };
-        // GPIO 0..31 live in `GPIO_OUT_W1TS/W1TC` at +0x08/+0x0C, 32..48 in the
-        // `GPIO_OUT1_*` pair at +0x14/+0x18.
-        let (set_offset, clear_offset, bit) = if chip_select_pin < 32 {
-            (0x08, 0x0C, chip_select_pin)
-        } else {
-            (0x14, 0x18, chip_select_pin - 32)
         };
         esp!(unsafe { spi_device_acquire_bus(frame_device, u32::MAX) })?;
         let interrupt_enable = unsafe { read_register(spi_base, DMA_INT_ENA) };
@@ -529,11 +571,8 @@ impl FrameReader {
             write_register(spi_base, DMA_INT_ENA, interrupt_enable & !TRANS_DONE_INT);
             write_register(spi_base, DMA_INT_CLR, TRANS_DONE_INT);
         }
-        let reader = ChipReader {
+        let reader = HostReader {
             spi_base,
-            chip_select_set: DR_REG_GPIO_BASE + set_offset,
-            chip_select_clear: DR_REG_GPIO_BASE + clear_offset,
-            chip_select_mask: 1 << bit,
             recipe: Recipe {
                 ctrl: unsafe { read_register(spi_base, CTRL) },
                 clock: unsafe { read_register(spi_base, CLOCK) },
@@ -549,48 +588,48 @@ impl FrameReader {
                 slave: unsafe { read_register(spi_base, SLAVE) },
                 clk_gate: unsafe { read_register(spi_base, CLK_GATE) },
             },
+            chip_selects: chip_select_pins.map(ChipSelect::for_pin),
         };
-        // The interrupt for this chip has never been enabled, so nothing else
-        // can be looking at this slot.
-        unsafe { (*READERS.0.get())[index] = reader };
-        OWNERS[index].store(OWNER_RAW, Ordering::Release);
+        // The interrupt has never been enabled, so nothing else can be looking.
+        unsafe { *READER.0.get() = reader };
+        OWNER.store(OWNER_RAW, Ordering::Release);
         Ok(Self {
-            index,
-            data_ready_pin,
+            data_ready_pins,
             frame_device: frame_device as usize,
             interrupt_enable,
         })
     }
 
     /// Runs the interrupt's read path once, here in task context, and returns
-    /// the frame it produced.
+    /// the frames it produced, one per chip.
     ///
     /// This is the register recipe's proof. The caller compares what comes back
-    /// against the frame the SPI driver read moments earlier: same chip, same
+    /// against the frames the SPI driver read moments earlier: same chips, same
     /// stream, so a recipe that clocks the wrong number of bits, picks the wrong
     /// mode, or misses the FIFO shows up as a broken status marker or nonsense
     /// channel codes before the interrupt is ever armed.
-    pub(super) fn validate(&self) -> Option<[u8; FRAME_BYTES]> {
+    pub(super) fn validate(&self) -> Option<[[u8; FRAME_BYTES]; DEVICE_COUNT]> {
         // Safe by the ownership contract: the interrupt is not enabled yet, so
         // this is the only thing touching the host.
-        unsafe { read_frame_into_ring(self.index) };
-        self.pop().map(|frame| frame.bytes)
+        unsafe { read_frames_into_rings() };
+        let first = self.pop(0)?.bytes;
+        let second = self.pop(1)?.bytes;
+        Some([first, second])
     }
 
-    /// Routes this chip's DRDY falling edge into the handler. The dispatcher
-    /// must already be installed ([`install_interrupt_dispatcher`]); the
-    /// interrupt is left disabled, so [`Self::enable`] decides when reads start.
+    /// Routes chip 0's DRDY falling edge into the read handler and chip 1's into
+    /// the counter. The dispatcher must already be installed
+    /// ([`install_interrupt_dispatcher`]); both stay disabled until
+    /// [`Self::enable`].
     pub(super) fn attach(&self) -> Result<()> {
-        let pin = self.data_ready_pin as i32;
-        esp!(unsafe { gpio_set_intr_type(pin, gpio_int_type_t_GPIO_INTR_NEGEDGE) })?;
-        esp!(unsafe { gpio_intr_disable(pin) })?;
-        esp!(unsafe {
-            gpio_isr_handler_add(
-                pin,
-                Some(data_ready_handler),
-                self.index as *mut core::ffi::c_void,
-            )
-        })?;
+        let handlers: [unsafe extern "C" fn(*mut core::ffi::c_void); DEVICE_COUNT] =
+            [data_ready_handler, counted_edge_handler];
+        for (pin, handler) in self.data_ready_pins.into_iter().zip(handlers) {
+            let pin = pin as i32;
+            esp!(unsafe { gpio_set_intr_type(pin, gpio_int_type_t_GPIO_INTR_NEGEDGE) })?;
+            esp!(unsafe { gpio_intr_disable(pin) })?;
+            esp!(unsafe { gpio_isr_handler_add(pin, Some(handler), std::ptr::null_mut()) })?;
+        }
         Ok(())
     }
 
@@ -601,8 +640,8 @@ impl FrameReader {
     /// it runs handlers, so an edge landing during a read is latched and served
     /// next, and there is no re-arm to lose an edge in.
     pub(super) fn enable(&self) -> Result<()> {
-        let reader = unsafe { (*READERS.0.get())[self.index] };
-        if OWNERS[self.index].load(Ordering::Acquire) == OWNER_DRIVER {
+        let reader = unsafe { *READER.0.get() };
+        if OWNER.load(Ordering::Acquire) == OWNER_DRIVER {
             let frame_device = self.frame_device as spi_device_handle_t;
             esp!(unsafe { spi_device_acquire_bus(frame_device, u32::MAX) })?;
             unsafe {
@@ -613,29 +652,37 @@ impl FrameReader {
                 );
                 write_register(reader.spi_base, DMA_INT_CLR, TRANS_DONE_INT);
             }
-            OWNERS[self.index].store(OWNER_RAW, Ordering::Release);
+            OWNER.store(OWNER_RAW, Ordering::Release);
         }
-        HANDLER_GATES[self.index].store(HANDLER_GATE_OPEN, Ordering::Release);
-        esp!(unsafe { gpio_intr_enable(self.data_ready_pin as i32) })?;
+        HANDLER_GATE.store(HANDLER_GATE_OPEN, Ordering::Release);
+        for pin in self.data_ready_pins {
+            esp!(unsafe { gpio_intr_enable(pin as i32) })?;
+        }
         Ok(())
     }
 
     /// Closes the interrupt window and waits out any read still in flight, so
     /// the SPI driver can safely take the host back.
     ///
-    /// The atomic gate closes admission before the GPIO source is disabled and
+    /// The atomic gate closes admission before the GPIO sources are disabled and
     /// counts every admitted handler, including one executing on the other core.
     pub(super) fn disable(&self) -> Result<()> {
-        HANDLER_GATES[self.index].fetch_and(!HANDLER_GATE_OPEN, Ordering::AcqRel);
-        let disabled = esp!(unsafe { gpio_intr_disable(self.data_ready_pin as i32) });
+        HANDLER_GATE.fetch_and(!HANDLER_GATE_OPEN, Ordering::AcqRel);
+        let mut disabled = Ok(());
+        for pin in self.data_ready_pins {
+            let result = esp!(unsafe { gpio_intr_disable(pin as i32) });
+            if disabled.is_ok() {
+                disabled = result;
+            }
+        }
         self.hand_back_to_driver()?;
         disabled.map_err(Into::into)
     }
 
-    /// The oldest frame the interrupt has captured, or `None` when the ring is
-    /// empty. Never blocks.
-    pub(super) fn pop(&self) -> Option<CapturedFrame> {
-        let ring = &RINGS[self.index];
+    /// The oldest frame the interrupt has captured from chip `index`, or `None`
+    /// when its ring is empty. Never blocks.
+    pub(super) fn pop(&self, index: usize) -> Option<CapturedFrame> {
+        let ring = &RINGS[index];
         let read = ring.read_index.load(Ordering::Relaxed);
         if read == ring.write_index.load(Ordering::Acquire) {
             return None;
@@ -653,30 +700,38 @@ impl FrameReader {
         })
     }
 
-    /// Throws away every frame the ring holds. Used across a warm recovery,
-    /// whose frames belong to the chip's previous configuration.
+    /// Throws away every frame both rings hold. Used across a warm recovery,
+    /// whose frames belong to the chips' previous configuration.
     pub(super) fn clear(&self) {
-        let ring = &RINGS[self.index];
-        ring.read_index
-            .store(ring.write_index.load(Ordering::Acquire), Ordering::Release);
+        for ring in &RINGS {
+            ring.read_index
+                .store(ring.write_index.load(Ordering::Acquire), Ordering::Release);
+        }
     }
 
-    /// Cumulative interrupt-side counters: serviced edges, ring overruns, and
-    /// transfers that gave up waiting on the host.
-    pub(super) fn counters(&self) -> InterruptCounters {
-        let ring = &RINGS[self.index];
+    /// Cumulative interrupt-side counters for chip `index`: serviced edges, ring
+    /// overruns, and transfers that gave up waiting on the host.
+    pub(super) fn counters(&self, index: usize) -> InterruptCounters {
+        let ring = &RINGS[index];
         InterruptCounters {
             edges: ring.edges.load(Ordering::Relaxed),
             overruns: ring.overruns.load(Ordering::Relaxed),
             read_faults: ring.read_faults.load(Ordering::Relaxed),
         }
     }
+
+    /// Chip 1's DRDY falling edges, cumulative.
+    pub(super) fn counted_edges(&self) -> u32 {
+        COUNTED_EDGES.load(Ordering::Relaxed)
+    }
 }
 
 impl Drop for FrameReader {
     fn drop(&mut self) {
-        HANDLER_GATES[self.index].fetch_and(!HANDLER_GATE_OPEN, Ordering::AcqRel);
-        let _ = unsafe { gpio_intr_disable(self.data_ready_pin as i32) };
+        HANDLER_GATE.fetch_and(!HANDLER_GATE_OPEN, Ordering::AcqRel);
+        for pin in self.data_ready_pins {
+            let _ = unsafe { gpio_intr_disable(pin as i32) };
+        }
         if self.hand_back_to_driver().is_err() {
             std::process::abort();
         }

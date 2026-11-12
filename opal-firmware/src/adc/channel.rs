@@ -5,37 +5,13 @@ use core::fmt;
 /// Analog input channels on one ADS1298.
 pub(crate) const CHANNELS_PER_DEVICE: usize = 8;
 
-/// ADS1298s on the front end.
+/// ADS1298s on the front end: IC1 is device 0 and IC2 is device 1.
 ///
-/// Two self-clocked boards, each on its own SPI bus with its own chip select,
-/// START, RESET, PWDN, and DRDY. [`model_slot`] covers all sixteen slots, the
+/// They share one SPI bus, one clock, and the RESET, START, and PWDN lines; each
+/// has its own chip select and DRDY. [`model_slot`] covers all sixteen slots, the
 /// conditioner sizes itself to match, and `preprocess` documents the
 /// synchronisation the pair has to satisfy for the layout to be honest.
 pub(crate) const DEVICE_COUNT: usize = 2;
-
-/// One of the two analog-front-end boards, as wired in `main`: A is the
-/// right-column ribbon on SPI2, B the left-column ribbon on SPI3. This is
-/// hardware identity — it keys the wiring, the aligner source slot, and the
-/// core plan (`crate::cores`) — and stays put even when any of those
-/// assignments change.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Board {
-    A,
-    B,
-}
-
-impl Board {
-    /// Both boards, in device-index order.
-    pub(crate) const ALL: [Board; DEVICE_COUNT] = [Board::A, Board::B];
-
-    /// This board's aligner source slot and [`model_slot`] block.
-    pub(crate) const fn device_index(self) -> usize {
-        match self {
-            Board::A => 0,
-            Board::B => 1,
-        }
-    }
-}
 
 /// Which of the model's input slots device `device_index` fills with `channel`.
 ///

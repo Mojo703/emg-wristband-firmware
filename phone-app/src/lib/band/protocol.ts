@@ -7,11 +7,42 @@
 // run present), zero, boot count u32 LE, then this run and the previous run,
 // each uptime s u32, lowest free heap u32, disconnects u16, last disconnect
 // status u16, and the lowest free stack u16 per task in MONITORED_TASKS order.
+// Lead-off snapshot: version, frames per chip u16 LE, each channel's excitation
+// tone amplitude in microvolts (u32 LE, 16 of them), then each channel's percent
+// of frames at a rail (16 bytes).
 
 export const SERVICE_UUID = '5c3e7a10-2f4b-4d8e-9b61-0f1e2d3c4c00';
 export const SETTINGS_UUID = '5c3e7a10-2f4b-4d8e-9b61-0f1e2d3c4c01';
 export const GESTURE_UUID = '5c3e7a10-2f4b-4d8e-9b61-0f1e2d3c4c02';
 export const HEALTH_UUID = '5c3e7a10-2f4b-4d8e-9b61-0f1e2d3c4c04';
+export const LEAD_OFF_UUID = '5c3e7a10-2f4b-4d8e-9b61-0f1e2d3c4c05';
+
+const LEAD_OFF_VERSION = 2;
+const LEAD_OFF_CHANNELS = 16;
+const LEAD_OFF_LENGTH = 3 + 5 * LEAD_OFF_CHANNELS;
+
+/** One AC lead-off snapshot: each channel's excitation tone, which grows with
+ * electrode impedance, and how much of the snapshot it spent at a rail. */
+export interface LeadOffSnapshot {
+  readonly frames: number;
+  readonly amplitudeMicrovolts: readonly number[];
+  readonly railedPercent: readonly number[];
+}
+
+export function decodeLeadOffSnapshot(view: DataView): LeadOffSnapshot {
+  if (view.byteLength < LEAD_OFF_LENGTH) {
+    throw new Error(`lead-off snapshot is ${view.byteLength} bytes`);
+  }
+  if (view.getUint8(0) !== LEAD_OFF_VERSION) {
+    throw new Error(`lead-off snapshot version ${view.getUint8(0)}`);
+  }
+  const channels = Array.from({ length: LEAD_OFF_CHANNELS }, (_, channel) => channel);
+  return {
+    frames: view.getUint16(1, true),
+    amplitudeMicrovolts: channels.map((channel) => view.getUint32(3 + 4 * channel, true)),
+    railedPercent: channels.map((channel) => view.getUint8(3 + 4 * LEAD_OFF_CHANNELS + channel)),
+  };
+}
 
 export const SENSITIVITIES: readonly { readonly code: number; readonly label: string }[] = [
   { code: 0, label: 'Low' },

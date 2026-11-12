@@ -34,6 +34,17 @@
 //! bytes 36-63   the previous run, zero unless flag bit 0
 //! ```
 //!
+//! Lead-off snapshot. The phone writes any byte to request one; the band runs AC
+//! lead-off excitation at a quarter of its sample rate for a couple of seconds
+//! and notifies the result:
+//!
+//! ```text
+//! byte 0        version (LEAD_OFF_VERSION)
+//! bytes 1-2     frames measured per chip (u16 LE)
+//! bytes 3-66    channels 1-16: excitation tone amplitude, microvolts (u32 LE each)
+//! bytes 67-82   channels 1-16: percent of frames at a rail
+//! ```
+//!
 //! Each run, as of its last update:
 //!
 //! ```text
@@ -51,6 +62,11 @@ pub const SERVICE_UUID: &str = "5c3e7a10-2f4b-4d8e-9b61-0f1e2d3c4c00";
 pub const SETTINGS_UUID: &str = "5c3e7a10-2f4b-4d8e-9b61-0f1e2d3c4c01";
 pub const GESTURE_UUID: &str = "5c3e7a10-2f4b-4d8e-9b61-0f1e2d3c4c02";
 pub const HEALTH_UUID: &str = "5c3e7a10-2f4b-4d8e-9b61-0f1e2d3c4c04";
+pub const LEAD_OFF_UUID: &str = "5c3e7a10-2f4b-4d8e-9b61-0f1e2d3c4c05";
+
+pub const LEAD_OFF_VERSION: u8 = 2;
+pub const LEAD_OFF_CHANNELS: usize = 16;
+pub const LEAD_OFF_LEN: usize = 3 + 5 * LEAD_OFF_CHANNELS;
 
 /// More bindings than the band has gestures is a malformed record.
 pub const MAX_BINDINGS: usize = CalibrationGesture::ALL.len();
@@ -199,6 +215,29 @@ impl BandHealth {
     }
 }
 
+/// One AC lead-off snapshot: how large each channel's excitation tone came back.
+/// The tone grows with electrode impedance, and an open input rails it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeadOffSnapshot {
+    pub frames: u16,
+    pub amplitude_microvolts: [u32; LEAD_OFF_CHANNELS],
+    pub railed_percent: [u8; LEAD_OFF_CHANNELS],
+}
+
+impl LeadOffSnapshot {
+    pub fn encode(&self) -> [u8; LEAD_OFF_LEN] {
+        let mut out = [0u8; LEAD_OFF_LEN];
+        out[0] = LEAD_OFF_VERSION;
+        out[1..3].copy_from_slice(&self.frames.to_le_bytes());
+        for (channel, amplitude) in self.amplitude_microvolts.iter().enumerate() {
+            let at = 3 + 4 * channel;
+            out[at..at + 4].copy_from_slice(&amplitude.to_le_bytes());
+        }
+        out[3 + 4 * LEAD_OFF_CHANNELS..].copy_from_slice(&self.railed_percent);
+        out
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SettingsError {
     Truncated { needed: usize, got: usize },
@@ -301,6 +340,26 @@ fn media_key(usage: u16) -> Result<MediaKey, SettingsError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_lead_off_snapshot_encodes_to_the_documented_layout() {
+        let mut amplitude_microvolts = [0u32; LEAD_OFF_CHANNELS];
+        let mut railed_percent = [0u8; LEAD_OFF_CHANNELS];
+        amplitude_microvolts[0] = 349_436;
+        amplitude_microvolts[15] = 11_456;
+        railed_percent[15] = 37;
+        let bytes = LeadOffSnapshot {
+            frames: 4000,
+            amplitude_microvolts,
+            railed_percent,
+        }
+        .encode();
+        assert_eq!(bytes.len(), 83);
+        assert_eq!(&bytes[..3], &[LEAD_OFF_VERSION, 0xA0, 0x0F]);
+        assert_eq!(&bytes[3..7], &349_436u32.to_le_bytes());
+        assert_eq!(&bytes[63..67], &11_456u32.to_le_bytes());
+        assert_eq!(bytes[82], 37);
+    }
 
     fn demo_settings() -> BandSettings {
         BandSettings {
