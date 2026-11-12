@@ -13,6 +13,8 @@
     cueEdges,
     instructionAt,
   } from '../calibration/cues.ts';
+  import ContactCheck from '../calibration/ContactCheck.svelte';
+  import { contactFromSnapshot, type Contact } from '../calibration/contact.ts';
   import Playfield from '../collect/Playfield.svelte';
   import type { Schedule } from '../collect/schedule.ts';
   import { ScreenAwake } from '../collect/screenAwake.ts';
@@ -20,6 +22,9 @@
   const { back }: { back: () => void } = $props();
 
   const TICK_MILLIS = 50;
+  /** The band runs the excitation for 2 s and pauses the stream around it. */
+  const CHECK_EXPECTED_MILLIS = 3500;
+  const CHECK_LIMIT_MILLIS = 10_000;
   const FAILURES: Record<CalibrationFailure, string> = {
     none: '',
     tooFewRows: 'Not enough of each movement was recorded.',
@@ -38,6 +43,12 @@
   let cuesFinished = $state(false);
   let timer: ReturnType<typeof setInterval> | null = null;
   let queue: Promise<void> = Promise.resolve();
+
+  let contact = $state.raw<Contact[]>(Array(16).fill(null));
+  let checkProgress = $state<number | null>(null);
+  let checkTimer: ReturnType<typeof setInterval> | null = null;
+  let snapshotBeforeCheck: unknown = null;
+  let checkedOnce = false;
 
   const status = $derived(connection.calibration);
   const phase = $derived(status?.phase ?? 'idle');
@@ -101,7 +112,53 @@
     if (phase === 'collecting' && status?.failure === 'none' && !running && !cuesFinished) startCues();
   });
 
-  onDestroy(stopCues);
+  // The band answers a check with a new lead-off snapshot.
+  function runCheck(): void {
+    if (checkProgress !== null || !connection.band.takesLeadOffSnapshots) return;
+    checkedOnce = true;
+    error = '';
+    snapshotBeforeCheck = connection.leadOff;
+    const startedAt = performance.now();
+    checkProgress = 0;
+    checkTimer = setInterval(() => {
+      const elapsed = performance.now() - startedAt;
+      checkProgress = Math.min(0.95, elapsed / CHECK_EXPECTED_MILLIS);
+      if (elapsed > CHECK_LIMIT_MILLIS) {
+        stopCheck();
+        error = "The band didn't answer the contact check. Tap to try again.";
+      }
+    }, TICK_MILLIS);
+    queue = queue
+      .then(() => connection.band.requestLeadOffSnapshot())
+      .catch((failure: unknown) => {
+        stopCheck();
+        error = failure instanceof Error ? failure.message : String(failure);
+      });
+  }
+
+  $effect(() => {
+    const snapshot = connection.leadOff;
+    if (checkProgress !== null && snapshot !== null && snapshot !== snapshotBeforeCheck) {
+      contact = contactFromSnapshot(snapshot);
+      stopCheck();
+    }
+  });
+
+  function stopCheck(): void {
+    if (checkTimer !== null) clearInterval(checkTimer);
+    checkTimer = null;
+    checkProgress = null;
+  }
+
+  // Check contact as soon as the screen can, before anyone presses Start.
+  $effect(() => {
+    if (ready && !checkedOnce && (phase === 'idle' || phase === 'failed' || phase === 'saved')) runCheck();
+  });
+
+  onDestroy(() => {
+    stopCues();
+    stopCheck();
+  });
 </script>
 
 <main class="shell">
@@ -159,12 +216,12 @@
     {#if phase === 'failed' && status !== null}
       <p class="bad">{FAILURES[status.failure]}</p>
     {/if}
-    <p>
+    <ContactCheck {contact} progress={checkProgress} onStart={begin} onCheck={runCheck} />
+    <p class="muted">
       Hold still for 30 seconds while the band settles, then follow the cues: tip the pole forward or back
       when a cue reaches the line, and hold until it ends. Between rounds, the screen asks for other movements.
       It takes just over three minutes.
     </p>
-    <button class="oval-button" disabled={!ready} onclick={begin}>Start</button>
   {/if}
 
   {#if error !== ''}

@@ -3,7 +3,7 @@
 // wrapping the real settings-service connection instead of the bench one.
 
 import { Band, bluetoothAvailable } from './link.ts';
-import type { BandSettings, CalibrationStatus, GestureEvent } from './protocol.ts';
+import type { BandSettings, CalibrationStatus, GestureEvent, LeadOffSnapshot } from './protocol.ts';
 
 function note(log: string[], message: string): string[] {
   const stamp = new Date().toLocaleTimeString([], { hour12: false });
@@ -18,6 +18,7 @@ class Connection {
   settings = $state<BandSettings | null>(null);
   lastGesture = $state<GestureEvent | null>(null);
   calibration = $state<CalibrationStatus | null>(null);
+  leadOff = $state.raw<LeadOffSnapshot | null>(null);
   busy = $state<string | null>(null);
   log = $state<string[]>([]);
 
@@ -33,6 +34,9 @@ class Connection {
           break;
         case 'calibration':
           this.calibration = event.status;
+          break;
+        case 'leadOff':
+          this.leadOff = event.snapshot;
           break;
         case 'disconnected':
           this.connected = false;
