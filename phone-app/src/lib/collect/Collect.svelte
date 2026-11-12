@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { Band, bluetoothAvailable } from '$lib/band/link.ts';
+  import { bluetoothAvailable } from '$lib/band/link.ts';
+  import { connection } from '$lib/band/connection.svelte.ts';
   import type { LeadOffSnapshot } from '$lib/band/protocol.ts';
   import Playfield from './Playfield.svelte';
   import { CollectionRun } from './run.ts';
@@ -16,12 +17,15 @@
   const ACTIVITIES = ['Seated', 'Standing', 'Post workout', 'Arm swinging'];
   const LEVEL = 'hard';
 
-  const band = new Band();
+  const { back }: { back?: () => void } = $props();
+
+  // The app's one connection, shared with the menu and the other screens.
+  const band = connection.band;
   const screen = new ScreenAwake();
   let available = $state(true);
-  let connected = $state(false);
+  let connected = $state(connection.connected);
   let connecting = $state(false);
-  let status = $state('Not connected');
+  let status = $state(connection.connected ? band.name : 'Not connected');
   let streaming = $state(false);
   let summary = $state<StreamSummary | null>(null);
   let abandoned = $state(0);
@@ -98,11 +102,13 @@
     screen.hold();
     connecting = true;
     try {
-      await band.connect();
-      connected = true;
-      status = band.streams ? band.name : `${band.name}: firmware has no EMG stream`;
-    } catch (error) {
-      status = message(error);
+      await connection.connect();
+      connected = connection.connected;
+      if (connected) {
+        status = band.streams ? band.name : `${band.name}: firmware has no EMG stream`;
+      } else {
+        status = connection.log.at(-1) ?? 'Not connected';
+      }
     } finally {
       connecting = false;
     }
@@ -256,7 +262,12 @@
 <audio bind:this={audio} preload="auto"></audio>
 
 <main>
-  <h1>Collect</h1>
+  <div class="row">
+    {#if back}
+      <button onclick={back} disabled={run !== null}>Back</button>
+    {/if}
+    <h1>Collect</h1>
+  </div>
 
   {#if run !== null && schedule !== null}
     <Playfield {schedule} position={() => run?.positionMs ?? null} onFrame={frame} />

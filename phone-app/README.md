@@ -1,11 +1,24 @@
 # phone-app
 
-The phone side of the band, as a website. The main page connects to a band
-running `opal-firmware`. It maps each gesture to a media key, sets sensitivity,
-and shows the last gesture the band committed. Data collection lives at
-`#collect`. The link bench lives at
-`#bench`. It drives the `ble-gatt-bench` example in `ble-media` and reports
-what the phone's radio stack grants.
+The phone side of the band, as a website, for a band running `opal-firmware`.
+It opens on a splash screen and a menu that shows whether the band is
+connected. From the menu:
+
+- **Calibration** guides the wearer through cues while the band fits its
+  model.
+- **Gesture Configuration** assigns gestures to media commands by dragging
+  gesture chips onto command boxes. Save writes the whole mapping to the
+  band's settings characteristic, and the boxes show what the band echoes
+  back. The tray offers only the gestures the band recognizes
+  (`calibration-flow::ACTIVE_CALIBRATION_GESTURES`); `GestureConfig.svelte`
+  marks where to widen it.
+- **Collect Data** streams raw EMG, checks electrode contact, and records
+  song-guided sessions for upload.
+
+All three share one connection to the band (`src/lib/band/connection.svelte.ts`).
+The link bench lives at `#bench`. It drives the `ble-gatt-bench` example in
+`ble-media` and reports what the phone's radio stack grants. `#collect` opens
+data collection directly.
 
 ## Run
 
