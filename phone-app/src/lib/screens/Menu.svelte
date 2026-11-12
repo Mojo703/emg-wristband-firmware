@@ -10,7 +10,7 @@
   function statusLabel(): string {
     if (connection.busy === 'connect') return 'Connecting…';
     if (connection.connected) return `Connected to ${connection.deviceName || 'band'}`;
-    return 'Not connected';
+    return 'Not connected, tap to connect';
   }
 
   function tapStatus(): void {
@@ -35,8 +35,8 @@
   </button>
 
   <nav class="menu-buttons">
-    <button class="oval-button" onclick={onCalibration}>Calibration</button>
-    <button class="oval-button" onclick={onGestureConfig}>Gesture Configuration</button>
-    <button class="oval-button" onclick={onCollect}>Collect Data</button>
+    <button class="oval-button" disabled={!connection.connected} onclick={onCalibration}>Calibration</button>
+    <button class="oval-button" disabled={!connection.connected} onclick={onGestureConfig}>Gesture Configuration</button>
+    <button class="oval-button" disabled={!connection.connected} onclick={onCollect}>Collect Data</button>
   </nav>
 </main>
