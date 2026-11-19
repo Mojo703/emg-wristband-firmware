@@ -29,6 +29,7 @@ export type BandEvent =
   | { readonly kind: 'gesture'; readonly event: GestureEvent }
   | { readonly kind: 'leadOff'; readonly snapshot: LeadOffSnapshot }
   | { readonly kind: 'calibration'; readonly status: CalibrationStatus }
+  | { readonly kind: 'battery'; readonly percent: number }
   | { readonly kind: 'disconnected' };
 
 export function bluetoothAvailable(): boolean {
@@ -61,8 +62,8 @@ export class Band {
       throw new Error('Web Bluetooth is not available in this browser');
     }
     const device = await navigator.bluetooth.requestDevice({
-      filters: [{ services: [SERVICE_UUID] }, { namePrefix: 'EMG' }],
-      optionalServices: [SERVICE_UUID],
+      filters: [{ services: [SERVICE_UUID] }, { namePrefix: 'Opal' }],
+      optionalServices: [SERVICE_UUID, 'battery_service'],
     });
     this.#device = device;
     device.addEventListener('gattserverdisconnected', () => this.#emit({ kind: 'disconnected' }));
@@ -112,6 +113,23 @@ export class Band {
     await settings.startNotifications();
     await gesture.startNotifications();
     this.#emit({ kind: 'settings', settings: decodeSettings(await settings.readValue()) });
+    await this.#watchBattery(server);
+  }
+
+  /** The standard Bluetooth battery level, a single byte from 0 to 100. A
+   * band without the battery service connects all the same. */
+  async #watchBattery(server: BluetoothRemoteGATTServer): Promise<void> {
+    const level = await server
+      .getPrimaryService('battery_service')
+      .then((service) => service.getCharacteristic('battery_level'))
+      .catch(() => null);
+    if (level === null) return;
+    level.addEventListener('characteristicvaluechanged', (event) => {
+      const view = valueOf(event);
+      if (view !== null) this.#emit({ kind: 'battery', percent: view.getUint8(0) });
+    });
+    await level.startNotifications().catch(() => undefined);
+    this.#emit({ kind: 'battery', percent: (await level.readValue()).getUint8(0) });
   }
 
   get streams(): boolean {

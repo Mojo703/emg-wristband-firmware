@@ -44,7 +44,7 @@ use radio::{Commit, EmgSender, OutboundWindow, PhoneLink};
 use std::time::Instant;
 use wearer_model::{WearerModel, WearerModelStore};
 
-const DEVICE_NAME: &str = "EMG Wristband";
+const DEVICE_NAME: &str = "Opal Wristband";
 
 /// SPI clock for ADS1298 registers and opcodes: the rate the bring-up bench
 /// validated end to end. Nothing on this path is latency-sensitive.

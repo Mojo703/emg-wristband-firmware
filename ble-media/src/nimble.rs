@@ -156,11 +156,15 @@ impl NimbleRadio {
         server.advertise_on_disconnect(false);
 
         let mut hid_device = BLEHIDDevice::new(server);
-        hid_device.manufacturer("EMG Wristband");
+        hid_device.manufacturer("Opal");
         // Generic/open-source USB-IF VID (pid.codes 0x1209) + a local PID.
         hid_device.pnp(0x02, 0x1209, 0x0001, 0x0100);
         hid_device.hid_info(0x00, 0x01);
         hid_device.report_map(hid::REPORT_MAP);
+        // TODO: a placeholder. The phone app reads and subscribes to this standard
+        // battery level (service 0x180F, characteristic 0x2A19, one byte 0-100)
+        // for its battery pill. Replace it with the battery divider reading
+        // (GPIO4, D3) converted to percent, and notify on change.
         hid_device.set_battery_level(100);
 
         let input = hid_device.input_report(hid::REPORT_ID);

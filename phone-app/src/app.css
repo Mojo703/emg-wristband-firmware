@@ -242,6 +242,55 @@ pre.log {
   color: var(--muted);
 }
 
+/* Battery level, under the status pill */
+
+/* A battery outline, filled to the charge, with the number on top. */
+.battery-level {
+  position: relative;
+  display: grid;
+  place-items: center;
+  justify-self: center;
+  width: 96px;
+  height: 34px;
+  margin: 0;
+  border: 2px solid var(--text);
+  border-radius: 10px;
+}
+
+/* The battery's positive terminal, just outside the right end. */
+.battery-level::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  right: -7px;
+  width: 4px;
+  height: 12px;
+  border-radius: 0 3px 3px 0;
+  transform: translateY(-50%);
+  background: var(--text);
+}
+
+/* Inset from the outline, and clipped back from the right so the cut stays
+   straight at any charge. */
+.battery-fill {
+  position: absolute;
+  inset: 3px;
+  border-radius: 6px;
+  background: #28a745;
+}
+
+.battery-text {
+  position: relative;
+  color: #ffffff;
+  font-size: 0.85rem;
+  font-weight: 700;
+}
+
+/* No reading yet: an empty battery with a muted dash. */
+.battery-level.unknown .battery-text {
+  color: var(--muted);
+}
+
 /* Main menu buttons */
 
 .menu-buttons {
