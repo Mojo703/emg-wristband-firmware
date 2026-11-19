@@ -7,7 +7,7 @@
     onCollect,
   }: { onCalibration: () => void; onGestureConfig: () => void; onCollect: () => void } = $props();
 
-  // The band's battery service. Until it reports, the pill is empty.
+  // The band's battery service. Hidden until connected; empty until it reports.
   const batteryPercent = $derived(connection.battery);
 
   function statusLabel(): string {
@@ -37,14 +37,16 @@
     {statusLabel()}
   </button>
 
-  <p
-    class="battery-level"
-    class:unknown={batteryPercent === null}
-    aria-label={batteryPercent === null ? 'Battery level unknown' : `Battery ${batteryPercent} percent`}
-  >
-    <span class="battery-fill" style={`clip-path: inset(0 ${100 - (batteryPercent ?? 0)}% 0 0)`}></span>
-    <span class="battery-text">{batteryPercent === null ? '--' : `${batteryPercent}%`}</span>
-  </p>
+  {#if connection.connected}
+    <p
+      class="battery-level"
+      class:unknown={batteryPercent === null}
+      aria-label={batteryPercent === null ? 'Battery level unknown' : `Battery ${batteryPercent} percent`}
+    >
+      <span class="battery-fill" style={`clip-path: inset(0 ${100 - (batteryPercent ?? 0)}% 0 0)`}></span>
+      <span class="battery-text">{batteryPercent === null ? '--' : `${batteryPercent}%`}</span>
+    </p>
+  {/if}
 
   <nav class="menu-buttons">
     <button class="oval-button" disabled={!connection.connected} onclick={onCalibration}>Calibration</button>
