@@ -25,7 +25,7 @@ export const CALIBRATION_STATUS_UUID = '5c3e7a10-2f4b-4d8e-9b61-0f1e2d3c4c07';
 
 const LEAD_OFF_VERSION = 2;
 const LEAD_OFF_CHANNELS = 16;
-const LEAD_OFF_LENGTH = 3 + 5 * LEAD_OFF_CHANNELS;
+export const LEAD_OFF_LENGTH = 3 + 5 * LEAD_OFF_CHANNELS;
 
 /** One AC lead-off snapshot: each channel's excitation tone, which grows with
  * electrode impedance, and how much of the snapshot it spent at a rail. */

@@ -6,6 +6,7 @@ import {
   GESTURE_UUID,
   HEALTH_UUID,
   LEAD_OFF_UUID,
+  LEAD_OFF_LENGTH,
   SERVICE_UUID,
   SETTINGS_UUID,
   decodeCalibrationStatus,
@@ -42,6 +43,7 @@ export class Band {
   #emg: BluetoothRemoteGATTCharacteristic | null = null;
   #health: BluetoothRemoteGATTCharacteristic | null = null;
   #leadOff: BluetoothRemoteGATTCharacteristic | null = null;
+  #leadOffReading = false;
   #calibrationCommand: BluetoothRemoteGATTCharacteristic | null = null;
   #calibrationStatus: BluetoothRemoteGATTCharacteristic | null = null;
   #assembler = new WindowAssembler();
@@ -79,10 +81,23 @@ export class Band {
     this.#leadOff = await service.getCharacteristic(LEAD_OFF_UUID).catch(() => null);
     // The record can outgrow a notification on a small MTU, so the notification
     // is only the signal and the value is read back whole.
-    this.#leadOff?.addEventListener('characteristicvaluechanged', () => {
+    // A read raises this event too, and until the snapshot lands the value is
+    // the one-byte request, so only a full record is decoded and one read runs
+    // at a time.
+    this.#leadOff?.addEventListener('characteristicvaluechanged', (event) => {
+      const view = valueOf(event);
+      if (view !== null && view.byteLength >= LEAD_OFF_LENGTH) {
+        this.#emit({ kind: 'leadOff', snapshot: decodeLeadOffSnapshot(view) });
+        return;
+      }
+      if (this.#leadOffReading || this.#leadOff === null) return;
+      this.#leadOffReading = true;
       void this.#leadOff
-        ?.readValue()
-        .then((view) => this.#emit({ kind: 'leadOff', snapshot: decodeLeadOffSnapshot(view) }));
+        .readValue()
+        .catch(() => undefined)
+        .finally(() => {
+          this.#leadOffReading = false;
+        });
     });
     await this.#leadOff?.startNotifications();
     this.#calibrationCommand = await service.getCharacteristic(CALIBRATION_COMMAND_UUID).catch(() => null);
