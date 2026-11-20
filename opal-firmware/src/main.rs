@@ -85,6 +85,8 @@ const WINDOW_PERIOD: std::time::Duration = std::time::Duration::from_micros(
 /// running again. The front end flaps (~2 warm recoveries per second on the
 /// bench), and each edge buzzes the wearer.
 const RECOVERY_SETTLE_MS: u128 = 3000;
+/// A lead-off snapshot pauses windows for 4000 frames, two seconds at 2000 SPS.
+const LEAD_OFF_SNAPSHOT_LIMIT_MS: u128 = 4000;
 
 /// Windows between inference-performance reports (~4 s).
 const PERFORMANCE_REPORT_INTERVAL: u32 = 16;
@@ -114,6 +116,8 @@ struct App {
     performance: InferencePerformance,
     last_window_at: Instant,
     stall_reported: bool,
+    /// Windows pause while the pipeline measures lead-off, so the gap is not a stall.
+    lead_off_requested_at: Option<Instant>,
     front_end: FrontEnd,
     steady_since: Option<Instant>,
     config_generation: u32,
@@ -325,6 +329,7 @@ impl App {
             performance: InferencePerformance::default(),
             last_window_at: Instant::now(),
             stall_reported: false,
+            lead_off_requested_at: None,
             front_end,
             steady_since: None,
             config_generation: 0,
@@ -392,22 +397,33 @@ impl App {
         }
     }
 
-    fn relay_lead_off(&self) {
+    fn relay_lead_off(&mut self) {
         let (Some(phone), Some(source)) = (self.phone.as_ref(), self.source.as_ref()) else {
             return;
         };
         if phone.take_lead_off_request() {
             info!("lead-off snapshot requested");
             source.request_lead_off_snapshot();
+            self.lead_off_requested_at = Some(Instant::now());
         }
         if let Some(tones) = source.take_lead_off_snapshot() {
             phone.publish_lead_off(radio::lead_off_snapshot(&tones));
+            self.lead_off_requested_at = None;
+            self.last_window_at = Instant::now();
         }
+    }
+
+    /// A snapshot that never answers stops excusing the gap after this long.
+    fn lead_off_snapshot_in_progress(&self) -> bool {
+        self.lead_off_requested_at
+            .is_some_and(|at| at.elapsed().as_millis() < LEAD_OFF_SNAPSHOT_LIMIT_MS)
     }
 
     fn handle_idle_iteration(&mut self) {
         if let Some(source) = self.source.as_ref() {
-            if !self.stall_reported && self.last_window_at.elapsed().as_millis() > STALL_WARNING_MS
+            if !self.stall_reported
+                && !self.lead_off_snapshot_in_progress()
+                && self.last_window_at.elapsed().as_millis() > STALL_WARNING_MS
             {
                 warn!(
                     "no ADC window for {} ms (dropped {}, read errors {}, bad status {}, recoveries {})",
