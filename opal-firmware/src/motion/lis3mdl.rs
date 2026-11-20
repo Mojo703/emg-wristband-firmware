@@ -51,7 +51,10 @@ fn write_verified<V: MagnetometerRegisterValue>(
     bus.write_byte(address, V::ADDRESS.address(), byte)?;
     let read = bus.read_byte(address, V::ADDRESS.address())?;
     if read != byte {
-        bail!("LIS3MDL {:?} wrote {byte:#04x}, reads {read:#04x}", V::ADDRESS);
+        bail!(
+            "LIS3MDL {:?} wrote {byte:#04x}, reads {read:#04x}",
+            V::ADDRESS
+        );
     }
     Ok(())
 }

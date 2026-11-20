@@ -43,6 +43,20 @@ pub fn disconnects() -> (u16, u16) {
 /// `0x03C1` = HID Keyboard. Presenting as a keyboard makes iOS treat us as a
 /// media-capable input device.
 const APPEARANCE_HID_KEYBOARD: u16 = 0x03C1;
+const BATTERY_SERVICE_UUID: u16 = 0x180F;
+const BATTERY_LEVEL_UUID: u16 = 0x2A19;
+
+/// The standard Battery Level characteristic the HID device registers. A
+/// clone stays valid until the radio is torn down.
+#[derive(Clone)]
+pub struct BatteryLevel(Arc<Mutex<BLECharacteristic>>);
+
+impl BatteryLevel {
+    /// Store the charge in percent and notify subscribers.
+    pub fn publish(&self, percent: u8) {
+        self.0.lock().set_value(&[percent.min(100)]).notify();
+    }
+}
 
 /// Rolls back a partially configured stack unless bring-up completes.
 struct InitializationGuard {
@@ -75,6 +89,7 @@ impl Drop for InitializationGuard {
 /// must receive a teardown error.
 pub struct NimbleRadio {
     input: Option<Arc<Mutex<BLECharacteristic>>>,
+    battery: Option<BatteryLevel>,
     advertising: Option<&'static Mutex<BLEAdvertising>>,
     server: Option<&'static mut esp32_nimble::BLEServer>,
     // Cleared before deinit so Drop never retries a partially completed call.
@@ -164,6 +179,17 @@ impl NimbleRadio {
         hid_device.set_battery_level(100);
 
         let input = hid_device.input_report(hid::REPORT_ID);
+        let battery = esp_idf_svc::hal::task::block_on(async {
+            let service = server
+                .get_service(BleUuid::from_uuid16(BATTERY_SERVICE_UUID))
+                .await?;
+            let service = service.lock();
+            let characteristic = service
+                .get_characteristic(BleUuid::from_uuid16(BATTERY_LEVEL_UUID))
+                .await?;
+            Some(BatteryLevel(characteristic.clone()))
+        })
+        .context("finding the HID battery level characteristic")?;
         let advertising = device.get_advertising();
 
         // scan_response(false) keeps the name and HID service UUID in the
@@ -182,6 +208,7 @@ impl NimbleRadio {
 
         let radio = Self {
             input: Some(input),
+            battery: Some(battery),
             advertising: Some(advertising),
             server: Some(server),
             active: true,
@@ -200,8 +227,13 @@ impl NimbleRadio {
         self.deinitialize()
     }
 
+    pub fn battery_level(&self) -> Option<BatteryLevel> {
+        self.battery.clone()
+    }
+
     fn deinitialize(&mut self) -> Result<()> {
         self.input.take();
+        self.battery.take();
         self.advertising.take();
         self.server.take();
 
@@ -661,7 +693,9 @@ impl EmgStream {
         record: &WindowRecord,
         budget: Duration,
     ) -> Result<()> {
-        let deadline = Instant::now() + budget;
+        let deadline = Instant::now()
+            .checked_add(budget)
+            .with_context(|| format!("a send budget of {budget:?} has no deadline"))?;
         let mtu = usize::from(unsafe { sys::ble_att_mtu(connection) });
         let notification_len = mtu
             .saturating_sub(ATT_NOTIFICATION_HEADER_LEN)

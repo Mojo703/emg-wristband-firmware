@@ -400,7 +400,10 @@ mod tests {
             assert_eq!(next.bits(), previous.bits() + 1, "{previous:?} to {next:?}");
             // The datasheet's rates are rounded, so the doubling is only close.
             let ratio = next.hertz() / previous.hertz();
-            assert!((1.95..2.1).contains(&ratio), "{previous:?} to {next:?}: {ratio}");
+            assert!(
+                (1.95..2.1).contains(&ratio),
+                "{previous:?} to {next:?}: {ratio}"
+            );
         }
     }
 

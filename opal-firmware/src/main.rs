@@ -9,6 +9,7 @@
 
 mod adc;
 mod allocation;
+mod battery;
 mod calibration;
 mod config;
 mod cores;
@@ -108,6 +109,7 @@ struct App {
     health: health::Health,
     classifier: Option<Box<Classifier>>,
     feedback: Feedback,
+    battery: Option<battery::Battery>,
     source: Option<AdcSource>,
     performance: InferencePerformance,
     last_window_at: Instant,
@@ -184,6 +186,14 @@ impl App {
             indicator: peripherals.pins.gpio5.into(),
             power_button: peripherals.pins.gpio6,
         });
+
+        let battery = match battery::Battery::start(peripherals.adc1, peripherals.pins.gpio4) {
+            Ok(battery) => Some(battery),
+            Err(error) => {
+                error!("battery monitor unavailable: {error:#}");
+                None
+            }
+        };
 
         // NimBLE next, so its largest allocation sees a fresh boot heap.
         let phone = PhoneLink::start(DEVICE_NAME, &settings.to_band());
@@ -287,12 +297,9 @@ impl App {
         }
 
         let emg_sender = match (phone.as_ref(), source.as_ref()) {
-            (Some(phone), Some(source)) => EmgSender::start(
-                phone.emg_stream(),
-                source.recycler(),
-                WINDOW_SAMPLES as u16,
-                WINDOW_PERIOD,
-            ),
+            (Some(phone), Some(source)) => {
+                EmgSender::start(phone.emg_stream(), source.recycler(), WINDOW_SAMPLES as u16)
+            }
             _ => None,
         };
 
@@ -313,6 +320,7 @@ impl App {
             phone,
             classifier,
             feedback,
+            battery,
             source,
             performance: InferencePerformance::default(),
             last_window_at: Instant::now(),
@@ -339,6 +347,7 @@ impl App {
             self.apply_settings_writes();
             self.relay_lead_off();
             self.handle_calibration();
+            self.report_battery();
             if let (Some(record), Some(phone)) = (self.health.update(), self.phone.as_ref()) {
                 phone.publish_health(record);
             }
@@ -361,6 +370,25 @@ impl App {
             let kept = self.settings.to_band();
             info!("settings changed: {kept:?}");
             phone.publish_settings(kept);
+        }
+    }
+
+    fn report_battery(&mut self) {
+        let Some(battery) = self.battery.as_mut() else {
+            return;
+        };
+        match battery.poll() {
+            Ok(Some(reading)) => {
+                info!(
+                    "battery: {} mV, {}%",
+                    reading.cell_millivolts, reading.percent
+                );
+                if let Some(phone) = self.phone.as_ref() {
+                    phone.publish_battery(reading.percent);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => warn!("battery reading failed: {error:#}"),
         }
     }
 

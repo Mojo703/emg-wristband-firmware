@@ -10,17 +10,17 @@ use super::lsm6dso::Sample;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct MotionThresholds {
     /// How far the acceleration magnitude may stray from the 1 g of a still arm.
-    pub(crate)acceleration_deviation_g: f32,
+    pub(crate) acceleration_deviation_g: f32,
     /// The largest rotation rate, in any direction, that still counts as calm.
-    pub(crate)angular_rate_degrees_per_second: f32,
+    pub(crate) angular_rate_degrees_per_second: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Assessment {
-    pub(crate)acceleration_magnitude_g: f32,
-    pub(crate)angular_rate_magnitude_degrees_per_second: f32,
+    pub(crate) acceleration_magnitude_g: f32,
+    pub(crate) angular_rate_magnitude_degrees_per_second: f32,
     /// Either measure over its threshold.
-    pub(crate)excessive: bool,
+    pub(crate) excessive: bool,
 }
 
 /// What a still arm reads: gravity alone.
@@ -48,11 +48,11 @@ fn magnitude([x, y, z]: [f32; 3]) -> f32 {
 /// would have to be to separate calm from not.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct PeriodSummary {
-    pub(crate)samples: u32,
-    pub(crate)excessive_samples: u32,
-    pub(crate)minimum_acceleration_g: f32,
-    pub(crate)maximum_acceleration_g: f32,
-    pub(crate)maximum_angular_rate_degrees_per_second: f32,
+    pub(crate) samples: u32,
+    pub(crate) excessive_samples: u32,
+    pub(crate) minimum_acceleration_g: f32,
+    pub(crate) maximum_acceleration_g: f32,
+    pub(crate) maximum_angular_rate_degrees_per_second: f32,
 }
 
 impl PeriodSummary {
@@ -116,8 +116,14 @@ mod tests {
     fn the_summary_keeps_extremes_and_counts() {
         let mut summary = PeriodSummary::EMPTY;
         summary.record(&assess(&sample([0.0, 0.0, 1.0], [0.0; 3]), &THRESHOLDS));
-        summary.record(&assess(&sample([0.0, 0.0, 2.0], [300.0, 0.0, 0.0]), &THRESHOLDS));
-        summary.record(&assess(&sample([0.0, 0.0, 0.9], [10.0, 0.0, 0.0]), &THRESHOLDS));
+        summary.record(&assess(
+            &sample([0.0, 0.0, 2.0], [300.0, 0.0, 0.0]),
+            &THRESHOLDS,
+        ));
+        summary.record(&assess(
+            &sample([0.0, 0.0, 0.9], [10.0, 0.0, 0.0]),
+            &THRESHOLDS,
+        ));
         assert_eq!(summary.samples, 3);
         assert_eq!(summary.excessive_samples, 1);
         assert!((summary.minimum_acceleration_g - 0.9).abs() < 1e-6);

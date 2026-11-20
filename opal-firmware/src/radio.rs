@@ -7,10 +7,12 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use ble_media::emg_stream::WindowRecord;
-use ble_media::nimble::{EmgStream, NimbleRadio, SettingsService, TimedCalibrationCommand};
+use ble_media::nimble::{
+    BatteryLevel, EmgStream, NimbleRadio, SettingsService, TimedCalibrationCommand,
+};
 use ble_media::phone::{Delivery, Phone, RadioClaim};
 use ble_media::session::SESSION_TICK;
 use ble_media::settings_service::{
@@ -49,6 +51,7 @@ enum Outbound {
     Health(BandHealth),
     LeadOff(LeadOffSnapshot),
     Calibration(CalibrationStatus),
+    Battery(u8),
 }
 
 pub(crate) struct PhoneLink {
@@ -93,12 +96,13 @@ impl PhoneLink {
         let outbound = Handoff::with_capacity(COMMIT_CAPACITY);
         let inbox = outbound.clone();
         let (state_sender, states) = mpsc::sync_channel(1);
+        let battery = radio.battery_level();
         let phone = Phone::new(radio);
         let spawned = cores::spawn_pinned(cores::BLE_SESSION_CORE, || {
             std::thread::Builder::new()
                 .name("ble-session".into())
                 .stack_size(BLE_THREAD_STACK_BYTES)
-                .spawn(move || run(phone, service, inbox, state_sender))
+                .spawn(move || run(phone, service, battery, inbox, state_sender))
         });
         match spawned {
             Ok(Ok(_)) => {}
@@ -167,6 +171,10 @@ impl PhoneLink {
         self.send(Outbound::Calibration(status));
     }
 
+    pub(crate) fn publish_battery(&self, percent: u8) {
+        self.send(Outbound::Battery(percent));
+    }
+
     pub(crate) fn feedback_phone(&mut self) -> FeedbackPhone {
         while let Ok(status) = self.states.try_recv() {
             self.status = status;
@@ -211,7 +219,6 @@ impl EmgSender {
         stream: EmgStream,
         recycler: WindowRecycler,
         steps_per_channel: u16,
-        budget: Duration,
     ) -> Option<Self> {
         let (windows, inbox) = mpsc::sync_channel::<OutboundWindow>(1);
         let undelivered = Arc::new(AtomicU32::new(0));
@@ -229,9 +236,12 @@ impl EmgSender {
                             missing: &window.missing,
                             packed_samples: &window.packed_wire,
                         };
-                        if let Err(error) =
-                            stream.send_window(window.connection, window.sequence, &record, budget)
-                        {
+                        if let Err(error) = stream.send_window(
+                            window.connection,
+                            window.sequence,
+                            &record,
+                            crate::WINDOW_PERIOD,
+                        ) {
                             let total = counted.fetch_add(1, Ordering::Relaxed) + 1;
                             if total == 1 || total % UNDELIVERED_LOG_INTERVAL == 0 {
                                 warn!(
@@ -275,6 +285,7 @@ impl EmgSender {
 fn run(
     mut phone: Phone<NimbleRadio>,
     service: SettingsService,
+    battery: Option<BatteryLevel>,
     inbox: Handoff<Outbound>,
     states: SyncSender<PhoneStatus>,
 ) {
@@ -317,6 +328,11 @@ fn run(
                 Some(Outbound::Health(health)) => service.publish_health(&health),
                 Some(Outbound::LeadOff(snapshot)) => service.publish_lead_off(&snapshot),
                 Some(Outbound::Calibration(status)) => service.publish_calibration(&status),
+                Some(Outbound::Battery(percent)) => {
+                    if let Some(battery) = battery.as_ref() {
+                        battery.publish(percent);
+                    }
+                }
                 None => break,
             }
         }

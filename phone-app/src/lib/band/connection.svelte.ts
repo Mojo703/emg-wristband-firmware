@@ -18,6 +18,7 @@ class Connection {
   settings = $state<BandSettings | null>(null);
   lastGesture = $state<GestureEvent | null>(null);
   calibration = $state<CalibrationStatus | null>(null);
+  batteryPercent = $state<number | null>(null);
   leadOff = $state.raw<LeadOffSnapshot | null>(null);
   busy = $state<string | null>(null);
   log = $state<string[]>([]);
@@ -38,10 +39,14 @@ class Connection {
         case 'leadOff':
           this.leadOff = event.snapshot;
           break;
+        case 'battery':
+          this.batteryPercent = event.percent;
+          break;
         case 'disconnected':
           this.connected = false;
           this.settings = null;
           this.calibration = null;
+          this.batteryPercent = null;
           this.note('disconnected');
           break;
       }

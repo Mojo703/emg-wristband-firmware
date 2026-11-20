@@ -107,7 +107,10 @@ impl Lsm6dso {
             }
         }
         if !reset_finished {
-            bail!("LSM6DSO at {:#04x}: software reset never cleared", imu.address);
+            bail!(
+                "LSM6DSO at {:#04x}: software reset never cleared",
+                imu.address
+            );
         }
 
         imu.write_verified(interface)?;
@@ -134,10 +137,10 @@ impl Lsm6dso {
         let mut bytes = [0u8; SAMPLE_BYTES];
         self.bus
             .read(self.address, InertialRegister::OutxLG.address(), &mut bytes)?;
-        Ok(Some(
-            RawSample::from_bytes(&bytes)
-                .to_physical(self.accelerometer_range, self.gyroscope_range),
-        ))
+        Ok(Some(RawSample::from_bytes(&bytes).to_physical(
+            self.accelerometer_range,
+            self.gyroscope_range,
+        )))
     }
 
     fn read_register(&mut self, register: InertialRegister) -> Result<u8> {
