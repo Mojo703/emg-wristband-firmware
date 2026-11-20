@@ -62,7 +62,7 @@ export class Band {
       throw new Error('Web Bluetooth is not available in this browser');
     }
     const device = await navigator.bluetooth.requestDevice({
-      filters: [{ services: [SERVICE_UUID] }, { namePrefix: 'EMG' }],
+      filters: [{ services: [SERVICE_UUID] }, { namePrefix: 'Opal' }],
       optionalServices: [SERVICE_UUID, 'battery_service'],
     });
     this.#device = device;

@@ -2,6 +2,8 @@
   import { connection } from '../band/connection.svelte.ts';
   import { gestureLabel, type Binding } from '../band/protocol.ts';
   import { MEDIA_KEYS } from '../bench/protocol.ts';
+  import radialDeviationAnimation from '../../assets/gestures/radial-deviation.gif';
+  import ulnarDeviationAnimation from '../../assets/gestures/ulnar-deviation.gif';
 
   interface Tile {
     readonly id: string;
@@ -34,9 +36,19 @@
   // 1 Supination, 2 Radial deviation, 3 Ulnar deviation, 4 Tip center).
   const GESTURES = [2, 3];
 
+  // An animation of each gesture, by the same index. Add one alongside any
+  // gesture added to `GESTURES`; a gesture without one, or whose animation
+  // fails to load, shows its name instead.
+  const GESTURE_ANIMATIONS: Record<number, string> = {
+    2: radialDeviationAnimation,
+    3: ulnarDeviationAnimation,
+  };
+
   let assignment = $state<Record<string, number | null>>(Object.fromEntries(TILES.map((tile) => [tile.id, null])));
   let dragging = $state<{ gesture: number; x: number; y: number } | null>(null);
   let hoverTileId = $state<string | null>(null);
+  // Gestures whose animation failed to load; they fall back to their name.
+  let brokenAnimations = $state<readonly number[]>([]);
 
   const tray = $derived(GESTURES.filter((gesture) => !Object.values(assignment).includes(gesture)));
 
@@ -134,7 +146,7 @@
             onpointerdown={(event) => startDragFromTile(event, tile.id)}
             onkeydown={(event) => (event.key === 'Enter' || event.key === ' ') && clearTile(tile.id)}
           >
-            {gestureLabel(gesture)}
+            {@render gestureFace(gesture)}
           </div>
         {:else}
           <div class="gesture-box" class:hover-target={dragging !== null && hoverTileId === tile.id} data-tile-id={tile.id}></div>
@@ -146,11 +158,8 @@
 
   <div class="gesture-tray">
     {#each tray as gesture (gesture)}
-      <button type="button" class="gesture-chip" onpointerdown={(event) => startDrag(event, gesture)}>{gestureLabel(gesture)}</button>
+      <button type="button" class="gesture-chip" class:lifted={dragging?.gesture === gesture} onpointerdown={(event) => startDrag(event, gesture)}>{@render gestureFace(gesture)}</button>
     {/each}
-    {#if tray.length === 0}
-      <p class="muted">All gestures placed — drag a box here, to another box, or use Clear.</p>
-    {/if}
   </div>
 
   <div class="row" style="justify-content: space-between">
@@ -164,5 +173,19 @@
 </main>
 
 {#if dragging}
-  <div class="drag-ghost" style={`left:${dragging.x}px; top:${dragging.y}px;`}>{gestureLabel(dragging.gesture)}</div>
+  <div class="drag-ghost" style={`left:${dragging.x}px; top:${dragging.y}px;`}>{@render gestureFace(dragging.gesture)}</div>
 {/if}
+
+{#snippet gestureFace(gesture: number)}
+  {#if GESTURE_ANIMATIONS[gesture] && !brokenAnimations.includes(gesture)}
+    <img
+      class="gesture-animation"
+      src={GESTURE_ANIMATIONS[gesture]}
+      alt={gestureLabel(gesture)}
+      draggable="false"
+      onerror={() => (brokenAnimations = [...brokenAnimations, gesture])}
+    />
+  {:else}
+    <span class="gesture-name">{gestureLabel(gesture)}</span>
+  {/if}
+{/snippet}

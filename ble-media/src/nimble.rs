@@ -171,7 +171,7 @@ impl NimbleRadio {
         server.advertise_on_disconnect(false);
 
         let mut hid_device = BLEHIDDevice::new(server);
-        hid_device.manufacturer("EMG Wristband");
+        hid_device.manufacturer("Opal");
         // Generic/open-source USB-IF VID (pid.codes 0x1209) + a local PID.
         hid_device.pnp(0x02, 0x1209, 0x0001, 0x0100);
         hid_device.hid_info(0x00, 0x01);
